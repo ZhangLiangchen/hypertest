@@ -1,0 +1,46 @@
+name: Bootstrap verified source
+
+on:
+  push:
+    branches: [agent/initialize-project]
+    paths:
+      - .bootstrap/**
+      - .github/workflows/bootstrap-source.yml
+
+permissions:
+  contents: write
+
+jobs:
+  materialize-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/initialize-project
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+      - run: python -m pip install pytest coverage
+      - name: Materialize source archive
+        run: |
+          cat .bootstrap/part-* | base64 --decode > /tmp/hypertest-source.tar.gz
+          tar -xzf /tmp/hypertest-source.tar.gz -C .
+      - run: npm install --ignore-scripts
+      - run: npm run ci
+      - run: npm run test:examples
+      - name: Publish verified source
+        run: |
+          rm -f profiles/python-http-pytest.example.yaml profiles/go-cli-go-test.example.yaml
+          rm -rf .bootstrap .github/workflows/bootstrap-source.yml
+          git config user.name "hypertest-bootstrap"
+          git config user.email "48679871+ZhangLiangchen@users.noreply.github.com"
+          git add -A
+          git commit -m "Implement HyperTest end-to-end reference system"
+          git push origin HEAD:agent/initialize-project
