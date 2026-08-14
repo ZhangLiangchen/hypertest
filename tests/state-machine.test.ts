@@ -3,12 +3,14 @@ import test from "node:test";
 
 import {
   InvalidRunTransitionError,
+  createRunLedger,
   isTerminalRunState,
+  recordTransition,
   transitionRun,
   type RunState,
 } from "../src/state-machine.js";
 
-test("happy path reaches completed through all three BUGate decision points", () => {
+test("happy path reaches completed through all three quality gates", () => {
   const steps = [
     "accepted",
     "evidence_ready",
@@ -22,37 +24,29 @@ test("happy path reaches completed through all three BUGate decision points", ()
     "allowed",
     "published",
   ] as const;
-
   let state: RunState = "intake";
-  for (const event of steps) {
-    state = transitionRun(state, event);
-  }
-
+  for (const event of steps) state = transitionRun(state, event);
   assert.equal(state, "completed");
   assert.equal(isTerminalRunState(state), true);
 });
 
-test("a failed test can make one governed repair loop", () => {
-  let state: RunState = "execute";
-  state = transitionRun(state, "tests_failed");
-  state = transitionRun(state, "safe_repair");
-  state = transitionRun(state, "allowed");
-  state = transitionRun(state, "repair_applied");
-  assert.equal(state, "execute");
+test("ledger records a governed repair round", () => {
+  let ledger: import("../src/state-machine.js").RunLedger = {
+    ...createRunLedger("run-1"),
+    state: "execute",
+  };
+  ledger = recordTransition(ledger, "tests_failed", 1);
+  ledger = recordTransition(ledger, "safe_repair", 2);
+  ledger = recordTransition(ledger, "allowed", 3);
+  ledger = recordTransition(ledger, "repair_applied", 4);
+  assert.equal(ledger.state, "execute");
+  assert.equal(ledger.repairRounds, 1);
+  assert.equal(ledger.transitions.length, 4);
 });
 
-test("BUGate denial is terminal", () => {
+test("denial and invalid transitions fail closed", () => {
   const state = transitionRun("pre_code_gate", "denied");
   assert.equal(state, "rejected");
-  assert.throws(
-    () => transitionRun(state, "allowed"),
-    InvalidRunTransitionError,
-  );
-});
-
-test("invalid transitions fail closed", () => {
-  assert.throws(
-    () => transitionRun("intake", "published"),
-    InvalidRunTransitionError,
-  );
+  assert.throws(() => transitionRun(state, "allowed"), InvalidRunTransitionError);
+  assert.throws(() => transitionRun("intake", "published"), InvalidRunTransitionError);
 });

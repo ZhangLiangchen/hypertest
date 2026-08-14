@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hypertest.dev/schemas/gate-decision.v1.schema.json",
+  "title": "HyperTest Gate Decision v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "requestId",
+    "requestHash",
+    "verdict",
+    "receiptId",
+    "reasonCodes",
+    "obligations",
+    "evidenceHashes"
+  ],
+  "properties": {
+    "schema": {
+      "const": "hypertest.gate-decision/v1"
+    },
+    "requestId": {
+      "type": "string"
+    },
+    "requestHash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "verdict": {
+      "enum": [
+        "allow",
+        "deny",
+        "needs_human"
+      ]
+    },
+    "receiptId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "reasonCodes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "obligations": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "evidenceHashes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-f0-9]{64}$"
+      }
+    },
+    "expiresAtEpochMs": {
+      "type": "integer"
+    },
+    "authority": {
+      "type": "string"
+    }
+  }
+}

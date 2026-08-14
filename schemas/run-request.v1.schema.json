@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hypertest.dev/schemas/run-request.v1.schema.json",
+  "title": "HyperTest Run Request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "runId",
+    "profilePath",
+    "workspacePath",
+    "sourceRevision",
+    "mode",
+    "budget"
+  ],
+  "properties": {
+    "schema": {
+      "const": "hypertest.run-request/v1"
+    },
+    "runId": {
+      "type": "string"
+    },
+    "profilePath": {
+      "type": "string"
+    },
+    "workspacePath": {
+      "type": "string"
+    },
+    "sourceRevision": {
+      "type": "string"
+    },
+    "mode": {
+      "enum": [
+        "plan",
+        "execute",
+        "repair",
+        "propose"
+      ]
+    },
+    "budget": {
+      "type": "object"
+    }
+  }
+}

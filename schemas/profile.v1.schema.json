@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hypertest.dev/schemas/profile.v1.schema.json",
+  "title": "HyperTest Profile v1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema",
+    "name",
+    "runtime",
+    "sut",
+    "adapters",
+    "gate",
+    "workspace"
+  ],
+  "properties": {
+    "schema": {
+      "const": "hypertest.profile/v1"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "runtime": {
+      "type": "object",
+      "required": [
+        "provider",
+        "budgets"
+      ],
+      "properties": {
+        "provider": {
+          "enum": [
+            "deterministic",
+            "fake",
+            "pi"
+          ]
+        },
+        "model": {
+          "type": "string"
+        },
+        "budgets": {
+          "type": "object"
+        }
+      }
+    },
+    "sut": {
+      "type": "object",
+      "required": [
+        "contractSource",
+        "sourceKind"
+      ],
+      "properties": {
+        "contractSource": {
+          "type": "string"
+        },
+        "sourceKind": {
+          "type": "string"
+        }
+      }
+    },
+    "adapters": {
+      "type": "object",
+      "required": [
+        "sut",
+        "test"
+      ],
+      "properties": {}
+    },
+    "gate": {
+      "type": "object",
+      "required": [
+        "mode"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "static-allow",
+            "static-deny",
+            "process"
+          ]
+        },
+        "process": {
+          "type": "object"
+        }
+      }
+    },
+    "workspace": {
+      "type": "object",
+      "required": [
+        "allowedWriteGlobs",
+        "forbiddenGlobs"
+      ],
+      "properties": {
+        "allowedWriteGlobs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "forbiddenGlobs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "options": {
+      "type": "object"
+    }
+  }
+}

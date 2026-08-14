@@ -2,6 +2,11 @@ node_modules/
 dist/
 coverage/
 .testagent/
+.hypertest-*.xml
+.hypertest-*.out
+.coverage
+.coverage.*
+.coverage.json
 .env
 .env.*
 !.env.example
@@ -9,3 +14,5 @@ coverage/
 .DS_Store
 .idea/
 .vscode/
+examples/python-http/tests/generated/
+examples/go-cli/hypertest_generated_test.go

@@ -1,0 +1,49 @@
+{
+  "schema": "hypertest.profile/v1",
+  "name": "python-http-pytest-example",
+  "runtime": {
+    "provider": "deterministic",
+    "budgets": {
+      "maxTurns": 20,
+      "maxToolCalls": 60,
+      "maxRepairRounds": 2,
+      "wallClockMs": 300000,
+      "tokenBudget": 50000
+    }
+  },
+  "sut": {
+    "contractSource": "../examples/python-http/openapi.json",
+    "sourceKind": "openapi"
+  },
+  "adapters": {
+    "sut": {
+      "command": "node",
+      "args": ["dist/src/adapter-cli.js", "--adapter", "sut-http-openapi"],
+      "cwd": ".."
+    },
+    "test": {
+      "command": "node",
+      "args": ["dist/src/adapter-cli.js", "--adapter", "test-pytest"],
+      "cwd": "..",
+      "config": {
+        "outputPath": "examples/python-http/tests/generated/test_hypertest_generated.py",
+        "workdir": "examples/python-http",
+        "command": ["python3", "run-tests.py"],
+        "resultPath": ".hypertest-junit.xml",
+        "coveragePath": ".coverage.json",
+        "coverageMediaType": "application/json",
+        "timeoutMs": 120000
+      }
+    },
+    "coverage": {
+      "command": "node",
+      "args": ["dist/src/adapter-cli.js", "--adapter", "coverage-json"],
+      "cwd": ".."
+    }
+  },
+  "gate": { "mode": "static-allow" },
+  "workspace": {
+    "allowedWriteGlobs": ["examples/python-http/tests/**"],
+    "forbiddenGlobs": [".git/**", "src/**", "examples/python-http/app.py"]
+  }
+}

@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hypertest.dev/schemas/test-run.v1.schema.json",
+  "title": "HyperTest Test Run v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "runId",
+    "sourceRevision",
+    "status",
+    "command",
+    "startedAtEpochMs",
+    "finishedAtEpochMs",
+    "cases",
+    "rawArtifacts",
+    "coverageArtifacts"
+  ],
+  "properties": {
+    "schema": {
+      "const": "hypertest.test-run/v1"
+    },
+    "runId": {
+      "type": "string"
+    },
+    "sourceRevision": {
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "passed",
+        "failed",
+        "build_error",
+        "runner_error",
+        "environment_error",
+        "timeout",
+        "cancelled"
+      ]
+    },
+    "command": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "exitCode": {
+      "type": "integer"
+    },
+    "startedAtEpochMs": {
+      "type": "integer"
+    },
+    "finishedAtEpochMs": {
+      "type": "integer"
+    },
+    "cases": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "stdout": {
+      "type": "string"
+    },
+    "stderr": {
+      "type": "string"
+    },
+    "rawArtifacts": {
+      "type": "array",
+      "items": {
+        "$ref": "https://hypertest.dev/schemas/artifact-ref.v1.schema.json"
+      }
+    },
+    "coverageArtifacts": {
+      "type": "array",
+      "items": {
+        "$ref": "https://hypertest.dev/schemas/artifact-ref.v1.schema.json"
+      }
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

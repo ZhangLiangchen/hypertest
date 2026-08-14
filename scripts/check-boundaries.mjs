@@ -3,7 +3,7 @@ import { extname, join, relative } from "node:path";
 
 const root = new URL("../", import.meta.url);
 const sourceRoot = new URL("../src/", import.meta.url);
-const forbiddenCoreTerms = [
+const ecosystemTerms = [
   "pytest",
   "go test",
   "junit",
@@ -13,37 +13,43 @@ const forbiddenCoreTerms = [
   "github actions",
   "openapi",
 ];
-const piPackage = "@earendil-works/pi-agent-core";
+const piPackageFragments = ["pi-agent-core", "@earendil-works/pi"];
 const violations = [];
 
 async function walk(directory) {
   const entries = await readdir(directory, { withFileTypes: true });
   for (const entry of entries) {
     const path = join(directory, entry.name);
-    if (entry.isDirectory()) {
-      await walk(path);
-    } else if ([".ts", ".mts", ".cts"].includes(extname(entry.name))) {
-      await inspect(path);
-    }
+    if (entry.isDirectory()) await walk(path);
+    else if ([".ts", ".mts", ".cts"].includes(extname(entry.name))) await inspect(path);
   }
 }
 
 async function inspect(path) {
   const text = await readFile(path, "utf8");
-  const projectPath = relative(root.pathname, path);
-  const normalized = projectPath.replaceAll("\\", "/");
+  const normalized = relative(root.pathname, path).replaceAll("\\", "/");
+  const lower = text.toLowerCase();
 
-  if (text.includes(piPackage) && !normalized.startsWith("src/runtime/pi/")) {
-    violations.push(`${normalized}: pi SDK import outside src/runtime/pi`);
+  if (
+    piPackageFragments.some((fragment) => lower.includes(fragment.toLowerCase())) &&
+    !normalized.startsWith("src/runtime/pi/")
+  ) {
+    violations.push(`${normalized}: pi SDK reference outside src/runtime/pi`);
   }
 
-  if (normalized.startsWith("src/core/") || normalized === "src/state-machine.ts") {
-    const lower = text.toLowerCase();
-    for (const term of forbiddenCoreTerms) {
+  const isAdapter = normalized.startsWith("src/adapters/");
+  const isAdapterCli = normalized === "src/adapter-cli.ts";
+  const isProfileExampleAwareCli = normalized === "src/cli.ts";
+  if (!isAdapter && !isAdapterCli && !isProfileExampleAwareCli) {
+    for (const term of ecosystemTerms) {
       if (lower.includes(term)) {
-        violations.push(`${normalized}: ecosystem-specific term '${term}' in core`);
+        violations.push(`${normalized}: ecosystem-specific term '${term}' outside adapter boundary`);
       }
     }
+  }
+
+  if (normalized.startsWith("src/adapters/") && text.includes("@earendil-works/pi")) {
+    violations.push(`${normalized}: adapter imports the agent SDK`);
   }
 }
 

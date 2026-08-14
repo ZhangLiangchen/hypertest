@@ -1,17 +1,26 @@
 {
   "name": "hypertest",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
   "description": "A general-purpose, cross-language AI test development agent governed by BUGate.",
   "type": "module",
+  "bin": {
+    "hypertest": "dist/src/cli.js",
+    "hypertest-adapter": "dist/src/adapter-cli.js"
+  },
   "engines": {
     "node": ">=22.19.0"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "check": "tsc -p tsconfig.json --noEmit && node scripts/check-boundaries.mjs",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.json",
+    "check:types": "tsc -p tsconfig.json --noEmit",
+    "check:boundaries": "node scripts/check-boundaries.mjs",
+    "check": "npm run check:types && npm run check:boundaries && npm run check:schemas",
     "test": "npm run build && node --test dist/tests/*.test.js",
-    "ci": "npm run check && npm test"
+    "test:examples": "npm run build && node scripts/run-examples.mjs",
+    "ci": "npm run check && npm test",
+    "check:schemas": "node scripts/check-schemas.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.84.1"

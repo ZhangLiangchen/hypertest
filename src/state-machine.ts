@@ -85,6 +85,22 @@ const transitions: Readonly<
   publish: { published: "completed", fatal_error: "failed" },
 };
 
+export interface RunTransitionRecord {
+  readonly from: RunState;
+  readonly event: RunEvent;
+  readonly to: RunState;
+  readonly atEpochMs: number;
+  readonly detail?: string;
+}
+
+export interface RunLedger {
+  readonly schema: "hypertest.run-ledger/v1";
+  readonly runId: string;
+  readonly state: RunState;
+  readonly repairRounds: number;
+  readonly transitions: readonly RunTransitionRecord[];
+}
+
 export class InvalidRunTransitionError extends Error {
   public constructor(
     public readonly state: RunState,
@@ -109,4 +125,41 @@ export function transitionRun(state: RunState, event: RunEvent): RunState {
     throw new InvalidRunTransitionError(state, event);
   }
   return next;
+}
+
+export function recordTransition(
+  ledger: RunLedger,
+  event: RunEvent,
+  atEpochMs = Date.now(),
+  detail?: string,
+): RunLedger {
+  const next = transitionRun(ledger.state, event);
+  return {
+    ...ledger,
+    state: next,
+    repairRounds:
+      ledger.state === "repair" && event === "repair_applied"
+        ? ledger.repairRounds + 1
+        : ledger.repairRounds,
+    transitions: [
+      ...ledger.transitions,
+      {
+        from: ledger.state,
+        event,
+        to: next,
+        atEpochMs,
+        ...(detail === undefined ? {} : { detail }),
+      },
+    ],
+  };
+}
+
+export function createRunLedger(runId: string): RunLedger {
+  return {
+    schema: "hypertest.run-ledger/v1",
+    runId,
+    state: "intake",
+    repairRounds: 0,
+    transitions: [],
+  };
 }

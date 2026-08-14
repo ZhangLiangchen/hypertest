@@ -1,0 +1,49 @@
+{
+  "schema": "hypertest.profile/v1",
+  "name": "go-cli-go-test-example",
+  "runtime": {
+    "provider": "deterministic",
+    "budgets": {
+      "maxTurns": 20,
+      "maxToolCalls": 60,
+      "maxRepairRounds": 2,
+      "wallClockMs": 300000,
+      "tokenBudget": 50000
+    }
+  },
+  "sut": {
+    "contractSource": "../examples/go-cli/command-contract.json",
+    "sourceKind": "command-contract"
+  },
+  "adapters": {
+    "sut": {
+      "command": "node",
+      "args": ["dist/src/adapter-cli.js", "--adapter", "sut-command"],
+      "cwd": ".."
+    },
+    "test": {
+      "command": "node",
+      "args": ["dist/src/adapter-cli.js", "--adapter", "test-go"],
+      "cwd": "..",
+      "config": {
+        "outputPath": "examples/go-cli/hypertest_generated_test.go",
+        "packageName": "fixture_test",
+        "workdir": "examples/go-cli",
+        "command": ["go", "test", "-json", "-coverprofile=.hypertest-cover.out", "./..."],
+        "coveragePath": ".hypertest-cover.out",
+        "coverageMediaType": "text/plain",
+        "timeoutMs": 120000
+      }
+    },
+    "coverage": {
+      "command": "node",
+      "args": ["dist/src/adapter-cli.js", "--adapter", "coverage-go"],
+      "cwd": ".."
+    }
+  },
+  "gate": { "mode": "static-allow" },
+  "workspace": {
+    "allowedWriteGlobs": ["examples/go-cli/**/*_test.go"],
+    "forbiddenGlobs": [".git/**", "src/**", "examples/go-cli/cmd/**"]
+  }
+}

@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hypertest.dev/schemas/diagnosis.v1.schema.json",
+  "title": "HyperTest Diagnosis v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "category",
+    "confidence",
+    "hypotheses",
+    "repairAllowed",
+    "rationale"
+  ],
+  "properties": {
+    "schema": {
+      "const": "hypertest.diagnosis/v1"
+    },
+    "category": {
+      "enum": [
+        "TEST_DEFECT",
+        "FIXTURE_DEFECT",
+        "ADAPTER_CONFIG",
+        "SUT_DEFECT",
+        "CONTRACT_DRIFT",
+        "BUILD",
+        "ENVIRONMENT",
+        "FLAKY",
+        "UNKNOWN"
+      ]
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "hypotheses": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "culprit": {
+      "type": "object"
+    },
+    "repairAllowed": {
+      "type": "boolean"
+    },
+    "rationale": {
+      "type": "string"
+    }
+  }
+}

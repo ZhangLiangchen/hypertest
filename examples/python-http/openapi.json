@@ -1,0 +1,45 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "HyperTest Greeting HTTP Fixture",
+    "version": "1.0.0"
+  },
+  "servers": [{ "url": "http://127.0.0.1:8765" }],
+  "paths": {
+    "/greet/{name}": {
+      "get": {
+        "operationId": "greet",
+        "summary": "Return a greeting for a required name",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Greeting returned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["message"],
+                  "properties": { "message": { "type": "string" } }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The name was absent or invalid"
+          }
+        }
+      }
+    }
+  }
+}
