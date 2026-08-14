@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hypertest.dev/schemas/test-plan.v1.schema.json",
+  "title": "HyperTest Test Plan v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "sutContractHash",
+    "sourceRevision",
+    "generatedAtEpochMs",
+    "cases",
+    "uncoveredRisks"
+  ],
+  "properties": {
+    "schema": {
+      "const": "hypertest.test-plan/v1"
+    },
+    "sutContractHash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "sourceRevision": {
+      "type": "string"
+    },
+    "generatedAtEpochMs": {
+      "type": "integer"
+    },
+    "cases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "title",
+          "objective",
+          "operationIds",
+          "preconditions",
+          "steps",
+          "oracles",
+          "risk",
+          "provenance",
+          "generatedBy"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "objective": {
+            "type": "string"
+          },
+          "operationIds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "preconditions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "steps": {
+            "type": "array",
+            "minItems": 1
+          },
+          "oracles": {
+            "type": "array",
+            "minItems": 1
+          },
+          "risk": {
+            "type": "object"
+          },
+          "provenance": {
+            "type": "array",
+            "items": {
+              "$ref": "https://hypertest.dev/schemas/artifact-ref.v1.schema.json"
+            }
+          },
+          "generatedBy": {
+            "enum": [
+              "deterministic",
+              "model"
+            ]
+          }
+        }
+      }
+    },
+    "uncoveredRisks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

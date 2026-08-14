@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hypertest.dev/schemas/adapter-manifest.v1.schema.json",
+  "title": "HyperTest Adapter Manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "adapter",
+    "protocolVersion",
+    "operations",
+    "capabilities"
+  ],
+  "properties": {
+    "schema": {
+      "const": "hypertest.adapter-manifest/v1"
+    },
+    "adapter": {
+      "type": "object",
+      "required": [
+        "name",
+        "version"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      }
+    },
+    "protocolVersion": {
+      "const": "1"
+    },
+    "operations": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
+    "capabilities": {
+      "type": "object"
+    }
+  }
+}

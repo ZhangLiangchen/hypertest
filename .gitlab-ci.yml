@@ -1,0 +1,29 @@
+stages:
+  - verify
+  - conformance
+
+variables:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+hypertest-verify:
+  stage: verify
+  image: node:22.19.0-bookworm-slim
+  script:
+    - npm install --ignore-scripts
+    - npm run ci
+  artifacts:
+    when: always
+    paths:
+      - dist/
+
+hypertest-cross-language-conformance:
+  stage: conformance
+  image: node:22.19.0-bookworm
+  needs: [hypertest-verify]
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends python3 python3-pip golang-go
+    - python3 -m pip install --break-system-packages pytest coverage
+  script:
+    - npm install --ignore-scripts
+    - npm run test:examples

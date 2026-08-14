@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hypertest.dev/schemas/run-summary.v1.schema.json",
+  "title": "HyperTest Run Summary v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "runId",
+    "sourceRevision",
+    "finalState",
+    "gateDecisions",
+    "warnings"
+  ],
+  "properties": {
+    "schema": {
+      "const": "hypertest.run-summary/v1"
+    },
+    "runId": {
+      "type": "string"
+    },
+    "sourceRevision": {
+      "type": "string"
+    },
+    "finalState": {
+      "type": "string"
+    },
+    "testPlan": {
+      "$ref": "https://hypertest.dev/schemas/artifact-ref.v1.schema.json"
+    },
+    "patch": {
+      "$ref": "https://hypertest.dev/schemas/artifact-ref.v1.schema.json"
+    },
+    "testRun": {
+      "$ref": "https://hypertest.dev/schemas/artifact-ref.v1.schema.json"
+    },
+    "coverage": {
+      "$ref": "https://hypertest.dev/schemas/artifact-ref.v1.schema.json"
+    },
+    "diagnosis": {
+      "$ref": "https://hypertest.dev/schemas/artifact-ref.v1.schema.json"
+    },
+    "change": {
+      "$ref": "https://hypertest.dev/schemas/artifact-ref.v1.schema.json"
+    },
+    "gateDecisions": {
+      "type": "array",
+      "items": {
+        "$ref": "https://hypertest.dev/schemas/artifact-ref.v1.schema.json"
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "id": "hypertest-go-cli-fixture",
+  "title": "HyperTest Greeting CLI Fixture",
+  "operations": [
+    {
+      "id": "greet",
+      "title": "Return a greeting",
+      "description": "The command requires a non-empty name and writes one JSON object to stdout.",
+      "argv": ["go", "run", "./cmd/hyperfixture", "greet", "{name}"],
+      "inputSchema": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32
+          }
+        }
+      },
+      "expectedExitCodes": [0],
+      "effects": "none",
+      "tags": ["cli", "greeting"]
+    }
+  ]
+}

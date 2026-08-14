@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hypertest.dev/schemas/sut-contract.v1.schema.json",
+  "title": "HyperTest SUT Contract v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "id",
+    "title",
+    "sourceRevision",
+    "operations",
+    "lifecycleCapabilities",
+    "provenance"
+  ],
+  "properties": {
+    "schema": {
+      "const": "hypertest.sut-contract/v1"
+    },
+    "id": {
+      "type": "string"
+    },
+    "title": {
+      "type": "string"
+    },
+    "sourceRevision": {
+      "type": "string"
+    },
+    "operations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "interactionKind",
+          "inputSchema",
+          "observationSchema",
+          "effects",
+          "preconditions",
+          "oracleHints",
+          "tags"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "interactionKind": {
+            "type": "string"
+          },
+          "inputSchema": {
+            "type": "object"
+          },
+          "observationSchema": {
+            "type": "object"
+          },
+          "effects": {
+            "enum": [
+              "none",
+              "read",
+              "write",
+              "destructive",
+              "unknown"
+            ]
+          },
+          "preconditions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "oracleHints": {
+            "type": "array"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "extensionSchema": {
+            "type": "string"
+          },
+          "extension": true
+        }
+      }
+    },
+    "lifecycleCapabilities": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "provenance": {
+      "type": "array",
+      "items": {
+        "$ref": "https://hypertest.dev/schemas/artifact-ref.v1.schema.json"
+      }
+    }
+  }
+}

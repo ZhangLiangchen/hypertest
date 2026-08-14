@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hypertest.dev/schemas/adapter-response.v1.schema.json",
+  "title": "HyperTest Adapter Response v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "requestId",
+    "adapter",
+    "status",
+    "artifacts",
+    "diagnostics"
+  ],
+  "properties": {
+    "schema": {
+      "const": "hypertest.adapter-response/v1"
+    },
+    "requestId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "adapter": {
+      "type": "object",
+      "required": [
+        "name",
+        "version"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      }
+    },
+    "status": {
+      "enum": [
+        "ok",
+        "unsupported",
+        "transient_error",
+        "permanent_error",
+        "cancelled"
+      ]
+    },
+    "outcome": true,
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "$ref": "https://hypertest.dev/schemas/artifact-ref.v1.schema.json"
+      }
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "detail": true
+        }
+      }
+    },
+    "retry": {
+      "type": "object",
+      "required": [
+        "safe"
+      ],
+      "properties": {
+        "safe": {
+          "type": "boolean"
+        },
+        "afterMs": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

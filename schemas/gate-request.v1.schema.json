@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hypertest.dev/schemas/gate-request.v1.schema.json",
+  "title": "HyperTest Gate Request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "requestId",
+    "runId",
+    "action",
+    "sourceRevision",
+    "evidence"
+  ],
+  "properties": {
+    "schema": {
+      "const": "hypertest.gate-request/v1"
+    },
+    "requestId": {
+      "type": "string"
+    },
+    "runId": {
+      "type": "string"
+    },
+    "action": {
+      "enum": [
+        "enter_implementation",
+        "apply_patch",
+        "publish_change"
+      ]
+    },
+    "sourceRevision": {
+      "type": "string"
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "$ref": "https://hypertest.dev/schemas/artifact-ref.v1.schema.json"
+      }
+    },
+    "context": true
+  }
+}

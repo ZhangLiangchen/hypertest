@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hypertest.dev/schemas/coverage-map.v1.schema.json",
+  "title": "HyperTest Coverage Map v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "sourceRevision",
+    "files",
+    "capabilities",
+    "completeness",
+    "warnings"
+  ],
+  "properties": {
+    "schema": {
+      "const": "hypertest.coverage-map/v1"
+    },
+    "sourceRevision": {
+      "type": "string"
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "uri",
+          "regions"
+        ],
+        "properties": {
+          "uri": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "regions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "start",
+                "end",
+                "kind",
+                "hits",
+                "testIds"
+              ],
+              "properties": {
+                "start": {
+                  "type": "object"
+                },
+                "end": {
+                  "type": "object"
+                },
+                "kind": {
+                  "enum": [
+                    "line",
+                    "block",
+                    "branch",
+                    "condition",
+                    "function"
+                  ]
+                },
+                "hits": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "testIds": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "required": [
+        "line",
+        "block",
+        "branch",
+        "condition",
+        "function",
+        "perTest"
+      ],
+      "properties": {
+        "line": {
+          "type": "boolean"
+        },
+        "block": {
+          "type": "boolean"
+        },
+        "branch": {
+          "type": "boolean"
+        },
+        "condition": {
+          "type": "boolean"
+        },
+        "function": {
+          "type": "boolean"
+        },
+        "perTest": {
+          "type": "boolean"
+        }
+      }
+    },
+    "completeness": {
+      "enum": [
+        "complete",
+        "partial",
+        "unknown"
+      ]
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}
