@@ -1,53 +1,84 @@
-# HyperTest architecture baseline
+# HyperTest architecture
 
-## Decision summary
+## Authority model
 
-HyperTest uses one deterministic core, one policy authority, and one SDK-level runtime seam:
-
-- **HyperTest Core** owns run state, budgets, artifacts, diagnosis, repair policy, and adapter capability negotiation.
-- **BUGate PDP/PEP** owns quality decisions and enforcement receipts.
-- **pi-agent-core** supplies the programmable model/tool loop behind a HyperTest-owned `AgentRuntime` interface.
-- **Adapters** isolate the SUT, test framework, code intelligence, coverage, sandbox, CI, SCM, and domain knowledge.
-
-## Component topology
-
-```mermaid
-flowchart LR
-  Entry[CLI / CI / optional UI] --> Core[HyperTest Core]
-  Core --> Runtime[AgentRuntime facade]
-  Runtime --> Pi[pi-agent-core]
-  Pi --> Tools[Typed tool facade]
-  Tools --> Gate[BUGate bridge]
-  Gate --> PDP[BUGate PDP/PEP]
-  Tools --> Sut[SUT adapter]
-  Tools --> Test[Test-framework adapter]
-  Tools --> Code[Code-intelligence adapter]
-  Tools --> Ci[CI adapter]
-  Tools --> Scm[Change-publisher adapter]
-  Test --> Sandbox[OCI sandbox provider]
-  Core <--> Store[Versioned artifact store]
-```
-
-## Authority split
+HyperTest deliberately has three non-overlapping authorities:
 
 | Concern | Authority |
 |---|---|
-| Next computational step | HyperTest deterministic state machine |
-| Model/tool execution mechanics | AgentRuntime implementation |
-| Quality policy and write/publish permission | BUGate PDP/PEP |
-| Ecosystem-specific behavior | Selected adapter |
-| Durable evidence | Versioned artifact store |
+| Next computational step, retry, timeout and budget | HyperTest deterministic core |
+| Model/tool-loop mechanics | `AgentRuntime`; pi is the only SDK implementation |
+| Quality policy and permission to mutate/publish | BUGate PDP/PEP |
 
-No model, adapter, CI platform, or hub may override a BUGate denial.
+A model, adapter, CI platform, or hub cannot override a BUGate denial. BUGate unavailability permits read-only analysis but fails closed for applying a governed patch or publishing a change.
 
-## Initial implementation slice
+## Topology
 
-The repository starts with:
+```mermaid
+flowchart TB
+  Entry[CLI / GitLab CI / GitHub Actions / optional UI] --> Core
 
-1. capability-neutral adapter contracts;
-2. a deterministic state machine with pre-code, repair, and publish gates;
-3. an atomic SHA-256 file artifact store;
-4. a fake runtime for model-independent tests;
-5. architecture boundary checks in CI.
+  subgraph Control[Quality control plane]
+    PDP[BUGate PDP]
+    PEP[BUGate PEP]
+    PDP --> PEP
+  end
 
-The first two conformance scenarios will be Python/pytest/HTTP and Go/go test/CLI. A switch between them is accepted only when common core and schema changes are zero.
+  subgraph CoreBox[HyperTest Core]
+    Core[Deterministic state machine]
+    Runtime[AgentRuntime facade]
+    Store[Versioned artifact store]
+    Policy[Diagnosis and repair policy]
+    Core --> Runtime
+    Core <--> Store
+    Core --> Policy
+  end
+
+  Runtime --> Pi[pi-agent-core]
+  Pi --> Tools[Typed tool facade]
+  Tools --> Gate[BUGate process bridge]
+  Gate --> PEP
+
+  Tools --> Sut[SUT adapter]
+  Tools --> Test[Test-framework adapter]
+  Tools --> Code[Code-intelligence adapter]
+  Tools --> CI[CI adapter]
+  Tools --> SCM[Change-publisher adapter]
+  Test --> Sandbox[Local / OCI sandbox]
+  Test --> Coverage[Native coverage adapter]
+
+  Sut --> Target[HTTP / CLI / library / message / device]
+  Test --> Runner[pytest / go test / other runner]
+  Code --> LSP[LSP server]
+  CI --> Platform[GitLab / GitHub / Jenkins]
+  SCM --> Host[GitLab / GitHub / other SCM]
+```
+
+## Core pipeline
+
+```text
+raw interface definition
+  -> sut-contract.v1
+  -> test-plan.v1
+  -> BUGate enter-implementation decision
+  -> framework-owned patch
+  -> validation and BUGate apply-patch decision
+  -> isolated test-run.v1 + coverage-map.v1
+  -> diagnosis.v1
+  -> optional safety-checked repair loop (maximum two rounds)
+  -> verification
+  -> BUGate publish-change decision
+  -> optional idempotent draft MR/PR
+```
+
+## Portability boundary
+
+The common core has no pytest, Go, HTTP, OpenAPI, JUnit, LCOV, GitLab, or GitHub domain types. Adapters receive JSON requests and return versioned JSON/file artifacts with explicit status, timeout, retry, and domain-failure semantics.
+
+Coverage is normalized to source regions with a capabilities object. Missing branch, condition, function, or per-test information remains unknown; it is never coerced to zero. LSP results likewise carry capabilities and completeness because language servers do not provide identical semantics.
+
+## Failure model
+
+An assertion failure is a successfully completed adapter call whose `TestRun` outcome failed. It is not a transport failure. Adapter failures are separately classified as unsupported, transient, permanent, cancelled, or timed out.
+
+Only `TEST_DEFECT`, `FIXTURE_DEFECT`, selected generated-code `BUILD` failures, and `ADAPTER_CONFIG` diagnoses may enter automatic repair. SUT defects, contract drift, environment failures, flaky behavior, and unknown causes require evidence or human review rather than weakened tests.
