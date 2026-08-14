@@ -1,0 +1,23 @@
+{
+  "name": "hypertest",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A general-purpose, cross-language AI test development agent governed by BUGate.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit && node scripts/check-boundaries.mjs",
+    "test": "npm run build && node --test dist/tests/*.test.js",
+    "ci": "npm run check && npm test"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "0.84.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.12.4",
+    "typescript": "5.9.3"
+  }
+}

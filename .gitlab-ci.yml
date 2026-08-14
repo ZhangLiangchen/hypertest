@@ -1,0 +1,14 @@
+image: node:22.19.0-bookworm-slim
+
+stages:
+  - verify
+
+hypertest-contracts:
+  stage: verify
+  script:
+    - npm install --ignore-scripts
+    - npm run ci
+  artifacts:
+    when: always
+    paths:
+      - dist/

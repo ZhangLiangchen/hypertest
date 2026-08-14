@@ -1,0 +1,27 @@
+schema: hypertest.profile/v1
+name: go-cli-go-test-example
+
+runtime:
+  provider: pi
+  model: deepseek-v4-pro
+  max_repair_rounds: 2
+
+adapters:
+  sut:
+    executable: adapters/sut/command
+    config:
+      contract_source: examples/go-cli/cli-contract.yaml
+  test:
+    executable: adapters/test/go-test
+  code:
+    executable: adapters/code/lsp
+    config:
+      server: gopls
+  coverage:
+    executable: adapters/coverage/go-cover
+  sandbox:
+    executable: adapters/sandbox/oci
+  ci:
+    executable: adapters/ci/gitlab
+  scm:
+    executable: adapters/scm/gitlab
