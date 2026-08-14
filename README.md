@@ -78,6 +78,10 @@ A new language, framework, SUT shape, CI provider, or SCM provider must not requ
 
 CI enforces that ecosystem-specific terms and the pi SDK do not leak across the accepted boundaries.
 
+## External activation
+
+Live deployment requires operator-supplied infrastructure: a model endpoint and credentials, an installed BUGate process bridge and governed profile, GitLab project/token settings, and a Docker/Podman-compatible engine with digest-pinned test images. No secrets are stored in this repository, and static-allow gates are restricted to development and conformance.
+
 ## Project status
 
-`0.1.0` is an engineering-complete reference implementation and integration baseline. Live model-provider, BUGate, GitLab, and OCI runs require the corresponding endpoint, executable, credentials, and image configuration; deterministic and process-contract behavior is covered without those secrets.
+`0.1.0` is an engineering-complete reference implementation and integration baseline. All deterministic behavior, contracts, schemas, safety policy, coverage normalization, and the two permanent cross-language scenarios are exercised in CI; external provider operations become live when their endpoint, executable, credentials, and image configuration are supplied.
