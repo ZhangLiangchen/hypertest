@@ -1,0 +1,28 @@
+name: Agent workspace bootstrap
+
+on:
+  push:
+    branches:
+      - agent/v0.2-runtime-vertical-slice
+
+permissions:
+  contents: read
+
+jobs:
+  package-workspace:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Package checkout and dependencies
+        run: tar --exclude=.git -czf /tmp/workspace.tgz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hypertest-agent-workspace
+          path: /tmp/workspace.tgz
+          retention-days: 1
+          if-no-files-found: error
