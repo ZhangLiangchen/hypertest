@@ -41,6 +41,7 @@ test("v0.1 scripted runtime fails explicitly after its finite script is exhauste
   assert.equal(output[0]?.type, "started");
   assert.deepEqual(output[1], {
     type: "failed",
+    code: "provider_protocol_error",
     message: "No scripted result remains",
     retryable: false,
   });

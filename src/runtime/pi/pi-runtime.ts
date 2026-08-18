@@ -10,11 +10,15 @@ import type {
 import type { TSchema } from "typebox";
 
 import type { Json } from "../../contracts.js";
-import type {
-  AgentEvent,
-  AgentRunRequest,
-  AgentRuntime,
+import {
+  AgentRuntimeError,
+  failure,
+  type AgentEvent,
+  type AgentFailureCode,
+  type AgentRunRequest,
+  type AgentRuntime,
 } from "../../runtime.js";
+import { AsyncQueue } from "../async-queue.js";
 
 export interface PiToolExecutionRequest {
   readonly runId: string;
@@ -31,12 +35,43 @@ export interface PiAgentRuntimeOptions {
   readonly thinkingLevel?: AgentState["thinkingLevel"];
 }
 
+interface ActivePiRun {
+  readonly agent: Agent;
+  readonly abort: (
+    code: AgentFailureCode,
+    message: string,
+    retryable: boolean,
+  ) => void;
+}
+
 export class PiAgentRuntime implements AgentRuntime {
-  private readonly active = new Map<string, Agent>();
+  private readonly active = new Map<string, ActivePiRun>();
 
   public constructor(private readonly options: PiAgentRuntimeOptions) {}
 
   public async *run(request: AgentRunRequest): AsyncIterable<AgentEvent> {
+    if (this.active.has(request.runId)) {
+      throw new AgentRuntimeError(
+        failure(
+          "provider_protocol_error",
+          `Run ${request.runId} is already active`,
+          false,
+        ),
+      );
+    }
+
+    const queue = new AsyncQueue<AgentEvent>();
+    const maxTurns = request.maxTurns ?? 20;
+    const maxToolCalls = request.maxToolCalls ?? 60;
+    const maxOutputBytes = request.maxOutputBytes ?? 1_048_576;
+    let terminal = false;
+    let text = "";
+    let outputBytes = 0;
+    let turnCount = 0;
+    let toolCallCount = 0;
+    let unsubscribe: (() => void) | undefined;
+    let deadlineTimer: NodeJS.Timeout | undefined;
+
     const tools: AgentTool<TSchema, Json>[] = request.tools.map((tool) => ({
       name: tool.name,
       label: tool.name,
@@ -72,67 +107,154 @@ export class PiAgentRuntime implements AgentRuntime {
         ? {}
         : { transformContext: this.options.transformContext }),
       shouldStopAfterTurn: (context: ShouldStopAfterTurnContext) =>
-        Date.now() >= request.deadlineEpochMs || context.context.messages.length > 100,
+        Date.now() >= request.deadlineEpochMs ||
+        context.context.messages.length > 100,
+      toolExecution: "sequential",
     });
 
-    this.active.set(request.runId, agent);
-    const events: AgentEvent[] = [{ type: "started", runId: request.runId }];
-    let text = "";
-    let failed: string | undefined;
+    const cleanup = (): void => {
+      if (deadlineTimer !== undefined) {
+        clearTimeout(deadlineTimer);
+        deadlineTimer = undefined;
+      }
+      unsubscribe?.();
+      unsubscribe = undefined;
+      this.active.delete(request.runId);
+    };
 
-    const unsubscribe = agent.subscribe((event: PiAgentEvent) => {
+    const finish = (event: Extract<AgentEvent, { type: "completed" | "failed" }>): void => {
+      if (terminal) return;
+      terminal = true;
+      queue.push(event);
+      queue.close();
+      cleanup();
+    };
+
+    const abort = (
+      code: AgentFailureCode,
+      message: string,
+      retryable: boolean,
+    ): void => {
+      if (terminal) return;
+      agent.abort();
+      finish(failure(code, message, retryable));
+    };
+
+    unsubscribe = agent.subscribe(async (event: PiAgentEvent) => {
+      if (terminal) return;
+      if (event.type === "turn_start") {
+        turnCount += 1;
+        if (turnCount > maxTurns) {
+          abort(
+            "tool_loop_limit",
+            `Agent exceeded the maximum of ${maxTurns} turns`,
+            false,
+          );
+        }
+        return;
+      }
       if (
         event.type === "message_update" &&
         event.assistantMessageEvent.type === "text_delta"
       ) {
         const delta = event.assistantMessageEvent.delta;
+        outputBytes += Buffer.byteLength(delta, "utf8");
+        if (outputBytes > maxOutputBytes) {
+          abort(
+            "output_limit",
+            `Model output exceeded ${maxOutputBytes} bytes`,
+            false,
+          );
+          return;
+        }
         text += delta;
-        events.push({ type: "text_delta", text: delta });
-      } else if (event.type === "tool_execution_start") {
-        events.push({
+        queue.push({ type: "text_delta", text: delta });
+        return;
+      }
+      if (event.type === "tool_execution_start") {
+        toolCallCount += 1;
+        if (toolCallCount > maxToolCalls) {
+          abort(
+            "tool_loop_limit",
+            `Agent exceeded the maximum of ${maxToolCalls} tool calls`,
+            false,
+          );
+          return;
+        }
+        await queue.pushAndWait({
           type: "tool_requested",
           callId: event.toolCallId,
           name: event.toolName,
           input: toJson(event.args),
         });
-      } else if (event.type === "tool_execution_end") {
-        events.push({
+        return;
+      }
+      if (event.type === "tool_execution_end") {
+        queue.push({
           type: "tool_completed",
           callId: event.toolCallId,
-          result: toJson(event.result),
+          result: toolResultJson(event.result),
           isError: event.isError,
         });
-      } else if (
+        return;
+      }
+      if (
         event.type === "message_end" &&
         isAssistantFailure(event.message)
       ) {
-        failed = event.message.errorMessage ?? `Pi agent stopped with ${event.message.stopReason}`;
+        finish(
+          failure(
+            event.message.stopReason === "aborted"
+              ? "cancelled"
+              : "provider_error",
+            event.message.errorMessage ??
+              `Pi agent stopped with ${event.message.stopReason}`,
+            event.message.stopReason === "error",
+            event.message.responseId,
+          ),
+        );
       }
     });
 
-    try {
-      await agent.prompt(request.prompt);
-      for (const event of events) yield event;
-      if (failed !== undefined) {
-        yield { type: "failed", message: failed, retryable: true };
-        return;
+    this.active.set(request.runId, { agent, abort });
+    queue.push({ type: "started", runId: request.runId });
+
+    const remainingMs = request.deadlineEpochMs - Date.now();
+    if (remainingMs <= 0) {
+      abort("deadline_exceeded", "Agent run deadline exceeded", false);
+    } else {
+      deadlineTimer = setTimeout(() => {
+        abort("deadline_exceeded", "Agent run deadline exceeded", false);
+      }, remainingMs);
+    }
+
+    void (async () => {
+      try {
+        await agent.prompt(request.prompt);
+        if (!terminal) {
+          finish({ type: "completed", result: parseModelResult(text) });
+        }
+      } catch (error) {
+        if (!terminal) {
+          const mapped = mapProviderError(error);
+          finish(failure(mapped.code, mapped.message, mapped.retryable));
+        }
+      } finally {
+        cleanup();
       }
-      yield { type: "completed", result: parseModelResult(text) };
-    } catch (error) {
-      for (const event of events) yield event;
-      yield {
-        type: "failed",
-        message: error instanceof Error ? error.message : String(error),
-        retryable: true,
-      };
+    })();
+
+    try {
+      for await (const event of queue) yield event;
     } finally {
-      unsubscribe();
-      this.active.delete(request.runId);
+      if (!terminal) abort("cancelled", "Agent event consumer cancelled", false);
     }
   }
 
   public async cancel(runId: string): Promise<void> {
-    this.active.get(runId)?.abort();
+    this.active
+      .get(runId)
+      ?.abort("cancelled", "Agent run cancelled", false);
   }
 }
 
@@ -147,6 +269,7 @@ function isAssistantFailure(message: unknown): message is {
   readonly role: "assistant";
   readonly stopReason: "error" | "aborted";
   readonly errorMessage?: string;
+  readonly responseId?: string;
 } {
   if (typeof message !== "object" || message === null) return false;
   const record = message as Record<string, unknown>;
@@ -166,6 +289,32 @@ function parseModelResult(text: string): Json {
   } catch {
     return { text: trimmed };
   }
+}
+
+function toolResultJson(value: unknown): Json {
+  if (
+    typeof value === "object" &&
+    value !== null &&
+    "details" in value
+  ) {
+    return toJson(value.details);
+  }
+  return toJson(value);
+}
+
+function mapProviderError(error: unknown): {
+  readonly code: AgentFailureCode;
+  readonly message: string;
+  readonly retryable: boolean;
+} {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/\b429\b|rate.?limit/i.test(message)) {
+    return { code: "provider_rate_limited", message, retryable: true };
+  }
+  if (/protocol|invalid.*event|malformed/i.test(message)) {
+    return { code: "provider_protocol_error", message, retryable: false };
+  }
+  return { code: "provider_error", message, retryable: true };
 }
 
 function toJson(value: unknown): Json {
