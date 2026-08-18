@@ -8,6 +8,7 @@ import {
   type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 
+import type { Json } from "../src/contracts.js";
 import type { AgentEvent, AgentRunRequest } from "../src/runtime.js";
 import { AgentRuntimeError } from "../src/runtime.js";
 import {
@@ -343,4 +344,112 @@ test("rejects a concurrent run id and releases it after cancellation", async () 
   await controlled.next();
   await runtime.cancel("same-id");
   assert.equal((await third.next()).value?.type, "failed");
+});
+
+test("invalid JSON and schema mismatch fail closed in PiAgentRuntime", async () => {
+  const scenarios: Array<{
+    readonly runId: string;
+    readonly text: string;
+    readonly expectedResultSchema?: Json;
+    readonly code: "model_output_parse_error" | "model_output_schema_error";
+  }> = [
+    {
+      runId: "pi-invalid-json",
+      text: "not-json SECRET-MODEL-BODY",
+      code: "model_output_parse_error",
+    },
+    {
+      runId: "pi-schema-mismatch",
+      text: '{"cases":"wrong"}',
+      expectedResultSchema: {
+        type: "object",
+        required: ["cases"],
+        properties: { cases: { type: "array" } },
+        additionalProperties: false,
+      },
+      code: "model_output_schema_error",
+    },
+  ];
+  for (const scenario of scenarios) {
+    const runtime = new PiAgentRuntime({
+      model,
+      streamFn: () => {
+        const stream = createAssistantMessageEventStream();
+        queueMicrotask(() => emitText(stream, scenario.text));
+        return stream;
+      },
+    });
+    const output = await collect(
+      runtime,
+      request(scenario.runId, {
+        ...(scenario.expectedResultSchema === undefined
+          ? {}
+          : { expectedResultSchema: scenario.expectedResultSchema }),
+      }),
+    );
+    const terminal = output.at(-1);
+    assert.equal(terminal?.type, "failed");
+    if (terminal?.type === "failed") {
+      assert.equal(terminal.code, scenario.code);
+      assert.doesNotMatch(terminal.message, /SECRET-MODEL-BODY|wrong/);
+    }
+  }
+});
+
+test("invalid tool input is rejected before the executor runs", async () => {
+  let executions = 0;
+  const runtime = new PiAgentRuntime({
+    model,
+    streamFn: () => {
+      const stream = createAssistantMessageEventStream();
+      queueMicrotask(() => {
+        const toolCall = {
+          type: "toolCall" as const,
+          id: "invalid-call",
+          name: "contract.get_operation",
+          arguments: {},
+        };
+        const assistant = message([toolCall], "toolUse");
+        stream.push({ type: "start", partial: message([], "pending") });
+        stream.push({ type: "toolcall_start", contentIndex: 0, partial: assistant });
+        stream.push({
+          type: "toolcall_end",
+          contentIndex: 0,
+          toolCall,
+          partial: assistant,
+        });
+        stream.push({ type: "done", reason: "toolUse", message: assistant });
+      });
+      return stream;
+    },
+    toolExecutor: async () => {
+      executions += 1;
+      return { impossible: true };
+    },
+  });
+
+  const output = await collect(
+    runtime,
+    request("invalid-tool", {
+      tools: [
+        {
+          name: "contract.get_operation",
+          description: "Read one operation",
+          inputSchema: {
+            type: "object",
+            properties: { operationId: { type: "string" } },
+            required: ["operationId"],
+            additionalProperties: false,
+          },
+          idempotent: true,
+        },
+      ],
+    }),
+  );
+  assert.equal(executions, 0);
+  const terminal = output.at(-1);
+  assert.equal(terminal?.type, "failed");
+  if (terminal?.type === "failed") {
+    assert.equal(terminal.code, "tool_input_schema_error");
+  }
 });

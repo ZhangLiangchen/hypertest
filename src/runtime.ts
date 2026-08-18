@@ -1,4 +1,5 @@
 import type { ArtifactRef, Json } from "./contracts.js";
+import { RuntimeValidationError, validateModelResult } from "./runtime/validation.js";
 
 export type AgentFailureCode =
   | "cancelled"
@@ -105,7 +106,18 @@ abstract class InMemoryAgentRuntime implements AgentRuntime {
         );
         return;
       }
-      yield { type: "completed", result };
+      try {
+        yield {
+          type: "completed",
+          result: validateModelResult(result, request.expectedResultSchema),
+        };
+      } catch (error) {
+        if (error instanceof RuntimeValidationError) {
+          yield failure(error.code, error.message, false);
+          return;
+        }
+        throw error;
+      }
     } finally {
       this.active.delete(request.runId);
       this.cancelled.delete(request.runId);

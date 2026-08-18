@@ -288,50 +288,149 @@ function buildOracles(
   return [baseline, ...hints];
 }
 
+export class PlannerModelValidationError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = "PlannerModelValidationError";
+  }
+}
+
+export function plannerAugmentationSchema(maxCases: number): Json {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["cases"],
+    properties: {
+      cases: {
+        type: "array",
+        maxItems: Math.max(0, Math.min(maxCases, 64)),
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["title", "objective", "steps", "oracle"],
+          properties: {
+            title: { type: "string", minLength: 1, maxLength: 160 },
+            objective: { type: "string", minLength: 1, maxLength: 1_000 },
+            steps: {
+              type: "array",
+              minItems: 1,
+              maxItems: 8,
+              items: {
+                type: "object",
+                additionalProperties: false,
+                required: ["operationId", "input"],
+                properties: {
+                  operationId: {
+                    type: "string",
+                    minLength: 1,
+                    maxLength: 200,
+                  },
+                  input: {},
+                },
+              },
+            },
+            oracle: {
+              type: "object",
+              maxProperties: 32,
+            },
+          },
+        },
+      },
+    },
+  };
+}
+
 async function requestModelCases(
   contract: SutContract,
   contractRef: ArtifactRef<"sut-contract">,
   options: PlanOptions,
 ): Promise<TestPlanCase[]> {
+  const maxCases =
+    Math.max(1, options.maxCasesPerOperation ?? 12) *
+    Math.max(1, contract.operations.length);
   const result = await collectAgentResult(options.runtime!, {
     runId: options.runId ?? `plan-${Date.now()}`,
     phase: "test-plan-augmentation",
     systemPrompt:
-      "Generate framework-neutral test cases only. Never emit test source code. Return JSON with a cases array.",
-    prompt: JSON.stringify({ contract, constraints: { maxCasesPerOperation: options.maxCasesPerOperation ?? 12 } }),
+      "Generate framework-neutral test cases only. Never emit test source code. Return only JSON matching the supplied result schema.",
+    prompt: JSON.stringify({
+      contract,
+      constraints: {
+        maxCasesPerOperation: options.maxCasesPerOperation ?? 12,
+        includeDestructive: options.includeDestructive ?? false,
+      },
+    }),
     tools: [],
     artifacts: [contractRef],
     tokenBudget: options.tokenBudget ?? 20_000,
     deadlineEpochMs: options.deadlineEpochMs ?? Date.now() + 120_000,
+    expectedResultSchema: plannerAugmentationSchema(maxCases),
+    maxOutputBytes: 262_144,
   });
   if (!isRecord(result) || !Array.isArray(result.cases)) {
-    return [];
+    throw new PlannerModelValidationError(
+      "Validated planner augmentation is missing its cases array",
+    );
   }
-  const cases: TestPlanCase[] = [];
-  for (const item of result.cases) {
-    const candidate = validateModelCase(item, contract, contractRef);
-    if (candidate !== undefined) cases.push(candidate);
-  }
-  return cases;
+  return result.cases.map((item, index) =>
+    validateModelCase(item, index, contract, contractRef, options),
+  );
 }
 
 function validateModelCase(
   value: Json,
+  index: number,
   contract: SutContract,
   contractRef: ArtifactRef<"sut-contract">,
-): TestPlanCase | undefined {
-  if (!isRecord(value)) return undefined;
-  if (typeof value.title !== "string" || typeof value.objective !== "string") return undefined;
-  if (!Array.isArray(value.steps) || value.steps.length === 0) return undefined;
-  const known = new Set(contract.operations.map((operation) => operation.id));
-  const steps = value.steps.flatMap((step) => {
-    if (!isRecord(step) || typeof step.operationId !== "string" || !known.has(step.operationId)) {
-      return [];
+  options: PlanOptions,
+): TestPlanCase {
+  if (
+    !isRecord(value) ||
+    typeof value.title !== "string" ||
+    typeof value.objective !== "string" ||
+    !Array.isArray(value.steps) ||
+    value.steps.length === 0 ||
+    !isRecord(value.oracle)
+  ) {
+    throw new PlannerModelValidationError(
+      `Planner augmentation case ${index} is structurally invalid`,
+    );
+  }
+
+  const operations = new Map(
+    contract.operations.map((operation) => [operation.id, operation]),
+  );
+  const steps = value.steps.map((step, stepIndex) => {
+    if (
+      !isRecord(step) ||
+      typeof step.operationId !== "string" ||
+      !("input" in step)
+    ) {
+      throw new PlannerModelValidationError(
+        `Planner augmentation case ${index} step ${stepIndex} is invalid`,
+      );
     }
-    return [{ operationId: step.operationId, input: step.input ?? null }];
+    const operation = operations.get(step.operationId);
+    if (operation === undefined) {
+      throw new PlannerModelValidationError(
+        `Planner augmentation references unknown operationId ${safeIdentifier(step.operationId)}`,
+      );
+    }
+    if (operation.effects === "destructive" && !options.includeDestructive) {
+      throw new PlannerModelValidationError(
+        `Planner augmentation references destructive operation ${safeIdentifier(step.operationId)} while destructive cases are disabled`,
+      );
+    }
+    return { operationId: operation.id, input: step.input };
   });
-  if (steps.length === 0) return undefined;
-  const id = stableCaseId(steps[0]?.operationId ?? "case", value.title, 0);
+
+  const firstOperation = steps[0]?.operationId;
+  if (firstOperation === undefined) {
+    throw new PlannerModelValidationError(
+      `Planner augmentation case ${index} has no executable step`,
+    );
+  }
+  const id = stableCaseId(firstOperation, value.title, index);
   return {
     id,
     title: value.title,
@@ -342,7 +441,7 @@ function validateModelCase(
     oracles: [
       {
         kind: "model-proposed",
-        expression: isRecord(value.oracle) ? value.oracle : { expectedValidity: "unknown" },
+        expression: value.oracle,
         rationale: "Model-proposed oracle pending deterministic execution evidence",
         strength: "weak",
       },
@@ -351,6 +450,10 @@ function validateModelCase(
     provenance: [contractRef],
     generatedBy: "model",
   };
+}
+
+function safeIdentifier(value: string): string {
+  return JSON.stringify(value.replace(/[\r\n\t]+/g, " ").slice(0, 120));
 }
 
 function deduplicateCases(cases: readonly TestPlanCase[]): TestPlanCase[] {

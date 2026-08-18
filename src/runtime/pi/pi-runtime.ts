@@ -19,6 +19,11 @@ import {
   type AgentRuntime,
 } from "../../runtime.js";
 import { AsyncQueue } from "../async-queue.js";
+import {
+  RuntimeValidationError,
+  parseAndValidateModelResult,
+  validateToolInput,
+} from "../validation.js";
 
 export interface PiToolExecutionRequest {
   readonly runId: string;
@@ -77,16 +82,26 @@ export class PiAgentRuntime implements AgentRuntime {
       label: tool.name,
       description: tool.description,
       parameters: toSchema(tool.inputSchema, tool.name),
+      prepareArguments: (input) =>
+        validateToolInput(toJson(input), tool.inputSchema),
       execute: async (callId, input) => {
         if (this.options.toolExecutor === undefined) {
-          throw new Error(`No executor is configured for tool ${tool.name}`);
+          throw new PiToolExecutionError(`No executor is configured for tool ${tool.name}`);
         }
-        const result = await this.options.toolExecutor({
-          runId: request.runId,
-          name: tool.name,
-          callId,
-          input: toJson(input),
-        });
+        const validated = validateToolInput(toJson(input), tool.inputSchema);
+        let result: Json;
+        try {
+          result = await this.options.toolExecutor({
+            runId: request.runId,
+            name: tool.name,
+            callId,
+            input: validated,
+          });
+        } catch (error) {
+          throw new PiToolExecutionError(
+            error instanceof Error ? error.message : String(error),
+          );
+        }
         return {
           content: [{ type: "text", text: JSON.stringify(result) }],
           details: result,
@@ -190,12 +205,19 @@ export class PiAgentRuntime implements AgentRuntime {
         return;
       }
       if (event.type === "tool_execution_end") {
+        const result = toolResultJson(event.result);
         queue.push({
           type: "tool_completed",
           callId: event.toolCallId,
-          result: toolResultJson(event.result),
+          result,
           isError: event.isError,
         });
+        if (event.isError) {
+          const classification = classifyToolFailure(event.result);
+          if (classification !== undefined) {
+            finish(failure(classification, toolFailureMessage(classification), false));
+          }
+        }
         return;
       }
       if (
@@ -232,7 +254,21 @@ export class PiAgentRuntime implements AgentRuntime {
       try {
         await agent.prompt(request.prompt);
         if (!terminal) {
-          finish({ type: "completed", result: parseModelResult(text) });
+          try {
+            finish({
+              type: "completed",
+              result: parseAndValidateModelResult(
+                text,
+                request.expectedResultSchema,
+              ),
+            });
+          } catch (error) {
+            if (error instanceof RuntimeValidationError) {
+              finish(failure(error.code, error.message, false));
+            } else {
+              throw error;
+            }
+          }
         }
       } catch (error) {
         if (!terminal) {
@@ -279,18 +315,6 @@ function isAssistantFailure(message: unknown): message is {
   );
 }
 
-function parseModelResult(text: string): Json {
-  const trimmed = text.trim();
-  if (trimmed.length === 0) return { text: "" };
-  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(trimmed);
-  const candidate = fenced?.[1] ?? trimmed;
-  try {
-    return JSON.parse(candidate) as Json;
-  } catch {
-    return { text: trimmed };
-  }
-}
-
 function toolResultJson(value: unknown): Json {
   if (
     typeof value === "object" &&
@@ -300,6 +324,42 @@ function toolResultJson(value: unknown): Json {
     return toJson(value.details);
   }
   return toJson(value);
+}
+
+class PiToolExecutionError extends Error {
+  public constructor(message: string) {
+    super(`HYPERTEST_TOOL_EXECUTION_ERROR: ${safeToolError(message)}`);
+    this.name = "PiToolExecutionError";
+  }
+}
+
+function classifyToolFailure(
+  value: unknown,
+): "tool_input_schema_error" | "tool_execution_error" | undefined {
+  const text = JSON.stringify(toJson(value));
+  if (
+    text.includes("RuntimeValidationError") ||
+    text.includes("Tool input does not match the declared schema") ||
+    text.includes("HYPERTEST_TOOL_INPUT_SCHEMA_ERROR")
+  ) {
+    return "tool_input_schema_error";
+  }
+  if (text.includes("HYPERTEST_TOOL_EXECUTION_ERROR")) {
+    return "tool_execution_error";
+  }
+  return undefined;
+}
+
+function toolFailureMessage(
+  code: "tool_input_schema_error" | "tool_execution_error",
+): string {
+  return code === "tool_input_schema_error"
+    ? "Tool input does not match the declared schema"
+    : "Tool execution failed";
+}
+
+function safeToolError(message: string): string {
+  return message.replace(/[\r\n\t]+/g, " ").slice(0, 160);
 }
 
 function mapProviderError(error: unknown): {
