@@ -102,6 +102,7 @@ export class PiAgentRuntime implements AgentRuntime {
     const maxRepeatedToolCalls = request.maxRepeatedToolCalls ?? 3;
     let lastToolSignature: string | undefined;
     let repeatedToolCalls = 0;
+    let providerReplayLocked = false;
     let terminal = false;
     let text = "";
     let outputBytes = 0;
@@ -322,6 +323,7 @@ export class PiAgentRuntime implements AgentRuntime {
         event.assistantMessageEvent.type === "text_delta"
       ) {
         const delta = event.assistantMessageEvent.delta;
+        if (delta.length > 0) providerReplayLocked = true;
         outputBytes += Buffer.byteLength(delta, "utf8");
         if (outputBytes > maxOutputBytes) {
           abort(
@@ -336,6 +338,7 @@ export class PiAgentRuntime implements AgentRuntime {
         return;
       }
       if (event.type === "tool_execution_start") {
+        providerReplayLocked = true;
         toolCallCount += 1;
         if (toolCallCount > maxToolCalls) {
           abort(
@@ -404,17 +407,31 @@ export class PiAgentRuntime implements AgentRuntime {
       if (event.type === "message_end" && isAssistantMessage(event.message)) {
         const usage = emitUsage(event.message, event.message.stopReason);
         if (isAssistantFailure(event.message)) {
-          finish(
-            failure(
-              event.message.stopReason === "aborted"
-                ? "cancelled"
-                : "provider_error",
-              event.message.errorMessage ??
-                `Pi agent stopped with ${event.message.stopReason}`,
-              event.message.stopReason === "error",
-              event.message.responseId,
-            ),
-          );
+          if (event.message.stopReason === "aborted") {
+            finish(
+              failure(
+                "cancelled",
+                "OpenAI-compatible provider request was aborted",
+                false,
+                usage?.providerRequestId ?? event.message.responseId,
+              ),
+            );
+          } else {
+            const mapped = mapProviderError(
+              new Error(
+                event.message.errorMessage ?? "Pi agent provider request failed",
+              ),
+              providerReplayLocked,
+            );
+            finish(
+              failure(
+                mapped.code,
+                mapped.message,
+                mapped.retryable,
+                usage?.providerRequestId ?? event.message.responseId,
+              ),
+            );
+          }
           return;
         }
         if (event.message.stopReason === "toolUse") {
@@ -476,7 +493,7 @@ export class PiAgentRuntime implements AgentRuntime {
         } catch (error) {
           if (!terminal) {
             flushPendingUsage("error");
-            const mapped = mapProviderError(error);
+            const mapped = mapProviderError(error, providerReplayLocked);
             finish(failure(mapped.code, mapped.message, mapped.retryable));
           }
         } finally {
@@ -633,7 +650,7 @@ function toolFailureMessage(
     : "Tool execution failed";
 }
 
-function mapProviderError(error: unknown): {
+function mapProviderError(error: unknown, replayLocked = false): {
   readonly code: AgentFailureCode;
   readonly message: string;
   readonly retryable: boolean;
@@ -643,12 +660,23 @@ function mapProviderError(error: unknown): {
     return { code: "tool_loop_limit", message, retryable: false };
   }
   if (/\b429\b|rate.?limit/i.test(message)) {
-    return { code: "provider_rate_limited", message, retryable: true };
+    return {
+      code: "provider_rate_limited",
+      message,
+      retryable: !replayLocked,
+    };
   }
   if (/protocol|invalid.*event|malformed/i.test(message)) {
     return { code: "provider_protocol_error", message, retryable: false };
   }
-  return { code: "provider_error", message, retryable: true };
+  if (
+    /HTTP (502|503|504)\b|connection failed before the first visible delta|fetch failed|ECONNRESET|UND_ERR/i.test(
+      message,
+    )
+  ) {
+    return { code: "provider_error", message, retryable: !replayLocked };
+  }
+  return { code: "provider_error", message, retryable: false };
 }
 
 function toJson(value: unknown): Json {

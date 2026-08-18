@@ -49,3 +49,54 @@ test("rejects an invalid provider and missing adapters", () => {
     /Unsupported runtime provider/,
   );
 });
+
+test("validates bounded OpenAI-compatible settings without accepting secrets", () => {
+  const base = {
+    schema: "hypertest.profile/v1" as const,
+    name: "model-profile",
+    runtime: {
+      provider: "openai-compatible",
+      model: "model-2026-08",
+      baseUrl: "https://models.example.test/v1",
+      timeoutMs: 5_000,
+      maxRetries: 2,
+      maxOutputTokens: 512,
+      budgets: {
+        maxTurns: 4,
+        maxToolCalls: 4,
+        maxRepairRounds: 0,
+        wallClockMs: 10_000,
+        tokenBudget: 1_000,
+      },
+    },
+    sut: { contractSource: "contract.json", sourceKind: "command-contract" },
+    adapters: {
+      sut: { command: "node" },
+      test: { command: "node" },
+    },
+    gate: { mode: "static-allow" },
+    workspace: {
+      allowedWriteGlobs: ["tests/**"],
+      forbiddenGlobs: ["src/**"],
+    },
+  };
+  const profile = validateProfile(base);
+  assert.equal(profile.runtime.provider, "openai-compatible");
+  assert.equal(profile.runtime.maxOutputTokens, 512);
+  assert.throws(
+    () =>
+      validateProfile({
+        ...base,
+        runtime: { ...base.runtime, apiKey: "must-not-be-stored" },
+      }),
+    /HYPERTEST_MODEL_API_KEY/,
+  );
+  assert.throws(
+    () =>
+      validateProfile({
+        ...base,
+        runtime: { ...base.runtime, maxRetries: 11 },
+      }),
+    /runtime\.maxRetries/,
+  );
+});

@@ -133,6 +133,14 @@ export class HyperTestOrchestrator {
         profile.runtime.provider === "deterministic"
           ? undefined
           : this.options.runtime;
+      if (
+        profile.runtime.provider !== "deterministic" &&
+        planningRuntime === undefined
+      ) {
+        throw new Error(
+          `Runtime provider ${profile.runtime.provider} was selected but no AgentRuntime was configured`,
+        );
+      }
       const plan = await createTestPlan(contract, contractRef, {
         maxCasesPerOperation: 12,
         ...(planningRuntime === undefined ? {} : { runtime: planningRuntime }),

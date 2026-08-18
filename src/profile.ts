@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 
 import type { Json, RunBudget } from "./contracts.js";
+import type { ModelRuntimeSettings } from "./model-config.js";
 
 export interface AdapterCommandProfile {
   readonly executable?: string;
@@ -16,9 +17,7 @@ export interface AdapterCommandProfile {
 export interface HyperTestProfile {
   readonly schema: "hypertest.profile/v1";
   readonly name: string;
-  readonly runtime: {
-    readonly provider: "deterministic" | "fake" | "pi";
-    readonly model?: string;
+  readonly runtime: ModelRuntimeSettings & {
     readonly budgets: RunBudget;
   };
   readonly sut: {
@@ -86,8 +85,13 @@ export function validateProfile(value: Json): HyperTestProfile {
   }
   const name = expectString(root.name, "profile.name");
   const runtimeInput = expectRecord(root.runtime, "profile.runtime");
+  if (runtimeInput.apiKey !== undefined || runtimeInput.api_key !== undefined) {
+    throw new Error(
+      "Model API keys must be provided through HYPERTEST_MODEL_API_KEY, not stored in a profile",
+    );
+  }
   const provider = expectString(runtimeInput.provider, "runtime.provider");
-  if (!["deterministic", "fake", "pi"].includes(provider)) {
+  if (!["deterministic", "openai-compatible"].includes(provider)) {
     throw new Error(`Unsupported runtime provider: ${provider}`);
   }
   const budgetInput =
@@ -143,6 +147,39 @@ export function validateProfile(value: Json): HyperTestProfile {
       ...(runtimeInput.model === undefined
         ? {}
         : { model: expectString(runtimeInput.model, "runtime.model") }),
+      ...(runtimeInput.baseUrl === undefined
+        ? {}
+        : { baseUrl: expectString(runtimeInput.baseUrl, "runtime.baseUrl") }),
+      ...(runtimeInput.timeoutMs === undefined
+        ? {}
+        : {
+            timeoutMs: expectBoundedInteger(
+              runtimeInput.timeoutMs,
+              "runtime.timeoutMs",
+              100,
+              600_000,
+            ),
+          }),
+      ...(runtimeInput.maxRetries === undefined
+        ? {}
+        : {
+            maxRetries: expectBoundedInteger(
+              runtimeInput.maxRetries,
+              "runtime.maxRetries",
+              0,
+              10,
+            ),
+          }),
+      ...(runtimeInput.maxOutputTokens === undefined
+        ? {}
+        : {
+            maxOutputTokens: expectBoundedInteger(
+              runtimeInput.maxOutputTokens,
+              "runtime.maxOutputTokens",
+              1,
+              131_072,
+            ),
+          }),
       budgets,
     },
     sut: { contractSource, sourceKind },
@@ -317,6 +354,26 @@ function expectPositiveInteger(value: Json, path: string): number {
 function expectNonNegativeInteger(value: Json, path: string): number {
   if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
     throw new Error(`${path} must be a non-negative integer`);
+  }
+  return value;
+}
+
+
+function expectBoundedInteger(
+  value: Json,
+  path: string,
+  minimum: number,
+  maximum: number,
+): number {
+  if (
+    typeof value !== "number" ||
+    !Number.isInteger(value) ||
+    value < minimum ||
+    value > maximum
+  ) {
+    throw new Error(
+      `${path} must be an integer between ${minimum} and ${maximum}`,
+    );
   }
   return value;
 }

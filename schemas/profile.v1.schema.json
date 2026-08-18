@@ -23,6 +23,7 @@
     },
     "runtime": {
       "type": "object",
+      "additionalProperties": false,
       "required": [
         "provider",
         "budgets"
@@ -31,8 +32,7 @@
         "provider": {
           "enum": [
             "deterministic",
-            "fake",
-            "pi"
+            "openai-compatible"
           ]
         },
         "model": {
@@ -40,6 +40,29 @@
         },
         "budgets": {
           "type": "object"
+        },
+        "baseUrl": {
+          "type": "string",
+          "minLength": 1
+        },
+        "timeoutMs": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 600000
+        },
+        "maxRetries": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10
+        },
+        "maxOutputTokens": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 131072
+        },
+        "max_repair_rounds": {
+          "type": "integer",
+          "minimum": 0
         }
       }
     },
