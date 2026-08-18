@@ -30,6 +30,8 @@ export interface AgentRunRequest {
   readonly maxToolCalls?: number;
   readonly maxOutputBytes?: number;
   readonly maxOutputTokens?: number;
+  readonly maxRepeatedToolCalls?: number;
+  readonly toolExecutor?: AgentToolExecutor;
 }
 
 export interface AgentToolDefinition {
@@ -38,6 +40,22 @@ export interface AgentToolDefinition {
   readonly inputSchema: Json;
   readonly idempotent: boolean;
 }
+
+export interface AgentToolExecutionRequest {
+  readonly runId: string;
+  readonly name: string;
+  readonly callId: string;
+  readonly input: Json;
+}
+
+export interface AgentToolExecutionOutcome {
+  readonly status: "ok" | "error";
+  readonly output: Json;
+}
+
+export type AgentToolExecutor = (
+  request: AgentToolExecutionRequest,
+) => Promise<AgentToolExecutionOutcome>;
 
 export type AgentEvent =
   | { readonly type: "started"; readonly runId: string }
@@ -51,8 +69,10 @@ export type AgentEvent =
   | {
       readonly type: "tool_completed";
       readonly callId: string;
+      readonly name: string;
       readonly result: Json;
       readonly isError: boolean;
+      readonly durationMs: number;
     }
   | { readonly type: "usage"; readonly usage: AgentUsage }
   | { readonly type: "completed"; readonly result: Json }
@@ -63,7 +83,6 @@ export type AgentEvent =
       readonly retryable: boolean;
       readonly providerRequestId?: string;
     };
-
 
 export interface AgentUsage {
   readonly provider: string;
@@ -193,14 +212,20 @@ export class ScriptedAgentRuntime extends InMemoryAgentRuntime {
   }
 }
 
+export interface CollectAgentRunOptions {
+  readonly onEvent?: (event: AgentEvent) => void | Promise<void>;
+}
+
 export async function collectAgentRun(
   runtime: AgentRuntime,
   request: AgentRunRequest,
+  options: CollectAgentRunOptions = {},
 ): Promise<AgentRunOutcome> {
   let completed: Json | undefined;
   let terminalCount = 0;
   const records: AgentUsage[] = [];
   for await (const event of runtime.run(request)) {
+    await options.onEvent?.(event);
     if (event.type === "usage") {
       records.push(event.usage);
     } else if (event.type === "completed") {

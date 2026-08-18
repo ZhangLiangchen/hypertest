@@ -17,6 +17,8 @@ import {
   type AgentFailureCode,
   type AgentRunRequest,
   type AgentRuntime,
+  type AgentToolExecutionOutcome,
+  type AgentToolExecutionRequest,
   type AgentUsage,
 } from "../../runtime.js";
 import { AsyncQueue } from "../async-queue.js";
@@ -26,13 +28,6 @@ import {
   parseAndValidateModelResult,
   validateToolInput,
 } from "../validation.js";
-
-export interface PiToolExecutionRequest {
-  readonly runId: string;
-  readonly name: string;
-  readonly callId: string;
-  readonly input: Json;
-}
 
 type PiMessageEndEvent = Extract<PiAgentEvent, { readonly type: "message_end" }>;
 export type PiAssistantMessage = Extract<
@@ -50,7 +45,9 @@ export interface PiProviderTelemetry {
 export interface PiAgentRuntimeOptions {
   readonly model: AgentState["model"];
   readonly streamFn: StreamFn;
-  readonly toolExecutor?: (request: PiToolExecutionRequest) => Promise<Json>;
+  readonly toolExecutor?: (
+    request: AgentToolExecutionRequest,
+  ) => Promise<Json | AgentToolExecutionOutcome>;
   readonly transformContext?: AgentOptions["transformContext"];
   readonly thinkingLevel?: AgentState["thinkingLevel"];
   readonly provider?: string;
@@ -98,46 +95,61 @@ export class PiAgentRuntime implements AgentRuntime {
       this.options.endpointFingerprint ??
       fingerprintEndpoint(this.options.model.baseUrl);
     const providerCallStarts: number[] = [];
+    const toolStarts = new Map<
+      string,
+      { readonly name: string; readonly startedAt: number }
+    >();
+    const maxRepeatedToolCalls = request.maxRepeatedToolCalls ?? 3;
+    let lastToolSignature: string | undefined;
+    let repeatedToolCalls = 0;
     let terminal = false;
     let text = "";
     let outputBytes = 0;
     let turnCount = 0;
+    let providerCallCount = 0;
     let toolCallCount = 0;
     let consumedTokens = 0;
     let budgetStopReason: string | undefined;
+    let loopStopReason: string | undefined;
     let unsubscribe: (() => void) | undefined;
     let deadlineTimer: NodeJS.Timeout | undefined;
 
-    const tools: AgentTool<TSchema, Json>[] = request.tools.map((tool) => ({
+    const tools: AgentTool<TSchema, PiToolOutcomeEnvelope>[] = request.tools.map((tool) => ({
       name: tool.name,
       label: tool.name,
       description: tool.description,
       parameters: toSchema(tool.inputSchema, tool.name),
       prepareArguments: (input) =>
         validateToolInput(toJson(input), tool.inputSchema),
-      execute: async (callId, input) => {
-        if (this.options.toolExecutor === undefined) {
-          throw new PiToolExecutionError(
-            `No executor is configured for tool ${tool.name}`,
-          );
+      execute: async (callId, input, signal) => {
+        const executor = request.toolExecutor ?? this.options.toolExecutor;
+        if (executor === undefined) {
+          throw new PiToolExecutionError();
+        }
+        if (signal?.aborted === true) {
+          throw new PiToolExecutionError();
         }
         const validated = validateToolInput(toJson(input), tool.inputSchema);
-        let result: Json;
+        let outcome: AgentToolExecutionOutcome;
         try {
-          result = await this.options.toolExecutor({
-            runId: request.runId,
-            name: tool.name,
-            callId,
-            input: validated,
-          });
-        } catch (error) {
-          throw new PiToolExecutionError(
-            error instanceof Error ? error.message : String(error),
+          outcome = normalizeToolOutcome(
+            await executor({
+              runId: request.runId,
+              name: tool.name,
+              callId,
+              input: validated,
+            }),
           );
+        } catch {
+          throw new PiToolExecutionError();
         }
         return {
-          content: [{ type: "text", text: JSON.stringify(result) }],
-          details: result,
+          content: [{ type: "text", text: JSON.stringify(outcome.output) }],
+          details: {
+            hypertestToolOutcome: true,
+            status: outcome.status,
+            output: outcome.output,
+          },
         };
       },
     }));
@@ -146,6 +158,11 @@ export class PiAgentRuntime implements AgentRuntime {
       Math.max(0, tokenBudget - consumedTokens);
 
     const streamFn: StreamFn = (model, context, streamOptions) => {
+      if (providerCallCount >= maxTurns) {
+        loopStopReason = `Agent exceeded the maximum of ${maxTurns} turns`;
+        throw new PiRuntimeLimitError(loopStopReason);
+      }
+      providerCallCount += 1;
       const remaining = remainingBudget();
       const configuredMax = Math.min(
         model.maxTokens,
@@ -176,7 +193,21 @@ export class PiAgentRuntime implements AgentRuntime {
       ...(this.options.transformContext === undefined
         ? {}
         : { transformContext: this.options.transformContext }),
+      afterToolCall: async ({ result }) => {
+        if (!isPiToolOutcomeEnvelope(result.details)) return undefined;
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result.details.output),
+            },
+          ],
+          details: result.details.output,
+          isError: result.details.status === "error",
+        };
+      },
       shouldStopAfterTurn: (context: ShouldStopAfterTurnContext) =>
+        loopStopReason !== undefined ||
         budgetStopReason !== undefined ||
         now() >= request.deadlineEpochMs ||
         context.context.messages.length > 100,
@@ -190,6 +221,7 @@ export class PiAgentRuntime implements AgentRuntime {
       }
       unsubscribe?.();
       unsubscribe = undefined;
+      toolStarts.clear();
       this.active.delete(request.runId);
     };
 
@@ -313,21 +345,47 @@ export class PiAgentRuntime implements AgentRuntime {
           );
           return;
         }
+        const input = toJson(event.args);
+        const signature = `${event.toolName}:${canonicalJson(input)}`;
+        if (signature === lastToolSignature) repeatedToolCalls += 1;
+        else {
+          lastToolSignature = signature;
+          repeatedToolCalls = 1;
+        }
+        if (repeatedToolCalls > maxRepeatedToolCalls) {
+          abort(
+            "tool_loop_limit",
+            `Agent repeated the same tool call more than ${maxRepeatedToolCalls} times without progress`,
+            false,
+          );
+          return;
+        }
+        toolStarts.set(event.toolCallId, {
+          name: event.toolName,
+          startedAt: now(),
+        });
         await queue.pushAndWait({
           type: "tool_requested",
           callId: event.toolCallId,
           name: event.toolName,
-          input: toJson(event.args),
+          input,
         });
         return;
       }
       if (event.type === "tool_execution_end") {
         const result = toolResultJson(event.result);
+        const started = toolStarts.get(event.toolCallId);
+        toolStarts.delete(event.toolCallId);
         queue.push({
           type: "tool_completed",
           callId: event.toolCallId,
+          name: started?.name ?? event.toolName,
           result,
           isError: event.isError,
+          durationMs: Math.max(
+            0,
+            Math.floor(started === undefined ? 0 : now() - started.startedAt),
+          ),
         });
         if (event.isError) {
           const classification = classifyToolFailure(event.result);
@@ -360,7 +418,9 @@ export class PiAgentRuntime implements AgentRuntime {
           return;
         }
         if (event.message.stopReason === "toolUse") {
-          if (usage?.usageUnavailable === true) {
+          if (providerCallCount >= maxTurns) {
+            loopStopReason = `Agent exceeded the maximum of ${maxTurns} turns`;
+          } else if (usage?.usageUnavailable === true) {
             budgetStopReason =
               "Provider usage is unavailable, so another turn cannot be authorized within the hard token budget";
           } else if (consumedTokens >= tokenBudget) {
@@ -389,6 +449,10 @@ export class PiAgentRuntime implements AgentRuntime {
         try {
           await agent.prompt(request.prompt);
           if (!terminal) {
+            if (loopStopReason !== undefined) {
+              finish(failure("tool_loop_limit", loopStopReason, false));
+              return;
+            }
             if (budgetStopReason !== undefined) {
               finish(failure("budget_exhausted", budgetStopReason, false));
               return;
@@ -435,6 +499,52 @@ export class PiAgentRuntime implements AgentRuntime {
       .get(runId)
       ?.abort("cancelled", "Agent run cancelled", false);
   }
+}
+
+interface PiToolOutcomeEnvelope {
+  readonly hypertestToolOutcome: true;
+  readonly status: "ok" | "error";
+  readonly output: Json;
+}
+
+function normalizeToolOutcome(
+  value: Json | AgentToolExecutionOutcome,
+): AgentToolExecutionOutcome {
+  if (isAgentToolExecutionOutcome(value)) return value;
+  return { status: "ok", output: value };
+}
+
+function isAgentToolExecutionOutcome(
+  value: Json | AgentToolExecutionOutcome,
+): value is AgentToolExecutionOutcome {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    (value.status === "ok" || value.status === "error") &&
+    "output" in value
+  );
+}
+
+function isPiToolOutcomeEnvelope(value: unknown): value is PiToolOutcomeEnvelope {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    record.hypertestToolOutcome === true &&
+    (record.status === "ok" || record.status === "error") &&
+    "output" in record
+  );
+}
+
+function canonicalJson(value: Json): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  }
+  return `{${Object.keys(value)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key] ?? null)}`)
+    .join(",")}}`;
 }
 
 function toSchema(value: Json, toolName: string): TSchema {
@@ -484,9 +594,16 @@ function toolResultJson(value: unknown): Json {
   return toJson(value);
 }
 
-class PiToolExecutionError extends Error {
+class PiRuntimeLimitError extends Error {
   public constructor(message: string) {
-    super(`HYPERTEST_TOOL_EXECUTION_ERROR: ${safeToolError(message)}`);
+    super(message);
+    this.name = "PiRuntimeLimitError";
+  }
+}
+
+class PiToolExecutionError extends Error {
+  public constructor() {
+    super("HYPERTEST_TOOL_EXECUTION_ERROR");
     this.name = "PiToolExecutionError";
   }
 }
@@ -516,16 +633,15 @@ function toolFailureMessage(
     : "Tool execution failed";
 }
 
-function safeToolError(message: string): string {
-  return message.replace(/[\r\n\t]+/g, " ").slice(0, 160);
-}
-
 function mapProviderError(error: unknown): {
   readonly code: AgentFailureCode;
   readonly message: string;
   readonly retryable: boolean;
 } {
   const message = error instanceof Error ? error.message : String(error);
+  if (error instanceof PiRuntimeLimitError) {
+    return { code: "tool_loop_limit", message, retryable: false };
+  }
   if (/\b429\b|rate.?limit/i.test(message)) {
     return { code: "provider_rate_limited", message, retryable: true };
   }

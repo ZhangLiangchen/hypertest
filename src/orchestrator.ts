@@ -142,8 +142,31 @@ export class HyperTestOrchestrator {
           profile.runtime.budgets.tokenBudget,
         ),
         deadlineEpochMs: deadline,
+        maxTurns: Math.min(
+          request.budget.maxTurns,
+          profile.runtime.budgets.maxTurns,
+        ),
+        maxToolCalls: Math.min(
+          request.budget.maxToolCalls,
+          profile.runtime.budgets.maxToolCalls,
+        ),
         onUsage: (summary) => {
           modelUsage = summary;
+        },
+        onAgentEvent: async (event) => {
+          if (event.type === "tool_requested") {
+            await emit("model_tool_requested", {
+              callId: event.callId,
+              name: event.name,
+            });
+          } else if (event.type === "tool_completed") {
+            await emit("model_tool_completed", {
+              callId: event.callId,
+              name: event.name,
+              durationMs: event.durationMs,
+              status: event.isError ? "error" : "ok",
+            });
+          }
         },
       });
       const modelUsageRef = await this.store.putJson({

@@ -113,6 +113,30 @@ function emitText(
   }
 }
 
+function emitToolRequest(
+  stream: AssistantMessageEventStream,
+  callId: string,
+  name: string,
+  input: Record<string, Json>,
+): void {
+  const toolCall = {
+    type: "toolCall" as const,
+    id: callId,
+    name,
+    arguments: input,
+  };
+  const assistant = message([toolCall], "toolUse");
+  stream.push({ type: "start", partial: message([], "pending") });
+  stream.push({ type: "toolcall_start", contentIndex: 0, partial: assistant });
+  stream.push({
+    type: "toolcall_end",
+    contentIndex: 0,
+    toolCall,
+    partial: assistant,
+  });
+  stream.push({ type: "done", reason: "toolUse", message: assistant });
+}
+
 async function collect(runtime: PiAgentRuntime, value: AgentRunRequest): Promise<AgentEvent[]> {
   const output: AgentEvent[] = [];
   for await (const event of runtime.run(value)) output.push(event);
@@ -264,12 +288,17 @@ test("makes a tool request visible before execution and pairs call ids", async (
   assert.equal(executorStarted, false);
 
   const completed = await iterator.next();
-  assert.deepEqual(completed.value, {
-    type: "tool_completed",
-    callId: "call-1",
-    result: { operationId: "read", effects: "read" },
-    isError: false,
-  });
+  assert.equal(completed.value?.type, "tool_completed");
+  if (completed.value?.type === "tool_completed") {
+    assert.equal(completed.value.callId, "call-1");
+    assert.equal(completed.value.name, "contract.get_operation");
+    assert.deepEqual(completed.value.result, {
+      operationId: "read",
+      effects: "read",
+    });
+    assert.equal(completed.value.isError, false);
+    assert.ok(completed.value.durationMs >= 0);
+  }
   assert.equal(executorStarted, true);
   assert.equal((await iterator.next()).value?.type, "text_delta");
   const secondTurnUsage = (await iterator.next()).value;
@@ -478,5 +507,191 @@ test("invalid tool input is rejected before the executor runs", async () => {
   assert.equal(terminal?.type, "failed");
   if (terminal?.type === "failed") {
     assert.equal(terminal.code, "tool_input_schema_error");
+  }
+});
+
+test("tool executor failures are terminal and do not expose the raw exception", async () => {
+  const runtime = new PiAgentRuntime({
+    model,
+    streamFn: () => {
+      const stream = createAssistantMessageEventStream();
+      queueMicrotask(() =>
+        emitToolRequest(
+          stream,
+          "failing-tool",
+          "contract.get_operation",
+          { operationId: "read" },
+        ),
+      );
+      return stream;
+    },
+    toolExecutor: async () => {
+      throw new Error("SECRET-TOOL-DETAIL");
+    },
+  });
+
+  const output = await collect(
+    runtime,
+    request("tool-execution-error", {
+      tools: [
+        {
+          name: "contract.get_operation",
+          description: "Read one operation",
+          inputSchema: {
+            type: "object",
+            properties: { operationId: { type: "string" } },
+            required: ["operationId"],
+            additionalProperties: false,
+          },
+          idempotent: true,
+        },
+      ],
+    }),
+  );
+  const completed = output.find((event) => event.type === "tool_completed");
+  assert.equal(completed?.type, "tool_completed");
+  if (completed?.type === "tool_completed") {
+    assert.equal(completed.isError, true);
+    assert.equal(completed.name, "contract.get_operation");
+    assert.doesNotMatch(JSON.stringify(completed.result), /SECRET-TOOL-DETAIL/);
+  }
+  const terminal = output.at(-1);
+  assert.equal(terminal?.type, "failed");
+  if (terminal?.type === "failed") {
+    assert.equal(terminal.code, "tool_execution_error");
+    assert.doesNotMatch(terminal.message, /SECRET-TOOL-DETAIL/);
+  }
+});
+
+test("repeated no-progress tool calls stop before another execution", async () => {
+  let providerTurns = 0;
+  let executions = 0;
+  const runtime = new PiAgentRuntime({
+    model,
+    streamFn: () => {
+      const stream = createAssistantMessageEventStream();
+      providerTurns += 1;
+      const turn = providerTurns;
+      queueMicrotask(() =>
+        emitToolRequest(
+          stream,
+          `repeat-${turn}`,
+          "contract.get_operation",
+          { operationId: "read" },
+        ),
+      );
+      return stream;
+    },
+    toolExecutor: async () => {
+      executions += 1;
+      return { operationId: "read" };
+    },
+  });
+
+  const output = await collect(
+    runtime,
+    request("repeated-tool-loop", {
+      tools: [
+        {
+          name: "contract.get_operation",
+          description: "Read one operation",
+          inputSchema: {
+            type: "object",
+            properties: { operationId: { type: "string" } },
+            required: ["operationId"],
+            additionalProperties: false,
+          },
+          idempotent: true,
+        },
+      ],
+      tokenBudget: 100,
+      maxToolCalls: 10,
+      maxRepeatedToolCalls: 2,
+    }),
+  );
+  assert.equal(providerTurns, 3);
+  assert.equal(executions, 2);
+  assert.equal(
+    output.filter((event) => event.type === "tool_completed").length,
+    2,
+  );
+  const terminal = output.at(-1);
+  assert.equal(terminal?.type, "failed");
+  if (terminal?.type === "failed") {
+    assert.equal(terminal.code, "tool_loop_limit");
+    assert.match(terminal.message, /without progress/);
+  }
+});
+
+test("turn and tool-call limits stop an otherwise progressing loop", async () => {
+  const scenarios = [
+    {
+      runId: "max-tools",
+      maxTurns: 10,
+      maxToolCalls: 1,
+      expectedProviders: 2,
+      expectedExecutions: 1,
+    },
+    {
+      runId: "max-turns",
+      maxTurns: 2,
+      maxToolCalls: 10,
+      expectedProviders: 2,
+      expectedExecutions: 2,
+    },
+  ] as const;
+  for (const scenario of scenarios) {
+    let providerTurns = 0;
+    let executions = 0;
+    const runtime = new PiAgentRuntime({
+      model,
+      streamFn: () => {
+        const stream = createAssistantMessageEventStream();
+        providerTurns += 1;
+        const turn = providerTurns;
+        queueMicrotask(() =>
+          emitToolRequest(
+            stream,
+            `${scenario.runId}-${turn}`,
+            "contract.get_operation",
+            { operationId: `read-${turn}` },
+          ),
+        );
+        return stream;
+      },
+      toolExecutor: async ({ input }) => {
+        executions += 1;
+        return input;
+      },
+    });
+    const output = await collect(
+      runtime,
+      request(scenario.runId, {
+        tools: [
+          {
+            name: "contract.get_operation",
+            description: "Read one operation",
+            inputSchema: {
+              type: "object",
+              properties: { operationId: { type: "string" } },
+              required: ["operationId"],
+              additionalProperties: false,
+            },
+            idempotent: true,
+          },
+        ],
+        tokenBudget: 100,
+        maxTurns: scenario.maxTurns,
+        maxToolCalls: scenario.maxToolCalls,
+        maxRepeatedToolCalls: 10,
+      }),
+    );
+    assert.equal(providerTurns, scenario.expectedProviders, scenario.runId);
+    assert.equal(executions, scenario.expectedExecutions, scenario.runId);
+    const terminal = output.at(-1);
+    assert.equal(terminal?.type, "failed");
+    if (terminal?.type === "failed") {
+      assert.equal(terminal.code, "tool_loop_limit");
+    }
   }
 });
