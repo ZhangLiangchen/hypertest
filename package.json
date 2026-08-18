@@ -23,7 +23,8 @@
     "check:schemas": "node scripts/check-schemas.mjs"
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "0.84.1"
+    "@earendil-works/pi-agent-core": "0.84.1",
+    "typebox": "1.3.7"
   },
   "devDependencies": {
     "@types/node": "24.12.4",
