@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -96,4 +96,28 @@ test("orchestrator completes a cross-process plan and execute flow", async (t) =
   assert.equal(summary.testRun?.kind, "test-run");
   assert.equal(summary.patch?.kind, "patch");
   assert.equal(summary.gateDecisions.length, 2);
+
+  const usageText = await readFile(
+    join(
+      root,
+      ".testagent",
+      "runs",
+      request.runId,
+      "artifacts",
+      "model-usage.json",
+    ),
+    "utf8",
+  );
+  const usage = JSON.parse(usageText) as {
+    readonly providerCalls: number;
+    readonly usageUnavailableCalls: number;
+    readonly totalTokens: number;
+  };
+  assert.deepEqual(usage, {
+    ...usage,
+    providerCalls: 0,
+    usageUnavailableCalls: 0,
+    totalTokens: 0,
+  });
+  assert.match(summary.warnings.join("\n"), /model-usage=.*model-usage\.json/);
 });

@@ -17,8 +17,10 @@ import {
   type AgentFailureCode,
   type AgentRunRequest,
   type AgentRuntime,
+  type AgentUsage,
 } from "../../runtime.js";
 import { AsyncQueue } from "../async-queue.js";
+import { fingerprintEndpoint } from "../usage.js";
 import {
   RuntimeValidationError,
   parseAndValidateModelResult,
@@ -32,12 +34,33 @@ export interface PiToolExecutionRequest {
   readonly input: Json;
 }
 
+type PiMessageEndEvent = Extract<PiAgentEvent, { readonly type: "message_end" }>;
+export type PiAssistantMessage = Extract<
+  PiMessageEndEvent["message"],
+  { readonly role: "assistant" }
+>;
+
+export interface PiProviderTelemetry {
+  readonly providerRequestId?: string;
+  readonly retryCount?: number;
+  readonly usageUnavailable?: boolean;
+  readonly latencyMs?: number;
+}
+
 export interface PiAgentRuntimeOptions {
   readonly model: AgentState["model"];
   readonly streamFn: StreamFn;
   readonly toolExecutor?: (request: PiToolExecutionRequest) => Promise<Json>;
   readonly transformContext?: AgentOptions["transformContext"];
   readonly thinkingLevel?: AgentState["thinkingLevel"];
+  readonly provider?: string;
+  readonly modelId?: string;
+  readonly endpointFingerprint?: string;
+  readonly maxOutputTokens?: number;
+  readonly getProviderTelemetry?: (
+    message: PiAssistantMessage | undefined,
+  ) => PiProviderTelemetry | undefined;
+  readonly now?: () => number;
 }
 
 interface ActivePiRun {
@@ -66,14 +89,22 @@ export class PiAgentRuntime implements AgentRuntime {
     }
 
     const queue = new AsyncQueue<AgentEvent>();
+    const now = this.options.now ?? Date.now;
     const maxTurns = request.maxTurns ?? 20;
     const maxToolCalls = request.maxToolCalls ?? 60;
     const maxOutputBytes = request.maxOutputBytes ?? 1_048_576;
+    const tokenBudget = Math.max(0, Math.floor(request.tokenBudget));
+    const endpointFingerprint =
+      this.options.endpointFingerprint ??
+      fingerprintEndpoint(this.options.model.baseUrl);
+    const providerCallStarts: number[] = [];
     let terminal = false;
     let text = "";
     let outputBytes = 0;
     let turnCount = 0;
     let toolCallCount = 0;
+    let consumedTokens = 0;
+    let budgetStopReason: string | undefined;
     let unsubscribe: (() => void) | undefined;
     let deadlineTimer: NodeJS.Timeout | undefined;
 
@@ -86,7 +117,9 @@ export class PiAgentRuntime implements AgentRuntime {
         validateToolInput(toJson(input), tool.inputSchema),
       execute: async (callId, input) => {
         if (this.options.toolExecutor === undefined) {
-          throw new PiToolExecutionError(`No executor is configured for tool ${tool.name}`);
+          throw new PiToolExecutionError(
+            `No executor is configured for tool ${tool.name}`,
+          );
         }
         const validated = validateToolInput(toJson(input), tool.inputSchema);
         let result: Json;
@@ -109,6 +142,28 @@ export class PiAgentRuntime implements AgentRuntime {
       },
     }));
 
+    const remainingBudget = (): number =>
+      Math.max(0, tokenBudget - consumedTokens);
+
+    const streamFn: StreamFn = (model, context, streamOptions) => {
+      const remaining = remainingBudget();
+      const configuredMax = Math.min(
+        model.maxTokens,
+        this.options.maxOutputTokens ?? Number.POSITIVE_INFINITY,
+        request.maxOutputTokens ?? Number.POSITIVE_INFINITY,
+        streamOptions?.maxTokens ?? Number.POSITIVE_INFINITY,
+      );
+      const maxTokens = Math.max(
+        1,
+        Math.floor(Math.min(configuredMax, remaining)),
+      );
+      providerCallStarts.push(now());
+      return this.options.streamFn(model, context, {
+        ...(streamOptions ?? {}),
+        maxTokens,
+      });
+    };
+
     const agent = new Agent({
       initialState: {
         systemPrompt: request.systemPrompt ?? "You are a HyperTest worker.",
@@ -117,12 +172,13 @@ export class PiAgentRuntime implements AgentRuntime {
         tools,
         messages: [],
       },
-      streamFn: this.options.streamFn,
+      streamFn,
       ...(this.options.transformContext === undefined
         ? {}
         : { transformContext: this.options.transformContext }),
       shouldStopAfterTurn: (context: ShouldStopAfterTurnContext) =>
-        Date.now() >= request.deadlineEpochMs ||
+        budgetStopReason !== undefined ||
+        now() >= request.deadlineEpochMs ||
         context.context.messages.length > 100,
       toolExecution: "sequential",
     });
@@ -137,7 +193,67 @@ export class PiAgentRuntime implements AgentRuntime {
       this.active.delete(request.runId);
     };
 
-    const finish = (event: Extract<AgentEvent, { type: "completed" | "failed" }>): void => {
+    const resolveTelemetry = (
+      message: PiAssistantMessage | undefined,
+    ): PiProviderTelemetry | undefined => {
+      try {
+        return this.options.getProviderTelemetry?.(message);
+      } catch {
+        return undefined;
+      }
+    };
+
+    const emitUsage = (
+      message: PiAssistantMessage | undefined,
+      stopReason: string,
+    ): AgentUsage | undefined => {
+      const startedAt = providerCallStarts.shift();
+      if (startedAt === undefined) return undefined;
+      const telemetry = resolveTelemetry(message);
+      const usageUnavailable =
+        telemetry?.usageUnavailable ?? !hasReportedUsage(message);
+      const providerRequestId =
+        telemetry?.providerRequestId ?? message?.responseId;
+      const record: AgentUsage = {
+        provider:
+          this.options.provider ??
+          message?.provider ??
+          this.options.model.provider,
+        model:
+          this.options.modelId ?? message?.model ?? this.options.model.id,
+        endpointFingerprint,
+        ...(providerRequestId === undefined ? {} : { providerRequestId }),
+        ...(!usageUnavailable && message !== undefined
+          ? {
+              inputTokens: safeTokenCount(message.usage.input),
+              outputTokens: safeTokenCount(message.usage.output),
+              cachedTokens: safeTokenCount(message.usage.cacheRead),
+              estimatedCostUsd: safeCost(message.usage.cost.total),
+            }
+          : {}),
+        latencyMs: Math.max(
+          0,
+          Math.floor(telemetry?.latencyMs ?? now() - startedAt),
+        ),
+        retryCount: Math.max(0, Math.floor(telemetry?.retryCount ?? 0)),
+        stopReason,
+        usageUnavailable,
+      };
+      queue.push({ type: "usage", usage: record });
+      if (!usageUnavailable) {
+        consumedTokens +=
+          (record.inputTokens ?? 0) + (record.outputTokens ?? 0);
+      }
+      return record;
+    };
+
+    const flushPendingUsage = (stopReason: string): void => {
+      while (providerCallStarts.length > 0) emitUsage(undefined, stopReason);
+    };
+
+    const finish = (
+      event: Extract<AgentEvent, { type: "completed" | "failed" }>,
+    ): void => {
       if (terminal) return;
       terminal = true;
       queue.push(event);
@@ -151,6 +267,7 @@ export class PiAgentRuntime implements AgentRuntime {
       retryable: boolean,
     ): void => {
       if (terminal) return;
+      flushPendingUsage(code);
       agent.abort();
       finish(failure(code, message, retryable));
     };
@@ -215,34 +332,51 @@ export class PiAgentRuntime implements AgentRuntime {
         if (event.isError) {
           const classification = classifyToolFailure(event.result);
           if (classification !== undefined) {
-            finish(failure(classification, toolFailureMessage(classification), false));
+            finish(
+              failure(
+                classification,
+                toolFailureMessage(classification),
+                false,
+              ),
+            );
           }
         }
         return;
       }
-      if (
-        event.type === "message_end" &&
-        isAssistantFailure(event.message)
-      ) {
-        finish(
-          failure(
-            event.message.stopReason === "aborted"
-              ? "cancelled"
-              : "provider_error",
-            event.message.errorMessage ??
-              `Pi agent stopped with ${event.message.stopReason}`,
-            event.message.stopReason === "error",
-            event.message.responseId,
-          ),
-        );
+      if (event.type === "message_end" && isAssistantMessage(event.message)) {
+        const usage = emitUsage(event.message, event.message.stopReason);
+        if (isAssistantFailure(event.message)) {
+          finish(
+            failure(
+              event.message.stopReason === "aborted"
+                ? "cancelled"
+                : "provider_error",
+              event.message.errorMessage ??
+                `Pi agent stopped with ${event.message.stopReason}`,
+              event.message.stopReason === "error",
+              event.message.responseId,
+            ),
+          );
+          return;
+        }
+        if (event.message.stopReason === "toolUse") {
+          if (usage?.usageUnavailable === true) {
+            budgetStopReason =
+              "Provider usage is unavailable, so another turn cannot be authorized within the hard token budget";
+          } else if (consumedTokens >= tokenBudget) {
+            budgetStopReason = `Agent consumed the ${tokenBudget}-token budget before another provider turn`;
+          }
+        }
       }
     });
 
     this.active.set(request.runId, { agent, abort });
     queue.push({ type: "started", runId: request.runId });
 
-    const remainingMs = request.deadlineEpochMs - Date.now();
-    if (remainingMs <= 0) {
+    const remainingMs = request.deadlineEpochMs - now();
+    if (tokenBudget <= 0) {
+      abort("budget_exhausted", "Agent token budget is exhausted", false);
+    } else if (remainingMs <= 0) {
       abort("deadline_exceeded", "Agent run deadline exceeded", false);
     } else {
       deadlineTimer = setTimeout(() => {
@@ -250,40 +384,49 @@ export class PiAgentRuntime implements AgentRuntime {
       }, remainingMs);
     }
 
-    void (async () => {
-      try {
-        await agent.prompt(request.prompt);
-        if (!terminal) {
-          try {
-            finish({
-              type: "completed",
-              result: parseAndValidateModelResult(
-                text,
-                request.expectedResultSchema,
-              ),
-            });
-          } catch (error) {
-            if (error instanceof RuntimeValidationError) {
-              finish(failure(error.code, error.message, false));
-            } else {
-              throw error;
+    if (!terminal) {
+      void (async () => {
+        try {
+          await agent.prompt(request.prompt);
+          if (!terminal) {
+            if (budgetStopReason !== undefined) {
+              finish(failure("budget_exhausted", budgetStopReason, false));
+              return;
+            }
+            try {
+              finish({
+                type: "completed",
+                result: parseAndValidateModelResult(
+                  text,
+                  request.expectedResultSchema,
+                ),
+              });
+            } catch (error) {
+              if (error instanceof RuntimeValidationError) {
+                finish(failure(error.code, error.message, false));
+              } else {
+                throw error;
+              }
             }
           }
+        } catch (error) {
+          if (!terminal) {
+            flushPendingUsage("error");
+            const mapped = mapProviderError(error);
+            finish(failure(mapped.code, mapped.message, mapped.retryable));
+          }
+        } finally {
+          cleanup();
         }
-      } catch (error) {
-        if (!terminal) {
-          const mapped = mapProviderError(error);
-          finish(failure(mapped.code, mapped.message, mapped.retryable));
-        }
-      } finally {
-        cleanup();
-      }
-    })();
+      })();
+    }
 
     try {
       for await (const event of queue) yield event;
     } finally {
-      if (!terminal) abort("cancelled", "Agent event consumer cancelled", false);
+      if (!terminal) {
+        abort("cancelled", "Agent event consumer cancelled", false);
+      }
     }
   }
 
@@ -301,18 +444,33 @@ function toSchema(value: Json, toolName: string): TSchema {
   return value;
 }
 
-function isAssistantFailure(message: unknown): message is {
-  readonly role: "assistant";
+function isAssistantMessage(message: PiMessageEndEvent["message"]): message is PiAssistantMessage {
+  return message.role === "assistant";
+}
+
+function isAssistantFailure(message: PiAssistantMessage): message is PiAssistantMessage & {
   readonly stopReason: "error" | "aborted";
-  readonly errorMessage?: string;
-  readonly responseId?: string;
 } {
-  if (typeof message !== "object" || message === null) return false;
-  const record = message as Record<string, unknown>;
+  return message.stopReason === "error" || message.stopReason === "aborted";
+}
+
+function hasReportedUsage(message: PiAssistantMessage | undefined): boolean {
+  if (message === undefined) return false;
   return (
-    record.role === "assistant" &&
-    (record.stopReason === "error" || record.stopReason === "aborted")
+    message.usage.totalTokens > 0 ||
+    message.usage.input > 0 ||
+    message.usage.output > 0 ||
+    message.usage.cacheRead > 0 ||
+    message.usage.cacheWrite > 0
   );
+}
+
+function safeTokenCount(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
+}
+
+function safeCost(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, value) : 0;
 }
 
 function toolResultJson(value: unknown): Json {
@@ -380,7 +538,9 @@ function mapProviderError(error: unknown): {
 function toJson(value: unknown): Json {
   if (value === null) return null;
   if (typeof value === "string" || typeof value === "boolean") return value;
-  if (typeof value === "number") return Number.isFinite(value) ? value : String(value);
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : String(value);
+  }
   if (Array.isArray(value)) return value.map((item) => toJson(item));
   if (typeof value === "object") {
     return Object.fromEntries(

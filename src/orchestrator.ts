@@ -34,8 +34,8 @@ import { createTestPlan } from "./planner.js";
 import type { AdapterCommandProfile, HyperTestProfile } from "./profile.js";
 import { loadProfile } from "./profile.js";
 import { validateRepairPatch } from "./repair.js";
-import type { AgentRuntime } from "./runtime.js";
-import { collectAgentResult } from "./runtime.js";
+import type { AgentRuntime, AgentUsageSummary } from "./runtime.js";
+import { collectAgentResult, emptyAgentUsageSummary } from "./runtime.js";
 import {
   createRunLedger,
   recordTransition,
@@ -66,6 +66,7 @@ export class HyperTestOrchestrator {
     const workspace = workspaceRef(request.workspacePath, request.sourceRevision);
     let ledger = createRunLedger(request.runId);
     const warnings: string[] = [];
+    let modelUsage: AgentUsageSummary = emptyAgentUsageSummary(request.runId);
     const gateDecisionRefs: ArtifactRef<"gate-decision">[] = [];
     const qualityGate = createQualityGate(profile);
 
@@ -141,6 +142,28 @@ export class HyperTestOrchestrator {
           profile.runtime.budgets.tokenBudget,
         ),
         deadlineEpochMs: deadline,
+        onUsage: (summary) => {
+          modelUsage = summary;
+        },
+      });
+      const modelUsageRef = await this.store.putJson({
+        runId: request.runId,
+        relativePath: "model-usage.json",
+        kind: "model-usage",
+        schema: "hypertest.model-usage/v1",
+        sourceRevision: request.sourceRevision,
+        value: modelUsage as unknown as Json,
+      });
+      warnings.push(`model-usage=${modelUsageRef.uri}`);
+      await emit("model_usage_recorded", {
+        artifactUri: modelUsageRef.uri,
+        artifactSha256: modelUsageRef.sha256,
+        providerCalls: modelUsage.providerCalls,
+        usageUnavailableCalls: modelUsage.usageUnavailableCalls,
+        inputTokens: modelUsage.inputTokens,
+        outputTokens: modelUsage.outputTokens,
+        cachedTokens: modelUsage.cachedTokens,
+        retryCount: modelUsage.retryCount,
       });
       const planRef = await this.store.putJson({
         runId: request.runId,

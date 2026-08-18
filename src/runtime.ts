@@ -1,5 +1,6 @@
 import type { ArtifactRef, Json } from "./contracts.js";
 import { RuntimeValidationError, validateModelResult } from "./runtime/validation.js";
+import { aggregateAgentUsage, emptyAgentUsageSummary } from "./runtime/usage.js";
 
 export type AgentFailureCode =
   | "cancelled"
@@ -53,7 +54,7 @@ export type AgentEvent =
       readonly result: Json;
       readonly isError: boolean;
     }
-  | { readonly type: "usage"; readonly inputTokens: number; readonly outputTokens: number }
+  | { readonly type: "usage"; readonly usage: AgentUsage }
   | { readonly type: "completed"; readonly result: Json }
   | {
       readonly type: "failed";
@@ -63,6 +64,42 @@ export type AgentEvent =
       readonly providerRequestId?: string;
     };
 
+
+export interface AgentUsage {
+  readonly provider: string;
+  readonly model: string;
+  readonly endpointFingerprint: string;
+  readonly providerRequestId?: string;
+  readonly inputTokens?: number;
+  readonly outputTokens?: number;
+  readonly cachedTokens?: number;
+  readonly latencyMs: number;
+  readonly retryCount: number;
+  readonly stopReason?: string;
+  readonly usageUnavailable: boolean;
+  readonly estimatedCostUsd?: number;
+}
+
+export interface AgentUsageSummary {
+  readonly schema: "hypertest.model-usage/v1";
+  readonly runId: string;
+  readonly providerCalls: number;
+  readonly usageUnavailableCalls: number;
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly cachedTokens: number;
+  readonly totalTokens: number;
+  readonly retryCount: number;
+  readonly totalLatencyMs: number;
+  readonly estimatedCostUsd: number;
+  readonly records: readonly AgentUsage[];
+}
+
+export interface AgentRunOutcome {
+  readonly result: Json;
+  readonly usage: AgentUsageSummary;
+}
+
 export interface AgentRuntime {
   run(request: AgentRunRequest): AsyncIterable<AgentEvent>;
   cancel(runId: string): Promise<void>;
@@ -71,6 +108,7 @@ export interface AgentRuntime {
 export class AgentRuntimeError extends Error {
   public constructor(
     public readonly failure: Extract<AgentEvent, { readonly type: "failed" }>,
+    public readonly usage?: AgentUsageSummary,
   ) {
     super(`Agent runtime failed (${failure.code}): ${failure.message}`);
     this.name = "AgentRuntimeError";
@@ -155,26 +193,44 @@ export class ScriptedAgentRuntime extends InMemoryAgentRuntime {
   }
 }
 
-export async function collectAgentResult(
+export async function collectAgentRun(
   runtime: AgentRuntime,
   request: AgentRunRequest,
-): Promise<Json> {
+): Promise<AgentRunOutcome> {
   let completed: Json | undefined;
   let terminalCount = 0;
+  const records: AgentUsage[] = [];
   for await (const event of runtime.run(request)) {
-    if (event.type === "completed") {
+    if (event.type === "usage") {
+      records.push(event.usage);
+    } else if (event.type === "completed") {
       terminalCount += 1;
       completed = event.result;
     } else if (event.type === "failed") {
       terminalCount += 1;
-      throw new AgentRuntimeError(event);
+      throw new AgentRuntimeError(
+        event,
+        aggregateAgentUsage(request.runId, records),
+      );
     }
   }
   if (terminalCount !== 1 || completed === undefined) {
     throw new Error("Agent runtime ended without exactly one terminal event");
   }
-  return completed;
+  return {
+    result: completed,
+    usage: aggregateAgentUsage(request.runId, records),
+  };
 }
+
+export async function collectAgentResult(
+  runtime: AgentRuntime,
+  request: AgentRunRequest,
+): Promise<Json> {
+  return (await collectAgentRun(runtime, request)).result;
+}
+
+export { aggregateAgentUsage, emptyAgentUsageSummary };
 
 export function failure(
   code: AgentFailureCode,

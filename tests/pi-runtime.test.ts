@@ -174,6 +174,13 @@ test("streams the first text delta before the provider turn finishes", async () 
     type: "text_delta",
     text: "true}",
   });
+  const liveUsage = (await iterator.next()).value;
+  assert.equal(liveUsage?.type, "usage");
+  if (liveUsage?.type === "usage") {
+    assert.equal(liveUsage.usage.inputTokens, 1);
+    assert.equal(liveUsage.usage.outputTokens, 3);
+    assert.equal(liveUsage.usage.usageUnavailable, false);
+  }
   assert.deepEqual((await iterator.next()).value, {
     type: "completed",
     result: { live: true },
@@ -242,6 +249,11 @@ test("makes a tool request visible before execution and pairs call ids", async (
   )[Symbol.asyncIterator]();
 
   assert.equal((await iterator.next()).value?.type, "started");
+  const firstTurnUsage = await iterator.next();
+  assert.equal(firstTurnUsage.value?.type, "usage");
+  if (firstTurnUsage.value?.type === "usage") {
+    assert.equal(firstTurnUsage.value.usage.stopReason, "toolUse");
+  }
   const requested = await iterator.next();
   assert.deepEqual(requested.value, {
     type: "tool_requested",
@@ -260,6 +272,8 @@ test("makes a tool request visible before execution and pairs call ids", async (
   });
   assert.equal(executorStarted, true);
   assert.equal((await iterator.next()).value?.type, "text_delta");
+  const secondTurnUsage = (await iterator.next()).value;
+  assert.equal(secondTurnUsage?.type, "usage");
   assert.deepEqual((await iterator.next()).value, {
     type: "completed",
     result: { cases: [] },
@@ -276,6 +290,11 @@ test("cancel is idempotent and interrupts an in-flight provider request", async 
 
   await runtime.cancel("cancelled-run");
   await runtime.cancel("cancelled-run");
+  const cancelledUsage = await withTimeout(iterator.next());
+  assert.equal(cancelledUsage.value?.type, "usage");
+  if (cancelledUsage.value?.type === "usage") {
+    assert.equal(cancelledUsage.value.usage.usageUnavailable, true);
+  }
   const terminal = await withTimeout(iterator.next());
   assert.deepEqual(terminal.value, {
     type: "failed",
@@ -295,6 +314,8 @@ test("wall-clock deadline terminates without waiting for the provider turn", asy
   assert.equal((await iterator.next()).value?.type, "started");
   await controlled.next();
 
+  const deadlineUsage = await withTimeout(iterator.next(), 500);
+  assert.equal(deadlineUsage.value?.type, "usage");
   const terminal = await withTimeout(iterator.next(), 500);
   assert.deepEqual(terminal.value, {
     type: "failed",
@@ -316,15 +337,19 @@ test("output flooding is stopped in-stream and produces one terminal event", asy
   emitText(provider.stream, "123456", false);
 
   const output = await withTimeout(outputPromise);
-  assert.deepEqual(output, [
-    { type: "started", runId: "flood" },
-    {
-      type: "failed",
-      code: "output_limit",
-      message: "Model output exceeded 5 bytes",
-      retryable: false,
-    },
-  ]);
+  assert.equal(output.length, 3);
+  assert.deepEqual(output[0], { type: "started", runId: "flood" });
+  assert.equal(output[1]?.type, "usage");
+  if (output[1]?.type === "usage") {
+    assert.equal(output[1].usage.usageUnavailable, true);
+    assert.equal(output[1].usage.stopReason, "output_limit");
+  }
+  assert.deepEqual(output[2], {
+    type: "failed",
+    code: "output_limit",
+    message: "Model output exceeded 5 bytes",
+    retryable: false,
+  });
 });
 
 test("rejects a concurrent run id and releases it after cancellation", async () => {
@@ -337,12 +362,14 @@ test("rejects a concurrent run id and releases it after cancellation", async () 
   const second = runtime.run(request("same-id"))[Symbol.asyncIterator]();
   await assert.rejects(second.next(), AgentRuntimeError);
   await runtime.cancel("same-id");
+  assert.equal((await first.next()).value?.type, "usage");
   assert.equal((await first.next()).value?.type, "failed");
 
   const third = runtime.run(request("same-id"))[Symbol.asyncIterator]();
   assert.equal((await third.next()).value?.type, "started");
   await controlled.next();
   await runtime.cancel("same-id");
+  assert.equal((await third.next()).value?.type, "usage");
   assert.equal((await third.next()).value?.type, "failed");
 });
 

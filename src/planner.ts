@@ -10,8 +10,8 @@ import type {
   TestPlan,
   TestPlanCase,
 } from "./contracts.js";
-import type { AgentRuntime } from "./runtime.js";
-import { collectAgentResult } from "./runtime.js";
+import type { AgentRuntime, AgentUsageSummary } from "./runtime.js";
+import { collectAgentRun, emptyAgentUsageSummary } from "./runtime.js";
 
 export interface PlanOptions {
   readonly maxCasesPerOperation?: number;
@@ -20,6 +20,7 @@ export interface PlanOptions {
   readonly runId?: string;
   readonly tokenBudget?: number;
   readonly deadlineEpochMs?: number;
+  readonly onUsage?: (summary: AgentUsageSummary) => void | Promise<void>;
 }
 
 export async function createTestPlan(
@@ -32,7 +33,7 @@ export async function createTestPlan(
   );
   const modelCases =
     options.runtime === undefined
-      ? []
+      ? await recordDeterministicUsage(options)
       : await requestModelCases(contract, contractRef, options);
   const merged = deduplicateCases([...deterministic, ...modelCases]);
   return {
@@ -340,6 +341,15 @@ export function plannerAugmentationSchema(maxCases: number): Json {
   };
 }
 
+async function recordDeterministicUsage(
+  options: PlanOptions,
+): Promise<TestPlanCase[]> {
+  await options.onUsage?.(
+    emptyAgentUsageSummary(options.runId ?? `plan-${Date.now()}`),
+  );
+  return [];
+}
+
 async function requestModelCases(
   contract: SutContract,
   contractRef: ArtifactRef<"sut-contract">,
@@ -348,8 +358,9 @@ async function requestModelCases(
   const maxCases =
     Math.max(1, options.maxCasesPerOperation ?? 12) *
     Math.max(1, contract.operations.length);
-  const result = await collectAgentResult(options.runtime!, {
-    runId: options.runId ?? `plan-${Date.now()}`,
+  const runId = options.runId ?? `plan-${Date.now()}`;
+  const outcome = await collectAgentRun(options.runtime!, {
+    runId,
     phase: "test-plan-augmentation",
     systemPrompt:
       "Generate framework-neutral test cases only. Never emit test source code. Return only JSON matching the supplied result schema.",
@@ -367,6 +378,8 @@ async function requestModelCases(
     expectedResultSchema: plannerAugmentationSchema(maxCases),
     maxOutputBytes: 262_144,
   });
+  await options.onUsage?.(outcome.usage);
+  const result = outcome.result;
   if (!isRecord(result) || !Array.isArray(result.cases)) {
     throw new PlannerModelValidationError(
       "Validated planner augmentation is missing its cases array",
