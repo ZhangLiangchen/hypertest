@@ -5,7 +5,7 @@ import {
   createAssistantMessageEventStream,
   type AssistantMessage,
   type AssistantMessageEventStream,
-} from "@earendil-works/pi-ai";
+} from "../src/runtime/pi/testing.js";
 
 import type { ArtifactRef, Json, SutContract } from "../src/contracts.js";
 import {
@@ -281,6 +281,12 @@ test("unknown operations return a structured recoverable tool error", async () =
 });
 
 test("planner exposes only the fixed in-memory read-only allowlist", async () => {
+  assert.equal(Object.isFrozen(plannerToolDefinitions()), true);
+  assert.ok(
+    plannerToolDefinitions().every(
+      (tool) => Object.isFrozen(tool) && Object.isFrozen(tool.inputSchema),
+    ),
+  );
   assert.deepEqual(
     plannerToolDefinitions().map((tool) => tool.name),
     ["contract.list_operations", "contract.get_operation"],

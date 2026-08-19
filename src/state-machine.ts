@@ -61,6 +61,8 @@ const transitions: Readonly<
   execute: {
     tests_passed: "verify",
     tests_failed: "diagnose",
+    denied: "rejected",
+    human_required: "needs_human",
     fatal_error: "failed",
   },
   diagnose: {
@@ -162,4 +164,47 @@ export function createRunLedger(runId: string): RunLedger {
     repairRounds: 0,
     transitions: [],
   };
+}
+
+export function assertValidRunLedger(ledger: RunLedger): void {
+  const invalid = (message: string): never => {
+    throw new Error(`Invalid run ledger: ${message}`);
+  };
+  if (ledger.schema !== "hypertest.run-ledger/v1" || ledger.runId.length === 0) {
+    invalid("identity is malformed");
+  }
+  let state: RunState = "intake";
+  let repairRounds = 0;
+  let previousAt = -1;
+  for (const transition of ledger.transitions) {
+    if (
+      !Number.isInteger(transition.atEpochMs) ||
+      transition.atEpochMs < 0 ||
+      transition.atEpochMs < previousAt
+    ) {
+      invalid("transition timestamps must be non-negative and nondecreasing");
+    }
+    if (transition.from !== state) {
+      invalid("transition source does not match the replayed state");
+    }
+    const expected: RunState = ((): RunState => {
+      try {
+        return transitionRun(state, transition.event);
+      } catch {
+        return invalid("transition event is not valid from its source state");
+      }
+    })();
+    if (transition.to !== expected) {
+      invalid("transition destination does not match the state machine");
+    }
+    if (state === "repair" && transition.event === "repair_applied") {
+      repairRounds += 1;
+    }
+    state = expected;
+    previousAt = transition.atEpochMs;
+  }
+  if (ledger.state !== state) invalid("final state does not match transition replay");
+  if (ledger.repairRounds !== repairRounds) {
+    invalid("repairRounds does not match transition replay");
+  }
 }

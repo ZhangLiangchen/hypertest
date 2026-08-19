@@ -4,6 +4,30 @@ import { dirname, isAbsolute, resolve } from "node:path";
 import type { Json, RunBudget } from "./contracts.js";
 import type { ModelRuntimeSettings } from "./model-config.js";
 
+const RUNTIME_PROFILE_KEYS = new Set([
+  "provider",
+  "model",
+  "baseUrl",
+  "timeoutMs",
+  "maxRetries",
+  "maxOutputTokens",
+  "budgets",
+  // Legacy flattened budget keys remain accepted for existing profiles.
+  "maxTurns",
+  "maxToolCalls",
+  "maxRepairRounds",
+  "wallClockMs",
+  "tokenBudget",
+  "max_repair_rounds",
+]);
+const BUDGET_PROFILE_KEYS = new Set([
+  "maxTurns",
+  "maxToolCalls",
+  "maxRepairRounds",
+  "wallClockMs",
+  "tokenBudget",
+]);
+
 export interface AdapterCommandProfile {
   readonly executable?: string;
   readonly command?: string;
@@ -90,6 +114,17 @@ export function validateProfile(value: Json): HyperTestProfile {
       "Model API keys must be provided through HYPERTEST_MODEL_API_KEY, not stored in a profile",
     );
   }
+  const unknownRuntimeKeys = Object.keys(runtimeInput).filter(
+    (key) => !RUNTIME_PROFILE_KEYS.has(key),
+  );
+  if (unknownRuntimeKeys.length > 0) {
+    throw new Error(
+      `Unsupported runtime profile key${unknownRuntimeKeys.length === 1 ? "" : "s"}: ${unknownRuntimeKeys
+        .sort()
+        .map((key) => JSON.stringify(key))
+        .join(", ")}`,
+    );
+  }
   const provider = expectString(runtimeInput.provider, "runtime.provider");
   if (!["deterministic", "openai-compatible"].includes(provider)) {
     throw new Error(`Unsupported runtime provider: ${provider}`);
@@ -98,15 +133,30 @@ export function validateProfile(value: Json): HyperTestProfile {
     runtimeInput.budgets === undefined
       ? runtimeInput
       : expectRecord(runtimeInput.budgets, "runtime.budgets");
+  if (runtimeInput.budgets !== undefined) {
+    const unknownBudgetKeys = Object.keys(budgetInput).filter(
+      (key) => !BUDGET_PROFILE_KEYS.has(key),
+    );
+    if (unknownBudgetKeys.length > 0) {
+      throw new Error(
+        `Unsupported runtime budget key${unknownBudgetKeys.length === 1 ? "" : "s"}: ${unknownBudgetKeys
+          .sort()
+          .map((key) => JSON.stringify(key))
+          .join(", ")}`,
+      );
+    }
+  }
   const budgets: RunBudget = {
     maxTurns: expectPositiveInteger(budgetInput.maxTurns ?? 20, "maxTurns"),
     maxToolCalls: expectPositiveInteger(
       budgetInput.maxToolCalls ?? 60,
       "maxToolCalls",
     ),
-    maxRepairRounds: expectNonNegativeInteger(
+    maxRepairRounds: expectBoundedInteger(
       budgetInput.maxRepairRounds ?? runtimeInput.max_repair_rounds ?? 2,
       "maxRepairRounds",
+      0,
+      2,
     ),
     wallClockMs: expectPositiveInteger(
       budgetInput.wallClockMs ?? 1_800_000,
@@ -350,14 +400,6 @@ function expectPositiveInteger(value: Json, path: string): number {
   }
   return value;
 }
-
-function expectNonNegativeInteger(value: Json, path: string): number {
-  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
-    throw new Error(`${path} must be a non-negative integer`);
-  }
-  return value;
-}
-
 
 function expectBoundedInteger(
   value: Json,

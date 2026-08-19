@@ -9,6 +9,8 @@
     "runId",
     "sourceRevision",
     "finalState",
+    "modelUsage",
+    "ledger",
     "gateDecisions",
     "warnings"
   ],
@@ -23,30 +25,129 @@
       "type": "string"
     },
     "finalState": {
-      "type": "string"
+      "enum": [
+        "planned",
+        "verified",
+        "completed",
+        "needs_human",
+        "rejected",
+        "failed"
+      ]
     },
     "testPlan": {
-      "$ref": "https://hypertest.dev/schemas/artifact-ref.v1.schema.json"
+      "allOf": [
+        { "$ref": "https://hypertest.dev/schemas/artifact-ref.v1.schema.json" },
+        {
+          "type": "object",
+          "required": ["kind", "schema"],
+          "properties": {
+            "kind": { "const": "test-plan" },
+            "schema": { "const": "hypertest.test-plan/v1" }
+          }
+        }
+      ]
     },
     "patch": {
-      "$ref": "https://hypertest.dev/schemas/artifact-ref.v1.schema.json"
+      "allOf": [
+        { "$ref": "https://hypertest.dev/schemas/artifact-ref.v1.schema.json" },
+        {
+          "type": "object",
+          "required": ["kind", "schema"],
+          "properties": {
+            "kind": { "const": "patch" },
+            "schema": { "const": "hypertest.patch/v1" }
+          }
+        }
+      ]
     },
     "testRun": {
-      "$ref": "https://hypertest.dev/schemas/artifact-ref.v1.schema.json"
+      "allOf": [
+        { "$ref": "https://hypertest.dev/schemas/artifact-ref.v1.schema.json" },
+        {
+          "type": "object",
+          "required": ["kind", "schema"],
+          "properties": {
+            "kind": { "const": "test-run" },
+            "schema": { "const": "hypertest.test-run/v1" }
+          }
+        }
+      ]
     },
     "coverage": {
-      "$ref": "https://hypertest.dev/schemas/artifact-ref.v1.schema.json"
+      "allOf": [
+        { "$ref": "https://hypertest.dev/schemas/artifact-ref.v1.schema.json" },
+        {
+          "type": "object",
+          "required": ["kind", "schema"],
+          "properties": {
+            "kind": { "const": "coverage-map" },
+            "schema": { "const": "hypertest.coverage-map/v1" }
+          }
+        }
+      ]
     },
     "diagnosis": {
-      "$ref": "https://hypertest.dev/schemas/artifact-ref.v1.schema.json"
+      "allOf": [
+        { "$ref": "https://hypertest.dev/schemas/artifact-ref.v1.schema.json" },
+        {
+          "type": "object",
+          "required": ["kind", "schema"],
+          "properties": {
+            "kind": { "const": "diagnosis" },
+            "schema": { "const": "hypertest.diagnosis/v1" }
+          }
+        }
+      ]
+    },
+    "modelUsage": {
+      "allOf": [
+        { "$ref": "https://hypertest.dev/schemas/artifact-ref.v1.schema.json" },
+        {
+          "type": "object",
+          "required": ["kind", "schema"],
+          "properties": {
+            "kind": { "const": "model-usage" },
+            "schema": { "const": "hypertest.model-usage/v1" }
+          }
+        }
+      ]
+    },
+    "ledger": {
+      "allOf": [
+        { "$ref": "https://hypertest.dev/schemas/artifact-ref.v1.schema.json" },
+        {
+          "type": "object",
+          "required": ["kind", "schema"],
+          "properties": {
+            "kind": { "const": "run-ledger" },
+            "schema": { "const": "hypertest.run-ledger/v1" }
+          }
+        }
+      ]
     },
     "change": {
-      "$ref": "https://hypertest.dev/schemas/artifact-ref.v1.schema.json"
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "url"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "url": { "type": "string", "minLength": 1 }
+      }
     },
     "gateDecisions": {
       "type": "array",
       "items": {
-        "$ref": "https://hypertest.dev/schemas/artifact-ref.v1.schema.json"
+        "allOf": [
+          { "$ref": "https://hypertest.dev/schemas/artifact-ref.v1.schema.json" },
+          {
+            "type": "object",
+            "required": ["kind", "schema"],
+            "properties": {
+              "kind": { "const": "gate-decision" },
+              "schema": { "const": "hypertest.gate-decision/v1" }
+            }
+          }
+        ]
       }
     },
     "warnings": {

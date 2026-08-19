@@ -3,6 +3,7 @@ import { extname, join, relative } from "node:path";
 
 const root = new URL("../", import.meta.url);
 const sourceRoot = new URL("../src/", import.meta.url);
+const testRoot = new URL("../tests/", import.meta.url);
 const ecosystemTerms = [
   "pytest",
   "go test",
@@ -13,7 +14,7 @@ const ecosystemTerms = [
   "github actions",
   "openapi",
 ];
-const piPackagePattern = /@earendil-works\/pi-(?:agent-core|ai)/i;
+const piPackagePattern = /@earendil-works\/pi-[a-z0-9-]+/i;
 const forbiddenAgentDependencyFragments = [
   "codex",
   "opencode",
@@ -94,6 +95,23 @@ async function inspect(path) {
   }
 }
 
+async function inspectPiReferences(directory) {
+  const entries = await readdir(directory, { withFileTypes: true });
+  for (const entry of entries) {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) {
+      await inspectPiReferences(path);
+      continue;
+    }
+    if (![".ts", ".mts", ".cts"].includes(extname(entry.name))) continue;
+    const text = await readFile(path, "utf8");
+    if (piPackagePattern.test(text)) {
+      const normalized = relative(root.pathname, path).replaceAll("\\", "/");
+      violations.push(`${normalized}: Pi SDK reference outside src/runtime/pi`);
+    }
+  }
+}
+
 async function inspectDependencies() {
   const packageDocument = JSON.parse(
     await readFile(new URL("../package.json", import.meta.url), "utf8"),
@@ -131,6 +149,7 @@ async function inspectDependencies() {
 }
 
 await walk(sourceRoot.pathname);
+await inspectPiReferences(testRoot.pathname);
 await inspectDependencies();
 if (violations.length > 0) {
   console.error("Architecture boundary violations:\n" + violations.join("\n"));

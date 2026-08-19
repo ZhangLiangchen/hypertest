@@ -133,7 +133,29 @@ const contract: SutContract = {
       inputSchema: { type: "object", properties: {} },
       observationSchema: {},
       effects: "read",
-      preconditions: [],
+      preconditions: ["authenticated"],
+      oracleHints: [{ status: 200 }],
+      tags: [],
+    },
+    {
+      id: "write",
+      title: "Write",
+      interactionKind: "http",
+      inputSchema: { type: "object", properties: {} },
+      observationSchema: {},
+      effects: "write",
+      preconditions: ["write lease held"],
+      oracleHints: [{ persisted: true }],
+      tags: [],
+    },
+    {
+      id: "unknown-effect",
+      title: "Unknown effect",
+      interactionKind: "custom",
+      inputSchema: { type: "object", properties: {} },
+      observationSchema: {},
+      effects: "unknown",
+      preconditions: ["operator review available"],
       oracleHints: [],
       tags: [],
     },
@@ -183,11 +205,68 @@ test("one illegal planner case fails the whole augmentation instead of being fil
   );
 });
 
+test("planner augmentation rejects whitespace fields and an empty oracle", async () => {
+  for (const invalid of [
+    { ...modelCase("read"), title: "   " },
+    { ...modelCase("read"), objective: "\n\t" },
+    { ...modelCase("read"), oracle: {} },
+  ]) {
+    await assert.rejects(
+      createTestPlan(contract, contractRef, {
+        runtime: new FakeAgentRuntime({ cases: [invalid] }),
+        runId: `planner-empty-${JSON.stringify(invalid).length}`,
+      }),
+      /model_output_schema_error|Planner augmentation case 0 is structurally invalid/,
+    );
+  }
+});
+
 test("a schema-valid and semantically valid model case is deterministically merged", async () => {
   const plan = await createTestPlan(contract, contractRef, {
     runtime: new FakeAgentRuntime({ cases: [modelCase("read")] }),
     runId: "planner-valid",
   });
-  assert.ok(plan.cases.some((item) => item.generatedBy === "model"));
+  const generated = plan.cases.find((item) => item.generatedBy === "model");
+  assert.ok(generated);
+  assert.deepEqual(generated.preconditions, ["authenticated"]);
+  assert.equal(generated.risk.severity, "medium");
+  assert.ok(generated.oracles.some((oracle) => oracle.kind === "sut-hint"));
+  assert.ok(generated.oracles.some((oracle) => oracle.kind === "interaction-outcome"));
+  assert.ok(generated.oracles.some((oracle) => oracle.kind === "model-proposed"));
   assert.ok(plan.cases.some((item) => item.generatedBy === "deterministic"));
+});
+
+test("model cases inherit write preconditions, safeguards, and high risk", async () => {
+  const plan = await createTestPlan(contract, contractRef, {
+    runtime: new FakeAgentRuntime({ cases: [modelCase("write")] }),
+    runId: "planner-write-risk",
+  });
+  const generated = plan.cases.find(
+    (item) => item.generatedBy === "model" && item.operationIds.includes("write"),
+  );
+  assert.ok(generated);
+  assert.deepEqual(generated.preconditions, ["write lease held"]);
+  assert.equal(generated.risk.severity, "high");
+  assert.ok(generated.risk.dimensions.includes("effect:write"));
+  assert.ok(generated.oracles.some((oracle) => oracle.kind === "sut-hint"));
+});
+
+test("unknown-effect model cases remain high risk without assuming valid input", async () => {
+  const plan = await createTestPlan(contract, contractRef, {
+    runtime: new FakeAgentRuntime({ cases: [modelCase("unknown-effect")] }),
+    runId: "planner-unknown-effect-risk",
+  });
+  const generated = plan.cases.find(
+    (item) =>
+      item.generatedBy === "model" &&
+      item.operationIds.includes("unknown-effect"),
+  );
+  assert.ok(generated);
+  assert.equal(generated.risk.severity, "high");
+  assert.deepEqual(generated.preconditions, ["operator review available"]);
+  const interaction = generated.oracles.find(
+    (oracle) => oracle.kind === "interaction-outcome",
+  );
+  assert.match(interaction?.rationale ?? "", /without assuming success/);
+  assert.equal(interaction?.strength, "weak");
 });

@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hypertest.dev/schemas/run-ledger.v1.schema.json",
+  "title": "HyperTest Run Ledger v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "runId", "state", "repairRounds", "transitions"],
+  "properties": {
+    "schema": { "const": "hypertest.run-ledger/v1" },
+    "runId": { "type": "string", "minLength": 1 },
+    "state": {
+      "enum": [
+        "intake",
+        "acquire_evidence",
+        "analyze",
+        "plan",
+        "pre_code_gate",
+        "render",
+        "validate_patch",
+        "execute",
+        "diagnose",
+        "repair_gate",
+        "repair",
+        "verify",
+        "publish_gate",
+        "publish",
+        "completed",
+        "needs_human",
+        "rejected",
+        "failed"
+      ]
+    },
+    "repairRounds": { "type": "integer", "minimum": 0, "maximum": 2 },
+    "transitions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["from", "event", "to", "atEpochMs"],
+        "properties": {
+          "from": { "$ref": "#/$defs/state" },
+          "event": {
+            "enum": [
+              "accepted",
+              "evidence_ready",
+              "analysis_ready",
+              "plan_ready",
+              "allowed",
+              "denied",
+              "human_required",
+              "patch_rendered",
+              "patch_valid",
+              "tests_passed",
+              "tests_failed",
+              "safe_repair",
+              "unsafe_or_unknown",
+              "repair_applied",
+              "verification_passed",
+              "published",
+              "fatal_error"
+            ]
+          },
+          "to": { "$ref": "#/$defs/state" },
+          "atEpochMs": { "type": "integer", "minimum": 0 },
+          "detail": { "type": "string" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "state": {
+      "enum": [
+        "intake",
+        "acquire_evidence",
+        "analyze",
+        "plan",
+        "pre_code_gate",
+        "render",
+        "validate_patch",
+        "execute",
+        "diagnose",
+        "repair_gate",
+        "repair",
+        "verify",
+        "publish_gate",
+        "publish",
+        "completed",
+        "needs_human",
+        "rejected",
+        "failed"
+      ]
+    }
+  }
+}

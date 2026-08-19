@@ -150,11 +150,8 @@ accepted boundaries.
 
 ## Project status
 
-v0.1 provides an engineering-complete deterministic control plane, contract
-system, and cross-language integration baseline.
-
-The first real model/tool Agent loop is introduced by the runtime vertical
-slice.
+v0.2 retains the deterministic v0.1 control plane and cross-language baseline,
+and adds the first bounded real model/tool Agent runtime vertical slice.
 
 Diagnosis remains deterministic, exploratory testing is not implemented, and
 no live paid Provider or production Pilot is exercised by default CI.

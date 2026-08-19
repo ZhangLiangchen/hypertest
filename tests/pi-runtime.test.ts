@@ -6,7 +6,7 @@ import {
   type AssistantMessage,
   type AssistantMessageEventStream,
   type SimpleStreamOptions,
-} from "@earendil-works/pi-ai";
+} from "../src/runtime/pi/testing.js";
 
 import type { Json } from "../src/contracts.js";
 import type { AgentEvent, AgentRunRequest } from "../src/runtime.js";
@@ -379,6 +379,108 @@ test("output flooding is stopped in-stream and produces one terminal event", asy
     message: "Model output exceeded 5 bytes",
     retryable: false,
   });
+});
+
+test("thinking and tool-call stream data count toward the output byte limit", async () => {
+  for (const kind of [
+    "thinking",
+    "toolcall",
+    "toolcall-start",
+    "toolcall-late-metadata",
+  ] as const) {
+    const controlled = controlledStreamFn();
+    const runtime = new PiAgentRuntime({ model, streamFn: controlled.streamFn });
+    const outputPromise = collect(
+      runtime,
+      request(`flood-${kind}`, { maxOutputBytes: 5 }),
+    );
+    const provider = await controlled.next();
+    const partial = message([], "pending");
+    provider.stream.push({ type: "start", partial });
+    if (kind === "thinking") {
+      provider.stream.push({
+        type: "thinking_start",
+        contentIndex: 0,
+        partial,
+      });
+      provider.stream.push({
+        type: "thinking_delta",
+        contentIndex: 0,
+        delta: "123456",
+        partial,
+      });
+    } else if (kind === "toolcall") {
+      provider.stream.push({
+        type: "toolcall_start",
+        contentIndex: 0,
+        partial,
+      });
+      provider.stream.push({
+        type: "toolcall_delta",
+        contentIndex: 0,
+        delta: "123456",
+        partial,
+      });
+    } else if (kind === "toolcall-start") {
+      const startWithLongId = message(
+        [
+          {
+            type: "toolCall",
+            id: "123456",
+            name: "",
+            arguments: {},
+          },
+        ],
+        "pending",
+      );
+      provider.stream.push({
+        type: "toolcall_start",
+        contentIndex: 0,
+        partial: startWithLongId,
+      });
+    } else {
+      const emptyMetadata = message(
+        [{ type: "toolCall", id: "", name: "", arguments: {} }],
+        "pending",
+      );
+      const lateMetadata = message(
+        [
+          {
+            type: "toolCall",
+            id: "123456",
+            name: "read",
+            arguments: {},
+          },
+        ],
+        "pending",
+      );
+      provider.stream.push({
+        type: "toolcall_start",
+        contentIndex: 0,
+        partial: emptyMetadata,
+      });
+      provider.stream.push({
+        type: "toolcall_delta",
+        contentIndex: 0,
+        delta: "",
+        partial: lateMetadata,
+      });
+    }
+
+    const output = await withTimeout(outputPromise);
+    assert.equal(output.at(-1)?.type, "failed", kind);
+    const terminal = output.at(-1);
+    if (terminal?.type === "failed") {
+      assert.equal(terminal.code, "output_limit", kind);
+    }
+    assert.equal(
+      output.filter(
+        (event) => event.type === "completed" || event.type === "failed",
+      ).length,
+      1,
+      kind,
+    );
+  }
 });
 
 test("rejects a concurrent run id and releases it after cancellation", async () => {

@@ -87,6 +87,8 @@ test("OpenAI-compatible configuration fails closed without required fields", () 
 test("model configuration rejects unsafe URLs and unbounded numeric values", () => {
   for (const value of [
     "file:///tmp/provider",
+    "http://models.example.test/v1",
+    "http://10.0.0.8/v1",
     "https://user:password@models.example.test/v1",
     "https://models.example.test/v1?secret=value",
     "https://models.example.test/v1#fragment",
@@ -116,6 +118,37 @@ test("model configuration rejects unsafe URLs and unbounded numeric values", () 
         assert.doesNotMatch(error.message, /do-not-print-this/);
         return true;
       },
+    );
+  }
+});
+
+test("model configuration allows HTTP only for explicit loopback endpoints", () => {
+  assert.equal(
+    normalizeEndpoint("http://localhost:9080/v1/"),
+    "http://localhost:9080/v1",
+  );
+  assert.equal(
+    normalizeEndpoint("http://127.42.7.9:9080/v1/"),
+    "http://127.42.7.9:9080/v1",
+  );
+  assert.equal(
+    normalizeEndpoint("http://[::1]:9080/v1/"),
+    "http://[::1]:9080/v1",
+  );
+  assert.equal(
+    normalizeEndpoint("https://models.example.test/v1/"),
+    "https://models.example.test/v1",
+  );
+
+  for (const value of [
+    "http://example.test/v1",
+    "http://127.example.test/v1",
+    "http://192.168.1.20/v1",
+    "http://[::ffff:127.0.0.1]/v1",
+  ]) {
+    assert.throws(
+      () => normalizeEndpoint(value),
+      /must use https unless it targets localhost/,
     );
   }
 });

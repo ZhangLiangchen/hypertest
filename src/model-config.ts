@@ -109,6 +109,11 @@ export function normalizeEndpoint(value: string): string {
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new Error("OpenAI-compatible model base URL must use http or https");
   }
+  if (url.protocol === "http:" && !isLoopbackHostname(url.hostname)) {
+    throw new Error(
+      "OpenAI-compatible model base URL must use https unless it targets localhost, 127.0.0.0/8, or [::1]",
+    );
+  }
   if (url.username.length > 0 || url.password.length > 0) {
     throw new Error("OpenAI-compatible model base URL must not contain credentials");
   }
@@ -119,6 +124,13 @@ export function normalizeEndpoint(value: string): string {
   }
   url.pathname = url.pathname.replace(/\/+$/, "") || "/";
   return url.toString().replace(/\/$/, "");
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  const normalized = hostname.toLowerCase();
+  return normalized === "localhost" ||
+    normalized === "[::1]" ||
+    /^127(?:\.\d{1,3}){3}$/.test(normalized);
 }
 
 function readOptional(

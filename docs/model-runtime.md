@@ -33,8 +33,11 @@ transitions. The model cannot decide a BUGate verdict or advance the run state.
 
 ## Pi adapter type boundary
 
-`@earendil-works/pi-agent-core` is the only SDK-level agent runtime. Pi SDK
-imports are confined to `src/runtime/pi/**`. The adapter uses the SDK's public
+`@earendil-works/pi-agent-core` is the only SDK-level agent runtime. The direct
+`@earendil-works/pi-ai` dependency supplies the official LLM transport and
+nominal stream types used by that runtime; it is not a second agent loop or
+policy authority. All Pi package imports, including test-fixture re-exports,
+are confined to `src/runtime/pi/**`. The adapter uses the SDK's public
 `Agent`, event, tool, model, context, and streaming types directly, so an
 incompatible SDK API change is visible to TypeScript. Core, planner,
 orchestrator, and CLI code use only HyperTest-owned contracts.
@@ -73,20 +76,24 @@ Environment variables override profile values:
 |---|---|
 | `HYPERTEST_MODEL_PROVIDER` | `deterministic` or `openai-compatible` |
 | `HYPERTEST_MODEL_ID` | Exact Provider model identifier; no implicit `latest` |
-| `HYPERTEST_MODEL_BASE_URL` | HTTP(S) OpenAI-compatible base URL |
+| `HYPERTEST_MODEL_BASE_URL` | HTTPS OpenAI-compatible base URL; HTTP is loopback-only |
 | `HYPERTEST_MODEL_API_KEY` | Required secret; environment only |
 | `HYPERTEST_MODEL_TIMEOUT_MS` | Per-request timeout, 100–600000 ms |
 | `HYPERTEST_MODEL_MAX_RETRIES` | Retry limit, 0–10 |
 | `HYPERTEST_MODEL_MAX_OUTPUT_TOKENS` | Output cap, 1–131072 |
 
-The URL cannot contain credentials, a query, or a fragment. It is normalized
-before use. Telemetry records only an irreversible SHA-256 endpoint
-fingerprint, never the URL. A compatible service, including a DeepSeek-style
-OpenAI-compatible deployment, is selected only through the generic base URL
-and exact model ID; Core has no Provider-specific fields.
+The URL cannot contain credentials, a query, or a fragment. Non-loopback
+endpoints must use HTTPS; plain HTTP is accepted only for `localhost`, the
+`127.0.0.0/8` range, and `[::1]` so local protocol mocks remain available. The
+URL is normalized before use. Telemetry records only an irreversible SHA-256
+endpoint fingerprint, never the URL. A compatible service, including a
+DeepSeek-style OpenAI-compatible deployment, is selected only through the
+generic base URL and exact model ID; Core has no Provider-specific fields.
 
 The API key is never accepted from a profile. HyperTest checks that the
-environment variable is present without printing its value.
+environment variable is present without printing its value. Unknown runtime
+profile keys are rejected; legacy flattened budget keys remain accepted for
+existing profiles.
 
 ## CLI activation
 
@@ -179,15 +186,21 @@ Every Provider call emits a usage record containing:
 A missing usage report is not represented as zero tokens. It is distinct from
 the deterministic path, which has zero Provider calls and therefore zero
 usage and cost. Per-call records are aggregated by run and persisted as
-`model-usage.json`; the planner can consume the aggregate after the loop.
+`model-usage.json`; each physical retry attempt has its own record. Failed
+attempts without Provider usage are marked unavailable instead of being folded
+into the successful attempt. The summary's aggregate fields are checked
+deterministically against its records before persistence.
 
 Before each Provider request, the runtime checks the remaining hard token
 budget and shrinks `maxTokens` to the remaining output allowance. Once
-reported cumulative usage reaches the budget, another turn is forbidden and
-the run fails with `budget_exhausted`. If a tool round would require another
-Provider call but the preceding call supplied no usage, HyperTest fails closed
-rather than authorizing an unbounded turn. A final single request can report
-slightly more usage than the pre-request estimate.
+reported cumulative input, output, cache-read, and cache-write usage reaches the budget,
+another turn is forbidden and the run fails with `budget_exhausted`. If any
+earlier physical attempt or tool round supplied no usage, HyperTest fails
+closed rather than authorizing another model turn. Planning and an existing
+policy-gated repair proposal share the same run-level token ledger; repair
+does not receive a fresh budget. If a final request reports more usage than
+the pre-request estimate and crosses the limit, its result is rejected with
+`budget_exhausted` while the actual usage remains persisted.
 
 ## Retry boundary
 
@@ -195,17 +208,19 @@ Retries share the original run deadline and are bounded by configuration. A
 whole Provider turn may be retried only for HTTP 429, HTTP 502/503/504,
 connection establishment failure, or a retryable network interruption before
 the first visible text/tool delta. A valid `Retry-After` seconds or HTTP-date
-value is honored.
+value is honored up to a one-second local cap and the original run deadline.
 
 Once text is visible, a tool call is visible, or a previous tool result exists
 in context, whole-turn replay is disabled. Therefore a retry cannot execute a
 tool twice. HTTP 400/401/403, malformed SSE, output/schema errors,
 cancellation, and timeout are not retried. Retry count is included in usage
-and structured logs.
+and structured logs. Redirect following is disabled so an allowed endpoint
+cannot redirect the Authorization header to another origin.
 
 Successful SSE is validated incrementally before it enters the upstream
 OpenAI parser. Malformed `data:` payloads become a redacted protocol error and
-are not echoed to stderr.
+are not echoed to stderr. Both an individual SSE event and the unterminated
+pending buffer are capped at 1 MiB.
 
 ## Planner read-only tools
 
@@ -274,7 +289,9 @@ Do not place credentials in profiles, source, examples, or artifacts.
 `Authorization`, cookies, complete request headers, complete Provider requests,
 and unknown response fields that may contain secrets are not logged. HTTP
 error bodies and malformed SSE payloads are reduced to stable safe messages.
-Request IDs are retained for diagnosis because they do not grant access.
+Provider request IDs are retained only after trimming, a 128-character bound,
+a conservative ASCII allowlist, and rejection of any value containing the
+configured API key. Unsafe IDs are omitted from events and usage artifacts.
 
 ## Known limitations
 
@@ -282,10 +299,16 @@ Request IDs are retained for diagnosis because they do not grant access.
 - Source-symbol and coverage-guided exploratory testing are not implemented.
 - No real Pilot profile has been executed by the default validation.
 - A final Provider request can report slightly more tokens than estimated
-  before the call.
+  before the call; HyperTest records the actual usage and fails the run with
+  `budget_exhausted` instead of accepting an over-budget result.
+- Provider cache-read and cache-write tokens are both recorded and budgeted in
+  the aggregate `cachedTokens` field; the current public `AgentUsage` contract
+  does not expose the two cache categories separately.
 - Local mock compatibility proves HyperTest's protocol behavior, not every
   external Provider's availability, conformance, or SLA.
 - The live paid smoke is optional and is not part of default CI.
-- This slice is single-agent and planner-only. Diagnosis, exploration,
+- This slice is single-agent and the autonomous read-only tool loop is
+  planner-only. The pre-existing repair proposal call has no model tools and
+  remains deterministic-policy and BUGate gated. Diagnosis, exploration,
   production-code edits, BUGate tool access, and publication are intentionally
   outside the model runtime boundary.

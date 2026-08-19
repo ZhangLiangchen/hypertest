@@ -35,16 +35,27 @@ export type PiAssistantMessage = Extract<
   { readonly role: "assistant" }
 >;
 
+export interface PiProviderAttemptTelemetry {
+  readonly providerRequestId?: string;
+  readonly retryCount?: number;
+  readonly usageUnavailable?: boolean;
+  readonly latencyMs?: number;
+  readonly stopReason?: string;
+}
+
 export interface PiProviderTelemetry {
   readonly providerRequestId?: string;
   readonly retryCount?: number;
   readonly usageUnavailable?: boolean;
   readonly latencyMs?: number;
+  readonly stopReason?: string;
+  readonly attempts?: readonly PiProviderAttemptTelemetry[];
 }
 
 export interface PiAgentRuntimeOptions {
   readonly model: AgentState["model"];
   readonly streamFn: StreamFn;
+  readonly streamFnForRun?: (runId: string) => StreamFn;
   readonly toolExecutor?: (
     request: AgentToolExecutionRequest,
   ) => Promise<Json | AgentToolExecutionOutcome>;
@@ -56,7 +67,11 @@ export interface PiAgentRuntimeOptions {
   readonly maxOutputTokens?: number;
   readonly getProviderTelemetry?: (
     message: PiAssistantMessage | undefined,
+    runId: string,
   ) => PiProviderTelemetry | undefined;
+  readonly sanitizeProviderRequestId?: (
+    providerRequestId: string,
+  ) => string | undefined;
   readonly now?: () => number;
 }
 
@@ -95,9 +110,15 @@ export class PiAgentRuntime implements AgentRuntime {
       this.options.endpointFingerprint ??
       fingerprintEndpoint(this.options.model.baseUrl);
     const providerCallStarts: number[] = [];
+    const providerStreamFn =
+      this.options.streamFnForRun?.(request.runId) ?? this.options.streamFn;
     const toolStarts = new Map<
       string,
       { readonly name: string; readonly startedAt: number }
+    >();
+    const toolMetadataByContentIndex = new Map<
+      number,
+      { readonly id: string; readonly name: string }
     >();
     const maxRepeatedToolCalls = request.maxRepeatedToolCalls ?? 3;
     let lastToolSignature: string | undefined;
@@ -110,6 +131,7 @@ export class PiAgentRuntime implements AgentRuntime {
     let providerCallCount = 0;
     let toolCallCount = 0;
     let consumedTokens = 0;
+    let usageUncertain = false;
     let budgetStopReason: string | undefined;
     let loopStopReason: string | undefined;
     let unsubscribe: (() => void) | undefined;
@@ -176,7 +198,7 @@ export class PiAgentRuntime implements AgentRuntime {
         Math.floor(Math.min(configuredMax, remaining)),
       );
       providerCallStarts.push(now());
-      return this.options.streamFn(model, context, {
+      return providerStreamFn(model, context, {
         ...(streamOptions ?? {}),
         maxTokens,
       });
@@ -223,6 +245,7 @@ export class PiAgentRuntime implements AgentRuntime {
       unsubscribe?.();
       unsubscribe = undefined;
       toolStarts.clear();
+      toolMetadataByContentIndex.clear();
       this.active.delete(request.runId);
     };
 
@@ -230,7 +253,21 @@ export class PiAgentRuntime implements AgentRuntime {
       message: PiAssistantMessage | undefined,
     ): PiProviderTelemetry | undefined => {
       try {
-        return this.options.getProviderTelemetry?.(message);
+        return this.options.getProviderTelemetry?.(message, request.runId);
+      } catch {
+        return undefined;
+      }
+    };
+
+    const sanitizeProviderRequestId = (
+      providerRequestId: string | undefined,
+    ): string | undefined => {
+      if (providerRequestId === undefined) return undefined;
+      if (this.options.sanitizeProviderRequestId === undefined) {
+        return providerRequestId;
+      }
+      try {
+        return this.options.sanitizeProviderRequestId(providerRequestId);
       } catch {
         return undefined;
       }
@@ -243,41 +280,72 @@ export class PiAgentRuntime implements AgentRuntime {
       const startedAt = providerCallStarts.shift();
       if (startedAt === undefined) return undefined;
       const telemetry = resolveTelemetry(message);
-      const usageUnavailable =
-        telemetry?.usageUnavailable ?? !hasReportedUsage(message);
-      const providerRequestId =
-        telemetry?.providerRequestId ?? message?.responseId;
-      const record: AgentUsage = {
-        provider:
-          this.options.provider ??
-          message?.provider ??
-          this.options.model.provider,
-        model:
-          this.options.modelId ?? message?.model ?? this.options.model.id,
-        endpointFingerprint,
-        ...(providerRequestId === undefined ? {} : { providerRequestId }),
-        ...(!usageUnavailable && message !== undefined
-          ? {
-              inputTokens: safeTokenCount(message.usage.input),
-              outputTokens: safeTokenCount(message.usage.output),
-              cachedTokens: safeTokenCount(message.usage.cacheRead),
-              estimatedCostUsd: safeCost(message.usage.cost.total),
-            }
-          : {}),
-        latencyMs: Math.max(
-          0,
-          Math.floor(telemetry?.latencyMs ?? now() - startedAt),
-        ),
-        retryCount: Math.max(0, Math.floor(telemetry?.retryCount ?? 0)),
-        stopReason,
-        usageUnavailable,
-      };
-      queue.push({ type: "usage", usage: record });
-      if (!usageUnavailable) {
-        consumedTokens +=
-          (record.inputTokens ?? 0) + (record.outputTokens ?? 0);
+      const attempts =
+        telemetry?.attempts !== undefined && telemetry.attempts.length > 0
+          ? telemetry.attempts
+          : [telemetry];
+      let finalRecord: AgentUsage | undefined;
+      for (const [index, attempt] of attempts.entries()) {
+        const finalAttempt = index === attempts.length - 1;
+        const usageUnavailable =
+          attempt?.usageUnavailable ??
+          telemetry?.usageUnavailable ??
+          (!finalAttempt || !hasReportedUsage(message));
+        const providerRequestId = sanitizeProviderRequestId(
+          attempt?.providerRequestId ??
+            (finalAttempt
+              ? telemetry?.providerRequestId ?? message?.responseId
+              : undefined),
+        );
+        const record: AgentUsage = {
+          provider:
+            this.options.provider ??
+            message?.provider ??
+            this.options.model.provider,
+          model:
+            this.options.modelId ?? message?.model ?? this.options.model.id,
+          endpointFingerprint,
+          ...(providerRequestId === undefined ? {} : { providerRequestId }),
+          ...(!usageUnavailable && finalAttempt && message !== undefined
+            ? {
+                inputTokens: safeTokenCount(message.usage.input),
+                outputTokens: safeTokenCount(message.usage.output),
+                cachedTokens:
+                  safeTokenCount(message.usage.cacheRead) +
+                  safeTokenCount(message.usage.cacheWrite),
+                estimatedCostUsd: safeCost(message.usage.cost.total),
+              }
+            : {}),
+          latencyMs: Math.max(
+            0,
+            Math.floor(
+              attempt?.latencyMs ??
+                (attempts.length === 1
+                  ? telemetry?.latencyMs ?? now() - startedAt
+                  : 0),
+            ),
+          ),
+          retryCount: Math.max(
+            0,
+            Math.floor(
+              attempt?.retryCount ??
+                (attempts.length === 1 ? telemetry?.retryCount ?? 0 : 0),
+            ),
+          ),
+          stopReason: attempt?.stopReason ?? (finalAttempt ? stopReason : "retry"),
+          usageUnavailable,
+        };
+        queue.push({ type: "usage", usage: record });
+        if (usageUnavailable) usageUncertain = true;
+        if (!usageUnavailable) {
+          consumedTokens +=
+            (record.inputTokens ?? 0) +
+            (record.outputTokens ?? 0) +
+            (record.cachedTokens ?? 0);
+        }
+        if (finalAttempt) finalRecord = record;
       }
-      return record;
+      return finalRecord;
     };
 
     const flushPendingUsage = (stopReason: string): void => {
@@ -318,11 +386,50 @@ export class PiAgentRuntime implements AgentRuntime {
         }
         return;
       }
-      if (
-        event.type === "message_update" &&
-        event.assistantMessageEvent.type === "text_delta"
-      ) {
-        const delta = event.assistantMessageEvent.delta;
+      if (event.type === "message_update") {
+        const update = event.assistantMessageEvent;
+        if (
+          update.type === "toolcall_start" ||
+          update.type === "toolcall_delta" ||
+          update.type === "toolcall_end"
+        ) {
+          const block = update.partial.content[update.contentIndex];
+          const currentMetadata =
+            block?.type === "toolCall"
+              ? { id: block.id, name: block.name }
+              : { id: "", name: "" };
+          const previousMetadata = toolMetadataByContentIndex.get(
+            update.contentIndex,
+          ) ?? { id: "", name: "" };
+          const metadataBytes =
+            incrementalStringBytes(previousMetadata.id, currentMetadata.id) +
+            incrementalStringBytes(previousMetadata.name, currentMetadata.name);
+          toolMetadataByContentIndex.set(
+            update.contentIndex,
+            currentMetadata,
+          );
+          if (metadataBytes > 0) {
+            providerReplayLocked = true;
+          }
+          outputBytes += metadataBytes;
+          if (outputBytes > maxOutputBytes) {
+            abort(
+              "output_limit",
+              `Model output exceeded ${maxOutputBytes} bytes`,
+              false,
+            );
+            return;
+          }
+          if (update.type !== "toolcall_delta") return;
+        }
+        if (
+          update.type !== "text_delta" &&
+          update.type !== "thinking_delta" &&
+          update.type !== "toolcall_delta"
+        ) {
+          return;
+        }
+        const delta = update.delta;
         if (delta.length > 0) providerReplayLocked = true;
         outputBytes += Buffer.byteLength(delta, "utf8");
         if (outputBytes > maxOutputBytes) {
@@ -333,8 +440,10 @@ export class PiAgentRuntime implements AgentRuntime {
           );
           return;
         }
-        text += delta;
-        queue.push({ type: "text_delta", text: delta });
+        if (update.type === "text_delta") {
+          text += delta;
+          queue.push({ type: "text_delta", text: delta });
+        }
         return;
       }
       if (event.type === "tool_execution_start") {
@@ -405,6 +514,7 @@ export class PiAgentRuntime implements AgentRuntime {
         return;
       }
       if (event.type === "message_end" && isAssistantMessage(event.message)) {
+        toolMetadataByContentIndex.clear();
         const usage = emitUsage(event.message, event.message.stopReason);
         if (isAssistantFailure(event.message)) {
           if (event.message.stopReason === "aborted") {
@@ -413,7 +523,8 @@ export class PiAgentRuntime implements AgentRuntime {
                 "cancelled",
                 "OpenAI-compatible provider request was aborted",
                 false,
-                usage?.providerRequestId ?? event.message.responseId,
+                usage?.providerRequestId ??
+                  sanitizeProviderRequestId(event.message.responseId),
               ),
             );
           } else {
@@ -428,18 +539,33 @@ export class PiAgentRuntime implements AgentRuntime {
                 mapped.code,
                 mapped.message,
                 mapped.retryable,
-                usage?.providerRequestId ?? event.message.responseId,
+                usage?.providerRequestId ??
+                  sanitizeProviderRequestId(event.message.responseId),
               ),
             );
           }
           return;
         }
+        if (
+          consumedTokens > tokenBudget &&
+          event.message.stopReason !== "toolUse"
+        ) {
+          finish(
+            failure(
+              "budget_exhausted",
+              `Agent exceeded the ${tokenBudget}-token budget`,
+              false,
+              usage?.providerRequestId,
+            ),
+          );
+          return;
+        }
         if (event.message.stopReason === "toolUse") {
           if (providerCallCount >= maxTurns) {
             loopStopReason = `Agent exceeded the maximum of ${maxTurns} turns`;
-          } else if (usage?.usageUnavailable === true) {
+          } else if (usageUncertain) {
             budgetStopReason =
-              "Provider usage is unavailable, so another turn cannot be authorized within the hard token budget";
+              "Provider usage is unavailable for at least one call, so another turn cannot be authorized within the hard token budget";
           } else if (consumedTokens >= tokenBudget) {
             budgetStopReason = `Agent consumed the ${tokenBudget}-token budget before another provider turn`;
           }
@@ -598,6 +724,14 @@ function safeTokenCount(value: number): number {
 
 function safeCost(value: number): number {
   return Number.isFinite(value) ? Math.max(0, value) : 0;
+}
+
+function incrementalStringBytes(previous: string, current: string): number {
+  if (current === previous) return 0;
+  if (current.startsWith(previous)) {
+    return Buffer.byteLength(current.slice(previous.length), "utf8");
+  }
+  return Buffer.byteLength(current, "utf8");
 }
 
 function toolResultJson(value: unknown): Json {

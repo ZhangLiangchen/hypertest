@@ -41,11 +41,20 @@ Every artifact carries a schema, media type, SHA-256, and optional source
 revision. Writes use a temporary file plus an atomic hard-link publication and
 do not overwrite an existing path.
 
+`RunSummary.finalState` is the externally consumable outcome, while the ledger
+records the exact deterministic checkpoint. The validated mapping is:
+`planned -> pre_code_gate`, `verified -> publish_gate`, and each terminal
+outcome (`completed`, `needs_human`, `rejected`, `failed`) maps to the ledger
+state of the same name. This lets plan-only and verify-only modes stop at a
+governed checkpoint without pretending that publication completed.
+
 `model-usage.json` stores per-call and aggregate Provider/model identity,
 endpoint fingerprint, request ID, input/output/cached tokens when available,
 latency, retry count, stop reason, and `usageUnavailable`. It never stores an
 API key, Authorization header, complete Provider request, endpoint URL, or
-complete model response.
+complete model response. Physical retry attempts are separate records;
+cache-read tokens count toward `totalTokens`, and deterministic validation
+checks aggregate fields against the record list before publication.
 
 ## Protected actions
 

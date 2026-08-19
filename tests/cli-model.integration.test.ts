@@ -168,7 +168,10 @@ async function closeServer(server: Server): Promise<void> {
   await once(server, "close");
 }
 
-async function writeCliFixture(root: string): Promise<string> {
+async function writeCliFixture(
+  root: string,
+  provider: "deterministic" | "openai-compatible" = "openai-compatible",
+): Promise<string> {
   const contractPath = join(root, "command-contract.json");
   await writeFile(
     contractPath,
@@ -198,7 +201,7 @@ async function writeCliFixture(root: string): Promise<string> {
       schema: "hypertest.profile/v1",
       name: "cli-model-e2e",
       runtime: {
-        provider: "openai-compatible",
+        provider,
         budgets: {
           maxTurns: 4,
           maxToolCalls: 4,
@@ -234,7 +237,7 @@ async function writeCliFixture(root: string): Promise<string> {
 test("CLI activates the real provider and closes the HTTP/SSE planner tool loop", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "hypertest-cli-model-"));
   t.after(async () => rm(root, { recursive: true, force: true }));
-  const profilePath = await writeCliFixture(root);
+  const profilePath = await writeCliFixture(root, "deterministic");
   const artifactRoot = join(root, "artifacts");
   const mock = await startPlannerMock();
   t.after(async () => mock.close());
@@ -257,6 +260,7 @@ test("CLI activates the real provider and closes the HTTP/SSE planner tool loop"
     ],
     cwd: root,
     env: {
+      HYPERTEST_MODEL_PROVIDER: "openai-compatible",
       HYPERTEST_MODEL_ID: "cli-mock-model-2026-08",
       HYPERTEST_MODEL_BASE_URL: mock.baseUrl,
       HYPERTEST_MODEL_API_KEY: cliSecret,
@@ -276,10 +280,14 @@ test("CLI activates the real provider and closes the HTTP/SSE planner tool loop"
   const summary = JSON.parse(result.stdout) as {
     readonly finalState: string;
     readonly testPlan?: { readonly uri?: string };
+    readonly modelUsage?: { readonly uri?: string };
+    readonly ledger?: { readonly uri?: string };
     readonly warnings: readonly string[];
   };
   assert.equal(summary.finalState, "planned");
   assert.match(summary.testPlan?.uri ?? "", /test-plan\.json$/);
+  assert.match(summary.modelUsage?.uri ?? "", /model-usage\.json$/);
+  assert.match(summary.ledger?.uri ?? "", /run-ledger\.json$/);
   assert.match(summary.warnings.join("\n"), /model-usage=.*model-usage\.json/);
 
   const artifactDirectory = join(
@@ -289,6 +297,10 @@ test("CLI activates the real provider and closes the HTTP/SSE planner tool loop"
     "artifacts",
   );
   const planText = await readFile(join(artifactDirectory, "test-plan.json"), "utf8");
+  const ledger = JSON.parse(
+    await readFile(join(artifactDirectory, "run-ledger.json"), "utf8"),
+  ) as { readonly state: string };
+  assert.equal(ledger.state, "pre_code_gate");
   const plan = JSON.parse(planText) as {
     readonly cases: ReadonlyArray<{
       readonly title: string;
@@ -312,6 +324,7 @@ test("CLI activates the real provider and closes the HTTP/SSE planner tool loop"
     readonly inputTokens: number;
     readonly outputTokens: number;
     readonly cachedTokens: number;
+    readonly totalTokens: number;
     readonly records: ReadonlyArray<{
       readonly providerRequestId?: string;
       readonly endpointFingerprint: string;
@@ -321,6 +334,7 @@ test("CLI activates the real provider and closes the HTTP/SSE planner tool loop"
   assert.equal(usage.inputTokens, 12);
   assert.equal(usage.outputTokens, 9);
   assert.equal(usage.cachedTokens, 3);
+  assert.equal(usage.totalTokens, 24);
   assert.deepEqual(
     usage.records.map((record) => record.providerRequestId),
     ["cli-tool-request", "cli-final-request"],
@@ -328,6 +342,121 @@ test("CLI activates the real provider and closes the HTTP/SSE planner tool loop"
   assert.ok(usage.records.every((record) => record.endpointFingerprint.length === 64));
   assert.doesNotMatch(`${planText}\n${usageText}`, new RegExp(cliSecret));
   assert.doesNotMatch(usageText, /127\.0\.0\.1/);
+});
+
+test("CLI honors a deterministic environment override over an OpenAI profile", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "hypertest-cli-deterministic-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const profilePath = await writeCliFixture(root, "openai-compatible");
+  const artifactRoot = join(root, "artifacts");
+  const mock = await startPlannerMock();
+  t.after(async () => mock.close());
+
+  const result = await runProcess({
+    command: process.execPath,
+    args: [
+      cliPath,
+      "plan",
+      "--profile",
+      profilePath,
+      "--workspace",
+      root,
+      "--artifact-root",
+      artifactRoot,
+      "--revision",
+      "cli-revision",
+      "--run-id",
+      "cli-deterministic-override",
+    ],
+    cwd: root,
+    env: {
+      HYPERTEST_MODEL_PROVIDER: "deterministic",
+      HYPERTEST_MODEL_BASE_URL: mock.baseUrl,
+      HYPERTEST_MODEL_API_KEY: cliSecret,
+    },
+    timeoutMs: 10_000,
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(mock.requests.length, 0);
+  const summary = JSON.parse(result.stdout) as {
+    readonly finalState: string;
+    readonly modelUsage?: { readonly uri?: string };
+  };
+  assert.equal(summary.finalState, "planned");
+  assert.match(summary.modelUsage?.uri ?? "", /model-usage\.json$/);
+  const usage = JSON.parse(
+    await readFile(
+      join(
+        artifactRoot,
+        "runs",
+        "cli-deterministic-override",
+        "artifacts",
+        "model-usage.json",
+      ),
+      "utf8",
+    ),
+  ) as { readonly providerCalls: number; readonly totalTokens: number };
+  assert.equal(usage.providerCalls, 0);
+  assert.equal(usage.totalTokens, 0);
+});
+
+test("CLI returns a distinct nonzero status when governance needs a human", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "hypertest-cli-human-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const profilePath = await writeCliFixture(root, "deterministic");
+  const gateScript = join(root, "needs-human-gate.mjs");
+  await writeFile(
+    gateScript,
+    `let input = "";
+for await (const chunk of process.stdin) input += String(chunk);
+const request = JSON.parse(input);
+process.stdout.write(JSON.stringify({
+  schema: "hypertest.gate-decision/v1",
+  requestId: request.requestId,
+  requestHash: "non-authorizing-decision",
+  verdict: "needs_human",
+  receiptId: "human-review-required",
+  reasonCodes: ["HUMAN_REVIEW_REQUIRED"],
+  obligations: [],
+  evidenceHashes: [],
+}));
+`,
+  );
+  const profile = JSON.parse(await readFile(profilePath, "utf8")) as Record<
+    string,
+    unknown
+  >;
+  profile.gate = {
+    mode: "process",
+    process: { command: process.execPath, args: [gateScript] },
+  };
+  await writeFile(profilePath, JSON.stringify(profile));
+
+  const result = await runProcess({
+    command: process.execPath,
+    args: [
+      cliPath,
+      "run",
+      "--profile",
+      profilePath,
+      "--workspace",
+      root,
+      "--artifact-root",
+      join(root, "artifacts"),
+      "--revision",
+      "cli-revision",
+      "--run-id",
+      "cli-human-review",
+    ],
+    cwd: root,
+    env: { HYPERTEST_MODEL_PROVIDER: "deterministic" },
+    timeoutMs: 10_000,
+  });
+
+  assert.equal(result.exitCode, 2, result.stderr);
+  const summary = JSON.parse(result.stdout) as { readonly finalState: string };
+  assert.equal(summary.finalState, "needs_human");
 });
 
 test("CLI does not fall back to deterministic when model credentials are missing", async (t) => {

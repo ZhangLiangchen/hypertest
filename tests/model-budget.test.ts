@@ -6,12 +6,14 @@ import {
   type AssistantMessage,
   type AssistantMessageEventStream,
   type SimpleStreamOptions,
-} from "@earendil-works/pi-ai";
+} from "../src/runtime/pi/testing.js";
 
 import type { Json } from "../src/contracts.js";
 import {
   AgentRuntimeError,
   FakeAgentRuntime,
+  aggregateAgentUsage,
+  assertValidAgentUsageSummary,
   collectAgentRun,
   type AgentEvent,
   type AgentRunRequest,
@@ -58,10 +60,12 @@ function assistant(
     readonly input: number;
     readonly output: number;
     readonly cacheRead?: number;
+    readonly cacheWrite?: number;
   },
   responseId: string,
 ): AssistantMessage {
   const cacheRead = usage.cacheRead ?? 0;
+  const cacheWrite = usage.cacheWrite ?? 0;
   return {
     role: "assistant",
     content,
@@ -73,17 +77,18 @@ function assistant(
       input: usage.input,
       output: usage.output,
       cacheRead,
-      cacheWrite: 0,
-      totalTokens: usage.input + usage.output,
+      cacheWrite,
+      totalTokens: usage.input + usage.output + cacheRead + cacheWrite,
       cost: {
         input: usage.input / 1_000_000,
         output: (usage.output * 2) / 1_000_000,
         cacheRead: cacheRead / 2_000_000,
-        cacheWrite: 0,
+        cacheWrite: cacheWrite / 2_000_000,
         total:
           usage.input / 1_000_000 +
           (usage.output * 2) / 1_000_000 +
-          cacheRead / 2_000_000,
+          cacheRead / 2_000_000 +
+          cacheWrite / 2_000_000,
       },
     },
     stopReason,
@@ -154,6 +159,42 @@ test("deterministic runtime records zero provider calls rather than unavailable 
   assert.equal(outcome.usage.estimatedCostUsd, 0);
 });
 
+test("usage validation rejects contradictory records and forged aggregates", () => {
+  assert.throws(
+    () =>
+      aggregateAgentUsage("invalid-unavailable", [
+        {
+          provider: "mock",
+          model: "mock-model",
+          endpointFingerprint: "a".repeat(64),
+          inputTokens: 1,
+          latencyMs: 1,
+          retryCount: 0,
+          usageUnavailable: true,
+        },
+      ]),
+    /unavailable usage must not contain token or cost estimates/,
+  );
+  assert.throws(
+    () =>
+      assertValidAgentUsageSummary({
+        schema: "hypertest.model-usage/v1",
+        runId: "forged-aggregate",
+        providerCalls: 1,
+        usageUnavailableCalls: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedTokens: 0,
+        totalTokens: 0,
+        retryCount: 0,
+        totalLatencyMs: 0,
+        estimatedCostUsd: 0,
+        records: [],
+      }),
+    /aggregate fields do not match/,
+  );
+});
+
 test("aggregates multi-turn usage and shrinks the next output limit to the remaining budget", async () => {
   let call = 0;
   const maxTokens: number[] = [];
@@ -210,17 +251,18 @@ test("aggregates multi-turn usage and shrinks the next output limit to the remai
     request("multi-turn-budget", {
       tools: [readTool],
       maxOutputTokens: 8,
+      tokenBudget: 13,
     }),
   );
 
   assert.deepEqual(outcome.result, { cases: [] });
-  assert.deepEqual(maxTokens, [8, 3]);
+  assert.deepEqual(maxTokens, [8, 4]);
   assert.equal(outcome.usage.providerCalls, 2);
   assert.equal(outcome.usage.usageUnavailableCalls, 0);
   assert.equal(outcome.usage.inputTokens, 6);
   assert.equal(outcome.usage.outputTokens, 4);
   assert.equal(outcome.usage.cachedTokens, 3);
-  assert.equal(outcome.usage.totalTokens, 10);
+  assert.equal(outcome.usage.totalTokens, 13);
   assert.equal(outcome.usage.retryCount, 2);
   assert.equal(outcome.usage.totalLatencyMs, 12);
   assert.equal(outcome.usage.records[0]?.providerRequestId, "provider-request-1");
@@ -230,6 +272,84 @@ test("aggregates multi-turn usage and shrinks the next output limit to the remai
   );
   const serialized = JSON.stringify(outcome.usage);
   assert.doesNotMatch(serialized, /SECRET|password|api_key|Authorization/i);
+});
+
+test("a final response that exceeds the hard token budget fails closed", async () => {
+  const runtime = new PiAgentRuntime({
+    model,
+    streamFn: () => {
+      const stream = createAssistantMessageEventStream();
+      queueMicrotask(() =>
+        emitText(
+          stream,
+          '{"cases":[]}',
+          assistant(
+            [{ type: "text", text: '{"cases":[]}' }],
+            "stop",
+            { input: 6, output: 5 },
+            "final-over-budget",
+          ),
+        ),
+      );
+      return stream;
+    },
+  });
+
+  await assert.rejects(
+    collectAgentRun(runtime, request("final-over-budget")),
+    (error: unknown) => {
+      assert.ok(error instanceof AgentRuntimeError);
+      assert.equal(error.failure.code, "budget_exhausted");
+      assert.equal(error.usage?.totalTokens, 11);
+      return true;
+    },
+  );
+});
+
+test("cache-write tokens count toward the hard token budget", async () => {
+  let providerCalls = 0;
+  const runtime = new PiAgentRuntime({
+    model,
+    streamFn: () => {
+      providerCalls += 1;
+      const stream = createAssistantMessageEventStream();
+      queueMicrotask(() =>
+        emitToolCall(
+          stream,
+          assistant(
+            [
+              {
+                type: "toolCall",
+                id: "cache-write-call",
+                name: readTool.name,
+                arguments: { operationId: "read" },
+              },
+            ],
+            "toolUse",
+            { input: 0, output: 0, cacheWrite: 10 },
+            "cache-write-request",
+          ),
+        ),
+      );
+      return stream;
+    },
+    toolExecutor: async () => ({ operationId: "read" }),
+  });
+
+  await assert.rejects(
+    collectAgentRun(
+      runtime,
+      request("cache-write-budget", { tools: [readTool] }),
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof AgentRuntimeError);
+      assert.equal(error.failure.code, "budget_exhausted");
+      assert.equal(error.usage?.cachedTokens, 10);
+      assert.equal(error.usage?.totalTokens, 10);
+      return true;
+    },
+  );
+  assert.equal(providerCalls, 1);
 });
 
 test("reaching the reported budget prevents a second provider turn", async () => {
@@ -253,7 +373,7 @@ test("reaching the reported budget prevents a second provider turn", async () =>
               },
             ],
             "toolUse",
-            { input: 6, output: 4 },
+            { input: 1, output: 1, cacheRead: 8 },
             "budget-request",
           ),
         ),

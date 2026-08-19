@@ -1,6 +1,10 @@
 import type { ArtifactRef, Json } from "./contracts.js";
 import { RuntimeValidationError, validateModelResult } from "./runtime/validation.js";
-import { aggregateAgentUsage, emptyAgentUsageSummary } from "./runtime/usage.js";
+import {
+  aggregateAgentUsage,
+  assertValidAgentUsageSummary,
+  emptyAgentUsageSummary,
+} from "./runtime/usage.js";
 
 export type AgentFailureCode =
   | "cancelled"
@@ -255,7 +259,11 @@ export async function collectAgentResult(
   return (await collectAgentRun(runtime, request)).result;
 }
 
-export { aggregateAgentUsage, emptyAgentUsageSummary };
+export {
+  aggregateAgentUsage,
+  assertValidAgentUsageSummary,
+  emptyAgentUsageSummary,
+};
 
 export function failure(
   code: AgentFailureCode,

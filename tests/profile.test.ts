@@ -100,3 +100,107 @@ test("validates bounded OpenAI-compatible settings without accepting secrets", (
     /runtime\.maxRetries/,
   );
 });
+
+test("rejects unknown runtime keys without masking the profile-secret error", () => {
+  const base = {
+    schema: "hypertest.profile/v1" as const,
+    name: "runtime-key-validation",
+    runtime: { provider: "deterministic" as const },
+    sut: { contractSource: "contract.json", sourceKind: "command-contract" },
+    adapters: {
+      sut: { command: "node" },
+      test: { command: "node" },
+    },
+    gate: { mode: "static-allow" },
+    workspace: {
+      allowedWriteGlobs: ["tests/**"],
+      forbiddenGlobs: ["src/**"],
+    },
+  };
+
+  assert.throws(
+    () =>
+      validateProfile({
+        ...base,
+        runtime: { ...base.runtime, maxRetry: 2 },
+      }),
+    /Unsupported runtime profile key: "maxRetry"/,
+  );
+  assert.throws(
+    () =>
+      validateProfile({
+        ...base,
+        runtime: { ...base.runtime, apiKey: "must-not-be-stored", maxRetry: 2 },
+      }),
+    /HYPERTEST_MODEL_API_KEY/,
+  );
+  assert.throws(
+    () =>
+      validateProfile({
+        ...base,
+        runtime: {
+          ...base.runtime,
+          budgets: { maxTurns: 4, maxTurn: 9 },
+        },
+      }),
+    /Unsupported runtime budget key: "maxTurn"/,
+  );
+});
+
+test("preserves legacy flattened runtime budget aliases", () => {
+  const profile = validateProfile({
+    schema: "hypertest.profile/v1",
+    name: "legacy-budget-profile",
+    runtime: {
+      provider: "deterministic",
+      maxTurns: 3,
+      maxToolCalls: 7,
+      max_repair_rounds: 0,
+      wallClockMs: 9_000,
+      tokenBudget: 321,
+    },
+    sut: { contractSource: "contract.json", sourceKind: "command-contract" },
+    adapters: {
+      sut: { command: "node" },
+      test: { command: "node" },
+    },
+    gate: { mode: "static-allow" },
+    workspace: {
+      allowedWriteGlobs: ["tests/**"],
+      forbiddenGlobs: ["src/**"],
+    },
+  });
+
+  assert.deepEqual(profile.runtime.budgets, {
+    maxTurns: 3,
+    maxToolCalls: 7,
+    maxRepairRounds: 0,
+    wallClockMs: 9_000,
+    tokenBudget: 321,
+  });
+});
+
+test("rejects profiles that authorize more than two automatic repairs", () => {
+  assert.throws(
+    () =>
+      validateProfile({
+        schema: "hypertest.profile/v1",
+        name: "too-many-repairs",
+        runtime: {
+          provider: "deterministic",
+          budgets: { maxRepairRounds: 3 },
+        },
+        sut: { contractSource: "contract.json", sourceKind: "command-contract" },
+        adapters: {
+          sut: { command: "node" },
+          test: { command: "node" },
+        },
+        gate: { mode: "static-allow" },
+        workspace: {
+          allowedWriteGlobs: ["tests/**"],
+          forbiddenGlobs: ["src/**"],
+        },
+      }),
+    /between 0 and 2/,
+  );
+});
