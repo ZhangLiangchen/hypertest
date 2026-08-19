@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   InvalidRunTransitionError,
+  assertValidRunLedger,
   createRunLedger,
   isTerminalRunState,
   recordTransition,
@@ -31,22 +32,61 @@ test("happy path reaches completed through all three quality gates", () => {
 });
 
 test("ledger records a governed repair round", () => {
-  let ledger: import("../src/state-machine.js").RunLedger = {
-    ...createRunLedger("run-1"),
-    state: "execute",
-  };
-  ledger = recordTransition(ledger, "tests_failed", 1);
-  ledger = recordTransition(ledger, "safe_repair", 2);
-  ledger = recordTransition(ledger, "allowed", 3);
-  ledger = recordTransition(ledger, "repair_applied", 4);
+  let ledger = createRunLedger("run-1");
+  for (const [index, event] of [
+    "accepted",
+    "evidence_ready",
+    "analysis_ready",
+    "plan_ready",
+    "allowed",
+    "patch_rendered",
+    "patch_valid",
+    "tests_failed",
+    "safe_repair",
+    "allowed",
+    "repair_applied",
+  ].entries()) {
+    ledger = recordTransition(
+      ledger,
+      event as Parameters<typeof recordTransition>[1],
+      index + 1,
+    );
+  }
   assert.equal(ledger.state, "execute");
   assert.equal(ledger.repairRounds, 1);
-  assert.equal(ledger.transitions.length, 4);
+  assert.equal(ledger.transitions.length, 11);
+  assert.doesNotThrow(() => assertValidRunLedger(ledger));
+});
+
+test("ledger validation rejects impossible or forged history", () => {
+  const base = createRunLedger("forged");
+  assert.throws(
+    () =>
+      assertValidRunLedger({
+        ...base,
+        state: "completed",
+        transitions: [
+          {
+            from: "intake",
+            event: "published",
+            to: "completed",
+            atEpochMs: 1,
+          },
+        ],
+      }),
+    /transition event is not valid/,
+  );
+  assert.throws(
+    () => assertValidRunLedger({ ...base, repairRounds: 1 }),
+    /repairRounds does not match/,
+  );
 });
 
 test("denial and invalid transitions fail closed", () => {
   const state = transitionRun("pre_code_gate", "denied");
   assert.equal(state, "rejected");
+  assert.equal(transitionRun("execute", "denied"), "rejected");
+  assert.equal(transitionRun("execute", "human_required"), "needs_human");
   assert.throws(() => transitionRun(state, "allowed"), InvalidRunTransitionError);
   assert.throws(() => transitionRun("intake", "published"), InvalidRunTransitionError);
 });

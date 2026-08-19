@@ -360,17 +360,39 @@ async function runTestAdapter(
       };
     } else if (name === "test-pytest") {
       const resultPath = resolve(executionCwd, string(config.resultPath) ?? ".hypertest-junit.xml");
-      const xml = await readFile(resultPath, "utf8");
-      testRun = parsePytestJunit(xml, {
-        runId: request.context.runId,
-        sourceRevision: request.context.sourceRevision,
-        command,
-        exitCode: result.exitCode ?? 1,
-        startedAtEpochMs: result.startedAtEpochMs,
-        finishedAtEpochMs: result.finishedAtEpochMs,
-        stdout: result.stdout,
-        stderr: result.stderr,
-      });
+      try {
+        const xml = await readFile(resultPath, "utf8");
+        testRun = parsePytestJunit(xml, {
+          runId: request.context.runId,
+          sourceRevision: request.context.sourceRevision,
+          command,
+          exitCode: result.exitCode ?? 1,
+          startedAtEpochMs: result.startedAtEpochMs,
+          finishedAtEpochMs: result.finishedAtEpochMs,
+          stdout: result.stdout,
+          stderr: result.stderr,
+        });
+      } catch (error) {
+        if (result.exitCode === undefined || result.exitCode === 0 || !isMissingFileError(error)) {
+          throw error;
+        }
+        testRun = {
+          schema: "hypertest.test-run/v1",
+          runId: request.context.runId,
+          sourceRevision: request.context.sourceRevision,
+          status: "runner_error",
+          command,
+          exitCode: result.exitCode,
+          ...(result.signal === undefined ? {} : { signal: result.signal }),
+          startedAtEpochMs: result.startedAtEpochMs,
+          finishedAtEpochMs: result.finishedAtEpochMs,
+          cases: [],
+          stdout: result.stdout,
+          stderr: result.stderr,
+          rawArtifacts: [],
+          coverageArtifacts: [],
+        };
+      }
     } else {
       testRun = parseGoTestJson(result.stdout, {
         runId: request.context.runId,
@@ -416,6 +438,15 @@ async function runTestAdapter(
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }
+}
+
+function isMissingFileError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === "ENOENT"
+  );
 }
 
 function manifestFor(name: string): AdapterManifest {

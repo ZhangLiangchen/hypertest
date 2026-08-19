@@ -1,63 +1,210 @@
-import type { Json } from "../../contracts.js";
+import { Agent } from "@earendil-works/pi-agent-core";
 import type {
-  AgentEvent,
-  AgentRunRequest,
-  AgentRuntime,
-} from "../../runtime.js";
+  AgentEvent as PiAgentEvent,
+  AgentOptions,
+  AgentState,
+  AgentTool,
+  ShouldStopAfterTurnContext,
+  StreamFn,
+} from "@earendil-works/pi-agent-core";
+import type { TSchema } from "typebox";
 
-export interface PiToolExecutionRequest {
-  readonly runId: string;
-  readonly name: string;
-  readonly callId: string;
-  readonly input: Json;
+import type { Json } from "../../contracts.js";
+import {
+  AgentRuntimeError,
+  failure,
+  type AgentEvent,
+  type AgentFailureCode,
+  type AgentRunRequest,
+  type AgentRuntime,
+  type AgentToolExecutionOutcome,
+  type AgentToolExecutionRequest,
+  type AgentUsage,
+} from "../../runtime.js";
+import { AsyncQueue } from "../async-queue.js";
+import { fingerprintEndpoint } from "../usage.js";
+import {
+  RuntimeValidationError,
+  parseAndValidateModelResult,
+  validateToolInput,
+} from "../validation.js";
+
+type PiMessageEndEvent = Extract<PiAgentEvent, { readonly type: "message_end" }>;
+export type PiAssistantMessage = Extract<
+  PiMessageEndEvent["message"],
+  { readonly role: "assistant" }
+>;
+
+export interface PiProviderAttemptTelemetry {
+  readonly providerRequestId?: string;
+  readonly retryCount?: number;
+  readonly usageUnavailable?: boolean;
+  readonly latencyMs?: number;
+  readonly stopReason?: string;
+}
+
+export interface PiProviderTelemetry {
+  readonly providerRequestId?: string;
+  readonly retryCount?: number;
+  readonly usageUnavailable?: boolean;
+  readonly latencyMs?: number;
+  readonly stopReason?: string;
+  readonly attempts?: readonly PiProviderAttemptTelemetry[];
 }
 
 export interface PiAgentRuntimeOptions {
-  readonly model: unknown;
-  readonly streamFn: (...args: readonly unknown[]) => unknown;
-  readonly toolExecutor?: (request: PiToolExecutionRequest) => Promise<Json>;
-  readonly transformContext?: (messages: readonly unknown[], signal: AbortSignal) => Promise<readonly unknown[]>;
-  readonly thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+  readonly model: AgentState["model"];
+  readonly streamFn: StreamFn;
+  readonly streamFnForRun?: (runId: string) => StreamFn;
+  readonly toolExecutor?: (
+    request: AgentToolExecutionRequest,
+  ) => Promise<Json | AgentToolExecutionOutcome>;
+  readonly transformContext?: AgentOptions["transformContext"];
+  readonly thinkingLevel?: AgentState["thinkingLevel"];
+  readonly provider?: string;
+  readonly modelId?: string;
+  readonly endpointFingerprint?: string;
+  readonly maxOutputTokens?: number;
+  readonly getProviderTelemetry?: (
+    message: PiAssistantMessage | undefined,
+    runId: string,
+  ) => PiProviderTelemetry | undefined;
+  readonly sanitizeProviderRequestId?: (
+    providerRequestId: string,
+  ) => string | undefined;
+  readonly now?: () => number;
 }
 
-interface PiAgentLike {
-  subscribe(listener: (event: any) => void | Promise<void>): () => void;
-  prompt(prompt: string): Promise<unknown>;
-  abort?: () => void;
-  cancel?: () => void;
-}
-
-interface PiModuleLike {
-  Agent: new (options: unknown) => PiAgentLike;
+interface ActivePiRun {
+  readonly agent: Agent;
+  readonly abort: (
+    code: AgentFailureCode,
+    message: string,
+    retryable: boolean,
+  ) => void;
 }
 
 export class PiAgentRuntime implements AgentRuntime {
-  private readonly active = new Map<string, PiAgentLike>();
+  private readonly active = new Map<string, ActivePiRun>();
 
   public constructor(private readonly options: PiAgentRuntimeOptions) {}
 
   public async *run(request: AgentRunRequest): AsyncIterable<AgentEvent> {
-    const packageName: string = ["@earendil-works", "pi-agent-core"].join("/");
-    const module = (await import(packageName)) as unknown as PiModuleLike;
-    const tools = request.tools.map((tool) => ({
+    if (this.active.has(request.runId)) {
+      throw new AgentRuntimeError(
+        failure(
+          "provider_protocol_error",
+          `Run ${request.runId} is already active`,
+          false,
+        ),
+      );
+    }
+
+    const queue = new AsyncQueue<AgentEvent>();
+    const now = this.options.now ?? Date.now;
+    const maxTurns = request.maxTurns ?? 20;
+    const maxToolCalls = request.maxToolCalls ?? 60;
+    const maxOutputBytes = request.maxOutputBytes ?? 1_048_576;
+    const tokenBudget = Math.max(0, Math.floor(request.tokenBudget));
+    const endpointFingerprint =
+      this.options.endpointFingerprint ??
+      fingerprintEndpoint(this.options.model.baseUrl);
+    const providerCallStarts: number[] = [];
+    const providerStreamFn =
+      this.options.streamFnForRun?.(request.runId) ?? this.options.streamFn;
+    const toolStarts = new Map<
+      string,
+      { readonly name: string; readonly startedAt: number }
+    >();
+    const toolMetadataByContentIndex = new Map<
+      number,
+      { readonly id: string; readonly name: string }
+    >();
+    const maxRepeatedToolCalls = request.maxRepeatedToolCalls ?? 3;
+    let lastToolSignature: string | undefined;
+    let repeatedToolCalls = 0;
+    let providerReplayLocked = false;
+    let terminal = false;
+    let text = "";
+    let outputBytes = 0;
+    let turnCount = 0;
+    let providerCallCount = 0;
+    let toolCallCount = 0;
+    let consumedTokens = 0;
+    let usageUncertain = false;
+    let budgetStopReason: string | undefined;
+    let loopStopReason: string | undefined;
+    let unsubscribe: (() => void) | undefined;
+    let deadlineTimer: NodeJS.Timeout | undefined;
+
+    const tools: AgentTool<TSchema, PiToolOutcomeEnvelope>[] = request.tools.map((tool) => ({
       name: tool.name,
       label: tool.name,
       description: tool.description,
-      parameters: tool.inputSchema,
-      execute: async (callId: string, input: Json) => {
-        if (this.options.toolExecutor === undefined) {
-          throw new Error(`No executor is configured for tool ${tool.name}`);
+      parameters: toSchema(tool.inputSchema, tool.name),
+      prepareArguments: (input) =>
+        validateToolInput(toJson(input), tool.inputSchema),
+      execute: async (callId, input, signal) => {
+        const executor = request.toolExecutor ?? this.options.toolExecutor;
+        if (executor === undefined) {
+          throw new PiToolExecutionError();
         }
-        return this.options.toolExecutor({
-          runId: request.runId,
-          name: tool.name,
-          callId,
-          input,
-        });
+        if (signal?.aborted === true) {
+          throw new PiToolExecutionError();
+        }
+        const validated = validateToolInput(toJson(input), tool.inputSchema);
+        let outcome: AgentToolExecutionOutcome;
+        try {
+          outcome = normalizeToolOutcome(
+            await executor({
+              runId: request.runId,
+              name: tool.name,
+              callId,
+              input: validated,
+            }),
+          );
+        } catch {
+          throw new PiToolExecutionError();
+        }
+        return {
+          content: [{ type: "text", text: JSON.stringify(outcome.output) }],
+          details: {
+            hypertestToolOutcome: true,
+            status: outcome.status,
+            output: outcome.output,
+          },
+        };
       },
     }));
 
-    const agent = new module.Agent({
+    const remainingBudget = (): number =>
+      Math.max(0, tokenBudget - consumedTokens);
+
+    const streamFn: StreamFn = (model, context, streamOptions) => {
+      if (providerCallCount >= maxTurns) {
+        loopStopReason = `Agent exceeded the maximum of ${maxTurns} turns`;
+        throw new PiRuntimeLimitError(loopStopReason);
+      }
+      providerCallCount += 1;
+      const remaining = remainingBudget();
+      const configuredMax = Math.min(
+        model.maxTokens,
+        this.options.maxOutputTokens ?? Number.POSITIVE_INFINITY,
+        request.maxOutputTokens ?? Number.POSITIVE_INFINITY,
+        streamOptions?.maxTokens ?? Number.POSITIVE_INFINITY,
+      );
+      const maxTokens = Math.max(
+        1,
+        Math.floor(Math.min(configuredMax, remaining)),
+      );
+      providerCallStarts.push(now());
+      return providerStreamFn(model, context, {
+        ...(streamOptions ?? {}),
+        maxTokens,
+      });
+    };
+
+    const agent = new Agent({
       initialState: {
         systemPrompt: request.systemPrompt ?? "You are a HyperTest worker.",
         model: this.options.model,
@@ -65,103 +212,618 @@ export class PiAgentRuntime implements AgentRuntime {
         tools,
         messages: [],
       },
-      streamFn: this.options.streamFn,
+      streamFn,
       ...(this.options.transformContext === undefined
         ? {}
         : { transformContext: this.options.transformContext }),
-      shouldStopAfterTurn: ({ context }: any) => {
-        const now = Date.now();
-        if (now >= request.deadlineEpochMs) {
-          return true;
-        }
-        return Array.isArray(context?.messages) && context.messages.length > 100;
+      afterToolCall: async ({ result }) => {
+        if (!isPiToolOutcomeEnvelope(result.details)) return undefined;
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result.details.output),
+            },
+          ],
+          details: result.details.output,
+          isError: result.details.status === "error",
+        };
       },
+      shouldStopAfterTurn: (context: ShouldStopAfterTurnContext) =>
+        loopStopReason !== undefined ||
+        budgetStopReason !== undefined ||
+        now() >= request.deadlineEpochMs ||
+        context.context.messages.length > 100,
+      toolExecution: "sequential",
     });
 
-    this.active.set(request.runId, agent);
-    const events: AgentEvent[] = [
-      { type: "started", runId: request.runId },
-    ];
-    let text = "";
-    let failed: string | undefined;
-
-    const unsubscribe = agent.subscribe((event: any) => {
-      if (
-        event?.type === "message_update" &&
-        event.assistantMessageEvent?.type === "text_delta" &&
-        typeof event.assistantMessageEvent.delta === "string"
-      ) {
-        const delta = event.assistantMessageEvent.delta;
-        text += delta;
-        events.push({ type: "text_delta", text: delta });
-      } else if (event?.type === "tool_execution_start") {
-        events.push({
-          type: "tool_requested",
-          callId: String(event.toolCallId ?? "unknown"),
-          name: String(event.toolName ?? "unknown"),
-          input: toJson(event.args),
-        });
-      } else if (event?.type === "tool_execution_end") {
-        events.push({
-          type: "tool_completed",
-          callId: String(event.toolCallId ?? "unknown"),
-          result: toJson(event.result),
-          isError: Boolean(event.isError),
-        });
-      } else if (event?.type === "agent_error") {
-        failed = String(event.message ?? "pi agent error");
+    const cleanup = (): void => {
+      if (deadlineTimer !== undefined) {
+        clearTimeout(deadlineTimer);
+        deadlineTimer = undefined;
       }
-    });
+      unsubscribe?.();
+      unsubscribe = undefined;
+      toolStarts.clear();
+      toolMetadataByContentIndex.clear();
+      this.active.delete(request.runId);
+    };
 
-    try {
-      await agent.prompt(request.prompt);
-      for (const event of events) {
-        yield event;
+    const resolveTelemetry = (
+      message: PiAssistantMessage | undefined,
+    ): PiProviderTelemetry | undefined => {
+      try {
+        return this.options.getProviderTelemetry?.(message, request.runId);
+      } catch {
+        return undefined;
       }
-      if (failed !== undefined) {
-        yield { type: "failed", message: failed, retryable: true };
+    };
+
+    const sanitizeProviderRequestId = (
+      providerRequestId: string | undefined,
+    ): string | undefined => {
+      if (providerRequestId === undefined) return undefined;
+      if (this.options.sanitizeProviderRequestId === undefined) {
+        return providerRequestId;
+      }
+      try {
+        return this.options.sanitizeProviderRequestId(providerRequestId);
+      } catch {
+        return undefined;
+      }
+    };
+
+    const emitUsage = (
+      message: PiAssistantMessage | undefined,
+      stopReason: string,
+    ): AgentUsage | undefined => {
+      const startedAt = providerCallStarts.shift();
+      if (startedAt === undefined) return undefined;
+      const telemetry = resolveTelemetry(message);
+      const attempts =
+        telemetry?.attempts !== undefined && telemetry.attempts.length > 0
+          ? telemetry.attempts
+          : [telemetry];
+      let finalRecord: AgentUsage | undefined;
+      for (const [index, attempt] of attempts.entries()) {
+        const finalAttempt = index === attempts.length - 1;
+        const usageUnavailable =
+          attempt?.usageUnavailable ??
+          telemetry?.usageUnavailable ??
+          (!finalAttempt || !hasReportedUsage(message));
+        const providerRequestId = sanitizeProviderRequestId(
+          attempt?.providerRequestId ??
+            (finalAttempt
+              ? telemetry?.providerRequestId ?? message?.responseId
+              : undefined),
+        );
+        const record: AgentUsage = {
+          provider:
+            this.options.provider ??
+            message?.provider ??
+            this.options.model.provider,
+          model:
+            this.options.modelId ?? message?.model ?? this.options.model.id,
+          endpointFingerprint,
+          ...(providerRequestId === undefined ? {} : { providerRequestId }),
+          ...(!usageUnavailable && finalAttempt && message !== undefined
+            ? {
+                inputTokens: safeTokenCount(message.usage.input),
+                outputTokens: safeTokenCount(message.usage.output),
+                cachedTokens:
+                  safeTokenCount(message.usage.cacheRead) +
+                  safeTokenCount(message.usage.cacheWrite),
+                estimatedCostUsd: safeCost(message.usage.cost.total),
+              }
+            : {}),
+          latencyMs: Math.max(
+            0,
+            Math.floor(
+              attempt?.latencyMs ??
+                (attempts.length === 1
+                  ? telemetry?.latencyMs ?? now() - startedAt
+                  : 0),
+            ),
+          ),
+          retryCount: Math.max(
+            0,
+            Math.floor(
+              attempt?.retryCount ??
+                (attempts.length === 1 ? telemetry?.retryCount ?? 0 : 0),
+            ),
+          ),
+          stopReason: attempt?.stopReason ?? (finalAttempt ? stopReason : "retry"),
+          usageUnavailable,
+        };
+        queue.push({ type: "usage", usage: record });
+        if (usageUnavailable) usageUncertain = true;
+        if (!usageUnavailable) {
+          consumedTokens +=
+            (record.inputTokens ?? 0) +
+            (record.outputTokens ?? 0) +
+            (record.cachedTokens ?? 0);
+        }
+        if (finalAttempt) finalRecord = record;
+      }
+      return finalRecord;
+    };
+
+    const flushPendingUsage = (stopReason: string): void => {
+      while (providerCallStarts.length > 0) emitUsage(undefined, stopReason);
+    };
+
+    const finish = (
+      event: Extract<AgentEvent, { type: "completed" | "failed" }>,
+    ): void => {
+      if (terminal) return;
+      terminal = true;
+      queue.push(event);
+      queue.close();
+      cleanup();
+    };
+
+    const abort = (
+      code: AgentFailureCode,
+      message: string,
+      retryable: boolean,
+    ): void => {
+      if (terminal) return;
+      flushPendingUsage(code);
+      agent.abort();
+      finish(failure(code, message, retryable));
+    };
+
+    unsubscribe = agent.subscribe(async (event: PiAgentEvent) => {
+      if (terminal) return;
+      if (event.type === "turn_start") {
+        turnCount += 1;
+        if (turnCount > maxTurns) {
+          abort(
+            "tool_loop_limit",
+            `Agent exceeded the maximum of ${maxTurns} turns`,
+            false,
+          );
+        }
         return;
       }
-      yield { type: "completed", result: parseModelResult(text) };
-    } catch (error) {
-      for (const event of events) {
-        yield event;
+      if (event.type === "message_update") {
+        const update = event.assistantMessageEvent;
+        if (
+          update.type === "toolcall_start" ||
+          update.type === "toolcall_delta" ||
+          update.type === "toolcall_end"
+        ) {
+          const block = update.partial.content[update.contentIndex];
+          const currentMetadata =
+            block?.type === "toolCall"
+              ? { id: block.id, name: block.name }
+              : { id: "", name: "" };
+          const previousMetadata = toolMetadataByContentIndex.get(
+            update.contentIndex,
+          ) ?? { id: "", name: "" };
+          const metadataBytes =
+            incrementalStringBytes(previousMetadata.id, currentMetadata.id) +
+            incrementalStringBytes(previousMetadata.name, currentMetadata.name);
+          toolMetadataByContentIndex.set(
+            update.contentIndex,
+            currentMetadata,
+          );
+          if (metadataBytes > 0) {
+            providerReplayLocked = true;
+          }
+          outputBytes += metadataBytes;
+          if (outputBytes > maxOutputBytes) {
+            abort(
+              "output_limit",
+              `Model output exceeded ${maxOutputBytes} bytes`,
+              false,
+            );
+            return;
+          }
+          if (update.type !== "toolcall_delta") return;
+        }
+        if (
+          update.type !== "text_delta" &&
+          update.type !== "thinking_delta" &&
+          update.type !== "toolcall_delta"
+        ) {
+          return;
+        }
+        const delta = update.delta;
+        if (delta.length > 0) providerReplayLocked = true;
+        outputBytes += Buffer.byteLength(delta, "utf8");
+        if (outputBytes > maxOutputBytes) {
+          abort(
+            "output_limit",
+            `Model output exceeded ${maxOutputBytes} bytes`,
+            false,
+          );
+          return;
+        }
+        if (update.type === "text_delta") {
+          text += delta;
+          queue.push({ type: "text_delta", text: delta });
+        }
+        return;
       }
-      yield {
-        type: "failed",
-        message: error instanceof Error ? error.message : String(error),
-        retryable: true,
-      };
+      if (event.type === "tool_execution_start") {
+        providerReplayLocked = true;
+        toolCallCount += 1;
+        if (toolCallCount > maxToolCalls) {
+          abort(
+            "tool_loop_limit",
+            `Agent exceeded the maximum of ${maxToolCalls} tool calls`,
+            false,
+          );
+          return;
+        }
+        const input = toJson(event.args);
+        const signature = `${event.toolName}:${canonicalJson(input)}`;
+        if (signature === lastToolSignature) repeatedToolCalls += 1;
+        else {
+          lastToolSignature = signature;
+          repeatedToolCalls = 1;
+        }
+        if (repeatedToolCalls > maxRepeatedToolCalls) {
+          abort(
+            "tool_loop_limit",
+            `Agent repeated the same tool call more than ${maxRepeatedToolCalls} times without progress`,
+            false,
+          );
+          return;
+        }
+        toolStarts.set(event.toolCallId, {
+          name: event.toolName,
+          startedAt: now(),
+        });
+        await queue.pushAndWait({
+          type: "tool_requested",
+          callId: event.toolCallId,
+          name: event.toolName,
+          input,
+        });
+        return;
+      }
+      if (event.type === "tool_execution_end") {
+        const result = toolResultJson(event.result);
+        const started = toolStarts.get(event.toolCallId);
+        toolStarts.delete(event.toolCallId);
+        queue.push({
+          type: "tool_completed",
+          callId: event.toolCallId,
+          name: started?.name ?? event.toolName,
+          result,
+          isError: event.isError,
+          durationMs: Math.max(
+            0,
+            Math.floor(started === undefined ? 0 : now() - started.startedAt),
+          ),
+        });
+        if (event.isError) {
+          const classification = classifyToolFailure(event.result);
+          if (classification !== undefined) {
+            finish(
+              failure(
+                classification,
+                toolFailureMessage(classification),
+                false,
+              ),
+            );
+          }
+        }
+        return;
+      }
+      if (event.type === "message_end" && isAssistantMessage(event.message)) {
+        toolMetadataByContentIndex.clear();
+        const usage = emitUsage(event.message, event.message.stopReason);
+        if (isAssistantFailure(event.message)) {
+          if (event.message.stopReason === "aborted") {
+            finish(
+              failure(
+                "cancelled",
+                "OpenAI-compatible provider request was aborted",
+                false,
+                usage?.providerRequestId ??
+                  sanitizeProviderRequestId(event.message.responseId),
+              ),
+            );
+          } else {
+            const mapped = mapProviderError(
+              new Error(
+                event.message.errorMessage ?? "Pi agent provider request failed",
+              ),
+              providerReplayLocked,
+            );
+            finish(
+              failure(
+                mapped.code,
+                mapped.message,
+                mapped.retryable,
+                usage?.providerRequestId ??
+                  sanitizeProviderRequestId(event.message.responseId),
+              ),
+            );
+          }
+          return;
+        }
+        if (
+          consumedTokens > tokenBudget &&
+          event.message.stopReason !== "toolUse"
+        ) {
+          finish(
+            failure(
+              "budget_exhausted",
+              `Agent exceeded the ${tokenBudget}-token budget`,
+              false,
+              usage?.providerRequestId,
+            ),
+          );
+          return;
+        }
+        if (event.message.stopReason === "toolUse") {
+          if (providerCallCount >= maxTurns) {
+            loopStopReason = `Agent exceeded the maximum of ${maxTurns} turns`;
+          } else if (usageUncertain) {
+            budgetStopReason =
+              "Provider usage is unavailable for at least one call, so another turn cannot be authorized within the hard token budget";
+          } else if (consumedTokens >= tokenBudget) {
+            budgetStopReason = `Agent consumed the ${tokenBudget}-token budget before another provider turn`;
+          }
+        }
+      }
+    });
+
+    this.active.set(request.runId, { agent, abort });
+    queue.push({ type: "started", runId: request.runId });
+
+    const remainingMs = request.deadlineEpochMs - now();
+    if (tokenBudget <= 0) {
+      abort("budget_exhausted", "Agent token budget is exhausted", false);
+    } else if (remainingMs <= 0) {
+      abort("deadline_exceeded", "Agent run deadline exceeded", false);
+    } else {
+      deadlineTimer = setTimeout(() => {
+        abort("deadline_exceeded", "Agent run deadline exceeded", false);
+      }, remainingMs);
+    }
+
+    if (!terminal) {
+      void (async () => {
+        try {
+          await agent.prompt(request.prompt);
+          if (!terminal) {
+            if (loopStopReason !== undefined) {
+              finish(failure("tool_loop_limit", loopStopReason, false));
+              return;
+            }
+            if (budgetStopReason !== undefined) {
+              finish(failure("budget_exhausted", budgetStopReason, false));
+              return;
+            }
+            try {
+              finish({
+                type: "completed",
+                result: parseAndValidateModelResult(
+                  text,
+                  request.expectedResultSchema,
+                ),
+              });
+            } catch (error) {
+              if (error instanceof RuntimeValidationError) {
+                finish(failure(error.code, error.message, false));
+              } else {
+                throw error;
+              }
+            }
+          }
+        } catch (error) {
+          if (!terminal) {
+            flushPendingUsage("error");
+            const mapped = mapProviderError(error, providerReplayLocked);
+            finish(failure(mapped.code, mapped.message, mapped.retryable));
+          }
+        } finally {
+          cleanup();
+        }
+      })();
+    }
+
+    try {
+      for await (const event of queue) yield event;
     } finally {
-      unsubscribe();
-      this.active.delete(request.runId);
+      if (!terminal) {
+        abort("cancelled", "Agent event consumer cancelled", false);
+      }
     }
   }
 
   public async cancel(runId: string): Promise<void> {
-    const agent = this.active.get(runId);
-    agent?.abort?.();
-    agent?.cancel?.();
+    this.active
+      .get(runId)
+      ?.abort("cancelled", "Agent run cancelled", false);
   }
 }
 
-function parseModelResult(text: string): Json {
-  const trimmed = text.trim();
-  if (trimmed.length === 0) {
-    return { text: "" };
+interface PiToolOutcomeEnvelope {
+  readonly hypertestToolOutcome: true;
+  readonly status: "ok" | "error";
+  readonly output: Json;
+}
+
+function normalizeToolOutcome(
+  value: Json | AgentToolExecutionOutcome,
+): AgentToolExecutionOutcome {
+  if (isAgentToolExecutionOutcome(value)) return value;
+  return { status: "ok", output: value };
+}
+
+function isAgentToolExecutionOutcome(
+  value: Json | AgentToolExecutionOutcome,
+): value is AgentToolExecutionOutcome {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    (value.status === "ok" || value.status === "error") &&
+    "output" in value
+  );
+}
+
+function isPiToolOutcomeEnvelope(value: unknown): value is PiToolOutcomeEnvelope {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    record.hypertestToolOutcome === true &&
+    (record.status === "ok" || record.status === "error") &&
+    "output" in record
+  );
+}
+
+function canonicalJson(value: Json): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
   }
-  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(trimmed);
-  const candidate = fenced?.[1] ?? trimmed;
-  try {
-    return JSON.parse(candidate) as Json;
-  } catch {
-    return { text: trimmed };
+  return `{${Object.keys(value)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key] ?? null)}`)
+    .join(",")}}`;
+}
+
+function toSchema(value: Json, toolName: string): TSchema {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`Tool ${toolName} input schema must be a JSON object`);
   }
+  return value;
+}
+
+function isAssistantMessage(message: PiMessageEndEvent["message"]): message is PiAssistantMessage {
+  return message.role === "assistant";
+}
+
+function isAssistantFailure(message: PiAssistantMessage): message is PiAssistantMessage & {
+  readonly stopReason: "error" | "aborted";
+} {
+  return message.stopReason === "error" || message.stopReason === "aborted";
+}
+
+function hasReportedUsage(message: PiAssistantMessage | undefined): boolean {
+  if (message === undefined) return false;
+  return (
+    message.usage.totalTokens > 0 ||
+    message.usage.input > 0 ||
+    message.usage.output > 0 ||
+    message.usage.cacheRead > 0 ||
+    message.usage.cacheWrite > 0
+  );
+}
+
+function safeTokenCount(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
+}
+
+function safeCost(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, value) : 0;
+}
+
+function incrementalStringBytes(previous: string, current: string): number {
+  if (current === previous) return 0;
+  if (current.startsWith(previous)) {
+    return Buffer.byteLength(current.slice(previous.length), "utf8");
+  }
+  return Buffer.byteLength(current, "utf8");
+}
+
+function toolResultJson(value: unknown): Json {
+  if (
+    typeof value === "object" &&
+    value !== null &&
+    "details" in value
+  ) {
+    return toJson(value.details);
+  }
+  return toJson(value);
+}
+
+class PiRuntimeLimitError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = "PiRuntimeLimitError";
+  }
+}
+
+class PiToolExecutionError extends Error {
+  public constructor() {
+    super("HYPERTEST_TOOL_EXECUTION_ERROR");
+    this.name = "PiToolExecutionError";
+  }
+}
+
+function classifyToolFailure(
+  value: unknown,
+): "tool_input_schema_error" | "tool_execution_error" | undefined {
+  const text = JSON.stringify(toJson(value));
+  if (
+    text.includes("RuntimeValidationError") ||
+    text.includes("Tool input does not match the declared schema") ||
+    text.includes("HYPERTEST_TOOL_INPUT_SCHEMA_ERROR")
+  ) {
+    return "tool_input_schema_error";
+  }
+  if (text.includes("HYPERTEST_TOOL_EXECUTION_ERROR")) {
+    return "tool_execution_error";
+  }
+  return undefined;
+}
+
+function toolFailureMessage(
+  code: "tool_input_schema_error" | "tool_execution_error",
+): string {
+  return code === "tool_input_schema_error"
+    ? "Tool input does not match the declared schema"
+    : "Tool execution failed";
+}
+
+function mapProviderError(error: unknown, replayLocked = false): {
+  readonly code: AgentFailureCode;
+  readonly message: string;
+  readonly retryable: boolean;
+} {
+  const message = error instanceof Error ? error.message : String(error);
+  if (error instanceof PiRuntimeLimitError) {
+    return { code: "tool_loop_limit", message, retryable: false };
+  }
+  if (/\b429\b|rate.?limit/i.test(message)) {
+    return {
+      code: "provider_rate_limited",
+      message,
+      retryable: !replayLocked,
+    };
+  }
+  if (/protocol|invalid.*event|malformed/i.test(message)) {
+    return { code: "provider_protocol_error", message, retryable: false };
+  }
+  if (
+    /HTTP (502|503|504)\b|connection failed before the first visible delta|fetch failed|ECONNRESET|UND_ERR/i.test(
+      message,
+    )
+  ) {
+    return { code: "provider_error", message, retryable: !replayLocked };
+  }
+  return { code: "provider_error", message, retryable: false };
 }
 
 function toJson(value: unknown): Json {
-  if (value === undefined) {
-    return null;
+  if (value === null) return null;
+  if (typeof value === "string" || typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : String(value);
   }
-  return JSON.parse(JSON.stringify(value)) as Json;
+  if (Array.isArray(value)) return value.map((item) => toJson(item));
+  if (typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, toJson(item)]),
+    );
+  }
+  return String(value);
 }

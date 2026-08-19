@@ -10,8 +10,19 @@ import type {
   TestPlan,
   TestPlanCase,
 } from "./contracts.js";
-import type { AgentRuntime } from "./runtime.js";
-import { collectAgentResult } from "./runtime.js";
+import type {
+  AgentEvent,
+  AgentRuntime,
+  AgentToolDefinition,
+  AgentToolExecutionOutcome,
+  AgentToolExecutor,
+  AgentUsageSummary,
+} from "./runtime.js";
+import {
+  AgentRuntimeError,
+  collectAgentRun,
+  emptyAgentUsageSummary,
+} from "./runtime.js";
 
 export interface PlanOptions {
   readonly maxCasesPerOperation?: number;
@@ -20,6 +31,11 @@ export interface PlanOptions {
   readonly runId?: string;
   readonly tokenBudget?: number;
   readonly deadlineEpochMs?: number;
+  readonly maxTurns?: number;
+  readonly maxToolCalls?: number;
+  readonly maxRepeatedToolCalls?: number;
+  readonly onUsage?: (summary: AgentUsageSummary) => void | Promise<void>;
+  readonly onAgentEvent?: (event: AgentEvent) => void | Promise<void>;
 }
 
 export async function createTestPlan(
@@ -32,7 +48,7 @@ export async function createTestPlan(
   );
   const modelCases =
     options.runtime === undefined
-      ? []
+      ? await recordDeterministicUsage(options)
       : await requestModelCases(contract, contractRef, options);
   const merged = deduplicateCases([...deterministic, ...modelCases]);
   return {
@@ -282,10 +298,240 @@ function buildOracles(
     rationale:
       expectedValidity === "invalid"
         ? "Invalid input must be rejected or handled without an unsafe side effect"
-        : "Valid input must complete without an infrastructure or protocol failure",
+        : expectedValidity === "unknown"
+          ? "Input validity is unknown; execution must preserve safety and surface a structured outcome without assuming success"
+          : "Valid input must complete without an infrastructure or protocol failure",
     strength: expectedValidity === "unknown" ? "weak" : "normal",
   };
   return [baseline, ...hints];
+}
+
+export class PlannerModelValidationError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = "PlannerModelValidationError";
+  }
+}
+
+export function plannerAugmentationSchema(maxCases: number): Json {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["cases"],
+    properties: {
+      cases: {
+        type: "array",
+        maxItems: Math.max(0, Math.min(maxCases, 64)),
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["title", "objective", "steps", "oracle"],
+          properties: {
+            title: { type: "string", minLength: 1, maxLength: 160 },
+            objective: { type: "string", minLength: 1, maxLength: 1_000 },
+            steps: {
+              type: "array",
+              minItems: 1,
+              maxItems: 8,
+              items: {
+                type: "object",
+                additionalProperties: false,
+                required: ["operationId", "input"],
+                properties: {
+                  operationId: {
+                    type: "string",
+                    minLength: 1,
+                    maxLength: 200,
+                  },
+                  input: {},
+                },
+              },
+            },
+            oracle: {
+              type: "object",
+              minProperties: 1,
+              maxProperties: 32,
+            },
+          },
+        },
+      },
+    },
+  };
+}
+
+const PLANNER_TOOL_DEFINITIONS: readonly AgentToolDefinition[] = Object.freeze([
+  Object.freeze({
+    name: "contract.list_operations",
+    description:
+      "List operation ids and minimal deterministic capabilities from the current in-memory SUT contract.",
+    inputSchema: deepFreezeJson({
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    }),
+    idempotent: true,
+  }),
+  Object.freeze({
+    name: "contract.get_operation",
+    description:
+      "Read a deterministic view of one operation from the current in-memory SUT contract.",
+    inputSchema: deepFreezeJson({
+      type: "object",
+      properties: {
+        operationId: { type: "string", minLength: 1, maxLength: 200 },
+      },
+      required: ["operationId"],
+      additionalProperties: false,
+    }),
+    idempotent: true,
+  }),
+]);
+
+export function plannerToolDefinitions(): readonly AgentToolDefinition[] {
+  return PLANNER_TOOL_DEFINITIONS;
+}
+
+export function createPlannerToolExecutor(
+  contract: SutContract,
+): AgentToolExecutor {
+  const operations = new Map(
+    contract.operations.map((operation) => [operation.id, operation]),
+  );
+  return async ({ name, input }): Promise<AgentToolExecutionOutcome> => {
+    if (name === "contract.list_operations") {
+      return {
+        status: "ok",
+        output: {
+          operations: contract.operations.map((operation) => ({
+            operationId: operation.id,
+            ...(operation.title === undefined
+              ? {}
+              : { title: operation.title }),
+            effects: operation.effects,
+            interactionKind: operation.interactionKind,
+            inputSchemaDigest: digestJson(operation.inputSchema),
+            capability: {
+              preconditionCount: operation.preconditions.length,
+              oracleHintCount: operation.oracleHints.length,
+              tags: operation.tags.slice(0, 16),
+            },
+          })),
+        },
+      };
+    }
+    if (name === "contract.get_operation") {
+      if (!isRecord(input) || typeof input.operationId !== "string") {
+        return plannerToolError(
+          "invalid_tool_input",
+          "contract.get_operation requires a string operationId",
+        );
+      }
+      const operation = operations.get(input.operationId);
+      if (operation === undefined) {
+        return plannerToolError(
+          "unknown_operation",
+          `No operation exists for ${safeIdentifier(input.operationId)}`,
+          { operationId: input.operationId },
+        );
+      }
+      return {
+        status: "ok",
+        output: { operation: operationView(operation) },
+      };
+    }
+    return plannerToolError(
+      "tool_not_allowed",
+      `Tool ${safeIdentifier(name)} is not in the planner allowlist`,
+    );
+  };
+}
+
+function operationView(operation: SutOperation): Json {
+  return {
+    operationId: operation.id,
+    ...(operation.title === undefined ? {} : { title: operation.title }),
+    ...(operation.description === undefined
+      ? {}
+      : { description: operation.description }),
+    interactionKind: operation.interactionKind,
+    effects: operation.effects,
+    inputSchema: toJsonValue(operation.inputSchema),
+    observationSchema: toJsonValue(operation.observationSchema),
+    preconditions: [...operation.preconditions],
+    oracleHints: [...operation.oracleHints],
+    tags: [...operation.tags],
+  };
+}
+
+function toJsonValue(value: unknown): Json {
+  if (value === null) return null;
+  if (typeof value === "string" || typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : String(value);
+  }
+  if (Array.isArray(value)) return value.map((item) => toJsonValue(item));
+  if (typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([, item]) => item !== undefined)
+        .map(([key, item]) => [key, toJsonValue(item)]),
+    );
+  }
+  return String(value);
+}
+
+function deepFreezeJson<T extends Json>(value: T): T {
+  if (Array.isArray(value)) {
+    for (const item of value) deepFreezeJson(item);
+  } else if (value !== null && typeof value === "object") {
+    for (const item of Object.values(value)) deepFreezeJson(item);
+  }
+  return Object.freeze(value);
+}
+
+function plannerToolError(
+  code: string,
+  message: string,
+  detail?: Json,
+): AgentToolExecutionOutcome {
+  return {
+    status: "error",
+    output: {
+      error: {
+        code,
+        message,
+        ...(detail === undefined ? {} : { detail }),
+      },
+    },
+  };
+}
+
+function digestJson(value: JsonSchemaShape): string {
+  return createHash("sha256").update(canonicalValue(value)).digest("hex");
+}
+
+function canonicalValue(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value ?? null);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalValue(item)).join(",")}]`;
+  }
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .filter((key) => record[key] !== undefined)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalValue(record[key])}`)
+    .join(",")}}`;
+}
+
+async function recordDeterministicUsage(
+  options: PlanOptions,
+): Promise<TestPlanCase[]> {
+  await options.onUsage?.(
+    emptyAgentUsageSummary(options.runId ?? `plan-${Date.now()}`),
+  );
+  return [];
 }
 
 async function requestModelCases(
@@ -293,64 +539,180 @@ async function requestModelCases(
   contractRef: ArtifactRef<"sut-contract">,
   options: PlanOptions,
 ): Promise<TestPlanCase[]> {
-  const result = await collectAgentResult(options.runtime!, {
-    runId: options.runId ?? `plan-${Date.now()}`,
-    phase: "test-plan-augmentation",
-    systemPrompt:
-      "Generate framework-neutral test cases only. Never emit test source code. Return JSON with a cases array.",
-    prompt: JSON.stringify({ contract, constraints: { maxCasesPerOperation: options.maxCasesPerOperation ?? 12 } }),
-    tools: [],
-    artifacts: [contractRef],
-    tokenBudget: options.tokenBudget ?? 20_000,
-    deadlineEpochMs: options.deadlineEpochMs ?? Date.now() + 120_000,
-  });
+  const maxCases =
+    Math.max(1, options.maxCasesPerOperation ?? 12) *
+    Math.max(1, contract.operations.length);
+  const runId = options.runId ?? `plan-${Date.now()}`;
+  let outcome;
+  try {
+    outcome = await collectAgentRun(
+      options.runtime!,
+      {
+        runId,
+        phase: "test-plan-augmentation",
+        systemPrompt:
+          "Generate framework-neutral test cases only. Use only the declared read-only contract tools when operation details are needed. Never emit test source code. Return only JSON matching the supplied result schema.",
+        prompt: JSON.stringify({
+          contract: {
+            id: contract.id,
+            title: contract.title,
+            sourceRevision: contract.sourceRevision,
+            operationCount: contract.operations.length,
+            lifecycleCapabilities: contract.lifecycleCapabilities,
+          },
+          constraints: {
+            maxCasesPerOperation: options.maxCasesPerOperation ?? 12,
+            includeDestructive: options.includeDestructive ?? false,
+          },
+          workflow: [
+            "Call contract.list_operations to discover operation ids and capabilities.",
+            "Call contract.get_operation only for operation details needed by a proposed case.",
+            "Return the final planner augmentation JSON after tool use.",
+          ],
+        }),
+        tools: plannerToolDefinitions(),
+        toolExecutor: createPlannerToolExecutor(contract),
+        artifacts: [contractRef],
+        tokenBudget: options.tokenBudget ?? 20_000,
+        deadlineEpochMs: options.deadlineEpochMs ?? Date.now() + 120_000,
+        expectedResultSchema: plannerAugmentationSchema(maxCases),
+        maxTurns: options.maxTurns ?? 12,
+        maxToolCalls: options.maxToolCalls ?? 24,
+        maxRepeatedToolCalls: options.maxRepeatedToolCalls ?? 3,
+        maxOutputBytes: 262_144,
+      },
+      options.onAgentEvent === undefined
+        ? {}
+        : { onEvent: options.onAgentEvent },
+    );
+  } catch (error) {
+    if (error instanceof AgentRuntimeError && error.usage !== undefined) {
+      await options.onUsage?.(error.usage);
+    }
+    throw error;
+  }
+  await options.onUsage?.(outcome.usage);
+  const result = outcome.result;
   if (!isRecord(result) || !Array.isArray(result.cases)) {
-    return [];
+    throw new PlannerModelValidationError(
+      "Validated planner augmentation is missing its cases array",
+    );
   }
-  const cases: TestPlanCase[] = [];
-  for (const item of result.cases) {
-    const candidate = validateModelCase(item, contract, contractRef);
-    if (candidate !== undefined) cases.push(candidate);
-  }
-  return cases;
+  return result.cases.map((item, index) =>
+    validateModelCase(item, index, contract, contractRef, options),
+  );
 }
 
 function validateModelCase(
   value: Json,
+  index: number,
   contract: SutContract,
   contractRef: ArtifactRef<"sut-contract">,
-): TestPlanCase | undefined {
-  if (!isRecord(value)) return undefined;
-  if (typeof value.title !== "string" || typeof value.objective !== "string") return undefined;
-  if (!Array.isArray(value.steps) || value.steps.length === 0) return undefined;
-  const known = new Set(contract.operations.map((operation) => operation.id));
-  const steps = value.steps.flatMap((step) => {
-    if (!isRecord(step) || typeof step.operationId !== "string" || !known.has(step.operationId)) {
-      return [];
+  options: PlanOptions,
+): TestPlanCase {
+  if (
+    !isRecord(value) ||
+    typeof value.title !== "string" ||
+    value.title.trim().length === 0 ||
+    typeof value.objective !== "string" ||
+    value.objective.trim().length === 0 ||
+    !Array.isArray(value.steps) ||
+    value.steps.length === 0 ||
+    !isRecord(value.oracle) ||
+    Object.keys(value.oracle).length === 0
+  ) {
+    throw new PlannerModelValidationError(
+      `Planner augmentation case ${index} is structurally invalid`,
+    );
+  }
+
+  const operations = new Map(
+    contract.operations.map((operation) => [operation.id, operation]),
+  );
+  const steps = value.steps.map((step, stepIndex) => {
+    if (
+      !isRecord(step) ||
+      typeof step.operationId !== "string" ||
+      !("input" in step)
+    ) {
+      throw new PlannerModelValidationError(
+        `Planner augmentation case ${index} step ${stepIndex} is invalid`,
+      );
     }
-    return [{ operationId: step.operationId, input: step.input ?? null }];
+    const operation = operations.get(step.operationId);
+    if (operation === undefined) {
+      throw new PlannerModelValidationError(
+        `Planner augmentation references unknown operationId ${safeIdentifier(step.operationId)}`,
+      );
+    }
+    if (operation.effects === "destructive" && !options.includeDestructive) {
+      throw new PlannerModelValidationError(
+        `Planner augmentation references destructive operation ${safeIdentifier(step.operationId)} while destructive cases are disabled`,
+      );
+    }
+    return { operationId: operation.id, input: step.input };
   });
-  if (steps.length === 0) return undefined;
-  const id = stableCaseId(steps[0]?.operationId ?? "case", value.title, 0);
+
+  const selectedOperations = [
+    ...new Map(
+      steps.map((step) => [step.operationId, operations.get(step.operationId)!]),
+    ).values(),
+  ];
+  const firstOperation = selectedOperations[0];
+  if (firstOperation === undefined) {
+    throw new PlannerModelValidationError(
+      `Planner augmentation case ${index} has no executable step`,
+    );
+  }
+  const title = value.title.trim();
+  const objective = value.objective.trim();
+  const id = stableCaseId(firstOperation.id, title, index);
+  const deterministicOracles = selectedOperations.flatMap((operation) =>
+    buildOracles(operation, "unknown"),
+  );
+  const effects = [...new Set(selectedOperations.map((operation) => operation.effects))];
   return {
     id,
-    title: value.title,
-    objective: value.objective,
+    title,
+    objective,
     operationIds: [...new Set(steps.map((step) => step.operationId))],
-    preconditions: [],
+    preconditions: [
+      ...new Set(selectedOperations.flatMap((operation) => operation.preconditions)),
+    ],
     steps,
     oracles: [
+      ...deterministicOracles,
       {
         kind: "model-proposed",
-        expression: isRecord(value.oracle) ? value.oracle : { expectedValidity: "unknown" },
+        expression: value.oracle,
         rationale: "Model-proposed oracle pending deterministic execution evidence",
         strength: "weak",
       },
     ],
-    risk: { severity: "medium", dimensions: ["model-proposed"] },
+    risk: {
+      severity: strongestModelRisk(selectedOperations),
+      dimensions: ["model-proposed", ...effects.map((effect) => `effect:${effect}`)],
+    },
     provenance: [contractRef],
     generatedBy: "model",
   };
+}
+
+function strongestModelRisk(
+  operations: readonly SutOperation[],
+): TestPlanCase["risk"]["severity"] {
+  let severity: TestPlanCase["risk"]["severity"] = "medium";
+  for (const operation of operations) {
+    if (operation.effects === "destructive") return "critical";
+    if (operation.effects === "write" || operation.effects === "unknown") {
+      severity = "high";
+    }
+  }
+  return severity;
+}
+
+function safeIdentifier(value: string): string {
+  return JSON.stringify(value.replace(/[\r\n\t]+/g, " ").slice(0, 120));
 }
 
 function deduplicateCases(cases: readonly TestPlanCase[]): TestPlanCase[] {

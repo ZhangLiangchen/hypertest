@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hypertest.dev/schemas/model-usage.v1.schema.json",
+  "title": "HyperTest Model Usage v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "runId",
+    "providerCalls",
+    "usageUnavailableCalls",
+    "inputTokens",
+    "outputTokens",
+    "cachedTokens",
+    "totalTokens",
+    "retryCount",
+    "totalLatencyMs",
+    "estimatedCostUsd",
+    "records"
+  ],
+  "properties": {
+    "schema": { "const": "hypertest.model-usage/v1" },
+    "runId": { "type": "string", "minLength": 1 },
+    "providerCalls": { "type": "integer", "minimum": 0 },
+    "usageUnavailableCalls": { "type": "integer", "minimum": 0 },
+    "inputTokens": { "type": "integer", "minimum": 0 },
+    "outputTokens": { "type": "integer", "minimum": 0 },
+    "cachedTokens": { "type": "integer", "minimum": 0 },
+    "totalTokens": { "type": "integer", "minimum": 0 },
+    "retryCount": { "type": "integer", "minimum": 0 },
+    "totalLatencyMs": { "type": "integer", "minimum": 0 },
+    "estimatedCostUsd": { "type": "number", "minimum": 0 },
+    "records": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "provider",
+          "model",
+          "endpointFingerprint",
+          "latencyMs",
+          "retryCount",
+          "usageUnavailable"
+        ],
+        "properties": {
+          "provider": { "type": "string", "minLength": 1 },
+          "model": { "type": "string", "minLength": 1 },
+          "endpointFingerprint": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+          "providerRequestId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/+=-]*$"
+          },
+          "inputTokens": { "type": "integer", "minimum": 0 },
+          "outputTokens": { "type": "integer", "minimum": 0 },
+          "cachedTokens": { "type": "integer", "minimum": 0 },
+          "latencyMs": { "type": "integer", "minimum": 0 },
+          "retryCount": { "type": "integer", "minimum": 0 },
+          "stopReason": { "type": "string" },
+          "usageUnavailable": { "type": "boolean" },
+          "estimatedCostUsd": { "type": "number", "minimum": 0 }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": { "usageUnavailable": { "const": true } },
+              "required": ["usageUnavailable"]
+            },
+            "then": {
+              "properties": {
+                "inputTokens": false,
+                "outputTokens": false,
+                "cachedTokens": false,
+                "estimatedCostUsd": false
+              }
+            },
+            "else": { "required": ["inputTokens", "outputTokens"] }
+          }
+        ]
+      }
+    }
+  }
+}

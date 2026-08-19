@@ -3,6 +3,7 @@ import { extname, join, relative } from "node:path";
 
 const root = new URL("../", import.meta.url);
 const sourceRoot = new URL("../src/", import.meta.url);
+const testRoot = new URL("../tests/", import.meta.url);
 const ecosystemTerms = [
   "pytest",
   "go test",
@@ -13,7 +14,14 @@ const ecosystemTerms = [
   "github actions",
   "openapi",
 ];
-const piPackageFragments = ["pi-agent-core", "@earendil-works/pi"];
+const piPackagePattern = /@earendil-works\/pi-[a-z0-9-]+/i;
+const forbiddenAgentDependencyFragments = [
+  "codex",
+  "opencode",
+  "openhands",
+  "metagpt",
+  "hermes",
+];
 const violations = [];
 
 async function walk(directory) {
@@ -21,7 +29,9 @@ async function walk(directory) {
   for (const entry of entries) {
     const path = join(directory, entry.name);
     if (entry.isDirectory()) await walk(path);
-    else if ([".ts", ".mts", ".cts"].includes(extname(entry.name))) await inspect(path);
+    else if ([".ts", ".mts", ".cts"].includes(extname(entry.name))) {
+      await inspect(path);
+    }
   }
 }
 
@@ -29,12 +39,42 @@ async function inspect(path) {
   const text = await readFile(path, "utf8");
   const normalized = relative(root.pathname, path).replaceAll("\\", "/");
   const lower = text.toLowerCase();
+  const isPiBoundary = normalized.startsWith("src/runtime/pi/");
+
+  if (piPackagePattern.test(text) && !isPiBoundary) {
+    violations.push(`${normalized}: Pi SDK reference outside src/runtime/pi`);
+  }
+
+  if (isPiBoundary) {
+    if (/\b(?:as\s+)?any\b/.test(text)) {
+      violations.push(`${normalized}: any is forbidden in the Pi adapter`);
+    }
+    if (/unknown\s+as\s+Pi[A-Z]/.test(text)) {
+      violations.push(`${normalized}: unsafe unknown-as-Pi assertion`);
+    }
+    if (/\bimport\s*\(/.test(text)) {
+      violations.push(`${normalized}: dynamic import is forbidden in the Pi adapter`);
+    }
+    if (/\.join\s*\(\s*["']\/["']\s*\)/.test(text)) {
+      violations.push(`${normalized}: dynamic package path assembly is forbidden`);
+    }
+  } else if (
+    /^\s*(?:export\s+)?(?:interface|type)\s+Pi[A-Z][A-Za-z0-9_]*/m.test(
+      text,
+    )
+  ) {
+    violations.push(`${normalized}: Pi shadow type outside src/runtime/pi`);
+  }
 
   if (
-    piPackageFragments.some((fragment) => lower.includes(fragment.toLowerCase())) &&
-    !normalized.startsWith("src/runtime/pi/")
+    (normalized === "src/runtime.ts" || normalized.startsWith("src/runtime/")) &&
+    /return\s*\{\s*text\s*:/.test(text)
   ) {
-    violations.push(`${normalized}: pi SDK reference outside src/runtime/pi`);
+    violations.push(`${normalized}: invalid model output text fallback`);
+  }
+
+  if (/\bfork\s*\(/.test(text)) {
+    violations.push(`${normalized}: process fork is forbidden`);
   }
 
   const isAdapter = normalized.startsWith("src/adapters/");
@@ -43,17 +83,74 @@ async function inspect(path) {
   if (!isAdapter && !isAdapterCli && !isProfileExampleAwareCli) {
     for (const term of ecosystemTerms) {
       if (lower.includes(term)) {
-        violations.push(`${normalized}: ecosystem-specific term '${term}' outside adapter boundary`);
+        violations.push(
+          `${normalized}: ecosystem-specific term '${term}' outside adapter boundary`,
+        );
       }
     }
   }
 
-  if (normalized.startsWith("src/adapters/") && text.includes("@earendil-works/pi")) {
+  if (isAdapter && piPackagePattern.test(text)) {
     violations.push(`${normalized}: adapter imports the agent SDK`);
   }
 }
 
+async function inspectPiReferences(directory) {
+  const entries = await readdir(directory, { withFileTypes: true });
+  for (const entry of entries) {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) {
+      await inspectPiReferences(path);
+      continue;
+    }
+    if (![".ts", ".mts", ".cts"].includes(extname(entry.name))) continue;
+    const text = await readFile(path, "utf8");
+    if (piPackagePattern.test(text)) {
+      const normalized = relative(root.pathname, path).replaceAll("\\", "/");
+      violations.push(`${normalized}: Pi SDK reference outside src/runtime/pi`);
+    }
+  }
+}
+
+async function inspectDependencies() {
+  const packageDocument = JSON.parse(
+    await readFile(new URL("../package.json", import.meta.url), "utf8"),
+  );
+  const dependencyNames = Object.keys({
+    ...(packageDocument.dependencies ?? {}),
+    ...(packageDocument.devDependencies ?? {}),
+    ...(packageDocument.optionalDependencies ?? {}),
+  });
+  for (const name of dependencyNames) {
+    const lower = name.toLowerCase();
+    if (
+      forbiddenAgentDependencyFragments.some((fragment) =>
+        lower.includes(fragment),
+      )
+    ) {
+      violations.push(`${name}: second agent SDK dependency is forbidden`);
+    }
+  }
+  const piDependencies = dependencyNames.filter((name) =>
+    piPackagePattern.test(name),
+  );
+  const allowedPiDependencies = new Set([
+    "@earendil-works/pi-agent-core",
+    "@earendil-works/pi-ai",
+  ]);
+  for (const name of piDependencies) {
+    if (!allowedPiDependencies.has(name)) {
+      violations.push(`${name}: unapproved Pi package dependency`);
+    }
+  }
+  if (!dependencyNames.includes("@earendil-works/pi-agent-core")) {
+    violations.push("package.json: missing sole SDK-level agent runtime");
+  }
+}
+
 await walk(sourceRoot.pathname);
+await inspectPiReferences(testRoot.pathname);
+await inspectDependencies();
 if (violations.length > 0) {
   console.error("Architecture boundary violations:\n" + violations.join("\n"));
   process.exitCode = 1;

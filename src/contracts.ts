@@ -316,16 +316,26 @@ export interface RunRequest {
   readonly budget: RunBudget;
 }
 
+export type RunFinalState =
+  | "planned"
+  | "verified"
+  | "completed"
+  | "needs_human"
+  | "rejected"
+  | "failed";
+
 export interface RunSummary {
   readonly schema: "hypertest.run-summary/v1";
   readonly runId: string;
   readonly sourceRevision: string;
-  readonly finalState: string;
+  readonly finalState: RunFinalState;
   readonly testPlan?: ArtifactRef<"test-plan">;
   readonly patch?: ArtifactRef<"patch">;
   readonly testRun?: ArtifactRef<"test-run">;
   readonly coverage?: ArtifactRef<"coverage-map">;
   readonly diagnosis?: ArtifactRef<"diagnosis">;
+  readonly modelUsage: ArtifactRef<"model-usage">;
+  readonly ledger: ArtifactRef<"run-ledger">;
   readonly gateDecisions: readonly ArtifactRef<"gate-decision">[];
   readonly change?: {
     readonly id: string;

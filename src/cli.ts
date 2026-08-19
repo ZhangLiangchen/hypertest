@@ -5,10 +5,13 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { Json, RunRequest } from "./contracts.js";
+import type { ResolvedModelConfig } from "./model-config.js";
+import { resolveModelConfig } from "./model-config.js";
 import { HyperTestOrchestrator } from "./orchestrator.js";
 import { loadProfile } from "./profile.js";
 import { runProcess } from "./process.js";
 import { FakeAgentRuntime } from "./runtime.js";
+import { createOpenAICompatibleRuntime } from "./runtime/pi/openai-compatible.js";
 
 const args = process.argv.slice(2);
 const command = args[0] ?? "help";
@@ -33,16 +36,32 @@ try {
       budget: profile.runtime.budgets,
     };
     const fakeResult = option(args, "--fake-result");
-    const runtime = fakeResult === undefined
-      ? undefined
-      : new FakeAgentRuntime(JSON.parse(fakeResult) as Json);
+    const configured =
+      fakeResult === undefined
+        ? (() => {
+            const config = resolveModelConfig(profile.runtime);
+            return {
+              runtime: createConfiguredRuntime(config),
+              runtimeProvider: config.provider,
+            };
+          })()
+        : {
+            runtime: new FakeAgentRuntime(JSON.parse(fakeResult) as Json),
+            runtimeProvider: "openai-compatible" as const,
+          };
     const orchestrator = new HyperTestOrchestrator({
       artifactRoot: option(args, "--artifact-root") ?? resolve(workspacePath, ".testagent"),
-      ...(runtime === undefined ? {} : { runtime }),
+      ...(configured.runtime === undefined
+        ? {}
+        : { runtime: configured.runtime }),
+      runtimeProvider: configured.runtimeProvider,
     });
     const summary = await orchestrator.run(request);
     process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
-    if (["failed", "rejected"].includes(summary.finalState)) process.exitCode = 1;
+    if (summary.finalState === "needs_human") process.exitCode = 2;
+    else if (!["planned", "verified", "completed"].includes(summary.finalState)) {
+      process.exitCode = 1;
+    }
   } else if (command === "validate-profile") {
     const path = requiredOption(args, "--profile");
     const profile = await loadProfile(path);
@@ -54,7 +73,7 @@ try {
     await writeFile(output, `${JSON.stringify(initialProfile(kind), null, 2)}\n`, { flag: "wx" });
     process.stdout.write(`Created ${output}\n`);
   } else if (command === "version" || args.includes("--version")) {
-    process.stdout.write("hypertest 0.1.0\n");
+    process.stdout.write("hypertest 0.2.0\n");
   } else {
     printHelp();
     if (command !== "help" && command !== "--help" && command !== "-h") process.exitCode = 64;
@@ -62,6 +81,14 @@ try {
 } catch (error) {
   console.error(error instanceof Error ? error.stack ?? error.message : String(error));
   process.exitCode = 1;
+}
+
+function createConfiguredRuntime(
+  config: ResolvedModelConfig,
+) {
+  return config.provider === "deterministic"
+    ? undefined
+    : createOpenAICompatibleRuntime(config);
 }
 
 function initialProfile(kind: string): Json {
@@ -151,5 +178,7 @@ function printHelp(): void {
     `  hypertest run --profile <file> [--mode execute|repair|propose]\n` +
     `  hypertest validate-profile --profile <file>\n` +
     `  hypertest init [--kind http|command] [--profile <file>]\n` +
-    `  hypertest version\n`);
+    `  hypertest version\n\n` +
+    `Development testing:\n` +
+    `  --fake-result <json>  explicitly bypass the configured model runtime\n`);
 }

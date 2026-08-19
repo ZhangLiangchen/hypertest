@@ -31,12 +31,20 @@ import {
   type QualityGate,
 } from "./gate.js";
 import { createTestPlan } from "./planner.js";
+import type { ModelRuntimeProvider } from "./model-config.js";
 import type { AdapterCommandProfile, HyperTestProfile } from "./profile.js";
 import { loadProfile } from "./profile.js";
 import { validateRepairPatch } from "./repair.js";
-import type { AgentRuntime } from "./runtime.js";
-import { collectAgentResult } from "./runtime.js";
+import type { AgentRuntime, AgentUsageSummary } from "./runtime.js";
 import {
+  AgentRuntimeError,
+  aggregateAgentUsage,
+  assertValidAgentUsageSummary,
+  collectAgentRun,
+  emptyAgentUsageSummary,
+} from "./runtime.js";
+import {
+  assertValidRunLedger,
   createRunLedger,
   recordTransition,
   type RunEvent,
@@ -46,8 +54,21 @@ import {
 export interface OrchestratorOptions {
   readonly artifactRoot?: string;
   readonly runtime?: AgentRuntime;
+  readonly runtimeProvider?: ModelRuntimeProvider;
   readonly now?: () => number;
 }
+
+type SummaryFields = Omit<
+  RunSummary,
+  | "schema"
+  | "runId"
+  | "sourceRevision"
+  | "finalState"
+  | "modelUsage"
+  | "ledger"
+  | "gateDecisions"
+  | "warnings"
+>;
 
 export class HyperTestOrchestrator {
   private readonly artifactRoot: string;
@@ -66,8 +87,19 @@ export class HyperTestOrchestrator {
     const workspace = workspaceRef(request.workspacePath, request.sourceRevision);
     let ledger = createRunLedger(request.runId);
     const warnings: string[] = [];
+    let modelUsage: AgentUsageSummary = emptyAgentUsageSummary(request.runId);
+    let modelUsageRef: ArtifactRef<"model-usage"> | undefined;
+    let summaryFields: SummaryFields = {};
     const gateDecisionRefs: ArtifactRef<"gate-decision">[] = [];
     const qualityGate = createQualityGate(profile);
+    const runtimeProvider =
+      this.options.runtimeProvider ?? profile.runtime.provider;
+    const modelRuntime =
+      runtimeProvider === "deterministic" ? undefined : this.options.runtime;
+    const tokenBudget = Math.min(
+      request.budget.tokenBudget,
+      profile.runtime.budgets.tokenBudget,
+    );
 
     const emit = async (event: string, detail?: Json): Promise<void> => {
       await this.store.appendEvent(request.runId, {
@@ -80,6 +112,50 @@ export class HyperTestOrchestrator {
     const advance = async (event: RunEvent, detail?: string): Promise<void> => {
       ledger = recordTransition(ledger, event, this.now(), detail);
       await emit("transition", { event, to: ledger.state });
+    };
+    const mergeModelUsage = (summary: AgentUsageSummary): void => {
+      modelUsage = aggregateAgentUsage(request.runId, [
+        ...modelUsage.records,
+        ...summary.records,
+      ]);
+    };
+    const persistModelUsage = async (): Promise<ArtifactRef<"model-usage">> => {
+      if (modelUsageRef !== undefined) return modelUsageRef;
+      assertValidAgentUsageSummary(modelUsage);
+      modelUsageRef = await this.store.putJson({
+        runId: request.runId,
+        relativePath: "model-usage.json",
+        kind: "model-usage",
+        schema: "hypertest.model-usage/v1",
+        sourceRevision: request.sourceRevision,
+        value: modelUsage as unknown as Json,
+      });
+      warnings.push(`model-usage=${modelUsageRef.uri}`);
+      await emit("model_usage_recorded", {
+        artifactUri: modelUsageRef.uri,
+        artifactSha256: modelUsageRef.sha256,
+        providerCalls: modelUsage.providerCalls,
+        usageUnavailableCalls: modelUsage.usageUnavailableCalls,
+        inputTokens: modelUsage.inputTokens,
+        outputTokens: modelUsage.outputTokens,
+        cachedTokens: modelUsage.cachedTokens,
+        retryCount: modelUsage.retryCount,
+      });
+      return modelUsageRef;
+    };
+    const finish = async (
+      finalState: RunSummary["finalState"],
+      fields: SummaryFields,
+    ): Promise<RunSummary> => {
+      const usageRef = await persistModelUsage();
+      return this.finishSummary(
+        request,
+        ledger,
+        finalState,
+        { ...fields, modelUsage: usageRef },
+        gateDecisionRefs,
+        warnings,
+      );
     };
 
     try {
@@ -128,19 +204,43 @@ export class HyperTestOrchestrator {
       await advance("analysis_ready");
       this.assertDeadline(deadline);
 
-      const planningRuntime =
-        profile.runtime.provider === "deterministic"
-          ? undefined
-          : this.options.runtime;
+      if (runtimeProvider !== "deterministic" && modelRuntime === undefined) {
+        throw new Error(
+          `Runtime provider ${runtimeProvider} was selected but no AgentRuntime was configured`,
+        );
+      }
       const plan = await createTestPlan(contract, contractRef, {
         maxCasesPerOperation: 12,
-        ...(planningRuntime === undefined ? {} : { runtime: planningRuntime }),
+        ...(modelRuntime === undefined ? {} : { runtime: modelRuntime }),
         runId: request.runId,
-        tokenBudget: Math.min(
-          request.budget.tokenBudget,
-          profile.runtime.budgets.tokenBudget,
-        ),
+        tokenBudget,
         deadlineEpochMs: deadline,
+        maxTurns: Math.min(
+          request.budget.maxTurns,
+          profile.runtime.budgets.maxTurns,
+        ),
+        maxToolCalls: Math.min(
+          request.budget.maxToolCalls,
+          profile.runtime.budgets.maxToolCalls,
+        ),
+        onUsage: (summary) => {
+          mergeModelUsage(summary);
+        },
+        onAgentEvent: async (event) => {
+          if (event.type === "tool_requested") {
+            await emit("model_tool_requested", {
+              callId: event.callId,
+              name: event.name,
+            });
+          } else if (event.type === "tool_completed") {
+            await emit("model_tool_completed", {
+              callId: event.callId,
+              name: event.name,
+              durationMs: event.durationMs,
+              status: event.isError ? "error" : "ok",
+            });
+          }
+        },
       });
       const planRef = await this.store.putJson({
         runId: request.runId,
@@ -150,17 +250,11 @@ export class HyperTestOrchestrator {
         sourceRevision: request.sourceRevision,
         value: plan as unknown as Json,
       });
+      summaryFields = { ...summaryFields, testPlan: planRef };
       await advance("plan_ready");
 
       if (request.mode === "plan") {
-        return this.finishSummary(
-          request,
-          ledger,
-          "planned",
-          { testPlan: planRef },
-          gateDecisionRefs,
-          warnings,
-        );
+        return finish("planned", { testPlan: planRef });
       }
 
       const preCode = await this.authorize(
@@ -172,14 +266,7 @@ export class HyperTestOrchestrator {
       );
       await advance(eventForVerdict(preCode));
       if (preCode.verdict !== "allow") {
-        return this.finishSummary(
-          request,
-          ledger,
-          ledger.state,
-          { testPlan: planRef },
-          gateDecisionRefs,
-          warnings,
-        );
+        return finish(blockedOutcome(preCode), { testPlan: planRef });
       }
 
       const testClient = new ProcessAdapterClient(
@@ -208,6 +295,7 @@ export class HyperTestOrchestrator {
         },
       );
       let patchRef = requireArtifactOutcome(renderResponse, "patch") as ArtifactRef<"patch">;
+      summaryFields = { ...summaryFields, patch: patchRef };
       await advance("patch_rendered");
 
       const validation = await testClient.invoke<Json, ArtifactRef<"validation-report">>(
@@ -231,18 +319,11 @@ export class HyperTestOrchestrator {
         gateDecisionRefs,
       );
       if (applyDecision.verdict !== "allow") {
-        ledger = {
-          ...ledger,
-          state: applyDecision.verdict === "deny" ? "rejected" : "needs_human",
-        };
-        return this.finishSummary(
-          request,
-          ledger,
-          ledger.state,
-          { testPlan: planRef, patch: patchRef },
-          gateDecisionRefs,
-          warnings,
-        );
+        await advance(eventForVerdict(applyDecision));
+        return finish(blockedOutcome(applyDecision), {
+          testPlan: planRef,
+          patch: patchRef,
+        });
       }
 
       let runRef: ArtifactRef<"test-run"> | undefined;
@@ -266,6 +347,7 @@ export class HyperTestOrchestrator {
           },
         );
         runRef = requireArtifactOutcome(runResponse, "test-run") as ArtifactRef<"test-run">;
+        summaryFields = { ...summaryFields, testRun: runRef };
         const testRun = await this.store.readJson<TestRun>(runRef);
         coverageRef = await this.normalizeCoverageIfAvailable(
           profile,
@@ -274,6 +356,9 @@ export class HyperTestOrchestrator {
           deadline,
           runResponse,
         );
+        if (coverageRef !== undefined) {
+          summaryFields = { ...summaryFields, coverage: coverageRef };
+        }
 
         if (testRun.status === "passed") {
           await advance("tests_passed");
@@ -296,27 +381,50 @@ export class HyperTestOrchestrator {
           sourceRevision: request.sourceRevision,
           value: lastDiagnosis as unknown as Json,
         });
+        summaryFields = { ...summaryFields, diagnosis: diagnosisRef };
 
         const repairLimit = Math.min(
+          2,
           request.budget.maxRepairRounds,
           profile.runtime.budgets.maxRepairRounds,
         );
         if (
           !lastDiagnosis.repairAllowed ||
           ledger.repairRounds >= repairLimit ||
-          this.options.runtime === undefined
+          modelRuntime === undefined
         ) {
           await advance("unsafe_or_unknown");
           break;
         }
         await advance("safe_repair");
+        if (modelUsage.usageUnavailableCalls > 0) {
+          await advance(
+            "human_required",
+            "Model usage is unavailable, so repair cannot be authorized within the hard token budget",
+          );
+          break;
+        }
+        const remainingTokenBudget = Math.max(
+          0,
+          tokenBudget - modelUsage.totalTokens,
+        );
+        if (remainingTokenBudget === 0) {
+          await advance(
+            "human_required",
+            "Model token budget exhausted before repair",
+          );
+          break;
+        }
         const repairPatch = await this.generateRepairPatch(
+          modelRuntime,
           request,
           deadline,
           plan,
           patchRef,
           runRef,
           diagnosisRef,
+          remainingTokenBudget,
+          mergeModelUsage,
         );
         const patchText = await this.store.readText(repairPatch);
         const safety = validateRepairPatch(lastDiagnosis, patchText, {
@@ -341,14 +449,13 @@ export class HyperTestOrchestrator {
         await advance(eventForVerdict(repairDecision));
         if (repairDecision.verdict !== "allow") break;
         patchRef = repairPatch;
+        summaryFields = { ...summaryFields, patch: patchRef };
         await advance("repair_applied");
       }
 
       if (ledger.state !== "publish_gate") {
-        return this.finishSummary(
-          request,
-          ledger,
-          ledger.state === "verify" ? "verified" : ledger.state,
+        return finish(
+          stoppedOutcome(ledger.state),
           {
             testPlan: planRef,
             patch: patchRef,
@@ -356,15 +463,11 @@ export class HyperTestOrchestrator {
             ...(coverageRef === undefined ? {} : { coverage: coverageRef }),
             ...(diagnosisRef === undefined ? {} : { diagnosis: diagnosisRef }),
           },
-          gateDecisionRefs,
-          warnings,
         );
       }
 
       if (request.mode !== "propose") {
-        return this.finishSummary(
-          request,
-          ledger,
+        return finish(
           "verified",
           {
             testPlan: planRef,
@@ -373,16 +476,12 @@ export class HyperTestOrchestrator {
             ...(coverageRef === undefined ? {} : { coverage: coverageRef }),
             ...(diagnosisRef === undefined ? {} : { diagnosis: diagnosisRef }),
           },
-          gateDecisionRefs,
-          warnings,
         );
       }
 
       if (profile.adapters.scm === undefined) {
         warnings.push("No SCM adapter is configured; verified patch was not published");
-        return this.finishSummary(
-          request,
-          ledger,
+        return finish(
           "verified",
           {
             testPlan: planRef,
@@ -390,8 +489,6 @@ export class HyperTestOrchestrator {
             ...(runRef === undefined ? {} : { testRun: runRef }),
             ...(coverageRef === undefined ? {} : { coverage: coverageRef }),
           },
-          gateDecisionRefs,
-          warnings,
         );
       }
 
@@ -417,14 +514,11 @@ export class HyperTestOrchestrator {
       );
       await advance(eventForVerdict(publishDecision));
       if (publishDecision.verdict !== "allow") {
-        return this.finishSummary(
-          request,
-          ledger,
-          ledger.state,
-          { testPlan: planRef, patch: patchRef, testRun: runRef! },
-          gateDecisionRefs,
-          warnings,
-        );
+        return finish(blockedOutcome(publishDecision), {
+          testPlan: planRef,
+          patch: patchRef,
+          testRun: runRef!,
+        });
       }
 
       const scmClient = new ProcessAdapterClient(
@@ -459,10 +553,8 @@ export class HyperTestOrchestrator {
         );
       }
       await advance("published");
-      return this.finishSummary(
-        request,
-        ledger,
-        ledger.state,
+      return finish(
+        "completed",
         {
           testPlan: planRef,
           patch: patchRef,
@@ -474,13 +566,11 @@ export class HyperTestOrchestrator {
             url: publishResponse.outcome.url,
           },
         },
-        gateDecisionRefs,
-        warnings,
       );
     } catch (error) {
-      await emit("run_failed", {
-        message: error instanceof Error ? error.message : String(error),
-      });
+      const failureMessage =
+        error instanceof Error ? error.message : String(error);
+      await persistModelUsage();
       if (
         ledger.state !== "completed" &&
         ledger.state !== "needs_human" &&
@@ -488,20 +578,19 @@ export class HyperTestOrchestrator {
         ledger.state !== "failed"
       ) {
         try {
-          ledger = recordTransition(ledger, "fatal_error", this.now());
+          await advance("fatal_error", failureMessage);
         } catch {
           ledger = { ...ledger, state: "failed" };
+          await emit("transition", {
+            event: "fatal_error",
+            to: "failed",
+            recovered: true,
+          });
         }
       }
-      warnings.push(error instanceof Error ? error.message : String(error));
-      return this.finishSummary(
-        request,
-        ledger,
-        "failed",
-        {},
-        gateDecisionRefs,
-        warnings,
-      );
+      await emit("run_failed", { message: failureMessage });
+      warnings.push(failureMessage);
+      return finish("failed", summaryFields);
     }
   }
 
@@ -561,29 +650,58 @@ export class HyperTestOrchestrator {
   }
 
   private async generateRepairPatch(
+    runtime: AgentRuntime,
     request: RunRequest,
     deadline: number,
     plan: TestPlan,
     currentPatch: ArtifactRef<"patch">,
     runRef: ArtifactRef<"test-run">,
     diagnosisRef: ArtifactRef<"diagnosis">,
+    tokenBudget: number,
+    onUsage: (summary: AgentUsageSummary) => void,
   ): Promise<ArtifactRef<"patch">> {
-    const result = await collectAgentResult(this.options.runtime!, {
-      runId: `${request.runId}-repair-${randomUUID()}`,
-      phase: "repair",
-      systemPrompt:
-        "Return JSON with patchText containing a complete replacement unified diff. Preserve or strengthen every oracle. Never add skips, expected failures, broad exception swallowing, or production-code edits.",
-      prompt: JSON.stringify({
-        plan,
-        currentPatch: await this.store.readText(currentPatch),
-        testRun: await this.store.readJson<TestRun>(runRef),
-        diagnosis: await this.store.readJson<Diagnosis>(diagnosisRef),
-      }),
-      tools: [],
-      artifacts: [currentPatch, runRef, diagnosisRef],
-      tokenBudget: request.budget.tokenBudget,
-      deadlineEpochMs: deadline,
-    });
+    let outcome;
+    try {
+      outcome = await collectAgentRun(runtime, {
+        runId: `${request.runId}-repair-${randomUUID()}`,
+        phase: "repair",
+        systemPrompt:
+          "Return JSON with patchText containing a complete replacement unified diff. Preserve or strengthen every oracle. Never add skips, expected failures, broad exception swallowing, or production-code edits.",
+        prompt: JSON.stringify({
+          plan,
+          currentPatch: await this.store.readText(currentPatch),
+          testRun: await this.store.readJson<TestRun>(runRef),
+          diagnosis: await this.store.readJson<Diagnosis>(diagnosisRef),
+        }),
+        tools: [],
+        artifacts: [currentPatch, runRef, diagnosisRef],
+        tokenBudget,
+        deadlineEpochMs: deadline,
+        expectedResultSchema: {
+          type: "object",
+          additionalProperties: false,
+          required: ["patchText"],
+          properties: {
+            patchText: {
+              type: "string",
+              minLength: 1,
+              maxLength: 1_048_576,
+            },
+          },
+        },
+        maxTurns: 1,
+        maxToolCalls: 0,
+        maxOutputBytes: 1_048_576,
+        maxOutputTokens: Math.max(1, Math.min(tokenBudget, 4_096)),
+      });
+    } catch (error) {
+      if (error instanceof AgentRuntimeError && error.usage !== undefined) {
+        onUsage(error.usage);
+      }
+      throw error;
+    }
+    onUsage(outcome.usage);
+    const result = outcome.result;
     if (!isRecord(result) || typeof result.patchText !== "string") {
       throw new Error("Repair runtime did not return patchText");
     }
@@ -601,11 +719,15 @@ export class HyperTestOrchestrator {
   private async finishSummary(
     request: RunRequest,
     ledger: RunLedger,
-    finalState: string,
-    fields: Omit<RunSummary, "schema" | "runId" | "sourceRevision" | "finalState" | "gateDecisions" | "warnings">,
+    finalState: RunSummary["finalState"],
+    fields: SummaryFields & {
+      readonly modelUsage: ArtifactRef<"model-usage">;
+    },
     gateDecisions: readonly ArtifactRef<"gate-decision">[],
     warnings: readonly string[],
   ): Promise<RunSummary> {
+    assertSummaryLedgerState(finalState, ledger);
+    assertValidRunLedger(ledger);
     const ledgerRef = await this.store.putJson({
       runId: request.runId,
       relativePath: "run-ledger.json",
@@ -620,6 +742,7 @@ export class HyperTestOrchestrator {
       sourceRevision: request.sourceRevision,
       finalState,
       ...fields,
+      ledger: ledgerRef,
       gateDecisions,
       warnings: [...warnings, `ledger=${ledgerRef.uri}`],
     };
@@ -636,6 +759,25 @@ export class HyperTestOrchestrator {
 
   private assertDeadline(deadline: number): void {
     if (this.now() >= deadline) throw new Error("HyperTest run deadline exceeded");
+  }
+}
+
+function assertSummaryLedgerState(
+  finalState: RunSummary["finalState"],
+  ledger: RunLedger,
+): void {
+  const expected: Record<RunSummary["finalState"], RunLedger["state"]> = {
+    planned: "pre_code_gate",
+    verified: "publish_gate",
+    completed: "completed",
+    needs_human: "needs_human",
+    rejected: "rejected",
+    failed: "failed",
+  };
+  if (ledger.state !== expected[finalState]) {
+    throw new Error(
+      `Run outcome ${finalState} is inconsistent with ledger state ${ledger.state}`,
+    );
   }
 }
 
@@ -699,6 +841,27 @@ function eventForVerdict(decision: GateDecision): RunEvent {
   if (decision.verdict === "allow") return "allowed";
   if (decision.verdict === "deny") return "denied";
   return "human_required";
+}
+
+function blockedOutcome(
+  decision: GateDecision,
+): "rejected" | "needs_human" {
+  if (decision.verdict === "deny") return "rejected";
+  if (decision.verdict === "needs_human") return "needs_human";
+  throw new Error("An allow decision is not a blocked run outcome");
+}
+
+function stoppedOutcome(
+  state: RunLedger["state"],
+): "needs_human" | "rejected" | "failed" {
+  if (
+    state === "needs_human" ||
+    state === "rejected" ||
+    state === "failed"
+  ) {
+    return state;
+  }
+  throw new Error(`Run stopped in a non-terminal ledger state: ${state}`);
 }
 
 function basenameSafe(path: string): string {

@@ -23,23 +23,60 @@
     },
     "runtime": {
       "type": "object",
+      "additionalProperties": false,
       "required": [
-        "provider",
-        "budgets"
+        "provider"
       ],
       "properties": {
         "provider": {
           "enum": [
             "deterministic",
-            "fake",
-            "pi"
+            "openai-compatible"
           ]
         },
         "model": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "budgets": {
-          "type": "object"
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "maxTurns": { "type": "integer", "minimum": 1 },
+            "maxToolCalls": { "type": "integer", "minimum": 1 },
+            "maxRepairRounds": { "type": "integer", "minimum": 0, "maximum": 2 },
+            "wallClockMs": { "type": "integer", "minimum": 1 },
+            "tokenBudget": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "baseUrl": {
+          "type": "string",
+          "minLength": 1
+        },
+        "timeoutMs": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 600000
+        },
+        "maxRetries": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10
+        },
+        "maxOutputTokens": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 131072
+        },
+        "maxTurns": { "type": "integer", "minimum": 1 },
+        "maxToolCalls": { "type": "integer", "minimum": 1 },
+        "maxRepairRounds": { "type": "integer", "minimum": 0, "maximum": 2 },
+        "wallClockMs": { "type": "integer", "minimum": 1 },
+        "tokenBudget": { "type": "integer", "minimum": 1 },
+        "max_repair_rounds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2
         }
       }
     },

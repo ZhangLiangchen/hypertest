@@ -1,6 +1,6 @@
 {
   "name": "hypertest",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "A general-purpose, cross-language AI test development agent governed by BUGate.",
   "type": "module",
@@ -20,10 +20,13 @@
     "test": "npm run build && node --test dist/tests/*.test.js",
     "test:examples": "npm run build && node scripts/run-examples.mjs",
     "ci": "npm run check && npm test",
-    "check:schemas": "node scripts/check-schemas.mjs"
+    "check:schemas": "node scripts/check-schemas.mjs",
+    "test:model:live": "npm run build && node scripts/test-model-live.mjs"
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "0.84.1"
+    "@earendil-works/pi-agent-core": "0.84.1",
+    "@earendil-works/pi-ai": "0.84.1",
+    "typebox": "1.3.7"
   },
   "devDependencies": {
     "@types/node": "24.12.4",
