@@ -20,7 +20,7 @@
 - `WorkflowRuntime` 只拥有 checkpoint/resume、调度和通用执行恢复；HyperTest 确定性 Core 继续拥有合法状态转换、预算和安全语义。
 - Execution state 与 authorization state 严格分离；LangGraph checkpoint 不得替代 BUGate Governance Receipt / Evidence Chain。
 - BUGate 是唯一质量策略与受保护动作授权权威。
-- HyperTest Core 是唯一执行状态、预算、诊断与修复语义权威。
+- HyperTest Core 是唯一合法执行状态转换、预算、诊断与修复语义权威。
 - `pi-agent-core` 是唯一 SDK 级 agent runtime；其类型不得泄漏出 `src/runtime/pi/**`。
 - SUT、测试框架、LSP、覆盖率、沙箱、CI、SCM 与知识源全部通过进程/产物级 adapter 接入。
 - Python/pytest/HTTP 与 Go/go test/CLI 是永久异构 conformance 场景；切换场景时公共 Core 与公共 schema 的改动面积必须为 0。
