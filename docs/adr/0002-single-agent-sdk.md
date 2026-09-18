@@ -3,6 +3,12 @@
 - Status: Accepted
 - Date: 2026-08-14
 
+Follow-up: [ADR-0007](0007-pi-first-test-agent.md) requires an evaluation of Pi
+capability reuse, including the full Coding Agent SDK. It does not yet replace
+the package decision below. Any package switch requires a separate recorded
+decision, boundary-check updates, and compatibility evidence; a second agent
+loop must not be introduced around the same session.
+
 ## Context
 
 Codex, OpenCode, pi, OpenHands, MetaGPT, and Hermes overlap across agent-runtime and orchestration layers. Combining them would exceed the single-maintainer integration budget and create competing state, tool, memory, and policy authorities.

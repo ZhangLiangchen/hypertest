@@ -1,5 +1,11 @@
 ## 13. 执行与权限模型
 
+> **原始设计基线（2026-08-14），部分决策已更新。** 后续开发方向与顺序以
+> [ADR-0007](../adr/0007-pi-first-test-agent.md) 和 [Pi 开发指南](../pi-agent-development-guide.zh-CN.md)
+> 为准；BUGate 2.0 边界以 [ADR-0006](../adr/0006-bugate-protocol-binding.md) 为准。
+> 本文中的 BUGate PDP/PEP 定位不再作为目标架构；当前 v1 gate 兼容行为仍须维护。
+> 完整 Pi SDK 尚处于评估阶段，当前生产依赖继续遵守 ADR-0002。
+
 ### 13.1 Typed Tools
 
 模型不可直接获得通用 shell。只暴露：

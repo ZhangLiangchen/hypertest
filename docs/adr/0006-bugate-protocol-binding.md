@@ -3,7 +3,8 @@
 - Status: Accepted
 - Date: 2026-09-18
 - Supersedes: the BUGate authorization/PDP/PEP portions of [ADR-0005](0005-durable-workflow-runtime-and-bugate-boundary.md)
-- Preserves from ADR-0005: replaceable durable workflow runtime, thin-graph/fat-agent principle, and the separation between agent reasoning and durable execution
+- Preserves from ADR-0005: runtime replaceability when a separate runtime is used, thin-graph/fat-agent as a conditional integration constraint, and the separation between agent reasoning and durable execution
+- Runtime selection clarification: [ADR-0007](0007-pi-first-test-agent.md) makes a separate workflow runtime optional and prioritizes Pi-based test-agent development; the ProtocolBinding contract below is unchanged
 - Companion: [BUGate 2.0 Protocol Guide](https://github.com/ZhangLiangchen/BUGate/blob/main/docs/qa-methodology/BUGATE_2_0_PROTOCOL_GUIDE.zh-CN.md)
 
 ## Context

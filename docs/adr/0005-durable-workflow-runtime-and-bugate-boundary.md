@@ -1,13 +1,20 @@
 # ADR-0005: Durable workflow runtime and BUGate authorization boundary
 
-- Status: Partially superseded by ADR-0006 (durable runtime decision remains accepted; BUGate authorization/PDP/PEP model is superseded)
+- Status: Superseded as a development direction by ADR-0006 and ADR-0007; retained for historical rationale
 - Date: 2026-09-18
 - Companion: [BUGate ADR-BUGATE-006](https://github.com/ZhangLiangchen/BUGate/blob/main/docs/qa-methodology/BUGATE_RUNTIME_BOUNDARY_ADR.md)
 - Superseding BUGate integration decision: [ADR-0006](0006-bugate-protocol-binding.md)
+- Superseding Pi/runtime decision: [ADR-0007](0007-pi-first-test-agent.md)
 
-Implementation sequencing, source-level scope and acceptance:
-[HyperTest refactoring guide](../governance-runtime-refactor-guide.md).
-The guide clarifies replay, human-approval and external-effect recovery requirements.
+The decision and rollout below are historical. ADR-0006 replaces the BUGate
+authorization/PDP/PEP model. ADR-0007 replaces the required separate workflow
+runtime, preferred LangGraph implementation, and workflow-first delivery order.
+Keep the useful separation of reasoning from recovery, external-effect
+reconciliation, and thin-graph/fat-agent constraints if a runtime is later
+selected; these do not require installing a workflow framework now.
+
+Current implementation sequencing and acceptance:
+[Pi-based development guide](../pi-agent-development-guide.zh-CN.md).
 
 ## Context
 
@@ -181,4 +188,3 @@ LangGraph is a separate workflow-runtime implementation.
   because HyperTest needs tested durable-execution semantics.
 - **Remove `sdtd_orchestrator.py` immediately.** Rejected until the standalone
   compatibility path has a proven replacement and support exit.
-

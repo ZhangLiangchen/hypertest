@@ -1,143 +1,124 @@
 # HyperTest architecture
 
-> Target architecture under ADR-0005 plus the BUGate 2.0 integration correction in ADR-0006; not a claim that every component below is already implemented. For current source status, ordered work packages and acceptance/rollback criteria, see the [refactoring guide](governance-runtime-refactor-guide.md).
+> Target responsibility model under [ADR-0007](adr/0007-pi-first-test-agent.md)
+> and [ADR-0006](adr/0006-bugate-protocol-binding.md), not a shipped-capability claim.
+> Start implementation with the [Pi-based development guide](pi-agent-development-guide.zh-CN.md).
 
-## Authority model
+## Product model
 
-HyperTest deliberately separates strategy, execution durability, domain
-semantics, and authorization:
+HyperTest is a specialized test-development agent built on Pi. It reuses a
+generic agent foundation and adds test-domain tools, task context, evidence,
+and deterministic product rules. A separate workflow framework is conditional
+on demonstrated recovery or coordination needs.
 
-| Concern | Authority |
+| Concern | Owner |
 |---|---|
-| Strategy, local planning, tool use, reflection, and subtask choice | `AgentRuntime`; Pi is the only SDK-level agent harness |
-| Legal workflow transitions, retry/budget rules, diagnosis/repair safety, and conformance | HyperTest deterministic domain core |
-| Checkpoint/resume, scheduling, interrupt, parallelism, and generic execution recovery | replaceable `WorkflowRuntime`; LangGraph is the current preferred implementation |
-| Testing methodology, Artifact/Evidence contracts, Claim semantics, and quality assessment | BUGate 2.0 Protocol |
-| Protocol pinning, context hydration, and the decision to continue/rework/escalate | HyperTest runtime/domain policy |
+| Strategy and local tool choice within granted capabilities | The agent running through Pi |
+| Model interaction, agent-loop mechanics and supported session facilities | Pi behind HyperTest's `AgentRuntime` |
+| Task/run state, workspaces, budgets, repair safety and publication policy | HyperTest deterministic code |
+| Test-domain execution and ecosystem integration | HyperTest process/artifact adapters |
+| Testing methodology, Artifact/Evidence/Claim contracts and quality assessment | Stateless BUGate 2.0 Protocol |
+| Exact protocol pinning, context hydration, assessment submission and next action | HyperTest |
+| Optional durable coordination across work packages | A runtime selected through a future needs-based decision |
 
-The governing rule is now `methodology state != execution state`. BUGate 2.0 does not authorize tools or workflow transitions; it evaluates structured Claims against a pinned testing methodology Protocol. HyperTest owns `ProtocolBinding`, context hydration, and the runtime decision to continue, rework, escalate, or stop.
+BUGate assesses results; HyperTest decides continue, rework, retry, escalate or
+stop. Assessment does not confer tool permissions. Pi packages stay under
+`src/runtime/pi/**`; the current approved agent SDK is `pi-agent-core`.
+Evaluating the full Coding Agent SDK does not authorize a dependency switch.
 
-LangGraph is not an agent harness and does not weaken the rule that Pi is the only SDK-level agent-runtime dependency; LangGraph-specific types stay behind `src/workflow/langgraph/**`.
-
-See [ADR-0005](adr/0005-durable-workflow-runtime-and-bugate-boundary.md) for the durable runtime decision and [ADR-0006](adr/0006-bugate-protocol-binding.md) for the corrected BUGate 2.0 integration boundary.
-
-## Topology
+## Target interactions
 
 ```mermaid
 flowchart TB
-  Entry[CLI / CI] --> Flow[WorkflowRuntime]
-
-  subgraph Methodology[Testing methodology]
-    Protocol[BUGate 2.0 Protocol]
-    Assess[BUGate Assessment]
-    Protocol --> Assess
+  Entry[CLI or CI] --> Task[Task and run lifecycle]
+  subgraph HyperTest[HyperTest]
+    Task --> Bind[Protocol binding and context]
+    Bind --> Agent[Pi agent via AgentRuntime]
+    Agent --> Tools[Scoped test tools]
+    Tools --> Adapters[Process and artifact adapters]
+    Adapters --> Store[Artifacts and evidence]
+    Store --> Policy[Validation and task policy]
+    Policy -->|Continue or rework| Bind
+    Policy -->|Finish or escalate| Task
   end
-
-  subgraph CoreBox[HyperTest domain core]
-    Spec[Transition specification]
-    Runtime[AgentRuntime facade]
-    Store[Versioned artifact store]
-    Policy[Diagnosis / repair policy]
-    Spec --> Policy
-  end
-
-  Flow --> Spec
-  Flow --> Runtime
-  Flow <--> Store
-  Flow --> Bind[ProtocolBinding / hydration]
-  Bind --> Protocol
-  Flow --> Assess
-
-  Runtime --> Pi[pi-agent-core]
-  Pi --> PlannerTools[Scoped agent tools]
-  PlannerTools --> Contract[In-memory SutContract]
-
-  Flow --> Sut[SUT adapter]
-  Flow --> Test[Test-framework adapter]
-  Flow --> SCM[Change-publisher adapter]
-  Flow --> Code[Code-intelligence adapter]
-  Flow --> CI[CI adapter]
-  Test --> Sandbox[Local / OCI sandbox]
-  Test --> Coverage[Native coverage adapter]
-
-  Sut --> Target[HTTP / CLI / other SUT]
-  Test --> Runner[Test runner]
-  Code --> LSP[LSP server]
-  CI --> Platform[CI platform]
-  SCM --> Host[SCM host]
+  Bind -->|Resolve pinned bundle| Protocol[BUGate Protocol]
+  Store -->|Submit Claim| Assess[BUGate Assessment]
+  Assess -->|AssessmentResult| Policy
+  Optional[Optional workflow runtime] -.-> Task
 ```
 
-The first implementation slice remains planner-only. Its tool allowlist is
-`contract.list_operations` and `contract.get_operation`; both read only the
-current in-memory contract. As autonomy grows, tools remain scoped capabilities. Any mutation restrictions belong to HyperTest/runtime policy rather than BUGate Protocol semantics.
+These are component interactions, not mandatory sequential reasoning stages.
+Pi chooses work within the current task and tool scope. HyperTest validates
+artifacts, invokes adapters, records actual outcomes and enforces its policies.
+An optional runtime would coordinate task boundaries, not duplicate Pi turns.
+
+## Current implementation boundary
+
+The v0.2 model tool loop is planner-only. Its tool allowlist is
+`contract.list_operations` and `contract.get_operation`, both read-only over the
+in-memory SutContract. The orchestrator also supports constrained repair-patch
+requests without model tools; diagnosis and acceptance remain deterministic.
+The current package/lockfile contains `pi-agent-core` and `pi-ai`, not the full
+Coding Agent SDK or LangGraph.
+
+Full test-agent autonomy, BUGate 2.0 consumption and durable resume are targets.
+The existing orchestrator, state-machine checks and v1 BUGate fail-closed gates
+remain the compatibility baseline until separately migrated and tested. See
+[model-runtime.md](model-runtime.md) for implemented model behavior.
 
 ## State separation
 
-HyperTest persists four related but non-substitutable forms of state:
-
-| State | Purpose | Source of truth |
+| State | Purpose | Owner |
 |---|---|---|
-| Workflow checkpoint | resume execution without repeating completed generic work | `WorkflowRuntime` checkpoint store |
-| Domain transition ledger/specification | prove that the path is legal and policy/budget rules were followed | HyperTest deterministic core |
-| Protocol binding | pin exact BUGate protocol/profile versions and digests for the run | HyperTest |
-| BUGate assessment provenance | prove why a quality conclusion was produced for a Claim | BUGate |
-| Product artifacts | plans, patches, test runs, diagnoses, reports, and immutable hashes | HyperTest artifact store |
+| Agent session | Conversation and tool interactions; compaction/continuation when supported | Selected Pi integration, with one session owner |
+| Task/run record | Identity, source/configuration versions, budgets, attempts, status and session/artifact references | HyperTest |
+| Operation record | Stable effect identity, intent, outcome and unresolved-result reconciliation | HyperTest execution/adapter boundary, when implemented |
+| ProtocolBinding | Exact protocol/profile versions and digests | HyperTest |
+| Artifacts and assessment results | Immutable plans, patches, execution evidence, Claims and returned assessments | HyperTest storage; BUGate defines assessment semantics |
+| Optional workflow checkpoint | Progress of separately coordinated work packages | Selected runtime, only if introduced |
 
-Workflow checkpoints reference immutable artifacts plus the ProtocolBinding id/version/digest; they do not embed a mutable copy of the BUGate protocol. Restoring a checkpoint resolves the exact pinned bundle, verifies its digest, recompiles the task-scoped Protocol Context Capsule, and rehydrates the agent before execution resumes.
+BUGate does not store HyperTest host state or manage sessions/workers. Protocol
+bindings are resolved and verified before context is rehydrated, including after
+compaction or resume. Missing exact bundles fail explicitly rather than silently
+upgrading the run.
 
-## Core pipeline
+Session history, run records and checkpoints do not prove that an external
+effect completed. Recovery must declare its granularity, retain consumed budgets
+and repair counts, and reconcile unknown outcomes before any replay. An optional
+runtime stores references, not another mutable copy of protocol or artifact truth.
 
-```text
-raw interface definition
-  -> sut-contract.v1
-  -> deterministic plan + optional validated model augmentation
-  -> test-plan.v1
-  -> BUGate assessment of the current Claim
-  -> HyperTest decides continue/rework/escalate
-  -> framework-owned patch
-  -> validation and another BUGate assessment
-  -> isolated test-run.v1 + coverage-map.v1
-  -> deterministic diagnosis.v1
-  -> optional safety-checked repair loop
-  -> verification
-  -> final BUGate assessment
-  -> HyperTest publication policy
-  -> optional idempotent draft MR/PR
-```
+## Test-task completion
 
-The model augmentation cannot bypass deterministic planning, semantic checks, artifact generation, or BUGate assessment. BUGate assessment does not itself authorize a side effect; HyperTest owns any runtime policy that chooses to prevent, delay, or escalate a mutation based on AssessmentResult.
+A target task fixes its inputs and capabilities, lets the Pi agent analyze and
+select tools, validates structured test intent, executes through adapters,
+collects evidence, and diagnoses or safely repairs where appropriate. Reports
+bind findings to actual source and execution evidence. Publication is a separate
+HyperTest policy decision through the SCM adapter.
 
-Runtime events, validation, retry, usage, budget, and tool security are
-specified in [model-runtime.md](model-runtime.md). Workflow-runtime placement is specified in [ADR-0005](adr/0005-durable-workflow-runtime-and-bugate-boundary.md); BUGate Protocol binding and hydration are specified in [ADR-0006](adr/0006-bugate-protocol-binding.md).
+Not every task needs every action. Successful tests need no forced repair;
+verified SUT defects can terminate with a defect report. Insufficient evidence,
+budget exhaustion and human-review requirements are explicit outcomes. A model
+Claim or successful tool transport must not be treated as a passing test.
 
-## Portability boundary
+## Portability and failure boundaries
 
-The common core has no pytest, Go, HTTP, OpenAPI, JUnit, LCOV, GitLab, GitHub,
-Pi, or LangGraph domain types. Adapters receive JSON requests and return
-versioned JSON/file artifacts with explicit status, timeout, retry, and
-domain-failure semantics. Pi types stay under `src/runtime/pi/**`; LangGraph
-types stay under `src/workflow/langgraph/**`.
+The common core has no pytest, Go, HTTP, OpenAPI, JUnit, LCOV, GitLab, GitHub or
+Pi-specific domain types. Adapters exchange versioned JSON/file artifacts with
+explicit capability, timeout and failure semantics. If a workflow runtime is
+later selected, its types also stay behind its adapter boundary.
 
-Coverage is normalized to source regions with a capabilities object. Missing
-branch, condition, function, or per-test information remains unknown; it is
-never coerced to zero. LSP results likewise carry capabilities and completeness
-because language servers do not provide identical semantics.
-
-## Failure model
-
-An assertion failure is a successfully completed adapter call whose `TestRun`
-outcome failed. It is not a transport failure. Adapter failures are separately
-classified as unsupported, transient, permanent, cancelled, or timed out.
-
-Model runtime failures are also separate from adapter and test failures. They
-are classified as cancellation/deadline, provider transport/protocol/rate
-limit, model parse/schema, tool input/execution/loop, output limit, or budget
-exhaustion. Workflow-runtime failures add checkpoint, lease, duplicate-delivery,
-and resume conflicts; they never authorize a retry of a protected effect by
-themselves.
+Coverage and LSP completeness remain capability-aware; unknown information is
+not zero or complete. Assertion failures are successful adapter calls with a
+failed test outcome, distinct from transport, timeout and cancellation failures.
+Model parse/schema, tool-loop and budget failures retain separate classifications.
 
 Only `TEST_DEFECT`, `FIXTURE_DEFECT`, selected generated-code `BUILD` failures,
-and `ADAPTER_CONFIG` diagnoses may enter automatic repair. SUT defects,
-contract drift, environment failures, flaky behavior, and unknown causes
-require evidence or human review rather than weakened tests.
+and `ADAPTER_CONFIG` diagnoses may enter automatic repair. Preserve the existing
+two-round limit and prohibition on skipped tests, weakened oracles or swallowed
+exceptions. SUT defects, contract drift, environment issues, flaky behavior and
+unknown causes require evidence or review.
 
+External effects, including tests that mutate the SUT, need appropriate capability
+checks and outcome handling. Framework installation does not supply those
+guarantees. LangGraph admission criteria and the implementation order are defined
+in [ADR-0007](adr/0007-pi-first-test-agent.md), not the superseded ADR-0005 rollout.

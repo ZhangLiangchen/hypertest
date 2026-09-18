@@ -1,7 +1,13 @@
 # HyperTest 治理接缝与持久化执行改造指导
 
+> **历史方案，停止按本文顺序安排新开发。** BUGate 授权/PDP/PEP 定位已由
+> [ADR-0006](adr/0006-bugate-protocol-binding.md) 替代；必须先接入 LangGraph 的路线和
+> HT-0～HT-5 排期已由 [ADR-0007](adr/0007-pi-first-test-agent.md) 及
+> [Pi 开发指南](pi-agent-development-guide.zh-CN.md) 替代。正文保留决策历史和可复用的
+> 故障场景，不表示新开发指令。当前 v0.2 gate 兼容行为仍须保持，直至单独迁移验收。
+
 - 计划修订号：`2026-09-18.1`；与 BUGate 指南配套。
-- 状态：ADR-0005 的实施路线；下列工作包、目录和新契约为**待实施目标**，不是当前已交付功能。
+- 状态：已替代的 ADR-0005 历史实施路线；下列工作包、目录和契约不代表已交付功能。
 - 核对基线：[`74b30c7`](https://github.com/ZhangLiangchen/hypertest/commit/74b30c747cdaf1084ad8095364f14b8292550c3f)。
 - 架构依据：[ADR-0005](adr/0005-durable-workflow-runtime-and-bugate-boundary.md)、[architecture.md](architecture.md)。
 - 配套：[BUGate 改造指南](https://github.com/ZhangLiangchen/BUGate/blob/main/docs/qa-methodology/BUGATE_GOVERNANCE_REFACTOR_GUIDE.zh-CN.md)。

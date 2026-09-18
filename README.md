@@ -20,6 +20,16 @@ roadmap items; they are not capabilities of the current release.
 
 ## Architecture
 
+HyperTest develops a specialized test agent on Pi. The next priority is to
+evaluate Pi capability reuse and deliver a complete test-task loop. A separate
+workflow runtime, including LangGraph, is conditional on demonstrated recovery
+or coordination needs; it is not a prerequisite for agent development.
+
+Start future development with [ADR-0007](docs/adr/0007-pi-first-test-agent.md)
+and the [Pi-based development guide](docs/pi-agent-development-guide.zh-CN.md).
+The full Pi Coding Agent SDK is an evaluation candidate; the approved production
+dependency remains `pi-agent-core` until a follow-up decision changes it.
+
 ```text
 BUGate Protocol   SUT-neutral testing methodology, Artifact/Evidence/Claim contracts, quality assessment
 HyperTest Core    task/run state, ProtocolBinding, budgets, artifacts, diagnosis and runtime policy
@@ -28,7 +38,9 @@ Adapters          replaceable process-level SUT, test, LSP, coverage, sandbox, C
 Artifacts         versioned, hashed portability and audit boundary
 ```
 
-![HyperTest architecture](docs/assets/architecture.svg)
+![HyperTest target architecture: Pi-based test agent](docs/assets/architecture.svg)
+
+The diagram shows the target responsibility boundaries, not shipped capability.
 
 The concise component model is in [docs/architecture.md](docs/architecture.md). Future BUGate Protocol consumption, pinning and context hydration are specified by [ADR-0006](docs/adr/0006-bugate-protocol-binding.md) and [docs/design/bugate-protocol-integration.md](docs/design/bugate-protocol-integration.md). HyperTest does not yet implement that integration end to end.
 The real planner model/tool boundary is documented in [docs/model-runtime.md](docs/model-runtime.md). The broader design baseline is
