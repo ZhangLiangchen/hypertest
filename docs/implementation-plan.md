@@ -7,6 +7,14 @@
 
 本文档是完整设计方案的目录。为便于评审和后续维护，原始方案按稳定主题拆分为四个 Markdown 文件，内容连续且不删减。
 
+## 后续改造执行入口（2026-09-18）
+
+[治理接缝与持久化执行改造指导](governance-runtime-refactor-guide.md) 将 ADR-0005 拆成
+HT-0～HT-5 工作包，明确模块改动、两仓依赖、恢复/审批/PEP 契约、验收与回退。
+下一批从 HT-0/HT-1 开始，与 BUGate BG-0/BG-1 对齐；本文及目标架构不表示 LangGraph
+或 brokered PEP 已经实现。原四篇方案保留为基线，涉及治理/运行时演进时以 ADR-0005
+及其改造指南为准；冻结的安全与公共契约变更仍需单独评审。
+
 ## 方案正文
 
 1. [目标、约束与技术选型](design/01-goals-and-technology-selection.md)

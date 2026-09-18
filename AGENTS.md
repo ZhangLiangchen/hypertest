@@ -23,4 +23,8 @@ Never make a failing test green by adding skip/xfail/ignore, deleting or weakeni
 
 ## Change discipline
 
+Before governance/workflow-runtime refactoring, read
+[the implementation guide](docs/governance-runtime-refactor-guide.md).
+It defines planned work packages and compatibility gates, not already-shipped capabilities.
+
 Every production change must include failure-path tests. New adapters must not require changes to the deterministic state machine or common schemas. Avoid dynamic plugin discovery; use explicit manifests and executable paths. Run `npm run ci` and `npm run test:examples` before publication.

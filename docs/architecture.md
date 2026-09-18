@@ -1,5 +1,9 @@
 # HyperTest architecture
 
+> Target architecture under ADR-0005, not a claim that every component below is
+> already implemented. For current source status, ordered work packages and
+> acceptance/rollback criteria, see the [refactoring guide](governance-runtime-refactor-guide.md).
+
 ## Authority model
 
 HyperTest deliberately separates strategy, execution durability, domain

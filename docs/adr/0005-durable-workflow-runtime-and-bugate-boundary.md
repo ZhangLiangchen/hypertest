@@ -4,6 +4,10 @@
 - Date: 2026-09-18
 - Companion: [BUGate ADR-BUGATE-006](https://github.com/ZhangLiangchen/BUGate/blob/main/docs/qa-methodology/BUGATE_RUNTIME_BOUNDARY_ADR.md)
 
+Implementation sequencing, source-level scope and acceptance:
+[HyperTest refactoring guide](../governance-runtime-refactor-guide.md).
+The guide clarifies replay, human-approval and external-effect recovery requirements.
+
 ## Context
 
 HyperTest's handwritten orchestrator and deterministic state machine currently
