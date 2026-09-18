@@ -1,8 +1,6 @@
 # HyperTest architecture
 
-> Target architecture under ADR-0005, not a claim that every component below is
-> already implemented. For current source status, ordered work packages and
-> acceptance/rollback criteria, see the [refactoring guide](governance-runtime-refactor-guide.md).
+> Target architecture under ADR-0005 plus the BUGate 2.0 integration correction in ADR-0006; not a claim that every component below is already implemented. For current source status, ordered work packages and acceptance/rollback criteria, see the [refactoring guide](governance-runtime-refactor-guide.md).
 
 ## Authority model
 
@@ -14,21 +12,14 @@ semantics, and authorization:
 | Strategy, local planning, tool use, reflection, and subtask choice | `AgentRuntime`; Pi is the only SDK-level agent harness |
 | Legal workflow transitions, retry/budget rules, diagnosis/repair safety, and conformance | HyperTest deterministic domain core |
 | Checkpoint/resume, scheduling, interrupt, parallelism, and generic execution recovery | replaceable `WorkflowRuntime`; LangGraph is the current preferred implementation |
-| Quality policy, evidence acceptance, and permission to mutate/publish | BUGate PDP/audit kernel plus a host PEP |
+| Testing methodology, Artifact/Evidence contracts, Claim semantics, and quality assessment | BUGate 2.0 Protocol |
+| Protocol pinning, context hydration, and the decision to continue/rework/escalate | HyperTest runtime/domain policy |
 
-The governing rule is `execution state != authorization state`. A workflow
-checkpoint can say that a run reached implementation, but only a valid BUGate
-decision bound to the current source and evidence can unlock the protected
-action. A model, adapter, CI platform, workflow runtime, or hub cannot override
-a BUGate denial.
+The governing rule is now `methodology state != execution state`. BUGate 2.0 does not authorize tools or workflow transitions; it evaluates structured Claims against a pinned testing methodology Protocol. HyperTest owns `ProtocolBinding`, context hydration, and the runtime decision to continue, rework, escalate, or stop.
 
-BUGate unavailability permits read-only analysis but fails closed for applying
-a governed patch or publishing a change. LangGraph is not an agent harness and
-does not weaken the rule that Pi is the only SDK-level agent-runtime
-dependency; LangGraph-specific types stay behind `src/workflow/langgraph/**`.
+LangGraph is not an agent harness and does not weaken the rule that Pi is the only SDK-level agent-runtime dependency; LangGraph-specific types stay behind `src/workflow/langgraph/**`.
 
-See [ADR-0005](adr/0005-durable-workflow-runtime-and-bugate-boundary.md) for
-the target boundary and migration plan.
+See [ADR-0005](adr/0005-durable-workflow-runtime-and-bugate-boundary.md) for the durable runtime decision and [ADR-0006](adr/0006-bugate-protocol-binding.md) for the corrected BUGate 2.0 integration boundary.
 
 ## Topology
 
@@ -36,10 +27,10 @@ the target boundary and migration plan.
 flowchart TB
   Entry[CLI / CI] --> Flow[WorkflowRuntime]
 
-  subgraph Control[Quality control plane]
-    PDP[BUGate PDP / audit]
-    PEP[Brokered PEP]
-    PDP --> PEP
+  subgraph Methodology[Testing methodology]
+    Protocol[BUGate 2.0 Protocol]
+    Assess[BUGate Assessment]
+    Protocol --> Assess
   end
 
   subgraph CoreBox[HyperTest domain core]
@@ -53,17 +44,17 @@ flowchart TB
   Flow --> Spec
   Flow --> Runtime
   Flow <--> Store
-  Flow --> Gate[BUGate process/service bridge]
-  Gate --> PDP
-  Flow --> PEP
+  Flow --> Bind[ProtocolBinding / hydration]
+  Bind --> Protocol
+  Flow --> Assess
 
   Runtime --> Pi[pi-agent-core]
   Pi --> PlannerTools[Scoped agent tools]
   PlannerTools --> Contract[In-memory SutContract]
 
-  PEP --> Sut[SUT adapter]
-  PEP --> Test[Test-framework adapter]
-  PEP --> SCM[Change-publisher adapter]
+  Flow --> Sut[SUT adapter]
+  Flow --> Test[Test-framework adapter]
+  Flow --> SCM[Change-publisher adapter]
   Flow --> Code[Code-intelligence adapter]
   Flow --> CI[CI adapter]
   Test --> Sandbox[Local / OCI sandbox]
@@ -90,13 +81,11 @@ HyperTest persists four related but non-substitutable forms of state:
 |---|---|---|
 | Workflow checkpoint | resume execution without repeating completed generic work | `WorkflowRuntime` checkpoint store |
 | Domain transition ledger/specification | prove that the path is legal and policy/budget rules were followed | HyperTest deterministic core |
-| Governance receipt/evidence chain | prove why a protected action was authorized and whether that authorization was consumed | BUGate |
+| Protocol binding | pin exact BUGate protocol/profile versions and digests for the run | HyperTest |
+| BUGate assessment provenance | prove why a quality conclusion was produced for a Claim | BUGate |
 | Product artifacts | plans, patches, test runs, diagnoses, reports, and immutable hashes | HyperTest artifact store |
 
-Workflow checkpoints reference immutable artifact and receipt IDs/hashes; they
-do not embed a second mutable copy of BUGate history. Restoring a checkpoint
-must revalidate expiry, evidence/source drift, obligations, and authorization
-consumption before attempting a protected side effect.
+Workflow checkpoints reference immutable artifacts plus the ProtocolBinding id/version/digest; they do not embed a mutable copy of the BUGate protocol. Restoring a checkpoint resolves the exact pinned bundle, verifies its digest, recompiles the task-scoped Protocol Context Capsule, and rehydrates the agent before execution resumes.
 
 ## Core pipeline
 
@@ -105,22 +94,20 @@ raw interface definition
   -> sut-contract.v1
   -> deterministic plan + optional validated model augmentation
   -> test-plan.v1
-  -> BUGate enter-implementation decision
-  -> brokered framework-owned patch
-  -> validation and BUGate apply-patch decision
+  -> BUGate assessment of the current Claim
+  -> HyperTest decides continue/rework/escalate
+  -> framework-owned patch
+  -> validation and another BUGate assessment
   -> isolated test-run.v1 + coverage-map.v1
   -> deterministic diagnosis.v1
   -> optional safety-checked repair loop
   -> verification
-  -> BUGate publish-change decision
+  -> final BUGate assessment
+  -> HyperTest publication policy
   -> optional idempotent draft MR/PR
 ```
 
-The model augmentation cannot bypass deterministic planning, semantic checks,
-artifact generation, or BUGate. At each protected side effect, the PEP builds a
-fresh gate request, validates and atomically consumes a narrowly scoped receipt,
-executes the exact effect, and records an outcome attestation. A decision
-receipt proves permission; the outcome attestation proves what actually ran.
+The model augmentation cannot bypass deterministic planning, semantic checks, artifact generation, or BUGate assessment. BUGate assessment does not itself authorize a side effect; HyperTest owns any runtime policy that chooses to prevent, delay, or escalate a mutation based on AssessmentResult.
 
 Runtime events, validation, retry, usage, budget, and tool security are
 specified in [model-runtime.md](model-runtime.md). Workflow-runtime placement
