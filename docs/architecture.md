@@ -69,9 +69,7 @@ flowchart TB
 
 The first implementation slice remains planner-only. Its tool allowlist is
 `contract.list_operations` and `contract.get_operation`; both read only the
-current in-memory contract. As autonomy grows, tools remain scoped capabilities
-and protected mutations are never exposed as a parallel raw path around the
-PEP.
+current in-memory contract. As autonomy grows, tools remain scoped capabilities. Any mutation restrictions belong to HyperTest/runtime policy rather than BUGate Protocol semantics.
 
 ## State separation
 
@@ -110,8 +108,7 @@ raw interface definition
 The model augmentation cannot bypass deterministic planning, semantic checks, artifact generation, or BUGate assessment. BUGate assessment does not itself authorize a side effect; HyperTest owns any runtime policy that chooses to prevent, delay, or escalate a mutation based on AssessmentResult.
 
 Runtime events, validation, retry, usage, budget, and tool security are
-specified in [model-runtime.md](model-runtime.md). Workflow-runtime placement
-and the BUGate boundary are specified in [ADR-0005](adr/0005-durable-workflow-runtime-and-bugate-boundary.md).
+specified in [model-runtime.md](model-runtime.md). Workflow-runtime placement is specified in [ADR-0005](adr/0005-durable-workflow-runtime-and-bugate-boundary.md); BUGate Protocol binding and hydration are specified in [ADR-0006](adr/0006-bugate-protocol-binding.md).
 
 ## Portability boundary
 
