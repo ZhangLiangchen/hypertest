@@ -2,8 +2,7 @@
 
 [![CI](https://github.com/ZhangLiangchen/hypertest/actions/workflows/ci.yml/badge.svg)](https://github.com/ZhangLiangchen/hypertest/actions/workflows/ci.yml)
 
-HyperTest is a general-purpose, cross-language test-development control plane
-governed by [BUGate](https://github.com/ZhangLiangchen/BUGate). It keeps the
+HyperTest is a general-purpose, cross-language autonomous test-development system that consumes the [BUGate](https://github.com/ZhangLiangchen/BUGate) executable testing methodology Protocol. It keeps the
 system under test, programming language, test framework, code-intelligence
 tool, coverage format, CI provider, and SCM provider behind explicit
 process/artifact contracts.
@@ -22,8 +21,8 @@ roadmap items; they are not capabilities of the current release.
 ## Architecture
 
 ```text
-BUGate PDP/PEP    quality policy and protected-action authority
-HyperTest Core    deterministic run state, budgets, artifacts, diagnosis and repair policy
+BUGate Protocol   SUT-neutral testing methodology, Artifact/Evidence/Claim contracts, quality assessment
+HyperTest Core    task/run state, ProtocolBinding, budgets, artifacts, diagnosis and runtime policy
 pi-agent-core     only SDK-level agent-loop dependency
 Adapters          replaceable process-level SUT, test, LSP, coverage, sandbox, CI and SCM providers
 Artifacts         versioned, hashed portability and audit boundary
@@ -31,9 +30,8 @@ Artifacts         versioned, hashed portability and audit boundary
 
 ![HyperTest architecture](docs/assets/architecture.svg)
 
-The concise component model is in [docs/architecture.md](docs/architecture.md).
-The real planner model/tool boundary is documented in
-[docs/model-runtime.md](docs/model-runtime.md). The broader design baseline is
+The concise component model is in [docs/architecture.md](docs/architecture.md). Future BUGate Protocol consumption, pinning and context hydration are specified by [ADR-0006](docs/adr/0006-bugate-protocol-binding.md) and [docs/design/bugate-protocol-integration.md](docs/design/bugate-protocol-integration.md). HyperTest does not yet implement that integration end to end.
+The real planner model/tool boundary is documented in [docs/model-runtime.md](docs/model-runtime.md). The broader design baseline is
 indexed by [docs/implementation-plan.md](docs/implementation-plan.md).
 
 ## Current executable slices
