@@ -1,8 +1,9 @@
 # ADR-0005: Durable workflow runtime and BUGate authorization boundary
 
-- Status: Accepted
+- Status: Partially superseded by ADR-0006 (durable runtime decision remains accepted; BUGate authorization/PDP/PEP model is superseded)
 - Date: 2026-09-18
 - Companion: [BUGate ADR-BUGATE-006](https://github.com/ZhangLiangchen/BUGate/blob/main/docs/qa-methodology/BUGATE_RUNTIME_BOUNDARY_ADR.md)
+- Superseding BUGate integration decision: [ADR-0006](0006-bugate-protocol-binding.md)
 
 Implementation sequencing, source-level scope and acceptance:
 [HyperTest refactoring guide](../governance-runtime-refactor-guide.md).
