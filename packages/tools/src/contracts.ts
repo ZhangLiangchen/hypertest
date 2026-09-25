@@ -1,0 +1,307 @@
+import type { BaseDeps, JsonSchema, JsonValue, Logger } from '@hypertest/core';
+import type { ActionCapability, ArtifactRef, ContextSnapshot, DomainEventSink, EventContext, EvidenceInput, EvidenceRecord, EvidenceType, ResourceRef, RiskClass, ToolDefinition, ToolEffect } from '@hypertest/domain';
+import type { ArtifactStore, EvidenceLedger } from '@hypertest/evidence';
+import type { SideEffectAdapter, SideEffectGateway } from '@hypertest/operation';
+import type { ActionPermit, PolicyDecisionLog, PolicyEngine } from '@hypertest/policy';
+
+/**
+ * @hypertest/tools — the Tool & Capability Runtime and the testing execution plane.
+ *
+ * Every invocation passes the pipeline (I1, I4, I9, I10):
+ *   lookup → input schema validation → capability check (policy.capabilityAllows) → PolicyEngine permit
+ *   (+ decision log) → FreshnessGuard for mutating effects → execution (side effects only through the
+ *   SideEffectGateway with a stable operationId) → timeout/abort → output offload to the ArtifactStore
+ *   → evidence records → tool.called / tool.completed / tool.denied events.
+ * A failing test is `status: 'success'` at the transport level with `outcome.passed = false` inside the
+ * structured result — never a thrown error (domain failure ≠ tool failure).
+ *
+ * Implementations to export from src/index.ts:
+ *   createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime
+ *   class ToolRegistry implements ToolRegistryLike
+ *   createWorkspaceManager(deps: WorkspaceDeps): WorkspaceManager
+ *   builtinTools(options: BuiltinToolOptions): ToolSpec[]      — all tools below
+ *   builtinSideEffectAdapters(options): SideEffectAdapter[]   — load generator, process env, docker, kubectl
+ *   runner adapters: nodeTestRunner, vitestRunner, jestRunner, pytestRunner, goTestRunner, commandRunner (TestRunnerAdapter)
+ *   coverage parsers: parseCoverageJson (coverage.py), parseLcov, parseCobertura, parseGoCoverProfile → CoverageMap
+ *   mutation: generateMutants(file, source, language) + runMutationAnalysis(...)
+ *   startHttpLoadGenerator / HttpLoadJob (built-in load generator process; operation-id labelled job files)
+ *   McpToolBridge (stdio MCP client → ToolSpecs; @modelcontextprotocol/sdk)
+ *
+ * Built-in tool ids (effect/risk):
+ *   fs.read, fs.list, fs.search (read/low) · fs.write, fs.apply_patch (write_workspace/medium; isolated worktree only)
+ *   git.status, git.diff, git.log, git.show, git.blame (read/low) · git.commit (write_workspace/medium)
+ *   shell.exec (execute/medium; allowlisted commands; scrubbed env; sandbox cwd)
+ *   test.run (execute/medium) · coverage.collect (execute/low) · mutation.run (execute/medium)
+ *   code.symbols, code.references (read/low)
+ *   http.request (read for GET/HEAD else external/medium; records api-response evidence)
+ *   metrics.query, metrics.scrape (read/low; Prometheus HTTP API / text exposition)
+ *   load.start (external/high, side-effect adapter `load.http`), load.observe (read), load.stop (external/medium)
+ *   env.restart, env.inject_fault, env.deploy (destructive/high|critical, side-effect adapters)
+ *   browser.navigate, browser.click, browser.fill, browser.screenshot, browser.text (Playwright; optional)
+ */
+
+export interface ToolContext {
+  runId: string;
+  workItemId: string;
+  agentId: string;
+  role: string;
+  /** Stable across retries: `${sessionId}:${turn}:${toolCallId}`. */
+  invocationId: string;
+  workspace: WorkspaceHandle;
+  artifacts: ArtifactStore;
+  /** Records evidence with producer/provenance pre-filled by the runtime. */
+  recordEvidence(input: { evidenceType: EvidenceType; data: string | Uint8Array; mimeType: string; summary: string; structured?: JsonValue; operationId?: string; parentEvidenceIds?: string[]; provenance?: EvidenceInput['provenance'] }): Promise<EvidenceRecord>;
+  /** Only for tools with a sideEffect binding. */
+  sideEffects?: SideEffectGateway;
+  eventContext: EventContext;
+  snapshot?: ContextSnapshot;
+  permit: ActionPermit;
+  signal: AbortSignal;
+  logger: Logger;
+  /** Environment registry for black-box tools (base URLs, metrics endpoints, env classes). */
+  environments: EnvironmentRegistry;
+}
+
+export type ToolStatus = 'success' | 'failed' | 'timeout' | 'denied' | 'pending' | 'stale_context';
+
+export interface ToolOutcome<O = JsonValue> {
+  status: ToolStatus;
+  /** Small structured result (validated against outputSchema when present). */
+  structured?: O;
+  /** Model-visible text; the runtime truncates/offloads it (I9). */
+  text?: string;
+  artifactRefs?: ArtifactRef[];
+  evidenceRefs?: string[];
+  operationId?: string;
+  error?: { code: string; message: string };
+}
+
+export interface SideEffectBinding {
+  adapterId: string;
+  operationType: string;
+  /** Derive the external target and the lease resource from the input. */
+  target(input: unknown, ctx: ToolContext): ResourceRef;
+  leaseTtlMs?: number;
+}
+
+export interface ToolSpec<I = any, O = JsonValue> {
+  id: string;
+  title: string;
+  description: string;
+  inputSchema: JsonSchema;
+  outputSchema?: JsonSchema;
+  effect: ToolEffect | ((input: I) => ToolEffect);
+  riskClass: RiskClass | ((input: I) => RiskClass);
+  /** Concrete resource keys touched (for capability scopes, freshness and resource claims). */
+  resources(input: I, ctx: Pick<ToolContext, 'workspace' | 'runId' | 'environments'>): string[];
+  environmentClass?: (input: I, ctx: Pick<ToolContext, 'environments'>) => string | undefined;
+  sideEffect?: SideEffectBinding;
+  timeoutMs: number;
+  /** Bytes of model-visible text before offloading to an artifact (default 16 KiB). */
+  maxInlineBytes?: number;
+  execute(input: I, ctx: ToolContext): Promise<ToolOutcome<O>>;
+}
+
+export interface ToolRegistryLike {
+  register(spec: ToolSpec): void;
+  get(id: string): ToolSpec | undefined;
+  list(): ToolSpec[];
+  /** Tool definitions visible to a model under a capability + tool policy (id → name with `.` → `__`). */
+  definitionsFor(capability: ActionCapability, allow: string[], deny?: string[]): ToolDefinition[];
+  /** Registry content hash for RuntimeManifest.toolCatalogRevision. */
+  revision(): string;
+}
+
+export interface ToolExecutionRequest {
+  toolId: string;
+  input: unknown;
+  invocationId: string;
+  runId: string;
+  workItemId: string;
+  agentId: string;
+  role: string;
+  capability: ActionCapability;
+  workspace: WorkspaceHandle;
+  snapshot?: ContextSnapshot;
+  eventContext: EventContext;
+  signal: AbortSignal;
+  timeoutMs?: number;
+}
+
+export interface ToolExecutionResult {
+  toolId: string;
+  invocationId: string;
+  status: ToolStatus;
+  structured?: JsonValue;
+  /** Bounded model-visible rendering (includes artifact refs when offloaded). */
+  modelText: string;
+  artifactRefs: ArtifactRef[];
+  evidenceRefs: string[];
+  operationId?: string;
+  permit?: ActionPermit;
+  durationMs: number;
+  error?: { code: string; message: string };
+}
+
+/** Structural freshness port (implemented by @hypertest/context FreshnessGuard). */
+export interface FreshnessPort {
+  validate(snapshot: ContextSnapshot | string, action: { tool: string; resources: string[]; mutating: boolean }, ctx: EventContext): Promise<{ fresh: true; checked: number } | { fresh: false; checked: number; stale: Array<{ resourceType: string; resourceId: string; reason: string }> }>;
+}
+
+export interface ToolRuntimeDeps extends BaseDeps {
+  registry: ToolRegistryLike;
+  policy: PolicyEngine;
+  decisionLog?: PolicyDecisionLog;
+  freshness?: FreshnessPort;
+  sideEffects?: SideEffectGateway;
+  artifacts: ArtifactStore;
+  evidence: EvidenceLedger;
+  events?: DomainEventSink;
+  environments: EnvironmentRegistry;
+  runtimeManifestId: string;
+  workerId: string;
+  /** Secret used to verify capability signatures. */
+  capabilitySecret: string;
+}
+
+export interface ToolRuntime {
+  readonly registry: ToolRegistryLike;
+  /**
+   * Idempotent per invocationId for side-effect tools (the operation is found again via the ledger).
+   * Never throws for domain outcomes; throws only on programmer errors.
+   */
+  execute(request: ToolExecutionRequest): Promise<ToolExecutionResult>;
+}
+
+// ----------------------------------------------------------------------------- workspaces + sandbox
+
+export interface WorkspaceHandle {
+  workspaceId: string;
+  kind: 'shared_readonly' | 'isolated_worktree' | 'scratch';
+  root: string;
+  /** Git commit the workspace was created from (when a repo). */
+  baseCommit?: string;
+  branch?: string;
+  readOnly: boolean;
+  sandbox: SandboxProfile;
+  /** Resource key prefix for capability scopes: `workspace/<workspaceId>`. */
+  resourcePrefix: string;
+}
+
+export interface SandboxProfile {
+  kind: 'local' | 'oci';
+  image?: string;
+  network: 'none' | 'loopback' | 'egress_allowlist' | 'open';
+  allowedHosts?: string[];
+  /** Environment variables passed through (everything else is scrubbed). */
+  envAllowlist: string[];
+  cpuLimit?: number;
+  memoryMb?: number;
+}
+
+export interface WorkspaceDeps extends BaseDeps {
+  /** Directory under which worktrees/scratch dirs are created (e.g. `.hypertest/workspaces`). */
+  baseDir: string;
+  defaultSandbox: SandboxProfile;
+}
+
+export interface WorkspaceManager {
+  /** Read-only view of the target (no copy for local paths; a git worktree at `commit` when given). */
+  sharedSnapshot(input: { runId: string; repoPath: string; commit?: string }): Promise<WorkspaceHandle>;
+  /** Isolated git worktree on branch `ht/<runId>/<workItemId>` for mutating agents. */
+  isolatedWorktree(input: { runId: string; workItemId: string; repoPath: string; baseCommit?: string }): Promise<WorkspaceHandle>;
+  scratch(input: { runId: string; workItemId: string }): Promise<WorkspaceHandle>;
+  get(workspaceId: string): WorkspaceHandle | undefined;
+  /** Resolves a path inside the workspace; throws permission_denied on traversal or symlink escape. */
+  resolvePath(ws: WorkspaceHandle, relPath: string): Promise<string>;
+  /** Unified diff of the worktree against its base. */
+  diff(ws: WorkspaceHandle): Promise<string>;
+  dispose(workspaceId: string): Promise<void>;
+}
+
+export interface ProcessResult {
+  exitCode: number | null;
+  signal: string | null;
+  stdout: string;
+  stderr: string;
+  durationMs: number;
+  timedOut: boolean;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
+}
+
+export interface SandboxRunner {
+  run(ws: WorkspaceHandle, command: string[], options: { cwd?: string; env?: Record<string, string>; timeoutMs: number; signal: AbortSignal; stdin?: string; maxOutputBytes?: number }): Promise<ProcessResult>;
+}
+
+// ----------------------------------------------------------------------------- environments (black-box)
+
+export interface EnvironmentDescriptor {
+  environmentId: string;
+  environmentClass: 'local' | 'sandbox' | 'staging' | 'production' | (string & {});
+  baseUrl?: string;
+  metricsUrl?: string;
+  prometheusUrl?: string;
+  generation: number;
+  buildDigest?: string;
+  /** Process/docker/k8s control descriptors for env.* adapters. */
+  control?: { kind: 'process' | 'docker' | 'kubectl'; target: string; namespace?: string; command?: string[] };
+}
+
+export interface EnvironmentRegistry {
+  get(environmentId: string): EnvironmentDescriptor | undefined;
+  list(): EnvironmentDescriptor[];
+  register(env: EnvironmentDescriptor): void;
+  /** Bumps generation (after deploy/restart) — invalidates snapshots that observed the old one. */
+  bumpGeneration(environmentId: string, buildDigest?: string): EnvironmentDescriptor;
+}
+
+// ----------------------------------------------------------------------------- test runners + coverage
+
+export type TestCaseStatus = 'passed' | 'failed' | 'skipped' | 'xfail' | 'xpass' | 'error';
+
+export interface TestCaseResult {
+  id: string;
+  name: string;
+  file?: string;
+  status: TestCaseStatus;
+  durationMs?: number;
+  message?: string;
+}
+
+export interface TestRunResult {
+  framework: string;
+  command: string[];
+  exitCode: number | null;
+  totals: Record<TestCaseStatus, number> & { total: number };
+  cases: TestCaseResult[];
+  /** True only when every selected case passed and at least one ran (fake-green guard). */
+  passed: boolean;
+  /** Harness-level problems (collection errors, crashes) distinguished from assertion failures. */
+  harnessError?: string;
+  durationMs: number;
+}
+
+export interface TestRunnerAdapter {
+  readonly framework: string;
+  detect(ws: WorkspaceHandle): Promise<boolean>;
+  run(ws: WorkspaceHandle, request: { selector?: string; coverage?: boolean; timeoutMs: number; signal: AbortSignal; env?: Record<string, string> }, sandbox: SandboxRunner): Promise<{ result: TestRunResult; rawReport?: { data: string; mimeType: string }; stdout: string; stderr: string; coverage?: CoverageMap }>;
+}
+
+export interface CoverageMap {
+  format: 'coverage.py' | 'lcov' | 'cobertura' | 'go' | 'v8' | (string & {});
+  files: Array<{ path: string; lines: { covered: number; total: number }; branches?: { covered: number; total: number } | 'unknown' }>;
+  totals: { lines: { covered: number; total: number }; branches: { covered: number; total: number } | 'unknown' };
+}
+
+export interface BuiltinToolOptions {
+  runners?: TestRunnerAdapter[];
+  shellAllowlist?: string[];
+  sandbox: SandboxRunner;
+  workspaces: WorkspaceManager;
+  retrieval?: { search(query: { text: string; symbol?: string; root?: string; limit?: number }): Promise<Array<{ path?: string; line?: number; snippet: string; score: number }>> };
+  enableBrowser?: boolean;
+  httpAllowlist?: string[];
+}
+
+export type { SideEffectAdapter };

@@ -1,0 +1,15 @@
+{
+  "name": "@hypertest/store",
+  "version": "0.3.0-dev",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@hypertest/core": "0.3.0-dev",
+    "@electric-sql/pglite": "0.5.8",
+    "pg": "8.23.0",
+    "@electric-sql/pglite-pgvector": "0.0.9"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "@hypertest/context",
+  "version": "0.3.0-dev",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "@hypertest/core": "0.3.0-dev",
+    "@hypertest/domain": "0.3.0-dev",
+    "@hypertest/collab": "0.3.0-dev",
+    "@hypertest/evidence": "0.3.0-dev"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "@hypertest/model",
+  "version": "0.3.0-dev",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "@hypertest/core": "0.3.0-dev",
+    "@hypertest/domain": "0.3.0-dev",
+    "@earendil-works/pi-ai": "0.87.1"
+  }
+}

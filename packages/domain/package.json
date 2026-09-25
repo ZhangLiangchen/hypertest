@@ -1,0 +1,10 @@
+{
+  "name": "@hypertest/domain",
+  "version": "0.3.0-dev",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "@hypertest/core": "0.3.0-dev"
+  }
+}

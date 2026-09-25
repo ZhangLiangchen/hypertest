@@ -1,0 +1,25 @@
+{
+  "name": "@hypertest/app",
+  "version": "0.3.0-dev",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "@hypertest/core": "0.3.0-dev",
+    "@hypertest/domain": "0.3.0-dev",
+    "@hypertest/store": "0.3.0-dev",
+    "@hypertest/collab": "0.3.0-dev",
+    "@hypertest/operation": "0.3.0-dev",
+    "@hypertest/policy": "0.3.0-dev",
+    "@hypertest/evidence": "0.3.0-dev",
+    "@hypertest/model": "0.3.0-dev",
+    "@hypertest/context": "0.3.0-dev",
+    "@hypertest/tools": "0.3.0-dev",
+    "@hypertest/runtime": "0.3.0-dev",
+    "@hypertest/runtime-pi": "0.3.0-dev",
+    "@hypertest/agents": "0.3.0-dev",
+    "@hypertest/control": "0.3.0-dev",
+    "@hypertest/durable": "0.3.0-dev",
+    "yaml": "2.9.1"
+  }
+}

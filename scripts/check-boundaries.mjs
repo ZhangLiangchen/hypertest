@@ -1,159 +1,133 @@
-import { readdir, readFile } from "node:fs/promises";
-import { extname, join, relative } from "node:path";
+#!/usr/bin/env node
+// Enforces the Hypertest package dependency DAG and third-party containment.
+//
+// Rules (see docs/architecture/BLUEPRINT.md §3):
+//   1. A package's src/ may import only the @hypertest packages listed in ALLOWED[pkg].
+//   2. Imports of another package must go through its root ("@hypertest/x"), never "@hypertest/x/src/...".
+//   3. Relative imports must stay inside the importing package.
+//   4. Selected third-party SDKs are confined to the package that adapts them (CONTAINED).
+//   5. Every @hypertest import used in src/ must be declared in that package's package.json dependencies.
+//   6. Tests may additionally import @hypertest/store and @hypertest/testkit and any declared devDependency.
+import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
+import { join, relative, resolve, dirname, sep } from 'node:path';
 
-const root = new URL("../", import.meta.url);
-const sourceRoot = new URL("../src/", import.meta.url);
-const testRoot = new URL("../tests/", import.meta.url);
-const ecosystemTerms = [
-  "pytest",
-  "go test",
-  "junit",
-  "lcov",
-  "cobertura",
-  "gitlab",
-  "github actions",
-  "openapi",
-];
-const piPackagePattern = /@earendil-works\/pi-[a-z0-9-]+/i;
-const forbiddenAgentDependencyFragments = [
-  "codex",
-  "opencode",
-  "openhands",
-  "metagpt",
-  "hermes",
-];
-const violations = [];
+const ROOT = resolve(dirname(new URL(import.meta.url).pathname), '..');
+const PACKAGES_DIR = join(ROOT, 'packages');
 
-async function walk(directory) {
-  const entries = await readdir(directory, { withFileTypes: true });
-  for (const entry of entries) {
-    const path = join(directory, entry.name);
-    if (entry.isDirectory()) await walk(path);
-    else if ([".ts", ".mts", ".cts"].includes(extname(entry.name))) {
-      await inspect(path);
-    }
+export const ALLOWED = {
+  core: [],
+  domain: ['core'],
+  store: ['core'],
+  testkit: ['core', 'domain', 'store'],
+  evidence: ['core', 'domain'],
+  operation: ['core', 'domain'],
+  collab: ['core', 'domain'],
+  policy: ['core', 'domain'],
+  model: ['core', 'domain'],
+  context: ['core', 'domain', 'collab', 'evidence'],
+  tools: ['core', 'domain', 'evidence', 'operation', 'policy'],
+  runtime: ['core', 'domain', 'model', 'context', 'tools', 'policy'],
+  'runtime-pi': ['core', 'domain', 'model', 'runtime'],
+  'runtime-dsh': ['core', 'domain', 'model', 'runtime'],
+  agents: ['core', 'domain'],
+  control: ['core', 'domain', 'collab', 'operation', 'policy', 'evidence', 'model', 'context', 'tools', 'runtime', 'agents'],
+  durable: ['core', 'domain', 'control'],
+  app: ['core', 'domain', 'store', 'collab', 'operation', 'policy', 'evidence', 'model', 'context', 'tools', 'runtime', 'runtime-pi', 'runtime-dsh', 'agents', 'control', 'durable'],
+  eval: ['core', 'domain', 'store', 'model', 'evidence', 'collab', 'operation', 'policy', 'control', 'app', 'agents', 'tools', 'runtime'],
+  cli: ['core', 'domain', 'app', 'eval', 'evidence', 'store'],
+};
+
+// third-party module prefix -> packages allowed to import it
+export const CONTAINED = [
+  { prefix: '@earendil-works/pi-agent-core', allowed: ['runtime-pi'] },
+  { prefix: '@earendil-works/pi-ai', allowed: ['runtime-pi', 'model'] },
+  { prefix: '@deepseek-ai/', allowed: ['runtime-dsh'] },
+  { prefix: '@temporalio/', allowed: ['durable'] },
+  { prefix: '@nats-io/', allowed: ['collab'] },
+  { prefix: 'pg', exact: true, allowed: ['store'] },
+  { prefix: '@electric-sql/', allowed: ['store'] },
+  { prefix: '@aws-sdk/', allowed: ['evidence'] },
+  { prefix: 'playwright', allowed: ['tools'] },
+  { prefix: 'playwright-core', allowed: ['tools'] },
+  { prefix: '@modelcontextprotocol/', allowed: ['tools'] },
+  { prefix: 'ajv', allowed: ['core'] },
+  { prefix: 'yaml', exact: true, allowed: ['app', 'policy', 'cli', 'eval'] },
+];
+
+const IMPORT_RE = /(?:^|[\s;])(?:import|export)\s[^'"`]*?from\s*['"]([^'"]+)['"]|(?:^|[\s;(=])import\s*\(\s*['"]([^'"]+)['"]\s*\)|(?:^|[\s;])import\s*['"]([^'"]+)['"]/gm;
+
+function walk(dir, out = []) {
+  if (!existsSync(dir)) return out;
+  for (const name of readdirSync(dir)) {
+    if (name === 'node_modules' || name.startsWith('.')) continue;
+    const p = join(dir, name);
+    const st = statSync(p);
+    if (st.isDirectory()) walk(p, out);
+    else if (/\.(ts|mts|js|mjs)$/.test(name) && !name.endsWith('.d.ts')) out.push(p);
   }
+  return out;
 }
 
-async function inspect(path) {
-  const text = await readFile(path, "utf8");
-  const normalized = relative(root.pathname, path).replaceAll("\\", "/");
-  const lower = text.toLowerCase();
-  const isPiBoundary = normalized.startsWith("src/runtime/pi/");
+function stripComments(src) {
+  return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:'"`])\/\/.*$/gm, '$1');
+}
 
-  if (piPackagePattern.test(text) && !isPiBoundary) {
-    violations.push(`${normalized}: Pi SDK reference outside src/runtime/pi`);
-  }
-
-  if (isPiBoundary) {
-    if (/\b(?:as\s+)?any\b/.test(text)) {
-      violations.push(`${normalized}: any is forbidden in the Pi adapter`);
+export function checkBoundaries() {
+  const errors = [];
+  if (!existsSync(PACKAGES_DIR)) return errors;
+  const pkgs = readdirSync(PACKAGES_DIR).filter((d) => existsSync(join(PACKAGES_DIR, d, 'package.json')));
+  for (const pkg of pkgs) {
+    if (!(pkg in ALLOWED)) {
+      errors.push(`packages/${pkg}: not registered in scripts/check-boundaries.mjs ALLOWED (add it with its allowed dependencies)`);
+      continue;
     }
-    if (/unknown\s+as\s+Pi[A-Z]/.test(text)) {
-      violations.push(`${normalized}: unsafe unknown-as-Pi assertion`);
-    }
-    if (/\bimport\s*\(/.test(text)) {
-      violations.push(`${normalized}: dynamic import is forbidden in the Pi adapter`);
-    }
-    if (/\.join\s*\(\s*["']\/["']\s*\)/.test(text)) {
-      violations.push(`${normalized}: dynamic package path assembly is forbidden`);
-    }
-  } else if (
-    /^\s*(?:export\s+)?(?:interface|type)\s+Pi[A-Z][A-Za-z0-9_]*/m.test(
-      text,
-    )
-  ) {
-    violations.push(`${normalized}: Pi shadow type outside src/runtime/pi`);
-  }
-
-  if (
-    (normalized === "src/runtime.ts" || normalized.startsWith("src/runtime/")) &&
-    /return\s*\{\s*text\s*:/.test(text)
-  ) {
-    violations.push(`${normalized}: invalid model output text fallback`);
-  }
-
-  if (/\bfork\s*\(/.test(text)) {
-    violations.push(`${normalized}: process fork is forbidden`);
-  }
-
-  const isAdapter = normalized.startsWith("src/adapters/");
-  const isAdapterCli = normalized === "src/adapter-cli.ts";
-  const isProfileExampleAwareCli = normalized === "src/cli.ts";
-  if (!isAdapter && !isAdapterCli && !isProfileExampleAwareCli) {
-    for (const term of ecosystemTerms) {
-      if (lower.includes(term)) {
-        violations.push(
-          `${normalized}: ecosystem-specific term '${term}' outside adapter boundary`,
-        );
+    const pkgDir = join(PACKAGES_DIR, pkg);
+    const manifest = JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8'));
+    if (manifest.name !== `@hypertest/${pkg}`) errors.push(`packages/${pkg}/package.json: name must be @hypertest/${pkg}`);
+    const declared = new Set(Object.keys(manifest.dependencies ?? {}));
+    const declaredDev = new Set(Object.keys(manifest.devDependencies ?? {}));
+    for (const area of ['src', 'test']) {
+      for (const file of walk(join(pkgDir, area))) {
+        const rel = relative(ROOT, file);
+        const src = stripComments(readFileSync(file, 'utf8'));
+        for (const m of src.matchAll(IMPORT_RE)) {
+          const spec = m[1] ?? m[2] ?? m[3];
+          if (!spec) continue;
+          if (spec.startsWith('.')) {
+            const target = resolve(dirname(file), spec);
+            if (!target.startsWith(pkgDir + sep)) errors.push(`${rel}: relative import escapes package: ${spec}`);
+            if (/\.js$/.test(spec) && area === 'src') errors.push(`${rel}: import TypeScript sources with the .ts extension: ${spec}`);
+            continue;
+          }
+          if (spec.startsWith('@hypertest/')) {
+            const [, name, ...rest] = spec.split('/');
+            if (rest.length > 0) errors.push(`${rel}: deep import into @hypertest/${name}; import the package root instead`);
+            if (name === pkg) { errors.push(`${rel}: package imports itself via @hypertest/${name}; use a relative import`); continue; }
+            const allowed = new Set(ALLOWED[pkg]);
+            if (area === 'test') { allowed.add('store'); allowed.add('testkit'); }
+            const okByDev = area === 'test' && declaredDev.has(`@hypertest/${name}`);
+            if (!allowed.has(name) && !okByDev) errors.push(`${rel}: @hypertest/${pkg} may not depend on @hypertest/${name}`);
+            if (area === 'src' && !declared.has(`@hypertest/${name}`)) errors.push(`${rel}: @hypertest/${name} is not declared in packages/${pkg}/package.json dependencies`);
+            continue;
+          }
+          if (spec.startsWith('node:')) continue;
+          for (const rule of CONTAINED) {
+            const hit = rule.exact ? (spec === rule.prefix || spec.startsWith(rule.prefix + '/')) : spec.startsWith(rule.prefix);
+            if (hit && !rule.allowed.includes(pkg)) errors.push(`${rel}: ${spec} is confined to ${rule.allowed.map((p) => '@hypertest/' + p).join(', ')}`);
+          }
+        }
       }
     }
   }
-
-  if (isAdapter && piPackagePattern.test(text)) {
-    violations.push(`${normalized}: adapter imports the agent SDK`);
-  }
+  return errors;
 }
 
-async function inspectPiReferences(directory) {
-  const entries = await readdir(directory, { withFileTypes: true });
-  for (const entry of entries) {
-    const path = join(directory, entry.name);
-    if (entry.isDirectory()) {
-      await inspectPiReferences(path);
-      continue;
-    }
-    if (![".ts", ".mts", ".cts"].includes(extname(entry.name))) continue;
-    const text = await readFile(path, "utf8");
-    if (piPackagePattern.test(text)) {
-      const normalized = relative(root.pathname, path).replaceAll("\\", "/");
-      violations.push(`${normalized}: Pi SDK reference outside src/runtime/pi`);
-    }
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const errors = checkBoundaries();
+  if (errors.length) {
+    console.error(`Boundary check failed (${errors.length}):`);
+    for (const e of errors) console.error('  - ' + e);
+    process.exit(1);
   }
-}
-
-async function inspectDependencies() {
-  const packageDocument = JSON.parse(
-    await readFile(new URL("../package.json", import.meta.url), "utf8"),
-  );
-  const dependencyNames = Object.keys({
-    ...(packageDocument.dependencies ?? {}),
-    ...(packageDocument.devDependencies ?? {}),
-    ...(packageDocument.optionalDependencies ?? {}),
-  });
-  for (const name of dependencyNames) {
-    const lower = name.toLowerCase();
-    if (
-      forbiddenAgentDependencyFragments.some((fragment) =>
-        lower.includes(fragment),
-      )
-    ) {
-      violations.push(`${name}: second agent SDK dependency is forbidden`);
-    }
-  }
-  const piDependencies = dependencyNames.filter((name) =>
-    piPackagePattern.test(name),
-  );
-  const allowedPiDependencies = new Set([
-    "@earendil-works/pi-agent-core",
-    "@earendil-works/pi-ai",
-  ]);
-  for (const name of piDependencies) {
-    if (!allowedPiDependencies.has(name)) {
-      violations.push(`${name}: unapproved Pi package dependency`);
-    }
-  }
-  if (!dependencyNames.includes("@earendil-works/pi-agent-core")) {
-    violations.push("package.json: missing sole SDK-level agent runtime");
-  }
-}
-
-await walk(sourceRoot.pathname);
-await inspectPiReferences(testRoot.pathname);
-await inspectDependencies();
-if (violations.length > 0) {
-  console.error("Architecture boundary violations:\n" + violations.join("\n"));
-  process.exitCode = 1;
-} else {
-  console.log("Architecture boundaries: PASS");
+  console.log('Boundary check passed.');
 }

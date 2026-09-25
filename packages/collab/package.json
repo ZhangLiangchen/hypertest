@@ -1,0 +1,13 @@
+{
+  "name": "@hypertest/collab",
+  "version": "0.3.0-dev",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "@hypertest/core": "0.3.0-dev",
+    "@hypertest/domain": "0.3.0-dev",
+    "@nats-io/jetstream": "3.4.0",
+    "@nats-io/transport-node": "3.4.0"
+  }
+}

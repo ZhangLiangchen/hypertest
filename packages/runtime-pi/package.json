@@ -1,0 +1,15 @@
+{
+  "name": "@hypertest/runtime-pi",
+  "version": "0.3.0-dev",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "@hypertest/core": "0.3.0-dev",
+    "@hypertest/domain": "0.3.0-dev",
+    "@hypertest/model": "0.3.0-dev",
+    "@hypertest/runtime": "0.3.0-dev",
+    "@earendil-works/pi-agent-core": "0.87.1",
+    "@earendil-works/pi-ai": "0.87.1"
+  }
+}

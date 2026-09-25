@@ -1,0 +1,16 @@
+{
+  "name": "@hypertest/cli",
+  "version": "0.3.0-dev",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "@hypertest/core": "0.3.0-dev",
+    "@hypertest/domain": "0.3.0-dev",
+    "@hypertest/app": "0.3.0-dev",
+    "@hypertest/eval": "0.3.0-dev",
+    "@hypertest/evidence": "0.3.0-dev",
+    "@hypertest/store": "0.3.0-dev",
+    "yaml": "2.9.1"
+  }
+}

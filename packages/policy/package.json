@@ -1,0 +1,12 @@
+{
+  "name": "@hypertest/policy",
+  "version": "0.3.0-dev",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "@hypertest/core": "0.3.0-dev",
+    "@hypertest/domain": "0.3.0-dev",
+    "yaml": "2.9.1"
+  }
+}

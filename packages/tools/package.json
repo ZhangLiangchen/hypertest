@@ -1,0 +1,18 @@
+{
+  "name": "@hypertest/tools",
+  "version": "0.3.0-dev",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@hypertest/core": "0.3.0-dev",
+    "@hypertest/domain": "0.3.0-dev",
+    "@hypertest/evidence": "0.3.0-dev",
+    "@hypertest/operation": "0.3.0-dev",
+    "@hypertest/policy": "0.3.0-dev",
+    "playwright-core": "1.56.1",
+    "@modelcontextprotocol/sdk": "1.30.1"
+  }
+}
