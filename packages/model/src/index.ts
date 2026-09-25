@@ -1,1 +1,11 @@
 export * from './contracts.ts';
+export { ModelCatalog, MODEL_CAPABILITY_PROFILE_SCHEMA } from './catalog.ts';
+export { ProviderRegistry } from './registry.ts';
+export { createModelRouter, ROUTING_STAGES, OUTPUT_RESERVE_CAP, type SelectionCriterion } from './router.ts';
+export { estimateCostUsd, estimateOutputTokens } from './usage.ts';
+export { ScriptedProvider } from './scripted.ts';
+export { OpenAICompatibleProvider, buildOpenAIBody, toOpenAIMessages, mapOpenAIUsage, mapFinishReason } from './openai.ts';
+export { AnthropicProvider, STRUCTURED_OUTPUT_TOOL, anthropicCompatibilityClass, buildAnthropicBody, toAnthropicMessages } from './anthropic.ts';
+export { PiAiProvider, piCompatibilityClass, toPiContext, fromPiAssistant, mapPiUsage, mapPiStopReason } from './pi-ai.ts';
+export { ToolNameMap, WIRE_TOOL_NAME } from './tool-names.ts';
+export { SAME_ROUTE_RETRYABLE, FALLBACK_ELIGIBLE, codeForHttpStatus, type ProviderErrorCode } from './errors.ts';

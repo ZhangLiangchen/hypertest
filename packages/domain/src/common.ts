@@ -38,6 +38,7 @@ export interface ActorRef {
 
 /** Typed reference to any Hypertest object. */
 export type RefKind =
+  | 'run'
   | 'record'
   | 'evidence'
   | 'artifact'

@@ -16,9 +16,13 @@ import type { AssistantMessage, ChatMessage, DataClassification, DomainEventSink
  *   class ModelCatalog                                   (profiles, revision = hash of profiles; get/list/withScores)
  *   createModelRouter(deps: RouterDeps): ModelRouter
  *   ProviderRegistry                                     (register(provider), get(providerId))
+ *   estimateCostUsd(profile, inputTokens, outputTokens)   (per-million prices → USD)
+ *   MODEL_CAPABILITY_PROFILE_SCHEMA                      (JSON Schema used by ModelCatalog validation)
  *
  * Provider error mapping (HypertestError codes): 429 → rate_limited, 408/5xx/network → unavailable,
  * timeout → timeout, 400 schema/tool errors → provider_error (non-retryable), abort → cancelled.
+ * A stream cut mid-event is an incomplete stream (unavailable), never a malformed payload; an exception thrown by
+ * the caller's `onDelta` is `internal` (non-retryable, never answered with a fallback).
  */
 
 // ----------------------------------------------------------------------------- message IR
@@ -149,6 +153,8 @@ export interface InvokeRequest {
   ctx: EventContext;
   /** Retries of the same route for retryable errors before reporting failure. */
   maxAttempts?: number;
+  /** Streaming deltas of the (single) route being invoked. Added in 0.3 (additive). */
+  onDelta?: (d: StreamDelta) => void;
 }
 
 export type InvokeOutcome =
@@ -168,6 +174,8 @@ export interface RouterDeps extends BaseDeps {
   catalog: ModelCatalogLike;
   providers: ProviderRegistryLike;
   events?: DomainEventSink;
+  /** Same-route retry backoff (defaults: base 250ms, max 4000ms). Added in 0.3 (additive). */
+  retry?: { baseDelayMs?: number; maxDelayMs?: number };
 }
 
 export interface ModelCatalogLike {
@@ -188,8 +196,90 @@ export interface ModelRouter {
    * Never cost-first. Emits model.routed with rejections.
    */
   route(request: RouteRequest, ctx: EventContext): Promise<RouteDecision>;
-  /** Calls the provider for the decided route; on failure computes a re-validated fallback (never swaps mid-call). */
+  /**
+   * Calls the provider for the decided route; on failure computes a re-validated fallback (never swaps mid-call).
+   * The decision is re-validated against `routeRequest` (the CURRENT request) before any call: a stale catalog
+   * revision, a forged decision, or a route that no longer passes every stage (e.g. the data classification or
+   * action risk escalated, a provider must now be avoided, the context no longer fits) is refused with
+   * `precondition_failed` (attempts 0). The fallback re-route also requires the tool compatibility the call used
+   * (tools → tool_use, responseFormat → structured output, images → vision) as far as the failed route declared it.
+   * Malformed inputs (non-finite maxAttempts, invalid routeRequest) are thrown as `invalid_argument`; a failure to
+   * record the audit events after a successful call is thrown as a fault (never reported as a model failure).
+   */
   invoke(request: InvokeRequest, routeRequest: RouteRequest): Promise<InvokeOutcome>;
   /** Cost estimate for budget reservation. */
   estimateCostUsd(routeId: string, inputTokens: number, outputTokens: number): number;
+}
+
+// ----------------------------------------------------------------------------- provider options (additive)
+
+export interface ScriptedProviderOptions {
+  /** Defaults to `scripted`. */
+  providerId?: string;
+  /** Brain used for every model without a dedicated entry in `brains`. */
+  brain?: ScriptedBrain;
+  /** Brains keyed by model name (the route's `model`). */
+  brains?: Record<string, ScriptedBrain>;
+  /** Simulated latency per call (respects the call's signal and timeoutMs). */
+  latencyMs?: number;
+}
+
+export interface OpenAICompatibleProviderOptions {
+  providerId: string;
+  /** Base URL including the version prefix, e.g. `https://api.openai.com/v1`; `/chat/completions` is appended. */
+  baseUrl: string;
+  apiKey?: string;
+  headers?: Record<string, string>;
+  /** Whole-call deadline (connect + stream). Default 120000. */
+  timeoutMs?: number;
+  fetchImpl?: typeof fetch;
+}
+
+export interface AnthropicProviderOptions {
+  /** Defaults to `anthropic`. */
+  providerId?: string;
+  /** Defaults to `https://api.anthropic.com`; `/v1/messages` is appended. */
+  baseUrl?: string;
+  apiKey?: string;
+  /** `anthropic-version` header. Default `2023-06-01`. */
+  version?: string;
+  headers?: Record<string, string>;
+  /** Whole-call deadline (connect + stream). Default 120000. */
+  timeoutMs?: number;
+  /** `max_tokens` when the call does not set maxOutputTokens (the API requires it). Default 4096. */
+  defaultMaxTokens?: number;
+  fetchImpl?: typeof fetch;
+}
+
+/** A model definition for PiAiProvider when the model is not in pi-ai's built-in catalog (e.g. a local server). */
+export interface PiAiModelDefinition {
+  id: string;
+  /** pi-ai API id: `openai-completions`, `openai-responses`, `anthropic-messages`, `google-generative-ai`, `mistral-conversations`, ... */
+  api: string;
+  baseUrl?: string;
+  contextWindow?: number;
+  maxTokens?: number;
+  reasoning?: boolean;
+  input?: Array<'text' | 'image'>;
+  headers?: Record<string, string>;
+  /** Passed through as the pi-ai model `compat` object. */
+  compat?: Record<string, JsonValue>;
+}
+
+export interface PiAiProviderOptions {
+  /** Hypertest provider id used in catalog profiles. */
+  providerId: string;
+  /** pi-ai provider id (built-in catalog lookup, e.g. `openai`, `anthropic`, `deepseek`, `openrouter`) or a custom name. */
+  piProvider: string;
+  apiKey?: string;
+  /** Overrides the model's base URL (custom gateways, local servers). */
+  baseUrl?: string;
+  headers?: Record<string, string>;
+  /** Custom model definitions; take precedence over the built-in catalog. */
+  models?: PiAiModelDefinition[];
+  /** API used for models found neither in `models` nor in the catalog when `baseUrl` is set. Default `openai-completions`. */
+  defaultApi?: string;
+  /** Whole-call deadline. Default 120000. */
+  timeoutMs?: number;
+  fetchImpl?: typeof fetch;
 }

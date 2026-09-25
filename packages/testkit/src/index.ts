@@ -78,7 +78,7 @@ function repoRoot(): string {
 }
 
 /** Local infra connection info (env vars, else .infra/env written by `npm run infra:up`). */
-export function infraEnv(): { pgUrl?: string; natsUrl?: string; temporalAddress?: string; infraBin?: string } {
+export function infraEnv(): { pgUrl?: string; natsUrl?: string; temporalAddress?: string; opaUrl?: string; infraBin?: string } {
   const env: Record<string, string | undefined> = { ...process.env };
   const f = join(repoRoot(), '.infra', 'env');
   if (existsSync(f)) {
@@ -87,7 +87,8 @@ export function infraEnv(): { pgUrl?: string; natsUrl?: string; temporalAddress?
       if (m && env[m[1]!] === undefined) env[m[1]!] = m[2];
     }
   }
-  const out: { pgUrl?: string; natsUrl?: string; temporalAddress?: string; infraBin?: string } = {};
+  const out: { pgUrl?: string; natsUrl?: string; temporalAddress?: string; opaUrl?: string; infraBin?: string } = {};
+  if (env['HYPERTEST_TEST_OPA_URL']) out.opaUrl = env['HYPERTEST_TEST_OPA_URL'];
   if (env['HYPERTEST_TEST_PG_URL']) out.pgUrl = env['HYPERTEST_TEST_PG_URL'];
   if (env['HYPERTEST_TEST_NATS_URL']) out.natsUrl = env['HYPERTEST_TEST_NATS_URL'];
   if (env['HYPERTEST_TEST_TEMPORAL_ADDRESS']) out.temporalAddress = env['HYPERTEST_TEST_TEMPORAL_ADDRESS'];

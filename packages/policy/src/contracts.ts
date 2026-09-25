@@ -1,4 +1,4 @@
-import type { BaseDeps, JsonValue, SqlDatabase } from '@hypertest/core';
+import type { BaseDeps, Clock, JsonValue, SqlDatabase } from '@hypertest/core';
 import type {
   ActionCapability, ActorRef, ApprovedException, BlackboardRecord, CoverageGap, DomainEventSink, EventContext, EvidenceRecord,
   ExperimentSpec, Finding, GateSpec, Objective, OracleAssertion, OracleChangeProposal, OracleSpec, PermissionProfile, QualityDecision,
@@ -11,7 +11,7 @@ import type {
  * Protocol binding.
  *
  * Implementations to export from src/index.ts:
- *   capabilities: createRootCapability, attenuateCapability, capabilityAllows, signCapability,
+ *   capabilities: createRootCapability, attenuateCapability (optional 4th arg AttenuateOptions), capabilityAllows, signCapability,
  *                 verifyCapability, matchesPattern, PERMISSION_PROFILES (read_only, analyst, test_author,
  *                 test_executor, environment_operator, product_fixer)
  *   class BuiltinPolicyEngine implements PolicyEngine   (constructor(rules: PolicyRule[], revision: string))
@@ -54,6 +54,45 @@ export interface CapabilityCheckRequest {
 }
 
 export type CapabilityCheck = { allowed: true } | { allowed: false; reason: string };
+
+/**
+ * Additive: pattern flavours. Tool patterns: exact id, trailing-`*` prefix glob (`git.*`, `oracle.approve*`)
+ * or `*`. Resource patterns: `/`-separated segments; `*` matches exactly one segment, `**` zero or more.
+ */
+export type PatternKind = 'tool' | 'resource';
+
+/** Additive: names of the built-in permission profiles (see PERMISSION_PROFILES). */
+export type PermissionProfileName = 'read_only' | 'analyst' | 'test_author' | 'test_executor' | 'environment_operator' | 'product_fixer';
+
+/** Additive: input of createRootCapability(input, secret). */
+export interface RootCapabilityInput {
+  runId: string;
+  subjectAgentId: string;
+  workItemId: string;
+  /** A built-in profile name or an explicit profile. */
+  profile: PermissionProfileName | PermissionProfile;
+  /** Tool patterns (default `['*']`; the role tool policy narrows tools separately). */
+  tools?: string[];
+  expiresAt: string;
+  /** Defaults to a fresh `cap_…` id. */
+  capabilityId?: string;
+}
+
+/**
+ * Additive: optional 4th argument of attenuateCapability. With `secret`, the parent's HMAC is verified
+ * (permission_denied when invalid) and the child is returned signed with the same secret.
+ */
+export interface AttenuateOptions {
+  secret?: string;
+}
+
+/** Additive: identity of the child produced by attenuateCapability(parent, constraints, child). */
+export interface ChildCapabilityIdentity {
+  subjectAgentId: string;
+  workItemId: string;
+  /** Defaults to a fresh `cap_…` id. */
+  capabilityId?: string;
+}
 
 // ----------------------------------------------------------------------------- permits
 
@@ -98,7 +137,33 @@ export interface PolicyEngine {
   evaluate(request: ActionRequest): Promise<ActionPermit>;
 }
 
-/** Declarative built-in rule: first matching rule with the most restrictive decision wins. */
+/**
+ * Additive: options of BuiltinPolicyEngine / CompositePolicyEngine / OpaPolicyEngine.
+ * `newId` produces ActionPermit.decisionId (default `pdec_<ulid>`); `clock` supplies `now` for capability
+ * expiry; `capabilitySecret`, when given, makes the engine verify the capability HMAC (deny when invalid).
+ */
+export interface PolicyEngineOptions {
+  newId?: () => string;
+  clock?: Clock;
+  capabilitySecret?: string;
+}
+
+export interface OpaPolicyEngineOptions extends PolicyEngineOptions {
+  url: string;
+  /** Data path of the decision document (default `hypertest/authz`). */
+  path?: string;
+  timeoutMs?: number;
+  revision: string;
+  /** Injectable fetch (tests); defaults to the global fetch. */
+  fetch?: typeof fetch;
+}
+
+/**
+ * Declarative built-in rule: every matching rule is evaluated and the most restrictive decision wins
+ * (deny > approval_required > allow); no matching rule ⇒ deny. A rule matches when every given `match`
+ * field matches. `resources`: an allow rule requires a non-empty resource list fully covered by its
+ * patterns; a deny/approval rule matches when any resource matches (fail closed either way).
+ */
 export interface PolicyRule {
   id: string;
   description: string;
@@ -251,6 +316,14 @@ export interface GateInput {
   policyRevision: string;
   decisionId: string;
   now: string;
+  /**
+   * Additive: model providers of the agents that produced findings/tests/evidence in this run. An
+   * approving review counts as independent only when its modelProvider is none of these.
+   */
+  producerProviders?: string[];
+  /** Additive: QualityDecision.revision / supersedes (default 1 / none). */
+  revision?: number;
+  supersedes?: string;
 }
 
 // ----------------------------------------------------------------------------- BUGate protocol
@@ -283,6 +356,8 @@ export interface ProtocolContextRequest {
   qualityPosture?: Record<string, QualityPosture>;
   activeConcerns?: PreparedProtocolContext['active_concerns'];
   maxBytes?: number;
+  /** Additive: PreparedProtocolContext.workspace.workspace_digest. */
+  workspaceDigest?: string | null;
 }
 
 export type { PermissionProfile };

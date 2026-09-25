@@ -57,7 +57,44 @@ export async function createTestDatabase(options: TestDatabaseOptions = {}): Pro
   }
   const raw = await template;
   const db = wrapPglite(await raw.clone());
-  return { db, dispose: () => db.close() };
+  active++;
+  if (idleTimer) {
+    clearTimeout(idleTimer);
+    idleTimer = undefined;
+  }
+  let disposed = false;
+  return {
+    db,
+    dispose: async () => {
+      if (disposed) return;
+      disposed = true;
+      try {
+        await db.close();
+      } finally {
+        active--;
+        if (active === 0) scheduleTemplateClose();
+      }
+    },
+  };
 }
 
-const templates = new Map<string, Promise<Awaited<ReturnType<typeof createRawPglite>>>>();
+type RawPglite = Awaited<ReturnType<typeof createRawPglite>>;
+const templates = new Map<string, Promise<RawPglite>>();
+let active = 0;
+let idleTimer: NodeJS.Timeout | undefined;
+
+/**
+ * An open PGlite instance keeps an internal WASM timer alive (~10s after DDL), which delays test
+ * process exit. Close cached templates shortly after the last test database is disposed; the timer
+ * is unref'd so it never keeps the process alive by itself. A later createTestDatabase rebuilds them.
+ */
+function scheduleTemplateClose(): void {
+  idleTimer = setTimeout(() => {
+    idleTimer = undefined;
+    if (active > 0) return;
+    const all = [...templates.values()];
+    templates.clear();
+    for (const t of all) void t.then((raw) => raw.close()).catch(() => undefined);
+  }, 250);
+  idleTimer.unref();
+}

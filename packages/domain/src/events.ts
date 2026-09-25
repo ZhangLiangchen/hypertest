@@ -49,6 +49,8 @@ export const EVENT_TYPES = {
   runPaused: 'run.paused',
   runResumed: 'run.resumed',
   runConverging: 'run.converging',
+  runGating: 'run.gating',
+  runUpdated: 'run.updated',
   runCompleted: 'run.completed',
   runFailed: 'run.failed',
   runCancelled: 'run.cancelled',
@@ -67,6 +69,8 @@ export const EVENT_TYPES = {
   workFailed: 'work.failed',
   workCancelled: 'work.cancelled',
   workRequeued: 'work.requeued',
+  workBlocked: 'work.blocked',
+  workUpdated: 'work.updated',
 
   agentSpawned: 'agent.spawned',
   agentTurnStarted: 'agent.turn_started',
@@ -116,6 +120,7 @@ export const EVENT_TYPES = {
   operationOutcomeUnknown: 'operation.outcome_unknown',
   operationReconciled: 'operation.reconciled',
   operationManualReview: 'operation.manual_review',
+  operationLateReceipt: 'operation.late_receipt',
 
   oracleChangeProposed: 'oracle.change_proposed',
   oracleChangeApproved: 'oracle.change_approved',

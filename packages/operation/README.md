@@ -1,0 +1,126 @@
+# @hypertest/operation
+
+Authority for **what actually happened in the external world** (I4) and for experiment isolation and
+budgets (I12). Every external/destructive side effect goes through the `SideEffectGateway` with a stable
+`operationId`; unknown outcomes are reconciled, never blindly retried; stale workers are fenced off.
+
+Depends on `@hypertest/core` and `@hypertest/domain` only. The ABI is `src/contracts.ts`.
+
+## Public API
+
+| Export | Purpose |
+|---|---|
+| `operationMigrations` | `operation/001-operations` … `004-budgets`: `ht_operations`, `ht_fences`, `ht_leases`, `ht_admission_lock`, `ht_resource_claims`, `ht_budget_scopes`, `ht_budget_reservations` (PGlite + PostgreSQL 16). |
+| `createOperationLedger(deps)` | `prepare` (idempotent by `idempotencyKey` and by `(toolInvocationId, operationType)`), `get`, `findBy*`, `transition` (domain state machine + optimistic concurrency), `list`, `listUnsettled`. Emits `operation.*` events in the same transaction. |
+| `createLeaseService(deps)` | Write leases with monotonic fencing tokens: `acquire`, `renew`, `release`, `current`, `checkFence`. |
+| `createSideEffectGateway(deps)` | `run` (retry switch), `observe` (durable polling), `compensate`. |
+| `createReconciler(deps)` | `reconcile({ runId? })`: settles unsettled operations by observation on startup/resume; never dispatches. |
+| `createResourceAdmission(deps)` | All-or-nothing admission of hierarchical `ResourceClaim`s (`read_shared` / `write_exclusive` / `fault_exclusive`). |
+| `createBudgetLedger(deps)` | Budget leases: `open`, `reserve` → `settle` \| `release`, `charge`, `usage`. |
+| `AdapterRegistry` | `register` (validates capabilities, duplicate ⇒ `conflict`), `get` (unknown ⇒ `not_found`), `has`, `list`. |
+| helpers | `outcomeForOperation`, `operationEventType`, `UNSETTLED_OPERATION_STATUSES`, `BUDGET_DIMENSIONS`. |
+
+## Gateway semantics (`run`)
+
+1. Find the operation by `(toolInvocationId, operationType)`. Same id with a different input/run/adapter ⇒
+   `conflict`. `verified` ⇒ recorded result; `failed` / `manual_review` / compensation states ⇒ recorded outcome.
+2. `request.lease`: reuse (renew) the owner's live lease, else acquire; held by another live owner ⇒
+   `failed` / `resource_busy` (no dispatch). Without `request.lease`, a lease recorded on the operation
+   (e.g. by the scheduler at prepare time) is used as the fence.
+3. New operation: the id is generated first, `adapter.prepare()` sees it (labels), then `ledger.prepare()`.
+4. Before any dispatch — and before a stale worker may drive reconciliation — `checkFence`; stale ⇒ `stale_fence`, status unchanged.
+5. `prepared`/`not_applied` ⇒ persist `dispatching` (attempt+1) **before** `adapter.dispatch()`.
+   Throw/timeout/abort ⇒ `outcome_unknown` (never `failed`): `pending` when the adapter supports lookup by
+   operationId, otherwise `manual_review`. `accepted=false` ⇒ `not_applied`. Receipt ⇒ `acknowledged`, then
+   observe + verify within `verifyWithinMs` (default: one observation).
+6. `dispatching`/`outcome_unknown`/`reconciling` ⇒ `reconciling` → `observe()`: present ⇒ `acknowledged` →
+   verify (attach, never re-create); absent ⇒ `not_applied` and **one** safe re-dispatch per call (unless
+   `non_reconcilable` and risk ≥ high ⇒ `manual_review`); uncertain ⇒ `manual_review`. Unknown outcome with no
+   lookup capability and risk ≥ high ⇒ `manual_review` without observing.
+7. `acknowledged` ⇒ attach (observe + verify). Because the target acknowledged the job, `absent` is treated as
+   *not yet observable* (`pending`), never as "not applied" — re-dispatching an acknowledged job could duplicate
+   it; `uncertain` ⇒ `manual_review`. (The domain state machine has no `acknowledged → reconciling` edge.)
+8. Outcome mapping for states without their own outcome: `compensated` ⇒ `not_applied`/`compensated`,
+   `compensating` ⇒ `pending`, `prepared` (observe only) ⇒ `not_applied`/`not_dispatched`. The
+   authoritative status is always `outcome.operation.status`.
+
+Concurrency: duplicate deliveries in one process share one drive (single-flight). The single-flight map
+and in-flight set are shared by **every** gateway and reconciler built over the same ledger instance, so a
+second gateway instance never reconciles underneath a dispatch or compensation still running here. Every
+transition uses `expectedFrom` + `expectedAttempt`; a concurrent move yields the other actor's recorded
+outcome. Adapter `prepare`/`observe`/`verify` calls are bounded by the request's abort signal (an adapter
+that ignores the signal cannot hang a drive or the Reconciler). A receipt that arrives after another actor
+moved the operation is never dropped:
+- same attempt, still `outcome_unknown`/`reconciling` ⇒ the receipt is recorded (`acknowledged`) and
+  verified, so the other actor can no longer conclude `not_applied` and re-dispatch;
+- already `not_applied` ⇒ recorded terminally (`failed`, outcome `manual_review`), never re-dispatched;
+- a later attempt was started ⇒ orphaned duplicate: outcome `manual_review`, an `operation.late_receipt`
+  audit event (`disposition: 'orphaned'`) and an error log;
+- already `manual_review` ⇒ `operation.late_receipt` (`disposition: 'manual_review'`) keeps the receipt.
+
+`externalJobId`/`externalReceipt` describe the current attempt: a transition to `dispatching` clears them
+(the previous values remain in the event history), so reconciliation never observes a previous attempt's job.
+The Reconciler, and `observe()` for a `dispatching` operation, skip operations whose recorded lease is still
+live (the holder may be mid-dispatch in another process) and operations in flight in this process.
+
+Compensation only from `verified` (an unknown outcome must be reconciled first ⇒ `precondition_failed`);
+`compensating → compensated | manual_review`; an interrupted compensation is resumed by lookup; a
+compensation still in flight in this process is never run a second time (`pending`).
+
+Leases: every grant (free, expired per the injected clock, or same-owner re-acquire) issues `previous + 1`
+from `ht_fences.last_token` (never reused, survives release). `acquire` locks the fence row and the current
+lease row, so a renewal in progress is never silently overwritten by a regrant. `renew` of an expired or
+superseded lease ⇒ `stale_fence`. `checkFence` is true iff the token equals the live lease token and ≥ `highest_accepted`.
+
+Budgets: scopes form an immutable parent chain (`open` is idempotent, also under concurrent opens); a reservation charges the listed scopes and all ancestors
+atomically (rows locked in sorted order); the first violation is reported in caller scope order, then
+`BUDGET_DIMENSIONS` order; missing limit = unlimited; `settle` records actual usage even above the
+reservation/limit; settle-after-settle and release-after-finish are no-ops; `charge` never records an
+exceeding amount.
+
+## Invariants and where they are proven
+
+| Invariant | Tests |
+|---|---|
+| I4 crash after external success, before ack ⇒ reconcile, exactly one job | `test/gateway.test.ts` (lost response; crash before ack persisted) |
+| I4 ack then crash before verify ⇒ attach, not recreate | `test/gateway.test.ts` |
+| I4 timeout/abort ⇒ `outcome_unknown`, never `failed` | `test/gateway.test.ts` (timeout, abort mid-dispatch) |
+| I4 stale fencing token refused, zero dispatches | `test/gateway.test.ts` (3 stale scenarios), `test/leases.test.ts` |
+| I4 absent ⇒ single safe retry; uncertain ⇒ manual_review; non-reconcilable high-risk ⇒ manual_review | `test/gateway.test.ts` |
+| I4 duplicate delivery ⇒ one operation, one side effect | `test/gateway.test.ts`, `test/ledger.test.ts` (10 concurrent prepares), `test/postgres.int.test.ts` |
+| I4 reconciliation never dispatches | `test/reconciler.test.ts` |
+| I4 monotonic fencing tokens (5 acquire/expire cycles), never reused | `test/leases.test.ts`, `test/postgres.int.test.ts` |
+| I10 every transition emits an `operation.*` event atomically with the state change | `test/ledger.test.ts`, `test/reconciler.test.ts` |
+| I12 admission conflicts (ancestor/descendant, read_shared compatibility), all-or-nothing | `test/admission.test.ts`, `test/postgres.int.test.ts` |
+| I12 budget exhaustion typed, parent enforcement, settle > reserved, atomic charge | `test/budget.test.ts`, `test/postgres.int.test.ts` |
+| I4 no reconcile under an in-flight dispatch (second gateway instance; `observe()` under a live lease) | `test/gateway-races.test.ts` |
+| I4 late receipts: attached during reconciliation; orphan after re-dispatch surfaced, never dropped | `test/gateway-races.test.ts`, `test/gateway.test.ts` |
+| I4 a re-dispatch never inherits the previous attempt's job id (no blind retry of high-risk no-lookup) | `test/gateway-races.test.ts`, `test/ledger.test.ts` |
+| I4 non-cooperative adapters cannot hang `run()`/`reconcile()` after abort; compensation runs once | `test/gateway-races.test.ts` |
+| I4 renewal vs regrant race: no lost renewal | `test/postgres.int.test.ts` |
+
+## Contract changes (additive, backward compatible)
+
+- `PrepareOperationInput.operationId?` — pre-generated id (the gateway needs it before `adapter.prepare`).
+- `OperationLedger.findByToolInvocation(toolInvocationId, operationType?)` — optional exact lookup.
+- `OperationLedger.transition(..., { expectedAttempt? })` — rules out ABA across a re-dispatch cycle.
+- `GatewayDeps.pollIntervalMs?`, `GatewayDeps.dispatchTimeoutMs?`, `RunSideEffectRequest.dispatchTimeoutMs?`.
+- `ReconcileReport.failed?` — operations whose verification definitively failed during reconciliation.
+- Documented outcome mapping for `compensated`/`compensating`/`prepared` (no new outcome statuses).
+- Documented (no signature change): `transition(→ dispatching)` clears `externalJobId`/`externalReceipt`
+  unless the patch supplies them; `prepare` also treats a different `adapterId` as a `conflict`; the
+  gateway emits `operation.late_receipt` audit events for receipts the ledger cannot store.
+
+## Testing
+
+```bash
+npx tsc -p packages/operation --noEmit
+node scripts/run-tests.mjs --package operation                          # PGlite + local Postgres int tests
+HYPERTEST_TEST_DB=postgres node scripts/run-tests.mjs --package operation # all tests on PostgreSQL 16
+```
+
+`test/helpers.ts` provides `FakeTarget`/`FakeAdapter` (scriptable prepare/dispatch/observe/compensate faults
+and gates, call counters), `crashingLedger()` (the first transition to a given status throws, modelling a
+worker crash at that point), `deferred()` and `waitForStatus()`. A second `createOperationLedger()` instance
+over the same database models another process (no shared in-process state).
+`test/postgres.int.test.ts` skips with an explicit reason when `HYPERTEST_TEST_PG_URL` is unset.

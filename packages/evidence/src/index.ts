@@ -1,1 +1,10 @@
 export * from './contracts.ts';
+export { FsArtifactStore } from './artifacts/fs.ts';
+export { MemoryArtifactStore } from './artifacts/memory.ts';
+export { S3ArtifactStore } from './artifacts/s3.ts';
+export { createEvidenceLedger, DEFAULT_CLASSIFICATION, DEFAULT_RETENTION_POLICY } from './ledger.ts';
+export { Ed25519Signer, verifyEd25519, ed25519KeyId } from './signer.ts';
+export { merkleRoot, EMPTY_ROOT, casUri, parseArtifactLocator, isSha256Hex } from './hash.ts';
+export { evidenceMetadata, computeMetadataHash, computeRecordHash, sealMessage, verifyEvidenceRecords, type VerifyRecordsOptions } from './records.ts';
+export { recordEvidence, resolveClaim } from './claims.ts';
+export { evidenceMigrations } from './migrations.ts';

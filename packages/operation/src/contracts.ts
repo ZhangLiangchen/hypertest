@@ -26,6 +26,12 @@ import type { DomainEventSink, EventContext, OperationRecord, OperationStatus, R
  *        uncertain        → manual_review (never blind retry of destructive actions)
  *   A timeout/crash between dispatch and receipt records `outcome_unknown`, never `failed`.
  *   Stale fencing token ⇒ outcome `stale_fence`, no dispatch.
+ *   Outcome mapping for states without their own outcome status: `compensated` ⇒ `not_applied` with
+ *   reason `compensated`; `compensating` ⇒ `pending`; `prepared` (observe only) ⇒ `not_applied`
+ *   with reason `not_dispatched`. The authoritative status is always `outcome.operation.status`.
+ *   A dispatch receipt that arrives after another actor moved the operation is never dropped: it is
+ *   attached while that reconciliation is still open, recorded terminally after `not_applied`, and
+ *   otherwise surfaced as outcome `manual_review` plus an `operation.late_receipt` audit event.
  */
 export interface OperationDeps extends BaseDeps {
   db: SqlDatabase;
@@ -33,6 +39,11 @@ export interface OperationDeps extends BaseDeps {
 }
 
 export interface PrepareOperationInput {
+  /**
+   * Pre-generated operation id (additive). The SideEffectGateway generates the id before calling
+   * adapter.prepare() so labels/names derived from it match the persisted record. Defaults to a new id.
+   */
+  operationId?: string;
   runId: string;
   workItemId: string;
   agentId?: string;
@@ -48,18 +59,27 @@ export interface PrepareOperationInput {
 }
 
 export interface OperationLedger {
-  /** Idempotent: same idempotencyKey (or same toolInvocationId+operationType) returns the existing record. */
+  /**
+   * Idempotent: same idempotencyKey (or same toolInvocationId+operationType) returns the existing record.
+   * Reusing either for a different run, operationType, adapterId or inputHash is a `conflict`.
+   */
   prepare(input: PrepareOperationInput, ctx: EventContext, tx?: SqlExecutor): Promise<OperationRecord>;
   get(operationId: string): Promise<OperationRecord | undefined>;
   findByIdempotencyKey(key: string): Promise<OperationRecord | undefined>;
-  findByToolInvocation(toolInvocationId: string): Promise<OperationRecord | undefined>;
-  /** Enforces canTransitionOperation; optimistic concurrency on `expectedFrom`. Increments attempt on → dispatching. */
+  /** With `operationType` (additive, optional) the lookup is exact; without it the oldest matching record is returned. */
+  findByToolInvocation(toolInvocationId: string, operationType?: string): Promise<OperationRecord | undefined>;
+  /**
+   * Enforces canTransitionOperation; optimistic concurrency on `expectedFrom` (and, additively, on
+   * `expectedAttempt`, which rules out ABA across a re-dispatch cycle). Increments attempt on → dispatching.
+   * `evidenceRefs` in the patch are appended (never removed). `externalJobId`/`externalReceipt` describe the
+   * current attempt: → dispatching clears them unless the patch supplies them (history stays in the events).
+   */
   transition(
     operationId: string,
     to: OperationStatus,
     patch: Partial<Pick<OperationRecord, 'externalJobId' | 'externalReceipt' | 'result' | 'lastError' | 'evidenceRefs' | 'lease'>>,
     ctx: EventContext,
-    options?: { expectedFrom?: OperationStatus[]; tx?: SqlExecutor },
+    options?: { expectedFrom?: OperationStatus[]; expectedAttempt?: number; tx?: SqlExecutor },
   ): Promise<OperationRecord>;
   list(filter: { runId: string; workItemId?: string; status?: OperationStatus[] }): Promise<OperationRecord[]>;
   /** Operations that need reconciliation: dispatching, acknowledged, outcome_unknown, reconciling. */
@@ -141,6 +161,10 @@ export interface GatewayDeps extends OperationDeps {
   ledger: OperationLedger;
   leases: LeaseService;
   adapters: AdapterRegistryLike;
+  /** Delay between observe polls while waiting `verifyWithinMs` (additive; default 250). */
+  pollIntervalMs?: number;
+  /** Default dispatch timeout when the request gives none (additive; default: none, only the abort signal). */
+  dispatchTimeoutMs?: number;
 }
 
 export interface AdapterRegistryLike {
@@ -164,6 +188,11 @@ export interface RunSideEffectRequest<I = unknown> {
   signal: AbortSignal;
   /** Max time to wait for verification before returning `pending`. */
   verifyWithinMs?: number;
+  /**
+   * Dispatch timeout (additive). A timed-out dispatch is recorded as `outcome_unknown`, never `failed`.
+   * Defaults to GatewayDeps.dispatchTimeoutMs.
+   */
+  dispatchTimeoutMs?: number;
 }
 
 export interface SideEffectGateway {
@@ -179,6 +208,8 @@ export interface ReconcileReport {
   notApplied: string[];
   manualReview: string[];
   stillPending: string[];
+  /** Operations whose verification definitively failed during reconciliation (additive). */
+  failed?: string[];
 }
 
 export interface Reconciler {

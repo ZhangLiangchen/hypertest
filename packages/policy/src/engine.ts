@@ -1,0 +1,311 @@
+import { HypertestError, deepFreeze, newId, systemClock, validateJson, type Clock, type JsonSchema } from '@hypertest/core';
+import { RISK_ORDER } from '@hypertest/domain';
+import { capabilityAllows, verifyCapability } from './capabilities.ts';
+import type { ActionPermit, ActionRequest, PermitConstraints, PolicyEngine, PolicyEngineOptions, PolicyRule } from './contracts.ts';
+import { intersectPatterns, matchesResourcePattern, matchesToolPattern } from './patterns.ts';
+
+type Decision = ActionPermit['decision'];
+const DECISION_RANK: Record<Decision, number> = { allow: 0, approval_required: 1, deny: 2 };
+
+/** Most restrictive of two decisions (deny > approval_required > allow). */
+export function mostRestrictive(a: Decision, b: Decision): Decision {
+  return DECISION_RANK[a] >= DECISION_RANK[b] ? a : b;
+}
+
+const effectEnum = ['read', 'record', 'write_workspace', 'execute', 'external', 'destructive'];
+const stringList = { type: 'array', items: { type: 'string', minLength: 1 } };
+
+export const PERMIT_CONSTRAINTS_SCHEMA: JsonSchema = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    allowedPaths: stringList,
+    allowedHosts: stringList,
+    allowedCommands: stringList,
+    credentialScope: stringList,
+    maxDurationMs: { type: 'integer', minimum: 0 },
+  },
+};
+
+/** JSON Schema of a PolicyRule (used to validate configured rules; app config reuses it). */
+export const POLICY_RULE_SCHEMA: JsonSchema = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['id', 'description', 'match', 'decision'],
+  properties: {
+    id: { type: 'string', minLength: 1 },
+    description: { type: 'string' },
+    match: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        tools: stringList,
+        effects: { type: 'array', items: { enum: effectEnum } },
+        minRisk: { enum: ['low', 'medium', 'high', 'critical'] },
+        roles: stringList,
+        environmentClasses: stringList,
+        resources: stringList,
+      },
+    },
+    decision: { enum: ['allow', 'deny', 'approval_required'] },
+    constraints: PERMIT_CONSTRAINTS_SCHEMA,
+  },
+};
+
+/**
+ * Default rule set (fail closed: anything not allowed here is denied).
+ * Rule ids are stable API (they appear in permit reasons and decision logs).
+ */
+export const DEFAULT_POLICY_RULES: PolicyRule[] = deepFreeze<PolicyRule[]>([
+  { id: 'allow-read-record', description: 'reads and blackboard/evidence records are allowed everywhere', match: { effects: ['read', 'record'] }, decision: 'allow' },
+  {
+    id: 'allow-workspace-write-execute',
+    description: 'workspace writes and sandboxed execution are allowed inside workspace/**',
+    match: { effects: ['write_workspace', 'execute'], resources: ['workspace/**'] },
+    decision: 'allow',
+  },
+  { id: 'allow-external-local-sandbox', description: 'reconcilable external effects are allowed on local and sandbox environments', match: { effects: ['external'], environmentClasses: ['local', 'sandbox'] }, decision: 'allow' },
+  { id: 'approve-external-staging', description: 'external effects on staging require approval', match: { effects: ['external'], environmentClasses: ['staging'] }, decision: 'approval_required' },
+  { id: 'allow-destructive-local-sandbox', description: 'destructive effects are allowed on local and sandbox environments (high risk needs approval on sandbox)', match: { effects: ['destructive'], environmentClasses: ['local', 'sandbox'] }, decision: 'allow' },
+  { id: 'approve-destructive-staging', description: 'destructive effects on staging require approval', match: { effects: ['destructive'], environmentClasses: ['staging'] }, decision: 'approval_required' },
+  {
+    id: 'approve-destructive-high-risk',
+    description: 'destructive effects with risk >= high on sandbox or staging require approval',
+    match: { effects: ['destructive'], minRisk: 'high', environmentClasses: ['sandbox', 'staging'] },
+    decision: 'approval_required',
+  },
+  { id: 'approve-critical-risk', description: 'critical-risk external or destructive effects always require approval', match: { effects: ['external', 'destructive'], minRisk: 'critical' }, decision: 'approval_required' },
+  { id: 'deny-destructive-production', description: 'destructive effects on production are denied', match: { effects: ['destructive'], environmentClasses: ['production'] }, decision: 'deny' },
+  {
+    id: 'deny-mutation-production',
+    description: 'any effect beyond read on production is denied',
+    match: { effects: ['record', 'write_workspace', 'execute', 'external', 'destructive'], environmentClasses: ['production'] },
+    decision: 'deny',
+  },
+  {
+    id: 'deny-governance-tools',
+    description: 'oracle approval and approval decisions are never agent tools (defense in depth)',
+    match: { tools: ['oracle.approve*', 'approval.decide*', 'oracle.decide*'] },
+    decision: 'deny',
+  },
+]);
+
+/** True when the rule's match block applies to the request (see PolicyRule for resource semantics). */
+export function ruleMatches(rule: PolicyRule, req: ActionRequest): boolean {
+  const m = rule.match;
+  if (m.tools && !m.tools.some((p) => matchesToolPattern(p, req.tool))) return false;
+  if (m.effects && !m.effects.includes(req.effect)) return false;
+  if (m.minRisk && !(RISK_ORDER[req.riskClass] >= RISK_ORDER[m.minRisk])) return false;
+  if (m.roles && (req.role === undefined || !m.roles.includes(req.role))) return false;
+  if (m.environmentClasses && (req.environmentClass === undefined || !m.environmentClasses.includes(req.environmentClass))) return false;
+  if (m.resources) {
+    const hit = (r: string) => m.resources!.some((p) => matchesResourcePattern(p, r));
+    if (rule.decision === 'allow') {
+      if (req.resources.length === 0 || !req.resources.every(hit)) return false;
+    } else if (!req.resources.some(hit)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function intersectStrings(a: string[] | undefined, b: string[] | undefined): string[] | undefined {
+  if (a === undefined) return b === undefined ? undefined : [...b];
+  if (b === undefined) return [...a];
+  return [...new Set(a.filter((x) => b.includes(x)))].sort();
+}
+
+/** Intersects permit constraints (undefined = unconstrained; defined lists intersect; durations take the min). */
+export function intersectConstraints(a: PermitConstraints | undefined, b: PermitConstraints | undefined): PermitConstraints | undefined {
+  if (!a) return b ? { ...b } : undefined;
+  if (!b) return { ...a };
+  const out: PermitConstraints = {};
+  const paths = a.allowedPaths && b.allowedPaths ? intersectPatterns(a.allowedPaths, b.allowedPaths, 'resource') : (a.allowedPaths ?? b.allowedPaths);
+  if (paths) out.allowedPaths = [...paths];
+  const hosts = intersectStrings(a.allowedHosts, b.allowedHosts);
+  if (hosts) out.allowedHosts = hosts;
+  const cmds = intersectStrings(a.allowedCommands, b.allowedCommands);
+  if (cmds) out.allowedCommands = cmds;
+  const creds = intersectStrings(a.credentialScope, b.credentialScope);
+  if (creds) out.credentialScope = creds;
+  if (a.maxDurationMs !== undefined || b.maxDurationMs !== undefined) out.maxDurationMs = Math.min(a.maxDurationMs ?? Infinity, b.maxDurationMs ?? Infinity);
+  return out;
+}
+
+function defaultDecisionId(): string {
+  return newId('pdec');
+}
+
+export interface CapabilityGateResult {
+  ok: boolean;
+  reason?: string;
+}
+
+const EFFECTS: ReadonlySet<string> = new Set(effectEnum);
+const isStringList = (x: unknown): x is string[] => Array.isArray(x) && x.every((v) => typeof v === 'string');
+
+/** Structural problem of a request (engines deny instead of throwing on malformed input), if any. */
+function malformedRequest(request: ActionRequest): string | undefined {
+  if (!request || typeof request !== 'object') return 'request is not an object';
+  if (typeof request.runId !== 'string' || request.runId === '') return 'runId';
+  if (typeof request.tool !== 'string' || request.tool === '') return 'tool';
+  if (typeof request.effect !== 'string' || !EFFECTS.has(request.effect)) return `effect ${String(request.effect)}`;
+  if (typeof request.riskClass !== 'string' || !Object.hasOwn(RISK_ORDER, request.riskClass)) return `riskClass ${String(request.riskClass)}`;
+  if (!isStringList(request.resources)) return 'resources';
+  for (const k of ['environmentClass', 'role', 'agentId', 'workItemId'] as const) {
+    if (request[k] !== undefined && typeof request[k] !== 'string') return k;
+  }
+  return undefined;
+}
+
+function malformedCapability(cap: ActionRequest['capability']): string | undefined {
+  if (!cap || typeof cap !== 'object') return 'not an object';
+  for (const k of ['capabilityId', 'runId', 'subjectAgentId', 'workItemId', 'expiresAt', 'maxRiskClass'] as const) if (typeof cap[k] !== 'string') return k;
+  for (const k of ['tools', 'resourceScopes', 'allowedEffects', 'credentialScopes', 'environmentClasses'] as const) if (!isStringList(cap[k])) return k;
+  return undefined;
+}
+
+/**
+ * Shared pre-check (I1/I2): well-formed request, signature (when a secret is configured), the capability is
+ * bound to this run, agent and work item (no confused deputy), then capabilityAllows.
+ */
+export function checkCapability(request: ActionRequest, clock: Clock, secret: string | undefined): CapabilityGateResult {
+  const badRequest = malformedRequest(request);
+  if (badRequest !== undefined) return { ok: false, reason: `malformed_request: ${badRequest}` };
+  if (!request.capability) return { ok: false, reason: 'capability_missing' };
+  const badCap = malformedCapability(request.capability);
+  if (badCap !== undefined) return { ok: false, reason: `capability_malformed: ${badCap}` };
+  if (secret !== undefined && !verifyCapability(request.capability, secret)) return { ok: false, reason: 'capability_signature_invalid' };
+  if (request.capability.runId !== request.runId) return { ok: false, reason: `capability_run_mismatch: ${request.capability.runId} != ${request.runId}` };
+  if (request.agentId !== undefined && request.agentId !== request.capability.subjectAgentId) {
+    return { ok: false, reason: `capability_subject_mismatch: ${request.capability.subjectAgentId} != ${request.agentId}` };
+  }
+  if (request.workItemId !== undefined && request.workItemId !== request.capability.workItemId) {
+    return { ok: false, reason: `capability_work_item_mismatch: ${request.capability.workItemId} != ${request.workItemId}` };
+  }
+  const check = capabilityAllows(request.capability, {
+    tool: request.tool,
+    effect: request.effect,
+    riskClass: request.riskClass,
+    resources: request.resources,
+    ...(request.environmentClass !== undefined ? { environmentClass: request.environmentClass } : {}),
+    now: clock.isoNow(),
+  });
+  if (check.allowed) return { ok: true };
+  return { ok: false, reason: `capability_denied: ${check.reason}` };
+}
+
+/**
+ * Built-in rule engine (I1). Order: capability check (deny when the capability forbids the action) →
+ * all matching rules → most restrictive decision; no matching rule ⇒ deny (fail closed). Constraints
+ * of the matching allow/approval rules are intersected.
+ */
+export class BuiltinPolicyEngine implements PolicyEngine {
+  readonly revision: string;
+  readonly #rules: PolicyRule[];
+  readonly #newId: () => string;
+  readonly #clock: Clock;
+  readonly #secret: string | undefined;
+
+  constructor(rules: PolicyRule[], revision: string, options: PolicyEngineOptions = {}) {
+    if (!revision) throw new HypertestError('invalid_argument', 'policy revision is required');
+    const ids = new Set<string>();
+    for (const r of rules) {
+      const v = validateJson(POLICY_RULE_SCHEMA, r);
+      if (!v.valid) throw new HypertestError('invalid_argument', `invalid policy rule ${(r as { id?: string }).id ?? '?'}: ${v.issues.map((i) => `${i.path} ${i.message}`).join('; ')}`);
+      if (ids.has(r.id)) throw new HypertestError('invalid_argument', `duplicate policy rule id ${r.id}`);
+      ids.add(r.id);
+    }
+    // a private deep-frozen copy: neither the caller's array nor the `rules` getter can change evaluation
+    this.#rules = deepFreeze(rules.map((r) => structuredClone(r)));
+    this.revision = revision;
+    this.#newId = options.newId ?? defaultDecisionId;
+    this.#clock = options.clock ?? systemClock;
+    this.#secret = options.capabilitySecret;
+  }
+
+  get rules(): readonly PolicyRule[] {
+    return this.#rules;
+  }
+
+  async evaluate(request: ActionRequest): Promise<ActionPermit> {
+    return this.evaluateSync(request);
+  }
+
+  /** Synchronous evaluation (deterministic apart from the decision id). */
+  evaluateSync(request: ActionRequest): ActionPermit {
+    const decisionId = this.#newId();
+    const cap = checkCapability(request, this.#clock, this.#secret);
+    if (!cap.ok) return { decision: 'deny', decisionId, reasons: [cap.reason!], policyRevision: this.revision };
+    const matched = this.#rules.filter((r) => ruleMatches(r, request));
+    if (matched.length === 0) {
+      return { decision: 'deny', decisionId, reasons: [`no_matching_rule: ${request.tool} (${request.effect}${request.environmentClass ? ` on ${request.environmentClass}` : ''})`], policyRevision: this.revision };
+    }
+    let decision: Decision = 'allow';
+    for (const r of matched) decision = mostRestrictive(decision, r.decision);
+    const reasons = matched.filter((r) => r.decision === decision).map((r) => `rule:${r.id}: ${r.description}`);
+    const permit: ActionPermit = { decision, decisionId, reasons, policyRevision: this.revision };
+    if (decision !== 'deny') {
+      let constraints: PermitConstraints | undefined;
+      for (const r of matched) if (r.decision !== 'deny' && r.constraints) constraints = intersectConstraints(constraints, r.constraints);
+      if (constraints) permit.constraints = constraints;
+    }
+    return permit;
+  }
+}
+
+/**
+ * Combines engines: deny wins, approval_required beats allow, reasons are concatenated (prefixed by the
+ * engine revision), constraints intersected, revision = joined revisions. No engines ⇒ deny. An engine
+ * that throws counts as deny (fail closed).
+ */
+export class CompositePolicyEngine implements PolicyEngine {
+  readonly revision: string;
+  readonly #engines: PolicyEngine[];
+  readonly #newId: () => string;
+
+  constructor(engines: PolicyEngine[], options: Pick<PolicyEngineOptions, 'newId'> = {}) {
+    this.#engines = [...engines];
+    this.revision = engines.map((e) => e.revision).join('+') || 'composite:empty';
+    this.#newId = options.newId ?? defaultDecisionId;
+  }
+
+  async evaluate(request: ActionRequest): Promise<ActionPermit> {
+    const decisionId = this.#newId();
+    if (this.#engines.length === 0) return { decision: 'deny', decisionId, reasons: ['no_policy_engines'], policyRevision: this.revision };
+    const permits = await Promise.all(
+      this.#engines.map(async (e): Promise<ActionPermit> => {
+        try {
+          return await e.evaluate(request);
+        } catch (err) {
+          return { decision: 'deny', decisionId: '', reasons: [`engine_error: ${err instanceof Error ? err.message : String(err)}`], policyRevision: e.revision };
+        }
+      }),
+    );
+    let decision: Decision = 'allow';
+    const reasons: string[] = [];
+    for (let i = 0; i < permits.length; i++) {
+      const p = permits[i]!;
+      const revision = this.#engines[i]!.revision;
+      const wellFormed = p !== null && typeof p === 'object' && isDecision(p.decision) && Array.isArray(p.reasons);
+      // a malformed permit counts as deny (fail closed)
+      decision = mostRestrictive(decision, wellFormed ? p.decision : 'deny');
+      if (!wellFormed) {
+        reasons.push(`[${revision}] engine_error: malformed permit`);
+        continue;
+      }
+      for (const r of p.reasons) reasons.push(`[${revision}] ${String(r)}`);
+    }
+    const permit: ActionPermit = { decision, decisionId, reasons, policyRevision: this.revision };
+    if (decision !== 'deny') {
+      let constraints: PermitConstraints | undefined;
+      for (const p of permits) if (p.constraints) constraints = intersectConstraints(constraints, p.constraints);
+      if (constraints) permit.constraints = constraints;
+    }
+    return permit;
+  }
+}
+
+function isDecision(x: unknown): x is Decision {
+  return x === 'allow' || x === 'deny' || x === 'approval_required';
+}

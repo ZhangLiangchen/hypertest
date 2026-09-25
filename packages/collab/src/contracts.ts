@@ -1,4 +1,4 @@
-import type { BaseDeps, EventBus, SqlDatabase, SqlExecutor } from '@hypertest/core';
+import type { BaseDeps, EventBus, Logger, SqlDatabase, SqlExecutor } from '@hypertest/core';
 import type {
   BlackboardPayloads, BlackboardRecord, BlackboardRecordType, DomainEvent, DomainEventInput, DomainEventSink, EventContext,
   ExperimentSpec, OracleChangeProposal, OracleSpec, PlanRevision, QualityDecision, SystemModel, TestArtifact, TestRun, WorkClaim,
@@ -28,7 +28,9 @@ import type {
  *  - Blackboard revision is per run, monotonic, incremented by every record write and work/plan change.
  *  - Work item fingerprints are unique per run; createWorkItem returns the existing item with created=false.
  *  - transitionWorkItem enforces canTransitionWorkItem; when `expectedFencingToken` is given the stored
- *    claim token must match (stale workers are refused with stale_fence).
+ *    claim token must match (stale workers are refused with stale_fence). Entering proposed/ready/blocked drops
+ *    the claim; claim tokens are monotonic per item (an older or re-used token is stale_fence); a same-state
+ *    change of claim/agentId/attempts/priority/result/failure/waitingOn emits `work.updated` (lease renewal does not).
  *  - Record writes emit type-specific events: finding.created|finding.updated (and finding.confirmed/
  *    finding.rejected on those statuses), hypothesis.created|hypothesis.supported|hypothesis.refuted,
  *    coverage.gap_detected, risk.identified, review.completed, record.posted (others).
@@ -58,13 +60,39 @@ export interface OutboxRelay {
   flush(): Promise<number>;
   start(): void;
   stop(): Promise<void>;
+  /** Number of outbox rows not yet marked sent (additive; used by convergence checks and tests). */
+  pending(): Promise<number>;
+}
+
+/** Dependencies of createOutboxRelay (additive named type for the inline contract signature). */
+export interface OutboxRelayDeps extends CollabDeps {
+  bus: EventBus;
+  /** Poll interval of start(); default 250 ms. */
+  pollMs?: number;
+  /** Rows per SELECT batch; default 100. */
+  batchSize?: number;
 }
 
 export interface InProcessBusOptions {
-  /** Fault injection for I5 tests: probability or explicit predicate for duplicate delivery. */
-  duplicateDelivery?: (event: { eventId: string; eventType: string }) => boolean;
+  /**
+   * Fault injection for I5 tests: probability (0..1, drawn from `random`) or explicit predicate for duplicate
+   * delivery. (The number form is additive: it was documented but not typed.)
+   */
+  duplicateDelivery?: number | ((event: { eventId: string; eventType: string }) => boolean);
+  /**
+   * Additive fault injection ("delayed ack"): milliseconds by which the ack of a successfully handled delivery is
+   * delayed. A delay beyond the consumer's ackWaitMs makes the bus redeliver a message whose side effect already
+   * happened (deliveryCount + 1) — the consumer's inbox must absorb it. 0 or less = no delay.
+   */
+  delayedAck?: (event: { eventId: string; eventType: string; deliveryCount: number }) => number;
+  /** Additive: random source for the probabilistic `duplicateDelivery` (default Math.random). */
+  random?: () => number;
+  /** Additive: how long close()/unsubscribe() wait for in-flight handlers before detaching (default 5000 ms). */
+  closeGraceMs?: number;
   defaultAckWaitMs?: number;
   defaultMaxDeliver?: number;
+  /** Additive: receives handler/dead-letter callback failures (default: no-op logger). */
+  logger?: Logger;
 }
 
 export interface NatsBusOptions {
@@ -72,6 +100,16 @@ export interface NatsBusOptions {
   /** JetStream stream name (created if missing) capturing subjects `ht.>`. */
   stream?: string;
   name?: string;
+  /**
+   * Additive: first subject token on the wire (default 'ht'). Envelope subjects `ht.<run>.<type>` are published as
+   * `<subjectPrefix>.<run>.<type>` and subscription filters are rewritten the same way; delivered envelopes keep
+   * their canonical `ht.` subject. Lets several independent streams (e.g. parallel test runs) share one server.
+   */
+  subjectPrefix?: string;
+  /** Additive: messages buffered per subscription (pull batch size); default 16. */
+  prefetch?: number;
+  /** Additive: connection/handler diagnostics (default: no-op logger). */
+  logger?: Logger;
 }
 
 export interface NewRecordInput<K extends BlackboardRecordType> {
@@ -176,4 +214,6 @@ export interface DecisionRepository {
   /** Decisions that used a given oracle revision (for needs_reassessment after an oracle is invalidated). */
   findByOracleRevision(oracleId: string, revision: number): Promise<QualityDecision[]>;
   markNeedsReassessment(decisionId: string, reason: string, ctx: EventContext): Promise<void>;
+  /** Additive: the reassessment flag set by markNeedsReassessment (undefined for an unknown decision). */
+  reassessment(decisionId: string): Promise<{ needsReassessment: boolean; reason?: string } | undefined>;
 }

@@ -18,7 +18,7 @@ const ROOT = resolve(dirname(new URL(import.meta.url).pathname), '..');
 const INFRA = join(ROOT, '.infra');
 const BIN = join(INFRA, 'bin');
 const NATS_VERSION = '2.11.8';
-const PORTS = { pg: 55432, nats: 54222, temporal: 57233, temporalUi: 58233 };
+const PORTS = { pg: 55432, nats: 54222, temporal: 57233, temporalUi: 58233, opa: 58181, minio: 59000, minioConsole: 59001 };
 const PG_BIN_CANDIDATES = ['/usr/lib/postgresql/17/bin', '/usr/lib/postgresql/16/bin', '/usr/lib/postgresql/15/bin', '/usr/local/pgsql/bin'];
 
 function log(msg) { console.log(`[infra] ${msg}`); }
@@ -62,6 +62,38 @@ async function fetchBins() {
     rmSync(tgz, { force: true });
     log('temporal CLI fetched');
   }
+  if (!existsSync(join(BIN, 'opa'))) {
+    download('https://openpolicyagent.org/downloads/v1.9.0/opa_linux_amd64_static', join(BIN, 'opa'));
+    chmodSync(join(BIN, 'opa'), 0o755);
+    log('opa fetched');
+  }
+  // MinIO no longer publishes server binaries (HTTP 410). S3 tests use HYPERTEST_TEST_S3_ENDPOINT when
+  // provided (any S3-compatible server); place a `minio` binary in .infra/bin manually to have `up` start it.
+}
+
+async function upOpa() {
+  const exe = join(BIN, 'opa');
+  if (!existsSync(exe)) { log('opa: binary missing (run `npm run infra:fetch`), skipped'); return undefined; }
+  if (!(await portOpen(PORTS.opa))) {
+    spawnDetached('opa', exe, ['run', '--server', '--addr', `127.0.0.1:${PORTS.opa}`, '--log-level', 'error']);
+    if (!(await waitPort(PORTS.opa))) { log('opa: failed to start'); return undefined; }
+  }
+  log(`opa: up on ${PORTS.opa}`);
+  return `http://127.0.0.1:${PORTS.opa}`;
+}
+
+async function upMinio() {
+  const exe = join(BIN, 'minio');
+  if (!existsSync(exe)) { log('minio: binary missing (run `npm run infra:fetch`), skipped'); return undefined; }
+  if (!(await portOpen(PORTS.minio))) {
+    mkdirSync(join(INFRA, 'minio'), { recursive: true });
+    spawnDetached('minio', exe, ['server', join(INFRA, 'minio'), '--address', `127.0.0.1:${PORTS.minio}`, '--console-address', `127.0.0.1:${PORTS.minioConsole}`], {
+      env: { ...process.env, MINIO_ROOT_USER: 'hypertest', MINIO_ROOT_PASSWORD: 'hypertest-dev-only' },
+    });
+    if (!(await waitPort(PORTS.minio, 60000))) { log('minio: failed to start'); return undefined; }
+  }
+  log(`minio: up on ${PORTS.minio}`);
+  return `http://127.0.0.1:${PORTS.minio}`;
 }
 
 function spawnDetached(name, cmd, args, opts = {}) {
@@ -127,7 +159,11 @@ async function up() {
   const pg = await upPostgres();
   const nats = await upNats();
   const temporal = await upTemporal();
+  const opa = await upOpa();
+  const minio = await upMinio();
   const lines = [];
+  if (opa) lines.push(`HYPERTEST_TEST_OPA_URL=${opa}`);
+  if (minio) lines.push(`HYPERTEST_TEST_S3_ENDPOINT=${minio}`, 'HYPERTEST_TEST_S3_ACCESS_KEY=hypertest', 'HYPERTEST_TEST_S3_SECRET_KEY=hypertest-dev-only');
   if (pg) lines.push(`HYPERTEST_TEST_PG_URL=${pg}`);
   if (nats) lines.push(`HYPERTEST_TEST_NATS_URL=${nats}`);
   if (temporal) lines.push(`HYPERTEST_TEST_TEMPORAL_ADDRESS=${temporal}`);
@@ -148,6 +184,8 @@ function killPid(name) {
 function down() {
   killPid('nats');
   killPid('temporal');
+  killPid('opa');
+  killPid('minio');
   const bin = pgBin();
   const data = join(INFRA, 'pg', 'data');
   if (bin && existsSync(join(data, 'PG_VERSION'))) {
@@ -159,7 +197,7 @@ function down() {
 }
 
 async function status() {
-  for (const [name, port] of Object.entries({ postgres: PORTS.pg, nats: PORTS.nats, temporal: PORTS.temporal })) {
+  for (const [name, port] of Object.entries({ postgres: PORTS.pg, nats: PORTS.nats, temporal: PORTS.temporal, opa: PORTS.opa, minio: PORTS.minio })) {
     log(`${name}: ${(await portOpen(port)) ? 'up' : 'down'} (port ${port})`);
   }
 }

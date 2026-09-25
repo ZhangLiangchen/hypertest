@@ -12,7 +12,7 @@ const refSchema = {
   additionalProperties: false,
   required: ['kind', 'id'],
   properties: {
-    kind: { type: 'string', enum: ['record', 'evidence', 'artifact', 'work_item', 'plan', 'file', 'commit', 'url', 'oracle', 'experiment', 'test_artifact', 'system_model', 'operation', 'decision'] },
+    kind: { type: 'string', enum: ['run', 'record', 'evidence', 'artifact', 'work_item', 'plan', 'file', 'commit', 'url', 'oracle', 'experiment', 'test_artifact', 'system_model', 'operation', 'decision'] },
     id: { type: 'string', minLength: 1 },
     note: { type: 'string' },
   },

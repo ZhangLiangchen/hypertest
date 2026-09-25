@@ -1,1 +1,11 @@
 export * from './contracts.ts';
+export { collabMigrations } from './migrations.ts';
+export { createEventStore } from './event-store.ts';
+export { createInbox } from './inbox.ts';
+export { createOutboxRelay } from './outbox-relay.ts';
+export { InProcessEventBus } from './inprocess-bus.ts';
+export { connectNatsEventBus, sanitizeDurableName, toWireSubject } from './nats-bus.ts';
+export { createBlackboard, workEventType, type BlackboardDeps } from './blackboard.ts';
+export { createRunRepository, runEventType, type RunRepositoryDeps } from './runs.ts';
+export { createSpecRepository, type SpecRepositoryDeps } from './specs.ts';
+export { createDecisionRepository, type DecisionRepositoryDeps } from './decisions.ts';

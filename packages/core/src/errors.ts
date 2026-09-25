@@ -21,7 +21,8 @@ export type ErrorCode =
   | 'unsupported'
   | 'internal';
 
-const RETRYABLE: ReadonlySet<ErrorCode> = new Set(['timeout', 'unavailable', 'rate_limited', 'provider_error']);
+// provider_error is a non-retryable bad request/response by contract (a different model must not mask it).
+const RETRYABLE: ReadonlySet<ErrorCode> = new Set(['timeout', 'unavailable', 'rate_limited']);
 
 export interface HypertestErrorOptions {
   retryable?: boolean;
