@@ -101,8 +101,12 @@ export interface ControlPlane {
   startRun(input: StartRunInput, ctx?: Partial<EventContext>): Promise<TestRun>;
   /** One scheduling step: reactors catch-up, plan application, replan triggers, admission, convergence, gate. */
   tick(runId: string): Promise<TickResult>;
-  /** Executes one agent turn for a dispatched work item (idempotent per turn). */
-  executeTurn(workItemId: string, fencingToken: number, signal?: AbortSignal): Promise<TurnOutcome>;
+  /**
+   * Executes one agent turn for a dispatched work item (idempotent per turn). `options` is additive:
+   * `expectedTurn` makes a durable retry return `{status:'continue', turn}` without running when the session
+   * already completed that turn (crash after a committed turn).
+   */
+  executeTurn(workItemId: string, fencingToken: number, signal?: AbortSignal, options?: ExecuteTurnOptions): Promise<TurnOutcome>;
   /** Polls long-running operations for a waiting work item; resumes it when all settled. */
   observeWaiting(workItemId: string, signal?: AbortSignal): Promise<TurnOutcome>;
   /** Startup recovery: reconcile operations, expire stale leases, requeue orphaned work. */
@@ -113,4 +117,12 @@ export interface ControlPlane {
   snapshot(runId: string): Promise<ContextSnapshot>;
   report(runId: string): Promise<RunReport>;
   readonly deps: BaseDeps;
+  /** (additive, optional) Releases process resources (e.g. the reactors' bus subscription). */
+  close?(): Promise<void>;
+}
+
+/** (additive) Options of ControlPlane.executeTurn. */
+export interface ExecuteTurnOptions {
+  /** The turn the caller is about to run; an already committed turn ≥ expectedTurn is not run again. */
+  expectedTurn?: number;
 }

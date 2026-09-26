@@ -51,6 +51,10 @@ test('permission profiles: effects per profile and no production in any built-in
   assert.deepEqual(PERMISSION_PROFILES.analyst.allowedEffects, ['read', 'record']);
   assert.deepEqual(PERMISSION_PROFILES.test_author.allowedEffects, ['read', 'record', 'write_workspace', 'execute']);
   assert.deepEqual(PERMISSION_PROFILES.test_author.resourceScopes, ['workspace/**', 'run/**']);
+  // the black-box execution plane (tools resource conventions): environments, load generators, load jobs
+  assert.deepEqual(PERMISSION_PROFILES.test_executor.resourceScopes, ['workspace/**', 'run/**', 'env/**', 'loadgen/**', 'loadjob/**']);
+  assert.deepEqual(PERMISSION_PROFILES.environment_operator.resourceScopes, ['workspace/**', 'run/**', 'env/**', 'loadgen/**', 'loadjob/**']);
+  assert.deepEqual(PERMISSION_PROFILES.product_fixer.resourceScopes, ['workspace/**', 'run/**']);
   assert.deepEqual(PERMISSION_PROFILES.test_executor.allowedEffects, ['read', 'record', 'execute', 'external']);
   assert.deepEqual(PERMISSION_PROFILES.test_executor.environmentClasses, ['local', 'sandbox']);
   assert.deepEqual(PERMISSION_PROFILES.environment_operator.allowedEffects, ['read', 'record', 'execute', 'external', 'destructive']);

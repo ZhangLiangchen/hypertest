@@ -14,8 +14,9 @@ const ALL_RISKS: readonly RiskClass[] = ['low', 'medium', 'high', 'critical'];
 
 /**
  * Built-in permission profiles. Resource keys follow the tools convention: `workspace/<workspaceId>/<path>`
- * for workspace files, `env/<environmentId>/…` for environments, `run/<runId>/…` for run-scoped records.
- * No built-in profile grants production; an operator must configure an explicit profile for that.
+ * for workspace files, `env/<environmentId>/…` for environments, `run/<runId>/…` for run-scoped records, and the
+ * black-box execution plane's `loadgen/<host>` (the load generator a load job occupies) and `loadjob/<operationId>`
+ * (a running load job). No built-in profile grants production; an operator must configure an explicit profile for that.
  */
 export const PERMISSION_PROFILES: Readonly<Record<PermissionProfileName, PermissionProfile>> = deepFreeze<Record<PermissionProfileName, PermissionProfile>>({
   read_only: {
@@ -46,7 +47,7 @@ export const PERMISSION_PROFILES: Readonly<Record<PermissionProfileName, Permiss
     name: 'test_executor',
     allowedEffects: ['read', 'record', 'execute', 'external'],
     maxRiskClass: 'high',
-    resourceScopes: ['workspace/**', 'run/**', 'env/**'],
+    resourceScopes: ['workspace/**', 'run/**', 'env/**', 'loadgen/**', 'loadjob/**'],
     environmentClasses: ['local', 'sandbox'],
     credentialScopes: [],
   },
@@ -54,7 +55,7 @@ export const PERMISSION_PROFILES: Readonly<Record<PermissionProfileName, Permiss
     name: 'environment_operator',
     allowedEffects: ['read', 'record', 'execute', 'external', 'destructive'],
     maxRiskClass: 'high',
-    resourceScopes: ['workspace/**', 'run/**', 'env/**'],
+    resourceScopes: ['workspace/**', 'run/**', 'env/**', 'loadgen/**', 'loadjob/**'],
     environmentClasses: ['local', 'sandbox', 'staging'],
     credentialScopes: [],
   },

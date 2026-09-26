@@ -1,1 +1,14 @@
 export * from './contracts.ts';
+export { main, COMMANDS } from './main.ts';
+export { EXIT_CODES, verdictExitCode, type ExitCode } from './exit-codes.ts';
+export { UsageError, splitCommand, parseCommand, GLOBAL_OPTIONS, type GlobalOptions, type OptionValues } from './args.ts';
+export type { Command } from './command.ts';
+export { CONFIG_ENV, CONFIG_FILE_NAMES, LOG_LEVEL_ENV, clientOnlyConfig, findConfig, loadBrainsModule, type CommandContext } from './context.ts';
+export { configTemplate, GITIGNORE_ENTRIES, TEMPLATE_KEY_VARIABLES } from './template.ts';
+export { ensureGitignore, projectNameFrom, writeConfigAtomically } from './commands/init.ts';
+export { MIN_NODE_VERSION, nodeVersionCheck } from './commands/doctor.ts';
+export { availableArms, availableSuites, suiteFactoryName, suiteIdOf } from './commands/eval.ts';
+export { DEFAULT_API_PORT, DEFAULT_API_TOKEN_ENV, MIN_API_TOKEN_LENGTH } from './commands/serve.ts';
+export { SANDBOX_ENV } from './commands/decide.ts';
+export { FOLLOW_POLL_MS, FOLLOW_QUIET_POLLS } from './commands/inspect.ts';
+export { WAIT_POLL_MS, resolveCommit } from './commands/run.ts';

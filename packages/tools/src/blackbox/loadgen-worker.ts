@@ -195,6 +195,8 @@ function main(): void {
       queued: queue.length,
       statusCodes,
       latencyMs: hist.summary(),
+      // errors / completed requests (non-2xx, timeouts, network errors); null until a request completed (unknown, never 0)
+      errorRate: ok + errors > 0 ? Math.round((errors / (ok + errors)) * 1e6) / 1e6 : null,
       achievedRps: round((sent * 1000) / windowMs),
       elapsedMs: round(elapsedMs),
       ...(lastError !== undefined ? { lastError } : {}),

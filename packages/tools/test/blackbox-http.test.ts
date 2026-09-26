@@ -127,6 +127,19 @@ test('environmentId + path is resolved against the environment baseUrl path pref
   assert.equal(tool.environmentClass!({ method: 'GET', environmentId: 'env_local' }, { environments: env.environments }), 'local');
 });
 
+test('the evidence records the request path an oracle names (http_expectation.path): environment-relative, without query', async () => {
+  // the QualityGate matches http_expectation {method, path} against structured request.method / request.path of
+  // api-response evidence: without the path, a black-box oracle could never be evaluated (C3 stays unknown)
+  const { ctx, evidence } = fakeContext({ environments: env.environments });
+  const viaEnv = await tool.execute({ method: 'GET', environmentId: 'env_local', path: '/ok?page=2' }, ctx);
+  assert.equal(viaEnv.status, 'success');
+  assert.equal(structuredOf(viaEnv)['json']['path'], '/api/ok', 'the request went to the environment baseUrl prefix');
+  const viaUrl = await tool.execute({ method: 'POST', url: `${server.url}/echo?x=1`, json: { a: 1 } }, ctx);
+  assert.equal(viaUrl.status, 'success');
+  const requests = evidence.map((e) => (e.input.structured as Record<string, any>)['request']);
+  assert.deepEqual(requests.map((r) => [r['method'], r['path']]), [['GET', '/ok'], ['POST', '/echo']]);
+});
+
 test('host allowlist: non-loopback host without allowlist is denied before any request', async () => {
   const { ctx, evidence } = fakeContext({ environments: env.environments });
   const out = await tool.execute({ method: 'GET', url: 'http://api.example.test/x' }, ctx);

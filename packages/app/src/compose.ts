@@ -1,0 +1,777 @@
+import { readFileSync } from 'node:fs';
+import { mkdir } from 'node:fs/promises';
+import { hostname } from 'node:os';
+import { join } from 'node:path';
+import {
+  HypertestError, UlidIdGenerator, canonicalJson, isHypertestError, jsonLogger, sha256Hex, systemClock, type EventBus, type Logger, type Migration, type SqlDatabase,
+} from '@hypertest/core';
+import { isTerminalRun, type EventContext, type Finding, type RuntimeManifest, type TestRun } from '@hypertest/domain';
+import { migrate, openDatabase } from '@hypertest/store';
+import {
+  InProcessEventBus, collabMigrations, connectNatsEventBus, createBlackboard, createDecisionRepository, createEventStore, createInbox, createOutboxRelay,
+  createRunRepository, createSpecRepository, type DecisionRepository, type OutboxRelay,
+} from '@hypertest/collab';
+import {
+  AdapterRegistry, createBudgetLedger, createLeaseService, createOperationLedger, createReconciler, createResourceAdmission, createSideEffectGateway,
+  operationMigrations,
+} from '@hypertest/operation';
+import { FsArtifactStore, S3ArtifactStore, createEvidenceLedger, evidenceMigrations, verifyEd25519, type ArtifactStore, type EvidenceLedger } from '@hypertest/evidence';
+import {
+  BuiltinPolicyEngine, CompositePolicyEngine, DEFAULT_POLICY_RULES, OpaPolicyEngine, QualityGate, createApprovalService, createOracleGovernance,
+  createPolicyDecisionLog, policyMigrations, resolveProtocolBinding, type PolicyEngine,
+} from '@hypertest/policy';
+import {
+  AnthropicProvider, ModelCatalog, OpenAICompatibleProvider, PiAiProvider, ProviderRegistry, ScriptedProvider, createModelRouter, piCompatibilityClass,
+  type ModelCapabilityProfile, type ModelProvider, type ModelRouter, type RouteRequest,
+} from '@hypertest/model';
+import {
+  ExactSearch, HybridRetriever, PowerContextClient, SymbolIndex, contextMigrations, createExperienceStore, createFreshnessGuard, createProvenanceService,
+  createResolverRegistry, createSnapshotBuilder, createSnapshotStore, createWorkingContextManager, environmentResolver, experimentResolver, leaseResolver,
+  oracleResolver, recordResolver, type DurableMemory, type Retriever,
+} from '@hypertest/context';
+import {
+  ToolRegistry, builtinSideEffectAdapters, builtinTools, closeBlackboxResources, createEnvironmentRegistry, createLocalSandbox, createOciSandbox,
+  createToolRuntime, createWorkspaceManager, type BuiltinToolOptions, type SandboxProfile, type ToolRuntimeDeps,
+} from '@hypertest/tools';
+import {
+  EngineRegistry, NativeEngine, RUNTIME_PACKAGE_VERSION, buildRuntimeManifest, createAgentRepository, createAgentRunner, createEpochManager,
+  createSessionStore, createSubagentRuntime, runtimeMigrations, type AgentEngine,
+} from '@hypertest/runtime';
+import { PI_AGENT_CORE_VERSION, PiEngine, RUNTIME_PI_PACKAGE_VERSION } from '@hypertest/runtime-pi';
+import { BUILTIN_ROLES, RoleCatalog, type RoleCatalogLike } from '@hypertest/agents';
+import { controlMigrations, createControlPlane, createDomainTools, type ControlConfig, type ControlDeps, type ControlPlane, type StartRunInput } from '@hypertest/control';
+import {
+  LocalDurableRuntime, RESUMABLE_RUN_STATUSES, TemporalDurableRuntime, type DurableHooks, type DurableRuntime, type RunOutcome, type TemporalDurableOptions,
+} from '@hypertest/durable';
+import {
+  DEFAULT_ENV_ALLOWLIST, completeRoute, providerCompatibilityClass, resolveConfigPaths, roleOverrides, validateConfig, validateRunOverrides, withDerivedPaths,
+} from './config.ts';
+import { ENVIRONMENT_STATE_FILE, persistentEnvironmentRegistry, resolveEnvironments } from './environments.ts';
+import { recordedFailureFlipDetector } from './governance.ts';
+import { loadCapabilitySecret, loadSigningKeys } from './keys.ts';
+import { acquireDirectoryLock, lockFileFor } from './lock.ts';
+import type { HypertestConfig, HypertestInstance, HypertestOverrides, HypertestServices, ProviderConfig } from './contracts.ts';
+
+/** Every migration of the stateful packages, in dependency order (applied idempotently at startup). */
+export const ALL_MIGRATIONS: readonly Migration[] = Object.freeze([
+  ...collabMigrations, ...operationMigrations, ...evidenceMigrations, ...policyMigrations, ...contextMigrations, ...runtimeMigrations, ...controlMigrations,
+]);
+
+/** Outbox relay poll interval (one relay per database per process). */
+export const RELAY_POLL_MS = 200;
+/** Per-process cap of agents per run (the scheduler enforces the run's work-item budget; this is a safety net). */
+export const MAX_AGENTS_PER_RUN = 1000;
+/** Version of the ToolSpec/ToolExecution ABI recorded as `schemas.tool` in runtime manifests. */
+export const TOOL_SCHEMA_VERSION = 'tools/1';
+const NON_TERMINAL: TestRun['status'][] = ['created', 'running', 'paused', 'converging', 'gating'];
+
+function readVersion(url: URL): { name?: string; version?: string } {
+  try {
+    return JSON.parse(readFileSync(url, 'utf8')) as { name?: string; version?: string };
+  } catch {
+    return {};
+  }
+}
+
+/** The Hypertest release version: the monorepo root package.json (falls back to this package's version). */
+export const HYPERTEST_VERSION: string = (() => {
+  const root = readVersion(new URL('../../../package.json', import.meta.url));
+  if (root.name === 'hypertest-monorepo' && root.version) return root.version;
+  return readVersion(new URL('../package.json', import.meta.url)).version ?? '0.0.0';
+})();
+
+function lastId(migrations: readonly Migration[]): string {
+  return [...migrations].map((m) => m.id).sort().at(-1) ?? 'none';
+}
+
+function invalid(message: string, details: Record<string, unknown> = {}): HypertestError {
+  return new HypertestError('invalid_argument', message, { details });
+}
+
+/** Worker identity: stable per host for PGlite (one process per data directory); per process for PostgreSQL. */
+export function defaultWorkerId(config: HypertestConfig): string {
+  return config.store.kind === 'pglite' ? `worker:${hostname()}` : `worker:${hostname()}:${process.pid}`;
+}
+
+// ------------------------------------------------------------------------------------------------ models
+
+function buildProviders(config: HypertestConfig, overrides: HypertestOverrides, env: Record<string, string | undefined>, logger: Logger): ProviderRegistry {
+  const registry = new ProviderRegistry();
+  const brains = overrides.scriptedBrains ?? {};
+  for (const p of config.models.providers) {
+    const apiKey = p.apiKeyEnv ? env[p.apiKeyEnv] : undefined;
+    if (p.apiKeyEnv && (apiKey === undefined || apiKey === '')) {
+      logger.warn('model provider API key variable is not set; calls to this provider will fail until it is (see `hypertest doctor`)', { provider: p.id, apiKeyEnv: p.apiKeyEnv });
+    }
+    const common: { apiKey?: string; headers?: Record<string, string>; timeoutMs?: number } = {};
+    if (apiKey) common.apiKey = apiKey;
+    if (p.headers) common.headers = { ...p.headers };
+    if (p.timeoutMs !== undefined) common.timeoutMs = p.timeoutMs;
+    let provider: ModelProvider;
+    switch (p.kind) {
+      case 'openai-compatible':
+        provider = new OpenAICompatibleProvider({ providerId: p.id, baseUrl: p.baseUrl!, ...common });
+        break;
+      case 'anthropic':
+        provider = new AnthropicProvider({ providerId: p.id, ...(p.baseUrl ? { baseUrl: p.baseUrl } : {}), ...common });
+        break;
+      case 'pi-ai':
+        provider = new PiAiProvider({ providerId: p.id, piProvider: p.piProvider!, ...(p.baseUrl ? { baseUrl: p.baseUrl } : {}), ...common });
+        break;
+      case 'scripted': {
+        const brain = Object.hasOwn(brains, p.id) ? brains[p.id] : undefined;
+        if (!brain) throw invalid(`models.providers (${p.id}): scripted provider has no brain; pass overrides.scriptedBrains['${p.id}']`, { provider: p.id });
+        provider = new ScriptedProvider({ providerId: p.id, brain });
+        break;
+      }
+      default:
+        throw invalid(`models.providers (${(p as ProviderConfig).id}): unknown provider kind ${JSON.stringify((p as ProviderConfig).kind)}`);
+    }
+    registry.register(provider);
+  }
+  for (const id of Object.keys(brains)) {
+    if (!config.models.providers.some((p) => p.id === id && p.kind === 'scripted')) logger.warn('a scripted brain was given for a provider that is not a configured scripted provider', { provider: id });
+  }
+  return registry;
+}
+
+/**
+ * The model catalog: every configured route completed with ROUTE_DEFAULTS; `continuationCompatibilityClass` is the
+ * provider's tag (`anthropic:<model>`, `pi-ai:<api>:<piProvider>:<model>` from the resolved pi model,
+ * `<providerId>:<model>` otherwise). A route pinning a different tag for anthropic/pi-ai is refused (the router would
+ * reject every continuation of such a route).
+ */
+export async function buildCatalog(config: HypertestConfig, providers: ProviderRegistry): Promise<ModelCatalog> {
+  const profiles: ModelCapabilityProfile[] = [];
+  for (const [i, route] of config.models.routes.entries()) {
+    const label = `models.routes[${i}] (${route.routeId})`;
+    const p = config.models.providers.find((x) => x.id === route.provider);
+    if (!p || !providers.has(route.provider)) throw invalid(`${label}: provider '${route.provider}' is not registered`);
+    let tag = providerCompatibilityClass(p, route.model);
+    if (p.kind === 'pi-ai') {
+      try {
+        tag = piCompatibilityClass(await (providers.get(p.id) as PiAiProvider).resolveModel(route.model));
+      } catch (e) {
+        throw invalid(`${label}: ${(e as Error).message}`, { routeId: route.routeId });
+      }
+    }
+    if ((p.kind === 'anthropic' || p.kind === 'pi-ai') && route.continuationCompatibilityClass !== undefined && route.continuationCompatibilityClass !== tag) {
+      throw invalid(`${label}: continuationCompatibilityClass must equal the provider's tag '${tag}'`, { routeId: route.routeId });
+    }
+    profiles.push(completeRoute(route, tag!));
+  }
+  return new ModelCatalog(profiles);
+}
+
+// ------------------------------------------------------------------------------------------------ infrastructure
+
+async function openStore(config: HypertestConfig, env: Record<string, string | undefined>): Promise<SqlDatabase> {
+  const s = config.store;
+  if (s.kind === 'pglite') {
+    await mkdir(s.dataDir!, { recursive: true, mode: 0o700 });
+    return openDatabase({ kind: 'pglite', dataDir: s.dataDir! });
+  }
+  const url = s.url ?? (s.urlEnv ? env[s.urlEnv] : undefined);
+  if (!url) throw new HypertestError('precondition_failed', `store.urlEnv names ${s.urlEnv}, which is not set`);
+  return openDatabase({ kind: 'postgres', url, ...(s.schema ? { schema: s.schema } : {}) });
+}
+
+async function openBus(config: HypertestConfig, workerId: string, logger: Logger): Promise<EventBus> {
+  if (config.bus.kind === 'inprocess') return new InProcessEventBus({ logger: logger.child({ component: 'bus' }) });
+  return connectNatsEventBus({
+    servers: config.bus.servers,
+    ...(config.bus.stream ? { stream: config.bus.stream } : {}),
+    ...(config.bus.subjectPrefix ? { subjectPrefix: config.bus.subjectPrefix } : {}),
+    name: `hypertest-${workerId.replace(/[^A-Za-z0-9_-]+/g, '-')}`,
+    logger: logger.child({ component: 'bus' }),
+  });
+}
+
+function openArtifacts(config: HypertestConfig, env: Record<string, string | undefined>): ArtifactStore {
+  const a = config.artifacts;
+  if (a.kind === 'fs') return new FsArtifactStore(a.root!);
+  const options: ConstructorParameters<typeof S3ArtifactStore>[0] = { region: a.region, bucket: a.bucket };
+  if (a.endpoint) options.endpoint = a.endpoint;
+  if (a.prefix) options.prefix = a.prefix;
+  if (a.forcePathStyle !== undefined) options.forcePathStyle = a.forcePathStyle;
+  if (a.objectLockDays !== undefined) options.objectLockDays = a.objectLockDays;
+  if (a.accessKeyIdEnv && a.secretAccessKeyEnv) {
+    const accessKeyId = env[a.accessKeyIdEnv];
+    const secretAccessKey = env[a.secretAccessKeyEnv];
+    if (!accessKeyId || !secretAccessKey) throw new HypertestError('precondition_failed', `artifacts: ${!accessKeyId ? a.accessKeyIdEnv : a.secretAccessKeyEnv} is not set`);
+    options.credentials = { accessKeyId, secretAccessKey };
+  }
+  return new S3ArtifactStore(options);
+}
+
+function policyEngine(config: HypertestConfig, capabilitySecret: string, deps: { clock: typeof systemClock; newId: () => string }): PolicyEngine {
+  const rules = [...DEFAULT_POLICY_RULES, ...(config.policy?.rules ?? [])];
+  const builtin = new BuiltinPolicyEngine(rules, `builtin:${sha256Hex(canonicalJson(rules)).slice(0, 16)}`, { clock: deps.clock, capabilitySecret, newId: deps.newId });
+  const opa = config.policy?.opa;
+  if (!opa) return builtin;
+  const path = opa.path ?? 'hypertest/authz';
+  const engine = new OpaPolicyEngine({
+    url: opa.url,
+    path,
+    revision: `opa:${path}`,
+    clock: deps.clock,
+    capabilitySecret,
+    newId: deps.newId,
+    ...(opa.timeoutMs !== undefined ? { timeoutMs: opa.timeoutMs } : {}),
+  });
+  return new CompositePolicyEngine([builtin, engine], { newId: deps.newId });
+}
+
+/** The local sandbox profile: loopback network, minimal environment allowlist, merged with `config.sandbox`. */
+export function sandboxProfile(config: HypertestConfig): SandboxProfile {
+  return { kind: 'local', network: 'loopback', envAllowlist: [...DEFAULT_ENV_ALLOWLIST], ...(config.sandbox ?? {}) } as SandboxProfile;
+}
+
+/** Exact search answers single-line queries only; multi-line prose (e.g. a work item objective) goes to the symbol index. */
+function singleLineOnly(inner: Retriever): Retriever {
+  return {
+    name: inner.name,
+    search: (query, signal) => ((query.text ?? query.symbol ?? '').includes('\n') ? Promise.resolve([]) : inner.search(query, signal)),
+  };
+}
+
+/** Per-root retrievers (symbol index + exact search, RRF-fused), cached so the symbol index is built once per root. */
+function cachedRetrievers(logger: Logger): (root: string) => Retriever {
+  const cache = new Map<string, Retriever>();
+  return (root) => {
+    let r = cache.get(root);
+    if (!r) {
+      r = new HybridRetriever([new SymbolIndex({ root }), singleLineOnly(new ExactSearch({ root }))], { logger });
+      cache.set(root, r);
+      if (cache.size > 64) cache.delete(cache.keys().next().value!);
+    }
+    return r;
+  };
+}
+
+/** The durable runtime of the configuration: LocalDurableRuntime (in-process) or TemporalDurableRuntime. */
+function createDurable(config: HypertestConfig, base: { control: ControlPlane; listRuns: () => Promise<TestRun[]> } & DurableHooks): DurableRuntime {
+  if (config.durable.kind === 'temporal') {
+    const options: TemporalDurableOptions = { ...base, address: config.durable.address };
+    if (config.durable.namespace) options.namespace = config.durable.namespace;
+    if (config.durable.taskQueue) options.taskQueue = config.durable.taskQueue;
+    if (config.durable.workerMode) options.workerMode = config.durable.workerMode;
+    return new TemporalDurableRuntime(options);
+  }
+  return new LocalDurableRuntime({ ...base, maxConcurrentTurns: config.durable.maxConcurrentTurns ?? 4 });
+}
+
+// ------------------------------------------------------------------------------------------------ I11 pinning
+
+/** Run ids accepted from callers (they become path segments, git branch names and workflow ids). */
+export const RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const PIN_CACHE_MAX = 10_000;
+
+function pinViolation(run: TestRun, manifestId: string): HypertestError {
+  return new HypertestError(
+    'precondition_failed',
+    `run ${run.runId} is pinned to runtime manifest ${run.runtimeManifestId}; this runtime is ${manifestId} (I11: a live run is never driven by another runtime — resume it with the runtime it was created on, or cancel it)`,
+    { details: { runId: run.runId, pinnedManifestId: run.runtimeManifestId, runtimeManifestId: manifestId } },
+  );
+}
+
+/** Lookups of pinnedControlPlane. */
+export interface PinLookup {
+  getRun(runId: string): Promise<TestRun | undefined>;
+  /** The run of a work item (undefined when unknown). */
+  runOf(workItemId: string): Promise<string | undefined>;
+}
+
+/**
+ * I11 at the control boundary: the ControlPlane the durable runtime (and its Temporal activities) drives refuses to
+ * tick, recover or execute turns of a live run pinned to another RuntimeManifest (`precondition_failed`, which both
+ * runtimes treat as non-retryable). Finished runs stay readable (their outcome, reconciliation of their operations).
+ * Every other member is the wrapped control plane's.
+ */
+export function pinnedControlPlane(control: ControlPlane, manifestId: string, lookup: PinLookup): ControlPlane {
+  const pinnedHere = new Set<string>();
+  const runOfItem = new Map<string, string>();
+  const bounded = (size: number, evict: () => void) => {
+    if (size > PIN_CACHE_MAX) evict();
+  };
+  async function assertRun(runId: string): Promise<void> {
+    if (pinnedHere.has(runId)) return;
+    const run = await lookup.getRun(runId);
+    if (!run) return; // the control plane reports not_found
+    if (run.runtimeManifestId === manifestId) {
+      pinnedHere.add(runId); // the pin of a run never changes
+      bounded(pinnedHere.size, () => pinnedHere.delete(pinnedHere.values().next().value!));
+      return;
+    }
+    if (isTerminalRun(run.status)) return;
+    throw pinViolation(run, manifestId);
+  }
+  async function assertWork(workItemId: string): Promise<void> {
+    let runId = runOfItem.get(workItemId);
+    if (runId === undefined) {
+      runId = await lookup.runOf(workItemId);
+      if (runId === undefined) return;
+      runOfItem.set(workItemId, runId);
+      bounded(runOfItem.size, () => runOfItem.delete(runOfItem.keys().next().value!));
+    }
+    await assertRun(runId);
+  }
+  return {
+    ...control,
+    async tick(runId) {
+      await assertRun(runId);
+      return control.tick(runId);
+    },
+    async recover(runId, signal) {
+      await assertRun(runId);
+      return control.recover(runId, signal);
+    },
+    async executeTurn(workItemId, fencingToken, signal, options) {
+      await assertWork(workItemId);
+      return control.executeTurn(workItemId, fencingToken, signal, options);
+    },
+    async observeWaiting(workItemId, signal) {
+      await assertWork(workItemId);
+      return control.observeWaiting(workItemId, signal);
+    },
+  };
+}
+
+/**
+ * The verdict's own verification (beyond the evidence chain): the run's current QualityDecision must carry an Ed25519
+ * signature by a trusted key over its content, and be bound to the root of the first `evidenceCount` evidence records
+ * of the verified chain. A decision edited in the store, or re-bound to other evidence, is reported.
+ */
+export async function decisionProblems(
+  run: TestRun,
+  deps: { decisions: Pick<DecisionRepository, 'get'>; evidence: Pick<EvidenceLedger, 'query' | 'rootHash'>; publicKeys: Record<string, string> },
+): Promise<string[]> {
+  if (!run.decisionId) return [];
+  const d = await deps.decisions.get(run.decisionId);
+  if (!d) return [`decision_missing: run ${run.runId} names decision ${run.decisionId}, which does not exist`];
+  const problems: string[] = [];
+  if (d.runId !== run.runId) problems.push(`decision_run: decision ${d.decisionId} belongs to run ${d.runId}`);
+  const sig = d.signature;
+  if (!sig) problems.push(`decision_signature: decision ${d.decisionId} is not signed`);
+  else {
+    const pem = Object.hasOwn(deps.publicKeys, sig.keyId) ? deps.publicKeys[sig.keyId] : undefined;
+    const { signature: _s, ...unsigned } = d;
+    if (!pem) problems.push(`decision_signature: decision ${d.decisionId} is signed by untrusted key ${sig.keyId}`);
+    else if (sig.algorithm !== 'ed25519') problems.push(`decision_signature: decision ${d.decisionId} uses unsupported algorithm ${sig.algorithm}`);
+    else if (!verifyEd25519(pem, canonicalJson(unsigned), sig.value)) problems.push(`decision_signature: the signature of decision ${d.decisionId} does not verify (its content was altered)`);
+  }
+  const records = (await deps.evidence.query({ runId: run.runId })).sort((a, b) => a.seq - b.seq);
+  if (!Number.isSafeInteger(d.evidenceCount) || d.evidenceCount < 0 || d.evidenceCount > records.length) {
+    problems.push(`decision_root: decision ${d.decisionId} covers ${d.evidenceCount} evidence records but the run has ${records.length}`);
+  } else {
+    const upto = d.evidenceCount === 0 ? 0 : records[d.evidenceCount - 1]!.seq;
+    const root = await deps.evidence.rootHash(run.runId, upto);
+    if (root.rootHash !== d.evidenceRootHash || root.count !== d.evidenceCount) {
+      problems.push(`decision_root: decision ${d.decisionId} is bound to evidence root ${d.evidenceRootHash} (${d.evidenceCount} records) but the chain's root over those records is ${root.rootHash}`);
+    }
+  }
+  return problems;
+}
+
+// ------------------------------------------------------------------------------------------------ composition
+
+/**
+ * The composition root. Validates the configuration, then wires (in this order) the store + ALL migrations, the event
+ * bus + one outbox relay, artifacts, the persisted evidence signer, the evidence ledger, the operation services and
+ * side-effect adapters, the policy engine (+ OPA), decision log, approvals, oracle governance, QualityGate and the
+ * BUGate binding, the model providers/catalog/router, the context services and freshness resolvers, the tool
+ * registry/runtime/workspaces/sandbox, the runtime (sessions, agents, epochs, native + pi engines, subagents, runner),
+ * the role catalog, the RuntimeManifest (I11), the control plane and the durable runtime. Anything opened before a
+ * failure is closed again. Runs are NOT resumed automatically: call `resumeIncomplete()` (e.g. `hypertest resume`).
+ */
+export async function createHypertest(input: HypertestConfig, overrides: HypertestOverrides = {}): Promise<HypertestInstance> {
+  const errors = validateConfig(input);
+  if (errors.length > 0) throw invalid(`invalid configuration:\n  - ${errors.join('\n  - ')}`, { errors });
+  const config = withDerivedPaths(resolveConfigPaths(input, process.cwd()));
+  const env = overrides.env ?? process.env;
+  const clock = overrides.clock ?? systemClock;
+  const ids = overrides.ids ?? new UlidIdGenerator();
+  const logger = overrides.logger ?? jsonLogger({ level: config.observability?.logLevel ?? 'info', fields: { component: 'hypertest' } });
+  const workerId = overrides.workerId ?? defaultWorkerId(config);
+  const dataDir = config.project.dataDir;
+  const base = { ids, clock, logger };
+
+  // Pure construction first: a missing scripted brain, a bad provider or route fails before anything is created.
+  const providers = buildProviders(config, overrides, env, logger);
+  for (const p of config.models.providers) {
+    if (p.maxRetries !== undefined) logger.warn('models.providers[].maxRetries is not supported: retries and fail-closed fallback are the model router\'s; the value is ignored', { provider: p.id });
+  }
+  const pending: Array<{ name: string; close: () => Promise<void> }> = [];
+  const closeAll = async (): Promise<void> => {
+    for (const c of pending.splice(0).reverse()) {
+      try {
+        await c.close();
+      } catch (e) {
+        logger.error('error while closing a Hypertest resource', { resource: c.name, error: (e as Error).message });
+      }
+    }
+  };
+
+  try {
+    const catalog = await buildCatalog(config, providers);
+    await mkdir(dataDir, { recursive: true, mode: 0o700 });
+    const keys = await loadSigningKeys(config, dataDir, logger);
+    const capabilitySecret = await loadCapabilitySecret(config, dataDir, env, logger);
+
+    // ---- store + collaboration plane
+    if (config.store.kind === 'pglite') {
+      // one process per embedded data directory: PGlite has no locking, and a second process would lose writes and act
+      // as the same worker (fencing)
+      await mkdir(config.store.dataDir!, { recursive: true, mode: 0o700 });
+      const lock = await acquireDirectoryLock(lockFileFor(config.store.dataDir!), `PGlite data directory ${config.store.dataDir}`, logger);
+      pending.push({ name: 'store lock', close: () => lock.release() });
+    }
+    const db = await openStore(config, env);
+    pending.push({ name: 'database', close: () => db.close() });
+    await migrate(db, ALL_MIGRATIONS);
+    const bus = overrides.bus ?? (await openBus(config, workerId, logger));
+    if (!overrides.bus) pending.push({ name: 'bus', close: () => bus.close() });
+    const events = createEventStore({ ...base, db });
+    const blackboard = createBlackboard({ ...base, db, events });
+    const runs = createRunRepository({ ...base, db, events });
+    const specs = createSpecRepository({ ...base, db, events });
+    const decisions = createDecisionRepository({ ...base, db, events });
+    const inbox = createInbox({ ...base, db });
+    const relay: OutboxRelay = createOutboxRelay({ ...base, db, bus, pollMs: RELAY_POLL_MS });
+
+    // ---- evidence
+    const artifacts = openArtifacts(config, env);
+    if (artifacts instanceof S3ArtifactStore) pending.push({ name: 'artifacts', close: async () => artifacts.destroy() });
+    const signer = keys.signer;
+    const evidence = createEvidenceLedger({ ...base, db, artifacts, events, signer });
+
+    // ---- external world (operation) + environments (generations persisted: a restart never forgets a deploy)
+    const stateDir = join(dataDir, 'state');
+    await mkdir(stateDir, { recursive: true, mode: 0o700 });
+    const environments = persistentEnvironmentRegistry(
+      createEnvironmentRegistry([...resolveEnvironments(config.environments ?? [], env, logger), ...(overrides.environments ?? [])]),
+      join(stateDir, ENVIRONMENT_STATE_FILE),
+      logger,
+    );
+    const ledger = createOperationLedger({ ...base, db, events });
+    const leases = createLeaseService({ ...base, db, events });
+    const adapters = new AdapterRegistry(builtinSideEffectAdapters({ stateDir, environments }));
+    const gateway = createSideEffectGateway({ ...base, db, events, ledger, leases, adapters });
+    const reconciler = createReconciler({ ...base, db, events, ledger, leases, adapters });
+    const admission = createResourceAdmission({ ...base, db, events });
+    const budget = createBudgetLedger({ ...base, db, events });
+
+    // ---- governance
+    const policy = policyEngine(config, capabilitySecret, { clock, newId: () => ids.next('pdec') });
+    const decisionLog = createPolicyDecisionLog({ ...base, db, events });
+    const approvals = createApprovalService({ ...base, db, events });
+    // SpecRepository.saveOracleProposal already emits oracle.change_* events: no `events` here (no double emission)
+    const oracles = createOracleGovernance({
+      ...base,
+      store: specs,
+      decisions,
+      wouldFlipRecordedFailure: recordedFailureFlipDetector({
+        getOracle: (id, revision) => specs.getOracle(id, revision),
+        // every revision: a failure recorded once stays recorded even if the finding was later superseded
+        findings: (runId) => blackboard.query<Finding>({ runId, recordType: 'finding', includeSuperseded: true }),
+        getEvidence: (ids) => evidence.getMany(ids),
+        testResults: (runId) => evidence.query({ runId, evidenceType: 'test-result' }),
+      }),
+    });
+    const protocol = await resolveProtocolBinding(config.bugate?.path ? { bugatePath: config.bugate.path } : {});
+
+    // ---- models
+    const router: ModelRouter = createModelRouter({ ...base, catalog, providers, events });
+    const preflightRouter: ModelRouter = createModelRouter({ ...base, catalog, providers });
+
+    // ---- context engine
+    const snapshots = createSnapshotStore({ ...base, db, events });
+    const resolvers = createResolverRegistry([
+      environmentResolver((id) => environments.get(id)),
+      oracleResolver((id) => specs.getOracle(id)),
+      experimentResolver((id) => specs.getExperiment(id)),
+      recordResolver((lineage) => blackboard.head(lineage)),
+      leaseResolver((key) => leases.current(key)),
+    ]);
+    const freshness = createFreshnessGuard({ ...base, db, events, snapshots, resolvers });
+    const snapshotBuilder = createSnapshotBuilder({
+      ...base,
+      db,
+      events,
+      snapshots,
+      resolvers,
+      sources: {
+        getRun: (runId) => runs.get(runId),
+        lastEventSeq: (runId) => events.lastSeq(runId),
+        blackboardRevision: (runId) => blackboard.revision(runId),
+        evidenceRoot: (runId) => evidence.rootHash(runId),
+        experimentRevisions: async (runId) => Object.fromEntries((await specs.listExperiments(runId)).map((e) => [e.experimentId, e.revision])),
+      },
+    });
+    let memory: DurableMemory;
+    if (config.memory?.kind === 'powercontext') {
+      const apiKey = config.memory.apiKeyEnv ? env[config.memory.apiKeyEnv] : undefined;
+      memory = new PowerContextClient({ baseUrl: config.memory.baseUrl, timeoutMs: 10_000, logger, ...(apiKey ? { apiKey } : {}) });
+    } else {
+      memory = createExperienceStore({ ...base, db, events });
+    }
+    const provenance = createProvenanceService({ evidence, events, records: blackboard });
+
+    // ---- tools
+    const profile = sandboxProfile(config);
+    const workspaces = createWorkspaceManager({ ...base, baseDir: join(dataDir, 'workspaces'), defaultSandbox: profile });
+    const sandbox = profile.kind === 'oci' ? createOciSandbox({ image: profile.image! }) : createLocalSandbox();
+    const toolOptions: BuiltinToolOptions = { sandbox, workspaces, stateDir };
+    if (config.tools?.shellAllowlist) toolOptions.shellAllowlist = [...config.tools.shellAllowlist];
+    if (config.tools?.httpAllowlist) toolOptions.httpAllowlist = [...config.tools.httpAllowlist];
+    if (config.tools?.enableBrowser) {
+      toolOptions.enableBrowser = true;
+      pending.push({ name: 'browser', close: () => closeBlackboxResources() });
+    }
+    const registry = new ToolRegistry(builtinTools(toolOptions));
+    const toolDeps: ToolRuntimeDeps = {
+      ...base,
+      registry,
+      policy,
+      decisionLog,
+      freshness,
+      sideEffects: gateway,
+      artifacts,
+      evidence,
+      events,
+      environments,
+      runtimeManifestId: 'rm_pending',
+      workerId,
+      capabilitySecret,
+    };
+    const toolRuntime = createToolRuntime(toolDeps);
+
+    // ---- agent runtime
+    const sessions = createSessionStore({ ...base, db, events });
+    const agents = createAgentRepository({ ...base, db, events });
+    const epochs = createEpochManager({ ...base, db, events, sessions });
+    const engineList: AgentEngine[] = [new NativeEngine({ ...base, sessions, events })];
+    try {
+      engineList.push(new PiEngine({ ...base, sessions, events }));
+    } catch (e) {
+      if (config.engines?.default === 'pi') throw e;
+      logger.warn('the pi engine is unavailable; only the native engine is registered', { error: (e as Error).message });
+    }
+    const engines = new EngineRegistry(engineList);
+    const defaultEngineKind = config.engines?.default ?? 'native';
+    if (!engines.has(defaultEngineKind)) throw invalid(`engines.default: engine '${defaultEngineKind}' is not registered`);
+    const subagents = createSubagentRuntime({ ...base, db, events, agents, sessions, engines, defaultEngineKind, maxAgentsPerRun: MAX_AGENTS_PER_RUN, capabilitySecret });
+    const runner = createAgentRunner({ ...base, db, events, agents, sessions, engines, subagents });
+    const roles: RoleCatalogLike = new RoleCatalog(BUILTIN_ROLES, { roles: roleOverrides(config) });
+
+    // ---- control plane
+    const controlConfig: ControlConfig = {
+      capabilitySecret,
+      runtimeManifest: { manifestId: 'rm_pending' } as RuntimeManifest,
+      workerId,
+      defaultEngineKind,
+    };
+    if (config.budget) controlConfig.defaultBudget = { ...config.budget };
+    if (config.gate) controlConfig.defaultGate = { ...config.gate };
+    const deps: ControlDeps = {
+      ...base,
+      db, events, blackboard, runs, specs, decisions, inbox, bus, relay,
+      ledger, leases, gateway, reconciler, admission, budget, adapters,
+      artifacts, evidence, signer,
+      policy, decisionLog, approvals, oracles, gate: new QualityGate(), protocol,
+      router, catalog,
+      snapshots, snapshotBuilder, freshness, resolvers, workingContext: createWorkingContextManager(), retrieverFactory: cachedRetrievers(logger), memory, provenance,
+      toolRuntime, registry, workspaces, environments,
+      sessions, agents, epochs, engines, subagents, runner, roles,
+      config: controlConfig,
+    };
+    // the manifest pins the complete tool catalog: built-in + domain tools
+    for (const spec of createDomainTools(deps)) if (!registry.get(spec.id)) registry.register(spec);
+    const engineAdapters = [{ provider: 'engine:native', package: '@hypertest/runtime', version: RUNTIME_PACKAGE_VERSION }];
+    if (engines.has('pi')) {
+      engineAdapters.push({ provider: 'engine:pi', package: '@hypertest/runtime-pi', version: RUNTIME_PI_PACKAGE_VERSION });
+      engineAdapters.push({ provider: 'engine:pi', package: '@earendil-works/pi-agent-core', version: PI_AGENT_CORE_VERSION });
+    }
+    const manifest = buildRuntimeManifest(
+      {
+        hypertest: { version: HYPERTEST_VERSION },
+        agentEngines: engines.manifestEntries(),
+        providerAdapters: [...providers.adapters(), ...engineAdapters],
+        modelCatalogRevision: catalog.revision,
+        schemas: {
+          event: lastId(collabMigrations),
+          contextSnapshot: lastId(contextMigrations),
+          tool: TOOL_SCHEMA_VERSION,
+          operation: lastId(operationMigrations),
+          evidence: lastId(evidenceMigrations),
+        },
+        // the governance bundle: policy rules (+ OPA) and the role catalog (tool policies, permission profiles, model policies)
+        policyBundleRevision: `${policy.revision}+roles:${roles.revision()}`,
+        toolCatalogRevision: registry.revision(),
+        protocol: { id: protocol.binding.protocolId, version: protocol.binding.version, digest: protocol.binding.digest },
+      },
+      clock.isoNow(),
+    );
+    toolDeps.runtimeManifestId = manifest.manifestId;
+    controlConfig.runtimeManifest = manifest;
+    const plane = createControlPlane(deps);
+    pending.push({ name: 'control', close: () => plane.close() });
+    // I11: what the durable runtime drives (and what the facade exposes) never drives a live run of another manifest
+    const control = pinnedControlPlane(plane, manifest.manifestId, {
+      getRun: (id) => runs.get(id),
+      runOf: async (id) => (await blackboard.getWorkItem(id))?.runId,
+    });
+    relay.start();
+    pending.push({ name: 'relay', close: () => relay.stop() });
+
+    const durable = createDurable(config, {
+      control,
+      listRuns: () => runs.list({ status: NON_TERMINAL }),
+      getRun: (id) => runs.get(id),
+      // the token of a claim THIS worker holds (never another worker's: that would bypass fencing)
+      resolveClaim: async (workItemId) => {
+        const claim = (await blackboard.getWorkItem(workItemId))?.claim;
+        return claim && claim.ownerId === workerId ? claim.fencingToken : undefined;
+      },
+      logger: logger.child({ component: 'durable' }),
+    });
+    pending.push({ name: 'durable', close: () => durable.shutdown() });
+
+    const services: HypertestServices = {
+      db, bus, relay, events, runs, blackboard, specs, decisions, operations: ledger, artifacts, evidence, signer, publicKeys: keys.publicKeys,
+      policy, decisionLog, approvals, oracles, protocol, providers, catalog, router, memory, tools: registry, environments, roles, workerId, logger, clock, ids,
+    };
+    const ctx = (runId: string, actorId: string, correlationId = runId): EventContext => ({ runId, correlationId, actorId });
+
+    /** Fail fast when the lead cannot be routed at all (a run would only fail its first work item). */
+    async function preflight(): Promise<void> {
+      const enabled = catalog.list().filter((p) => p.enabled);
+      if (enabled.length === 0) {
+        throw new HypertestError('precondition_failed', 'no model routes are configured (models.routes is empty or disabled): the lead agent cannot be routed; add a provider and a route to the configuration');
+      }
+      const lead = roles.get('lead');
+      if (!lead) return;
+      const request: RouteRequest = {
+        runId: 'preflight', agentId: 'preflight', role: 'lead', taskType: lead.taskType, policy: lead.defaultModelPolicy, requiredCapabilities: [],
+        actionRisk: 'low', dataClassification: lead.dataClassification, contextTokensEstimate: 1, contextSnapshotId: 'preflight',
+      };
+      const decision = await preflightRouter.route(request, ctx('preflight', 'system:preflight'));
+      if (!decision.ok) {
+        const why = decision.rejected.map((r) => `${r.routeId}: ${r.stage} — ${r.reason}`).join('; ');
+        throw new HypertestError('precondition_failed', `no configured route can serve the lead role (${why}); adjust models.routes (capabilities, quality) or roles.lead.defaultModelPolicy`, {
+          details: { rejected: decision.rejected },
+        });
+      }
+    }
+
+    /**
+     * Best-effort wake of a live run after a human decision: the decision is already recorded (the run loop also polls),
+     * so a failed signal is logged, never reported as a failed decision (a retry would find it decided).
+     */
+    async function wake(runId: string): Promise<void> {
+      try {
+        const run = await runs.get(runId);
+        if (run && !isTerminalRun(run.status)) await durable.signal(runId, { type: 'wake' });
+      } catch (e) {
+        logger.warn('could not wake the run after a decision; its loop picks the decision up on its next tick', { runId, error: (e as Error).message });
+      }
+    }
+
+    let closing: Promise<void> | undefined;
+    const ht: HypertestInstance = {
+      config,
+      control,
+      durable,
+      manifest,
+      services,
+      async start(runInput: StartRunInput): Promise<TestRun> {
+        if (closing) throw new HypertestError('unavailable', 'this Hypertest instance is closed');
+        const runId = runInput?.runId;
+        if (runId !== undefined && (typeof runId !== 'string' || !RUN_ID_RE.test(runId) || runId.includes('..'))) {
+          throw new HypertestError('invalid_argument', `runId must match ${RUN_ID_RE.source} (no '..'), got ${JSON.stringify(runId)}`);
+        }
+        const overrideErrors = validateRunOverrides({ budget: runInput?.budget, gate: runInput?.gate });
+        if (overrideErrors.length > 0) throw new HypertestError('invalid_argument', `invalid run overrides:\n  - ${overrideErrors.join('\n  - ')}`, { details: { errors: overrideErrors } });
+        await preflight();
+        // startRun is idempotent for an existing runId: never drive a run created by another runtime (I11)
+        const run = await control.startRun(runInput, { actorId: 'system:app' });
+        if (run.runtimeManifestId !== manifest.manifestId && !isTerminalRun(run.status)) throw pinViolation(run, manifest.manifestId);
+        try {
+          await durable.startRun(run.runId);
+        } catch (e) {
+          const code = isHypertestError(e) ? e.code : 'unavailable';
+          throw new HypertestError(code, `run ${run.runId} was created but its durable loop could not be started: ${(e as Error).message}; resumeIncomplete() (hypertest resume) drives it`, {
+            cause: e,
+            details: { runId: run.runId },
+          });
+        }
+        return run;
+      },
+      async run(runInput: StartRunInput, options: { timeoutMs?: number } = {}): Promise<RunOutcome> {
+        const run = await ht.start(runInput);
+        return durable.awaitCompletion(run.runId, options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {});
+      },
+      async resumeIncomplete(): Promise<string[]> {
+        if (closing) throw new HypertestError('unavailable', 'this Hypertest instance is closed');
+        // only runs pinned to THIS runtime's manifest (I11); the others wait for their own runtime (or a cancel)
+        const resumable = await runs.list({ status: [...RESUMABLE_RUN_STATUSES] });
+        const resumed: string[] = [];
+        const foreign: Array<{ runId: string; runtimeManifestId: string }> = [];
+        for (const run of resumable) {
+          if (run.runtimeManifestId !== manifest.manifestId) {
+            foreign.push({ runId: run.runId, runtimeManifestId: run.runtimeManifestId });
+            continue;
+          }
+          await durable.startRun(run.runId);
+          resumed.push(run.runId);
+        }
+        if (foreign.length > 0) logger.warn('incomplete runs pinned to another runtime manifest are not resumed by this runtime (I11)', { manifestId: manifest.manifestId, runs: foreign });
+        if (resumed.length > 0) logger.info('resumed incomplete runs', { runs: resumed });
+        return resumed;
+      },
+      status: (runId) => runs.get(runId),
+      report: (runId) => control.report(runId),
+      async verifyEvidence(runId) {
+        const run = await runs.get(runId);
+        if (!run) throw new HypertestError('not_found', `run ${runId} not found`);
+        const v = await evidence.verify(runId, { publicKeys: keys.publicKeys });
+        const problems = v.problems.map((p) => `${p.kind}${p.evidenceId ? ` ${p.evidenceId}` : ''}${p.seq !== undefined ? ` (seq ${p.seq})` : ''}: ${p.detail}`);
+        problems.push(...(await decisionProblems(run, { decisions, evidence, publicKeys: keys.publicKeys })));
+        return { ok: problems.length === 0, problems };
+      },
+      async approve(approvalId, approve, actor, rationale) {
+        const approval = await approvals.get(approvalId);
+        if (!approval) throw new HypertestError('not_found', `approval ${approvalId} not found`);
+        await approvals.decide(approvalId, approve, actor, rationale, ctx(approval.runId, `${actor.kind}:${actor.id}`, approvalId));
+        await wake(approval.runId);
+      },
+      async decideOracleProposal(proposalId, approve, actor, rationale) {
+        const proposal = await specs.getOracleProposal(proposalId);
+        if (!proposal) throw new HypertestError('not_found', `oracle change proposal ${proposalId} not found`);
+        await oracles.decide(proposalId, approve, actor, rationale, ctx(proposal.runId, `${actor.kind}:${actor.id}`, proposalId));
+        await wake(proposal.runId);
+      },
+      listRuns: (filter = {}) => runs.list(filter),
+      events: (runId, options = {}) => events.read(runId, options),
+      listApprovals: (filter = {}) => approvals.list(filter),
+      async cancel(runId, reason) {
+        const run = await runs.get(runId);
+        if (!run) throw new HypertestError('not_found', `run ${runId} not found`);
+        // a finished run keeps its outcome: report that instead of a silent no-op (cancelling a cancelled run is idempotent)
+        if (run.status === 'completed' || run.status === 'failed') throw new HypertestError('conflict', `run ${runId} is already ${run.status}`, { details: { runId, status: run.status } });
+        // cancelRun is idempotent: the control plane sweeps the work even when no loop of this process drives the run,
+        // and the durable signal stops the loop that does
+        await control.cancelRun(runId, reason);
+        await durable.signal(runId, { type: 'cancel', reason });
+      },
+      close() {
+        closing ??= closeAll();
+        return closing;
+      },
+    };
+    return ht;
+  } catch (e) {
+    await closeAll();
+    throw e;
+  }
+}

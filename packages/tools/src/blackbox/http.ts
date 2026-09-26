@@ -202,6 +202,8 @@ async function executeHttpRequest(input: HttpRequestInput, ctx: ToolContext, all
   const requestRecord = {
     method,
     url: redactUrl(url),
+    // the path an oracle names (QualityGate http_expectation.path): environment-relative, without query
+    path: requestPath(input, url, ctx.environments),
     headers: redactHeaders(headers.entries()),
     ...(evidenceBody !== undefined && body !== undefined ? { body: storableText(truncateUtf8Bytes(evidenceBody, EVIDENCE_BODY_LIMIT)), bodyBytes: Buffer.byteLength(body) } : {}),
   };
@@ -291,6 +293,17 @@ async function executeHttpRequest(input: HttpRequestInput, ctx: ToolContext, all
   const headerLines = ['content-type', 'location', 'retry-after'].filter((h) => responseHeaders[h] !== undefined).map((h) => `${h}: ${responseHeaders[h]}`);
   const text = [`HTTP ${res.status} ${res.statusText} — ${method} ${result.url} (${durationMs} ms, ${read.totalRead} bytes; evidence ${evidence.evidenceId})`, ...headerLines, '', result.bodyPreview].join('\n');
   return { status: 'success', structured: result as unknown as JsonValue, text, evidenceRefs: [evidence.evidenceId] };
+}
+
+/**
+ * The request path as an oracle names it (`http_expectation.path`): for an environment-addressed request the path below
+ * the environment's baseUrl path prefix (`/api/` + `/ok` ⇒ `/ok`), else the URL's pathname; never the query.
+ */
+function requestPath(input: HttpRequestInput, url: URL, envs: ToolContext['environments']): string {
+  if (input.environmentId === undefined) return url.pathname;
+  const base = envs.get(input.environmentId)?.baseUrl;
+  const prefix = base ? new URL(base).pathname.replace(/\/+$/, '') : '';
+  return prefix !== '' && url.pathname.startsWith(`${prefix}/`) ? url.pathname.slice(prefix.length) : url.pathname;
 }
 
 async function recordExchange(ctx: ToolContext, method: string, url: URL, structured: Record<string, unknown>, data: string | Uint8Array, mimeType: string, summary: string): Promise<EvidenceRecord> {

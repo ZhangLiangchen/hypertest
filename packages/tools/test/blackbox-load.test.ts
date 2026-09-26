@@ -23,8 +23,9 @@ const cleanups: Array<() => Promise<void>> = [];
 const workers = new Set<number>();
 
 before(async () => {
-  target = await startServer((_req, res) => {
-    res.writeHead(200, { 'content-type': 'text/plain' });
+  target = await startServer((req, res) => {
+    // /fail answers 500: the load generator must count it as an error
+    res.writeHead(req.url === '/fail' ? 500 : 200, { 'content-type': 'text/plain' });
     res.end('ok');
   });
   env = await openBlackboxEnv({ environments: [{ environmentId: 'env_load', environmentClass: 'local', generation: 1, baseUrl: target.url }] });
@@ -64,6 +65,24 @@ async function trackPid(dir: string, operationId: string): Promise<number> {
 
 const baseInput = (path: string, extra: Partial<LoadStartInput> = {}): LoadStartInput => ({ environmentId: 'env_load', path, method: 'GET', ratePerSecond: 20, durationMs: 1000, concurrency: 4, ...extra });
 
+test('load results report the error rate over completed requests (non-2xx responses are errors), recorded in the metric evidence', async () => {
+  const dir = await stateDir();
+  const { gateway } = newGateway(env, builtinSideEffectAdapters({ stateDir: dir, environments: env.environments }));
+  const runtime = newRuntime(env, blackboxTools({ stateDir: dir }), gateway);
+  const start = await runtime.execute(toolRequest('load.start', baseInput('/fail', { ratePerSecond: 10, durationMs: 500 })));
+  assert.equal(start.status, 'pending', start.modelText);
+  await trackPid(dir, start.operationId!);
+  const done = await waitFor(async () => {
+    const r = await runtime.execute(toolRequest('load.observe', { operationId: start.operationId! }));
+    return r.status === 'success' ? r : undefined;
+  }, 15_000, 100, 'load job verification');
+  const s = structuredOf(done);
+  assert.equal(s['results']['sent'], 5);
+  assert.equal(s['results']['errors'], 5);
+  assert.equal(s['results']['errorRate'], 1);
+  assert.deepEqual(s['results']['statusCodes'], { '500': 5 });
+});
+
 test('load.start → pending → load.observe → verified results (20 rps × 1 s) through the ToolRuntime, with metric evidence recorded once', async () => {
   const dir = await stateDir();
   const { gateway, ledger } = newGateway(env, builtinSideEffectAdapters({ stateDir: dir, environments: env.environments }));
@@ -86,6 +105,7 @@ test('load.start → pending → load.observe → verified results (20 rps × 1 
   assert.equal(s['results']['sent'], 20);
   assert.equal(s['results']['ok'], 20);
   assert.equal(s['results']['errors'], 0);
+  assert.equal(s['results']['errorRate'], 0, 'an error-rate SLO reads the error rate from the results evidence');
   assert.equal(s['results']['planned'], 20);
   assert.equal(typeof s['results']['latencyMs']['p95'], 'number');
   assert.equal(s['results']['histogram']['buckets'].at(-1).count, 20);
@@ -420,6 +440,7 @@ test('a stop requested before the worker started wins: the worker exits as stopp
   const results = JSON.parse(await readFile(join(jobDir, 'results.json'), 'utf8')) as { state: string; sent: number };
   assert.equal(results.state, 'stopped');
   assert.equal(results.sent, 0);
+  assert.equal((results as { errorRate?: unknown }).errorRate, null, 'no completed request: the error rate is unknown, never 0');
   assert.equal(hitsFor('op_prestop1'), 0);
 });
 

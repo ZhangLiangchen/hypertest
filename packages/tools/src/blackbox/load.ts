@@ -71,6 +71,8 @@ export interface LoadJobStatus {
   queued?: number;
   statusCodes?: Record<string, number>;
   latencyMs?: { p50: number | null; p95: number | null; p99: number | null; max: number | null; min?: number | null; mean: number | null };
+  /** errors / completed requests (ok + errors); null before any request completed. */
+  errorRate?: number | null;
   achievedRps?: number;
   elapsedMs?: number;
   error?: string;
@@ -293,7 +295,7 @@ export interface HttpLoadAdapterOptions {
 function summarizeResults(r: LoadJobStatus | undefined): Record<string, unknown> {
   if (!r) return {};
   const out: Record<string, unknown> = { sent: r.sent, ok: r.ok, errors: r.errors };
-  for (const k of ['planned', 'networkErrors', 'timeouts', 'statusCodes', 'latencyMs', 'achievedRps', 'elapsedMs', 'startedAt', 'finishedAt', 'histogram', 'lastError'] as const) {
+  for (const k of ['planned', 'networkErrors', 'timeouts', 'statusCodes', 'latencyMs', 'errorRate', 'achievedRps', 'elapsedMs', 'startedAt', 'finishedAt', 'histogram', 'lastError'] as const) {
     if (r[k] !== undefined) out[k] = r[k];
   }
   return out;
