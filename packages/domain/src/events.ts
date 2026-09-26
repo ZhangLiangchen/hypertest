@@ -40,7 +40,8 @@ export type AggregateType =
   | 'tool'
   | 'context'
   | 'budget'
-  | 'approval';
+  | 'approval'
+  | 'experience';
 
 /** Event catalog. Payload shapes are documented next to each producer; names are stable API. */
 export const EVENT_TYPES = {
@@ -77,6 +78,8 @@ export const EVENT_TYPES = {
   agentTurnCompleted: 'agent.turn_completed',
   agentInterrupted: 'agent.interrupted',
   agentDisposed: 'agent.disposed',
+  agentSettled: 'agent.settled',
+  agentResumed: 'agent.resumed',
 
   modelRouted: 'model.routed',
   modelEpochStarted: 'model.epoch_started',
@@ -141,6 +144,7 @@ export const EVENT_TYPES = {
   gateFailed: 'gate.failed',
   decisionRecorded: 'decision.recorded',
   experienceProposed: 'experience.proposed',
+  experienceReviewed: 'experience.reviewed',
 } as const;
 
 export type EventType = (typeof EVENT_TYPES)[keyof typeof EVENT_TYPES];

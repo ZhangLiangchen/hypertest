@@ -1,4 +1,4 @@
-import type { BaseDeps, SqlDatabase } from '@hypertest/core';
+import type { BaseDeps, Logger, SqlDatabase } from '@hypertest/core';
 import type { ArtifactRef, ChatMessage, ContextSnapshot, DomainEventSink, EventContext, ReadSetEntry, Ref, ReportClaim } from '@hypertest/domain';
 
 /**
@@ -22,12 +22,37 @@ import type { ArtifactRef, ChatMessage, ContextSnapshot, DomainEventSink, EventC
  *   class ExactSearch implements Retriever (ripgrep when on PATH, else JS walker; respects .gitignore basics)
  *   class SymbolIndex implements Retriever (regex symbol extraction for ts/js/py/go; definitions + references)
  *   class HashEmbedder implements Embedder (deterministic feature hashing, 256 dims)
- *   class InMemoryVectorIndex implements VectorIndex; createPgVectorIndex(db, dims) (pgvector; throws unsupported if unavailable)
+ *   class InMemoryVectorIndex implements VectorIndex; createPgVectorIndex(db, embedder): Promise<VectorIndex>
+ *     (pgvector; throws unsupported if unavailable — the embedder supplies dims + modelId, see README)
  *   class HybridRetriever implements Retriever (reciprocal-rank fusion over child retrievers)
  *   createExperienceStore(deps: ContextDeps): DurableMemory
  *   class PowerContextClient implements DurableMemory ({ baseUrl, apiKey?, timeoutMs })
  *   createProvenanceService(deps: ProvenanceDeps): ProvenanceService
  *   contextMigrations: Migration[] (ht_context_snapshots, ht_experience, ht_vectors (only if vector ext))
+ *
+ * Additive exports (v0.3 implementation):
+ *   createResolverRegistry(resolvers?: ResourceVersionResolver[]): ResolverRegistry
+ *   functionResolver(resourceType, fn), environmentResolver(getEnv), oracleResolver(getOracle),
+ *   experimentResolver(getExperiment), recordResolver(getHead, options?), leaseResolver(getLease),
+ *   fileResolver(root, options?)                     — built-in ResourceVersionResolvers over structural ports
+ *   snapshotIdFor(content): string                   — the content address used by SnapshotStore.create
+ *   offloadToolResult(artifacts, message, options?)   — I9 helper: large tool output → artifact + bounded digest
+ *   extractEvidenceIds(text), extractRecordIds(text) — id scanners used by condense()
+ *   createFreshnessGuard also accepts `resolvers?: ResolverRegistry` (default: an empty registry ⇒ fail closed).
+ *   createWorkingContextManager takes WorkingContextOptions (adds summaryRatio, maxToolResultTokens).
+ *   ht_vectors is created lazily by createPgVectorIndex (never by contextMigrations); rows are keyed by
+ *     (model_id, id) so indexes of different embedders never overwrite or remove each other's documents.
+ *   pinnedEntries(snapshot)                          — the snapshot's pinned environment/oracle/experiment versions
+ *                                                      as exact_version entries (FreshnessGuard checks them too)
+ *   sameActor(a, b), creatorActing(createdBy, reviewer, ctx) — the reviewer ≠ creator rule (trimmed, case-insensitive;
+ *                                                      the acting ctx.actorId/agentId counts as well)
+ *   resolveLimit(limit, fallback)                    — result limits: non-finite ⇒ invalid_argument
+ *
+ * Behavioural clarifications (v0.3 review):
+ *   FreshnessGuard.validate: a malformed action (mutating not a boolean, resources not string[]) is invalid_argument,
+ *     never treated as read-only; the snapshot's pinned versions are validated even without read-set entries.
+ *   DurableMemory.review: permission_denied also when ctx.actorId / ctx.agentId is the creator.
+ *   RetrievalQuery.root is honoured by the vector indexes (documents whose path lies inside it).
  */
 export interface ContextDeps extends BaseDeps {
   db: SqlDatabase;
@@ -92,7 +117,13 @@ export interface StaleEntry {
   resourceId: string;
   observedVersion: string;
   currentVersion?: string;
-  reason: 'version_changed' | 'expired' | 'missing' | 'no_resolver';
+  /**
+   * `resolver_error` (additive): the resolver threw — treated as stale (fail closed); `missing` is also used
+   * for an unknown snapshot id (resourceType `context_snapshot`).
+   */
+  reason: 'version_changed' | 'expired' | 'missing' | 'no_resolver' | 'resolver_error';
+  /** Additive: resolver error message when reason = resolver_error. */
+  error?: string;
 }
 
 export type FreshnessResult = { fresh: true; checked: number } | { fresh: false; checked: number; stale: StaleEntry[] };
@@ -168,6 +199,23 @@ export interface Summarizer {
   summarize(input: { messages: ChatMessage[]; instructions: string; maxTokens: number; signal?: AbortSignal }): Promise<string>;
 }
 
+/** Additive: options of createWorkingContextManager. */
+export interface WorkingContextOptions {
+  /** Turns kept verbatim after the cut (default 4). */
+  keepRecentTurns?: number;
+  /** tokens/budget ≥ softRatio ⇒ pressure 'soft' (default 0.7). */
+  softRatio?: number;
+  /** tokens/budget ≥ hardRatio ⇒ pressure 'hard' (default 0.95). */
+  hardRatio?: number;
+  /** Share of the budget given to the summary (default 0.2, at least 64 tokens). */
+  summaryRatio?: number;
+  /**
+   * I9 defence in depth: a tool result larger than this is shown truncated in the view (L0/SessionStore keep
+   * the full text). Default 8000 tokens; 0 disables.
+   */
+  maxToolResultTokens?: number;
+}
+
 export interface WorkingContextManager {
   view(input: { transcript: TranscriptEntry[]; compactions: Compaction[]; budgetTokens: number }): WorkingView;
   condense(input: {
@@ -209,6 +257,49 @@ export interface Retriever {
   search(query: RetrievalQuery, signal?: AbortSignal): Promise<RetrievalHit[]>;
 }
 
+/** Additive: options of ExactSearch. */
+export interface ExactSearchOptions {
+  root: string;
+  /** 'auto' (default): ripgrep when on PATH, else the JS walker. false forces the JS walker; true requires rg. */
+  ripgrep?: boolean | 'auto';
+  /** Files larger than this are skipped (default 1 MiB). */
+  maxFileBytes?: number;
+  /** Default hit limit when the query has none (default 20). */
+  defaultLimit?: number;
+}
+
+export type SymbolLanguage = 'ts' | 'js' | 'python' | 'go';
+
+/** Additive: options of SymbolIndex. */
+export interface SymbolIndexOptions {
+  root: string;
+  languages?: SymbolLanguage[];
+  maxFileBytes?: number;
+  defaultLimit?: number;
+}
+
+export type SymbolKind = 'function' | 'class' | 'interface' | 'type' | 'enum' | 'const_object' | 'variable' | 'method' | 'struct';
+
+/** Additive: one extracted definition. */
+export interface SymbolDefinition {
+  name: string;
+  kind: SymbolKind;
+  language: SymbolLanguage;
+  path: string;
+  line: number;
+  /** Enclosing class (TS/JS/Python) or receiver type (Go) for methods. */
+  container?: string;
+  signature: string;
+}
+
+/** Additive: one word-boundary occurrence of a name that is not its definition. */
+export interface SymbolReference {
+  name: string;
+  path: string;
+  line: number;
+  snippet: string;
+}
+
 export interface Embedder {
   readonly dims: number;
   readonly modelId: string;
@@ -247,6 +338,20 @@ export interface ExperienceItem {
   updatedAt: string;
 }
 
+/** Additive named type: the review decisions (`review` ⇒ status reviewed is additive). */
+export type ExperienceDecision = 'review' | 'approve' | 'publish' | 'reject' | 'quarantine';
+
+/** Additive: options of PowerContextClient. */
+export interface PowerContextOptions {
+  baseUrl: string;
+  apiKey?: string;
+  timeoutMs: number;
+  fetchImpl?: typeof fetch;
+  /** Endpoint paths (defaults below); `{id}` is replaced by the url-encoded experience id. */
+  paths?: { propose?: string; review?: string; retrieve?: string; list?: string };
+  logger?: Logger;
+}
+
 /**
  * Candidate → review/eval → approved → published. Only approved/published items are ever retrieved
  * (agent hallucinations must not become future testing policy). Reviewer ≠ creator.
@@ -254,21 +359,34 @@ export interface ExperienceItem {
 export interface DurableMemory {
   readonly kind: 'sql' | 'powercontext';
   propose(item: Omit<ExperienceItem, 'experienceId' | 'status' | 'createdAt' | 'updatedAt' | 'reviewedBy'>, ctx: EventContext): Promise<ExperienceItem>;
-  review(experienceId: string, decision: 'approve' | 'publish' | 'reject' | 'quarantine', reviewer: string, ctx: EventContext): Promise<ExperienceItem>;
+  /** `review` (additive) marks a candidate as reviewed (evaluated, not yet approved). */
+  review(experienceId: string, decision: ExperienceDecision, reviewer: string, ctx: EventContext): Promise<ExperienceItem>;
   retrieve(query: { text: string; scope?: ExperienceItem['scope']; limit?: number }): Promise<ExperienceItem[]>;
   list(filter: { status?: ExperienceStatus[]; sourceRunId?: string }): Promise<ExperienceItem[]>;
 }
 
 // ----------------------------------------------------------------------------- L5 provenance
 
+/**
+ * Additive: provenance-only node kinds that have no domain RefKind (tool invocations, L0 events, agents,
+ * environments, report claims). ProvenanceRef is a supertype of Ref, so every Ref is still accepted.
+ * Edge endpoints (`from`/`to`) are node keys `${ref.kind}:${ref.id}`.
+ */
+export type ProvenanceRefKind = Ref['kind'] | 'tool_invocation' | 'event' | 'agent' | 'environment' | 'claim';
+export interface ProvenanceRef {
+  kind: ProvenanceRefKind;
+  id: string;
+  note?: string;
+}
+
 export interface ProvenanceNode {
-  ref: Ref;
+  ref: ProvenanceRef;
   label: string;
   detail?: Record<string, unknown>;
 }
 
 export interface ProvenanceTrace {
-  root: Ref;
+  root: ProvenanceRef;
   nodes: ProvenanceNode[];
   edges: Array<{ from: string; to: string; relation: 'produced_by' | 'derived_from' | 'executed_in' | 'caused_by' | 'cites' | 'operation' | 'commit' }>;
   complete: boolean;

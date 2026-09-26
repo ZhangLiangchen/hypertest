@@ -692,6 +692,7 @@ class SideEffectEngine {
     throwIfAborted(signal);
     const op = await this.#deps.ledger.get(operationId);
     if (!op) throw new HypertestError('not_found', `operation ${operationId} not found`);
+    assertSameRun(op, ctx);
     // A dispatch in flight in this process, or under a still-live lease (its dispatcher may be alive in
     // another process), is not a crash: do not reconcile underneath it. Its receipt or lease expiry settles it.
     if (op.status === 'dispatching' && (this.#inFlight.has(op.operationId) || (await this.#leaseStillHeld(op)))) return outcomeForOperation(op);
@@ -709,6 +710,7 @@ class SideEffectEngine {
     throwIfAborted(signal);
     const op = await this.#deps.ledger.get(operationId);
     if (!op) throw new HypertestError('not_found', `operation ${operationId} not found`);
+    assertSameRun(op, ctx);
     const adapter = this.#deps.adapters.get(op.adapterId);
     if (!adapter.capabilities.supportsCompensation || typeof adapter.compensate !== 'function') {
       throw new HypertestError('unsupported', `adapter ${adapter.adapterId} does not support compensation`);
@@ -852,4 +854,12 @@ export function createReconciler(deps: GatewayDeps): Reconciler {
       return report;
     },
   };
+}
+
+
+/** Operations are run-scoped: a tool in one run can never observe or compensate another run's side effects. */
+function assertSameRun(op: { operationId: string; runId: string }, ctx: EventContext): void {
+  if (ctx.runId !== op.runId) {
+    throw new HypertestError('permission_denied', `operation ${op.operationId} belongs to run ${op.runId}, not ${ctx.runId}`, { details: { operationId: op.operationId } });
+  }
 }

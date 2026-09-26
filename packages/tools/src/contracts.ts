@@ -79,7 +79,10 @@ export interface ToolOutcome<O = JsonValue> {
 export interface SideEffectBinding {
   adapterId: string;
   operationType: string;
-  /** Derive the external target and the lease resource from the input. */
+  /**
+   * Derive the external target and the lease resource from the input. The target's resourceKey must be one
+   * of (or beneath) the tool's `resources(input)` — the runtime refuses (permission_denied) any other target.
+   */
   target(input: unknown, ctx: ToolContext): ResourceRef;
   leaseTtlMs?: number;
 }
@@ -186,6 +189,11 @@ export interface WorkspaceHandle {
   sandbox: SandboxProfile;
   /** Resource key prefix for capability scopes: `workspace/<workspaceId>`. */
   resourcePrefix: string;
+  /**
+   * (additive) Private per-workspace directory OUTSIDE `root` for sandbox HOME/TMPDIR, test reports and
+   * mutation copies, so tools never pollute the workspace (or its diff). Set by the WorkspaceManager.
+   */
+  tempDir?: string;
 }
 
 export interface SandboxProfile {
@@ -228,10 +236,16 @@ export interface ProcessResult {
   timedOut: boolean;
   stdoutTruncated: boolean;
   stderrTruncated: boolean;
+  /** (additive) Set when the program could not be started (e.g. ENOENT); exitCode is then 127. */
+  spawnError?: string;
 }
 
 export interface SandboxRunner {
+  /** (additive, optional) Which isolation the runner provides. */
+  readonly kind?: 'local' | 'oci';
   run(ws: WorkspaceHandle, command: string[], options: { cwd?: string; env?: Record<string, string>; timeoutMs: number; signal: AbortSignal; stdin?: string; maxOutputBytes?: number }): Promise<ProcessResult>;
+  /** (additive, optional) Probes whether the runner can execute at all (e.g. docker daemon reachable). */
+  available?(): Promise<boolean>;
 }
 
 // ----------------------------------------------------------------------------- environments (black-box)
@@ -302,6 +316,76 @@ export interface BuiltinToolOptions {
   retrieval?: { search(query: { text: string; symbol?: string; root?: string; limit?: number }): Promise<Array<{ path?: string; line?: number; snippet: string; score: number }>> };
   enableBrowser?: boolean;
   httpAllowlist?: string[];
+  /**
+   * (additive) State directory for the black-box tools (load job dirs, evidence markers); share it with
+   * builtinSideEffectAdapters. Optional: without it load.observe dedupes evidence in-process only.
+   */
+  stateDir?: string;
+}
+
+// ----------------------------------------------------------------------------- (additive) tools-core types
+
+/** (additive) Source mutation operators used by mutation.run / generateMutants. */
+export type MutationOperator = 'arithmetic' | 'relational' | 'logical' | 'boolean' | 'numeric_literal' | 'return_value' | 'off_by_one';
+
+export type MutationLanguage = 'javascript' | 'typescript' | 'python' | 'go';
+
+/** (additive) One source mutant: replace `source.slice(start, end)` (= original) with `replacement`. */
+export interface Mutant {
+  /** Deterministic id `m<nnn>-L<line>-<operator>` (index in generation order). */
+  id: string;
+  file: string;
+  line: number;
+  column: number;
+  operator: MutationOperator;
+  start: number;
+  end: number;
+  original: string;
+  replacement: string;
+}
+
+export type MutantStatus = 'killed' | 'survived' | 'error';
+
+/** (additive) Structured payload of `mutation-result` evidence. */
+export interface MutationAnalysisResult {
+  file: string;
+  framework: string;
+  selector?: string;
+  /** Mutants generated before capping. */
+  generated: number;
+  total: number;
+  killed: number;
+  survived: number;
+  errors: number;
+  /** killed / (killed + survived); 0 when no mutant was decidable (never a pass by default). */
+  score: number;
+  baseline: { passed: boolean; total: number; harnessError?: string };
+  mutants: Array<{ id: string; line: number; operator: MutationOperator; original: string; replacement: string; status: MutantStatus; detail?: string }>;
+}
+
+/** (additive) Options of createLocalSandbox(). */
+export interface LocalSandboxOptions {
+  /** Delay between SIGTERM and SIGKILL of the process group on timeout/abort (default 2000). */
+  killGraceMs?: number;
+  /** Default per-stream capture limit (default 4 MiB). */
+  maxOutputBytes?: number;
+}
+
+/** (additive) Options of createOciSandbox(). */
+export interface OciSandboxOptions extends LocalSandboxOptions {
+  image: string;
+  /** Docker CLI binary (default `docker`). */
+  docker?: string;
+  /** `uid:gid` for `--user` (default: the current process uid:gid). */
+  user?: string;
+}
+
+/** (additive) Options shared by the built-in test runner adapters. */
+export interface TestRunnerOptions {
+  /** Command prefix override (e.g. `['pytest']`, `['npx', 'vitest']`). */
+  command?: string[];
+  /** Extra environment passed to the runner process (runner-trusted, not agent input). */
+  env?: Record<string, string>;
 }
 
 export type { SideEffectAdapter };

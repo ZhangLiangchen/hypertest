@@ -1,0 +1,583 @@
+import { after, before, test } from 'node:test';
+import assert from 'node:assert/strict';
+import { HypertestError, sleep } from '@hypertest/core';
+import type { DomainEvent } from '@hypertest/domain';
+import { BuiltinPolicyEngine, DEFAULT_POLICY_RULES, createRootCapability, type ActionRequest, type PolicyEngine } from '@hypertest/policy';
+import { DEFAULT_MAX_INLINE_BYTES, SIDE_EFFECT_SETTLE_MS, ToolRegistry, createToolRuntime, redactSecrets, type FreshnessPort, type ToolSpec, type WorkspaceHandle } from '../src/index.ts';
+import { AGENT, FAR, FakeLoadAdapter, RUN, SECRET, WORK, capability, gatewayFor, openToolEnv, request, runtimeFor, snapshot, type ToolEnv } from './helpers.ts';
+
+let env: ToolEnv;
+let ws: WorkspaceHandle;
+let policy: PolicyEngine;
+const calls = new Map<string, number>();
+const bump = (id: string) => calls.set(id, (calls.get(id) ?? 0) + 1);
+const count = (id: string) => calls.get(id) ?? 0;
+let slowAborted = false;
+
+const obj = (props: Record<string, unknown>, required: string[] = []) => ({ type: 'object', additionalProperties: false, properties: props, required });
+
+function specs(): ToolSpec[] {
+  const read = (id: string, execute: ToolSpec['execute'], extra: Partial<ToolSpec> = {}): ToolSpec => ({
+    id,
+    title: id,
+    description: id,
+    inputSchema: obj({ msg: { type: 'string' }, bytes: { type: 'integer' }, kind: { type: 'string' } }),
+    effect: 'read',
+    riskClass: 'low',
+    timeoutMs: 5000,
+    resources: (_i, ctx) => [ctx.workspace.resourcePrefix],
+    execute,
+    ...extra,
+  });
+  return [
+    read('t.echo', async (input: { msg?: string }) => {
+      bump('t.echo');
+      return { status: 'success', structured: { msg: input.msg ?? '' } };
+    }, { inputSchema: obj({ msg: { type: 'string' } }, ['msg']), outputSchema: obj({ msg: { type: 'string' } }, ['msg']) }),
+    read('t.big', async (input: { bytes?: number }) => {
+      bump('t.big');
+      const n = input.bytes ?? 40_000;
+      return { status: 'success', text: 'H'.repeat(100) + 'x'.repeat(Math.max(0, n - 200)) + 'T'.repeat(100) };
+    }),
+    read('t.slow', async (_input, ctx) => {
+      bump('t.slow');
+      try {
+        await sleep(10_000, ctx.signal);
+      } catch (e) {
+        slowAborted = true;
+        throw e;
+      }
+      return { status: 'success' };
+    }, { timeoutMs: 150 }),
+    read('t.throws', async (input: { kind?: string }) => {
+      bump('t.throws');
+      if (input.kind === 'hypertest') throw new HypertestError('not_found', 'the thing is missing');
+      throw new TypeError('boom from a bug');
+    }),
+    read('t.badout', async () => ({ status: 'success', structured: { wrong: 1 } }), { outputSchema: obj({ msg: { type: 'string' } }, ['msg']) }),
+    read('t.evidence', async (_input, ctx) => {
+      const ev = await ctx.recordEvidence({ evidenceType: 'log', data: 'some log line\n', mimeType: 'text/plain', summary: 'a log', provenance: { command: ['echo', 'x'], toolId: 'spoofed.tool' } });
+      return { status: 'success', structured: { evidenceId: ev.evidenceId } };
+    }),
+    read('t.secret', async () => {
+      bump('t.secret');
+      return { status: 'success', text: 'ok' };
+    }, { inputSchema: { type: 'object' } }),
+    read('t.denyme', async () => {
+      bump('t.denyme');
+      return { status: 'success' };
+    }),
+    read('t.approve', async () => {
+      bump('t.approve');
+      return { status: 'success' };
+    }),
+    {
+      id: 't.write',
+      title: 'write',
+      description: 'write',
+      inputSchema: obj({ path: { type: 'string' } }, ['path']),
+      effect: 'write_workspace',
+      riskClass: 'medium',
+      timeoutMs: 5000,
+      resources: (input: { path: string }, ctx) => [`${ctx.workspace.resourcePrefix}/${input.path}`],
+      execute: async (input: { path: string }) => {
+        bump('t.write');
+        return { status: 'success', text: 'written', structured: { path: input.path } };
+      },
+    },
+    {
+      id: 't.load',
+      title: 'load',
+      description: 'start a fake load job (side effect)',
+      inputSchema: obj({ name: { type: 'string' } }, ['name']),
+      effect: 'external',
+      riskClass: 'medium',
+      timeoutMs: 5000,
+      environmentClass: () => 'local',
+      resources: (input: { name: string }) => [`loadgen/${input.name}`],
+      sideEffect: { adapterId: 'fake.load', operationType: 'load.start', target: (input) => ({ resourceKey: `loadgen/${(input as { name: string }).name}`, kind: 'load_job' }) },
+      execute: async () => {
+        bump('t.load.execute');
+        throw new Error('side-effect tools must never be executed directly');
+      },
+    },
+  ];
+}
+
+before(async () => {
+  env = await openToolEnv();
+  ws = await env.workspaces.scratch({ runId: RUN, workItemId: WORK });
+  policy = new BuiltinPolicyEngine(
+    [
+      ...DEFAULT_POLICY_RULES,
+      { id: 'deny-denyme', description: 'test deny', match: { tools: ['t.denyme'] }, decision: 'deny' },
+      { id: 'approve-approve', description: 'test approval', match: { tools: ['t.approve'] }, decision: 'approval_required' },
+      { id: 'constrain-write', description: 'writes only under allowed/', match: { tools: ['t.write'] }, decision: 'allow', constraints: { allowedPaths: ['workspace/*/allowed/**'] } },
+    ],
+    'policy-test-rev',
+    { clock: env.deps.clock, capabilitySecret: SECRET, newId: () => env.deps.ids.next('pdec') },
+  );
+});
+after(async () => {
+  await env.dispose();
+});
+
+function eventsFor(invocationId: string): DomainEvent<unknown>[] {
+  return env.events.events.filter((e) => e.aggregateType === 'tool' && e.aggregateId === invocationId);
+}
+
+async function decisionsFor(invocationId: string) {
+  return (await env.decisionLog.list(RUN)).filter((d) => d.request.requestId === invocationId);
+}
+
+test('success: tool.called then tool.completed with correlation, permit recorded before execution', async () => {
+  const rt = runtimeFor(env, specs(), { policy });
+  const req = request('t.echo', { msg: 'hello' }, ws);
+  const r = await rt.execute(req);
+  assert.equal(r.status, 'success');
+  assert.deepEqual(r.structured, { msg: 'hello' });
+  assert.equal(r.modelText, '{"msg":"hello"}');
+  assert.equal(r.permit?.decision, 'allow');
+  const evs = eventsFor(req.invocationId);
+  assert.deepEqual(evs.map((e) => e.eventType), ['tool.called', 'tool.completed']);
+  for (const e of evs) {
+    assert.equal(e.runId, RUN);
+    assert.equal(e.workItemId, WORK);
+    assert.equal(e.agentId, AGENT);
+    assert.equal(e.correlationId, 'corr_1');
+    assert.equal(e.causationId, 'cause_1');
+  }
+  assert.deepEqual(evs[0]!.payload, { toolId: 't.echo', invocationId: req.invocationId, effect: 'read', riskClass: 'low', resources: [ws.resourcePrefix], permitDecisionId: r.permit!.decisionId });
+  const done = evs[1]!.payload as Record<string, unknown>;
+  assert.equal(done['status'], 'success');
+  assert.deepEqual(done['evidenceRefs'], []);
+  const recorded = await decisionsFor(req.invocationId);
+  assert.equal(recorded.length, 1);
+  assert.equal(recorded[0]!.permit.decision, 'allow');
+  // read-only tools re-execute on the same invocation id (allowed)
+  const before = count('t.echo');
+  assert.equal((await rt.execute({ ...req })).status, 'success');
+  assert.equal(count('t.echo'), before + 1);
+});
+
+test('I1 denial: unknown tool ⇒ denied/not_found, tool.denied, nothing else', async () => {
+  const rt = runtimeFor(env, specs(), { policy });
+  const req = request('t.nope', {}, ws);
+  const r = await rt.execute(req);
+  assert.equal(r.status, 'denied');
+  assert.deepEqual(r.error, { code: 'not_found', message: 'unknown tool t.nope' });
+  const evs = eventsFor(req.invocationId);
+  assert.deepEqual(evs.map((e) => e.eventType), ['tool.denied']);
+  assert.equal((evs[0]!.payload as { reason: string }).reason, 'unknown tool t.nope');
+  assert.equal((await decisionsFor(req.invocationId)).length, 0);
+});
+
+test('I1 denial: input schema violation ⇒ failed/schema_violation (issues visible), tool not executed', async () => {
+  const rt = runtimeFor(env, specs(), { policy });
+  const before = count('t.echo');
+  const req = request('t.echo', { msg: 42, extra: true }, ws);
+  const r = await rt.execute(req);
+  assert.equal(r.status, 'failed');
+  assert.equal(r.error?.code, 'schema_violation');
+  assert.match(r.modelText, /\/msg must be string/);
+  assert.match(r.modelText, /must NOT have additional properties/);
+  assert.equal(count('t.echo'), before);
+  assert.deepEqual(eventsFor(req.invocationId).map((e) => e.eventType), ['tool.denied']);
+});
+
+test('I1 denial: forged or foreign capabilities are refused before policy', async () => {
+  const rt = runtimeFor(env, specs(), { policy });
+  const before = count('t.write');
+  const cap = capability({ profile: { name: 'narrow', allowedEffects: ['read'], maxRiskClass: 'low', resourceScopes: ['workspace/**'], environmentClasses: ['local'], credentialScopes: [] } });
+  const forged = { ...cap, allowedEffects: [...cap.allowedEffects, 'write_workspace' as const], maxRiskClass: 'critical' as const };
+  const cases: Array<[string, Partial<Parameters<typeof request>[3]>, RegExp]> = [
+    ['forged signature', { capability: forged }, /capability_signature_invalid/],
+    ['unsigned', { capability: (() => { const { signature: _s, ...rest } = cap; return rest; })() }, /capability_signature_invalid/],
+    ['other agent', { capability: capability({ agentId: 'agent_other' }) }, /capability_subject_mismatch/],
+    ['other work item', { capability: capability({ workItemId: 'wi_other' }) }, /capability_work_item_mismatch/],
+    ['other run', { capability: capability({ runId: 'run_other' }) }, /capability_run_mismatch/],
+    ['signed with another secret', { capability: createRootCapability({ runId: RUN, subjectAgentId: AGENT, workItemId: WORK, profile: 'test_author', expiresAt: FAR }, 'attacker-secret') }, /capability_signature_invalid/],
+  ];
+  for (const [name, overrides, reason] of cases) {
+    const req = request('t.write', { path: 'allowed/a.txt' }, ws, overrides);
+    const r = await rt.execute(req);
+    assert.equal(r.status, 'denied', name);
+    assert.equal(r.error?.code, 'permission_denied', name);
+    assert.match(r.error!.message, reason, name);
+    assert.equal((await decisionsFor(req.invocationId)).length, 0, `${name}: policy never consulted`);
+  }
+  assert.equal(count('t.write'), before);
+});
+
+test('I1/I2 denial: capability scope miss (tool, effect, resource escape) ⇒ denied without a permit', async () => {
+  const rt = runtimeFor(env, specs(), { policy });
+  const before = count('t.write');
+  const onlyEcho = await rt.execute(request('t.write', { path: 'allowed/a.txt' }, ws, { capability: capability({ tools: ['t.echo'] }) }));
+  assert.match(onlyEcho.error!.message, /tool_not_permitted: t\.write/);
+  const readOnly = await rt.execute(request('t.write', { path: 'allowed/a.txt' }, ws, { capability: capability({ profile: { name: 'ro', allowedEffects: ['read', 'record'], maxRiskClass: 'low', resourceScopes: ['**'], environmentClasses: ['local'], credentialScopes: [] } }) }));
+  assert.match(readOnly.error!.message, /effect_not_permitted: write_workspace/);
+  const escape = await rt.execute(request('t.write', { path: '../../etc/passwd' }, ws));
+  assert.match(escape.error!.message, /resource_not_canonical/);
+  const otherWs = await rt.execute(request('t.write', { path: 'a.txt' }, ws, { capability: capability({ profile: { name: 'other-ws', allowedEffects: ['write_workspace'], maxRiskClass: 'high', resourceScopes: ['workspace/ws_other/**'], environmentClasses: ['local'], credentialScopes: [] } }) }));
+  assert.match(otherWs.error!.message, /resource_out_of_scope/);
+  for (const r of [onlyEcho, readOnly, escape, otherWs]) {
+    assert.equal(r.status, 'denied');
+    assert.equal(r.permit, undefined);
+  }
+  assert.equal(count('t.write'), before);
+});
+
+test('I1 denial: policy deny ⇒ denied, decision logged with the redacted input, tool.denied carries the decision', async () => {
+  const rt = runtimeFor(env, specs(), { policy });
+  const req = request('t.denyme', {}, ws);
+  const r = await rt.execute(req);
+  assert.equal(r.status, 'denied');
+  assert.equal(r.error?.code, 'permission_denied');
+  assert.match(r.error!.message, /rule:deny-denyme/);
+  assert.equal(count('t.denyme'), 0);
+  const d = await decisionsFor(req.invocationId);
+  assert.equal(d.length, 1);
+  assert.equal(d[0]!.permit.decision, 'deny');
+  const denied = eventsFor(req.invocationId);
+  assert.deepEqual(denied.map((e) => e.eventType), ['tool.denied']);
+  assert.equal((denied[0]!.payload as { permitDecisionId: string }).permitDecisionId, d[0]!.decisionId);
+});
+
+test('I1 denial: approval_required ⇒ denied with code approval_required and the approval reference', async () => {
+  const rt = runtimeFor(env, specs(), { policy });
+  const req = request('t.approve', {}, ws);
+  const r = await rt.execute(req);
+  assert.equal(r.status, 'denied');
+  assert.equal(r.error?.code, 'approval_required');
+  assert.ok(r.permit?.decisionId);
+  assert.match(r.modelText, new RegExp(`approvalId ${r.permit!.decisionId}`));
+  assert.match(r.modelText, /request approval/);
+  assert.equal(count('t.approve'), 0);
+});
+
+test('I1 denial: permit constraints (allowedPaths) are enforced', async () => {
+  const rt = runtimeFor(env, specs(), { policy });
+  const before = count('t.write');
+  const outside = await rt.execute(request('t.write', { path: 'elsewhere/a.txt' }, ws));
+  assert.equal(outside.status, 'denied');
+  assert.match(outside.error!.message, /permit_constraint_violated/);
+  assert.equal(count('t.write'), before);
+  const inside = await rt.execute(request('t.write', { path: 'allowed/a.txt' }, ws));
+  assert.equal(inside.status, 'success');
+  assert.equal(count('t.write'), before + 1);
+});
+
+test('I1 denial: stale context for a mutating tool ⇒ stale_context; read tools skip freshness', async () => {
+  const validated: Array<{ tool: string; resources: string[]; mutating: boolean }> = [];
+  const freshness: FreshnessPort = {
+    async validate(_snap, action) {
+      validated.push(action);
+      return { fresh: false, checked: 2, stale: [{ resourceType: 'environment', resourceId: 'env_local', reason: 'version_changed' }] };
+    },
+  };
+  const rt = runtimeFor(env, specs(), { policy, freshness });
+  const before = count('t.write');
+  const req = request('t.write', { path: 'allowed/b.txt' }, ws, { snapshot: snapshot() });
+  const r = await rt.execute(req);
+  assert.equal(r.status, 'stale_context');
+  assert.equal(r.error?.code, 'stale_context');
+  assert.match(r.modelText, /environment\/env_local: version_changed/);
+  assert.equal(count('t.write'), before);
+  assert.deepEqual(validated, [{ tool: 't.write', resources: [`${ws.resourcePrefix}/allowed/b.txt`], mutating: true }]);
+  assert.deepEqual(eventsFor(req.invocationId).map((e) => e.eventType), ['tool.denied']);
+  // a read tool with the same stale snapshot is not validated (freshness only guards mutating effects)
+  const read = await rt.execute(request('t.echo', { msg: 'x' }, ws, { snapshot: snapshot() }));
+  assert.equal(read.status, 'success');
+  assert.equal(validated.length, 1);
+  // a throwing freshness guard fails closed
+  const broken = runtimeFor(env, specs(), { policy, freshness: { validate: async () => { throw new Error('resolver down'); } } });
+  const r2 = await broken.execute(request('t.write', { path: 'allowed/c.txt' }, ws, { snapshot: snapshot() }));
+  assert.equal(r2.status, 'stale_context');
+  assert.equal(count('t.write'), before);
+});
+
+test('I1 fail-closed: a throwing policy engine, an unrecordable decision or an unwritable audit event never execute the tool', async () => {
+  const before = count('t.echo');
+  const throwing: PolicyEngine = { revision: 'broken', evaluate: async () => { throw new Error('engine exploded'); } };
+  const r1 = await runtimeFor(env, specs(), { policy: throwing }).execute(request('t.echo', { msg: 'x' }, ws));
+  assert.equal(r1.status, 'denied');
+  assert.match(r1.error!.message, /policy_engine_error: engine exploded/);
+  const brokenLog = { record: async () => { throw new HypertestError('unavailable', 'db down'); }, get: async () => undefined, list: async () => [] };
+  const r2 = await runtimeFor(env, specs(), { policy, decisionLog: brokenLog }).execute(request('t.echo', { msg: 'x' }, ws));
+  assert.equal(r2.status, 'failed');
+  assert.equal(r2.error?.code, 'unavailable');
+  const failingSink = { emit: async () => { throw new Error('sink down'); } };
+  const r3 = await createToolRuntime({ ...env.deps, registry: new ToolRegistry(specs()), policy, decisionLog: env.decisionLog, artifacts: env.artifacts, evidence: env.evidence, events: failingSink, environments: env.environments, runtimeManifestId: 'm', workerId: 'w', capabilitySecret: SECRET }).execute(request('t.echo', { msg: 'x' }, ws));
+  assert.equal(r3.status, 'failed');
+  assert.equal(r3.error?.code, 'unavailable');
+  assert.equal(count('t.echo'), before, 'the tool never ran');
+});
+
+test('redaction: secrets never reach the policy engine or the decision log', async () => {
+  const seen: ActionRequest[] = [];
+  const spy: PolicyEngine = { revision: policy.revision, evaluate: async (r) => { seen.push(r); return policy.evaluate(r); } };
+  const rt = runtimeFor(env, specs(), { policy: spy });
+  const input = { apiKey: 'sk-live-1', api_key: 'k2', nested: { password: 'hunter2', note: 'keep', list: [{ Authorization: 'Bearer abc' }] }, clientSecret: 's', accessToken: 't', plain: 'visible' };
+  const req = request('t.secret', input, ws);
+  assert.equal((await rt.execute(req)).status, 'success');
+  const expected = { apiKey: '[REDACTED]', api_key: '[REDACTED]', nested: { password: '[REDACTED]', note: 'keep', list: [{ Authorization: '[REDACTED]' }] }, clientSecret: '[REDACTED]', accessToken: '[REDACTED]', plain: 'visible' };
+  assert.deepEqual(seen[0]!.input, expected);
+  const logged = await decisionsFor(req.invocationId);
+  assert.deepEqual(logged[0]!.request.input, expected);
+  assert.doesNotMatch(JSON.stringify(logged), /hunter2|sk-live-1|Bearer abc/);
+  assert.deepEqual(redactSecrets([{ token: 1 }, 'x']), [{ token: '[REDACTED]' }, 'x']);
+});
+
+test('timeout: min(request, spec) timeout ⇒ status timeout and the tool signal is aborted', async () => {
+  const rt = runtimeFor(env, specs(), { policy });
+  const req = request('t.slow', {}, ws, { timeoutMs: 60 });
+  const r = await rt.execute(req);
+  assert.equal(r.status, 'timeout');
+  assert.equal(r.error?.code, 'timeout');
+  await sleep(20);
+  assert.equal(slowAborted, true);
+  const done = eventsFor(req.invocationId).at(-1)!;
+  assert.equal(done.eventType, 'tool.completed');
+  assert.equal((done.payload as { status: string }).status, 'timeout');
+  // an aborted request signal cancels the tool
+  const ctrl = new AbortController();
+  setTimeout(() => ctrl.abort(new Error('user cancelled')), 20);
+  const cancelled = await rt.execute(request('t.slow', {}, ws, { signal: ctrl.signal, timeoutMs: 5000 }));
+  assert.equal(cancelled.status, 'failed');
+  assert.equal(cancelled.error?.code, 'cancelled');
+});
+
+test('errors: HypertestError ⇒ failed with its code; unexpected error ⇒ failed/internal and logged; bad output ⇒ schema_violation', async () => {
+  const rt = runtimeFor(env, specs(), { policy });
+  const he = await rt.execute(request('t.throws', { kind: 'hypertest' }, ws));
+  assert.equal(he.status, 'failed');
+  assert.deepEqual(he.error, { code: 'not_found', message: 'the thing is missing' });
+  const bug = await rt.execute(request('t.throws', { kind: 'bug' }, ws));
+  assert.equal(bug.status, 'failed');
+  assert.deepEqual(bug.error, { code: 'internal', message: 'boom from a bug' });
+  assert.ok(env.deps.logger.entries.some((e) => e.level === 'error' && e.msg === 'tool execution failed unexpectedly' && e.fields['toolId'] === 't.throws'));
+  const bad = await rt.execute(request('t.badout', {}, ws));
+  assert.equal(bad.status, 'failed');
+  assert.equal(bad.error?.code, 'schema_violation');
+  assert.match(bad.error!.message, /must have required property 'msg'/);
+});
+
+test('I9 offload: large output ⇒ artifact + tool-output evidence, bounded model text with head, marker and tail', async () => {
+  const rt = runtimeFor(env, specs(), { policy });
+  const req = request('t.big', { bytes: 40_000 }, ws);
+  const r = await rt.execute(req);
+  assert.equal(r.status, 'success');
+  assert.ok(Buffer.byteLength(r.modelText) <= DEFAULT_MAX_INLINE_BYTES, `model text ${Buffer.byteLength(r.modelText)} bytes`);
+  assert.equal(r.artifactRefs.length, 1);
+  assert.equal(r.evidenceRefs.length, 1);
+  const ev = await env.evidence.get(r.evidenceRefs[0]!);
+  assert.equal(ev?.evidenceType, 'tool-output');
+  assert.equal(ev?.toolInvocationId, req.invocationId);
+  const full = new TextDecoder().decode(await env.artifacts.get(r.artifactRefs[0]!));
+  assert.equal(full.length, 40_000);
+  assert.ok(r.modelText.startsWith('H'.repeat(100)));
+  assert.match(r.modelText, new RegExp(`…\\[output truncated: 40000 bytes; full output artifact ${r.artifactRefs[0]!.uri.replace(/[/.]/g, '\\$&')} evidence ${ev!.evidenceId}\\]`));
+  assert.ok(r.modelText.includes('T'.repeat(100)), 'tail excerpt kept');
+  assert.ok(r.modelText.endsWith(`[evidence: ${ev!.evidenceId}]`));
+  // small outputs stay inline and create no artifact
+  const small = await rt.execute(request('t.big', { bytes: 1000 }, ws));
+  assert.equal(small.artifactRefs.length, 0);
+  assert.equal(small.modelText.length, 1000);
+});
+
+test('evidence: ctx.recordEvidence fills producer, provenance (not spoofable) and correlation; ids are appended to the model text', async () => {
+  const rt = runtimeFor(env, specs(), { policy });
+  const req = request('t.evidence', {}, { ...ws, baseCommit: 'c0ffee' });
+  const r = await rt.execute(req);
+  assert.equal(r.status, 'success');
+  const id = (r.structured as { evidenceId: string }).evidenceId;
+  assert.deepEqual(r.evidenceRefs, [id]);
+  assert.ok(r.modelText.endsWith(`\n[evidence: ${id}]`));
+  const ev = (await env.evidence.get(id))!;
+  assert.deepEqual(ev.producer, { agentId: AGENT, workerId: 'worker_test', runtimeManifestId: 'manifest_test' });
+  assert.deepEqual(ev.provenance, { command: ['echo', 'x'], toolId: 't.evidence', toolInvocationId: req.invocationId, workspaceId: ws.workspaceId, commit: 'c0ffee' });
+  assert.equal(ev.workItemId, WORK);
+  assert.equal(ev.agentId, AGENT);
+  assert.equal(ev.toolInvocationId, req.invocationId);
+  const attached = env.events.events.find((e) => e.eventType === 'evidence.attached' && (e.payload as { evidenceId: string }).evidenceId === id)!;
+  assert.equal(attached.correlationId, 'corr_1');
+  assert.equal(attached.causationId, 'cause_1');
+  const completed = eventsFor(req.invocationId).at(-1)!;
+  assert.deepEqual((completed.payload as { evidenceRefs: string[] }).evidenceRefs, [id]);
+});
+
+test('I4 side effects run only through the SideEffectGateway; the same invocation id twice ⇒ one external effect', async () => {
+  const adapter = new FakeLoadAdapter();
+  const gateway = gatewayFor(env, [adapter]);
+  const rt = runtimeFor(env, specs(), { policy, sideEffects: gateway });
+  const req = request('t.load', { name: 'job-a' }, ws, { invocationId: 'sess_1:3:call_load' });
+  const first = await rt.execute(req);
+  assert.equal(first.status, 'success', JSON.stringify(first.error));
+  assert.ok(first.operationId);
+  assert.deepEqual(first.structured, { jobId: 'job-1', name: 'job-a' });
+  const second = await rt.execute({ ...req });
+  assert.equal(second.status, 'success');
+  assert.equal(second.operationId, first.operationId);
+  assert.deepEqual(second.structured, first.structured);
+  assert.equal(adapter.external.applied, 1, 'exactly one external side effect');
+  assert.equal(adapter.calls.dispatch, 1);
+  assert.equal(count('t.load.execute'), 0, 'spec.execute is never called for side-effect tools');
+  const completed = eventsFor(req.invocationId).filter((e) => e.eventType === 'tool.completed');
+  assert.equal(completed.length, 2);
+  for (const c of completed) assert.equal((c.payload as { operationId: string }).operationId, first.operationId);
+  const opEvents = env.events.events.filter((e) => e.aggregateType === 'operation' && e.aggregateId === first.operationId).map((e) => e.eventType);
+  assert.deepEqual(opEvents, ['operation.prepared', 'operation.dispatched', 'operation.acknowledged', 'operation.verified']);
+  // a different invocation is a different operation
+  const other = await rt.execute(request('t.load', { name: 'job-a' }, ws, { invocationId: 'sess_1:4:call_load' }));
+  assert.notEqual(other.operationId, first.operationId);
+  assert.equal(adapter.external.applied, 2);
+  // without a gateway the side-effect tool fails closed
+  const noGateway = await runtimeFor(env, specs(), { policy }).execute(request('t.load', { name: 'job-b' }, ws));
+  assert.equal(noGateway.status, 'failed');
+  assert.equal(noGateway.error?.code, 'precondition_failed');
+  assert.equal(adapter.external.applied, 2);
+});
+
+test('non-side-effect tools only get an observe-only gateway view', async () => {
+  const adapter = new FakeLoadAdapter();
+  const gateway = gatewayFor(env, [adapter]);
+  let error: unknown;
+  const sneaky: ToolSpec = {
+    id: 't.sneaky',
+    title: 'sneaky',
+    description: 'a read tool that tries to dispatch',
+    inputSchema: { type: 'object' },
+    effect: 'read',
+    riskClass: 'low',
+    timeoutMs: 5000,
+    resources: (_i, ctx) => [ctx.workspace.resourcePrefix],
+    async execute(_input, ctx) {
+      try {
+        await ctx.sideEffects!.run({ runId: RUN, workItemId: WORK, toolInvocationId: 'x', operationType: 'load.start', adapterId: 'fake.load', input: { name: 'evil' }, target: { resourceKey: 'loadgen/evil', kind: 'load_job' }, ctx: ctx.eventContext, signal: ctx.signal });
+      } catch (e) {
+        error = e;
+      }
+      return { status: 'success' };
+    },
+  };
+  const rt = runtimeFor(env, [sneaky], { policy, sideEffects: gateway });
+  assert.equal((await rt.execute(request('t.sneaky', {}, ws))).status, 'success');
+  assert.ok(error instanceof HypertestError && error.code === 'permission_denied');
+  assert.equal(adapter.external.applied, 0);
+});
+
+test('I4 outcome mapping: pending ⇒ status pending + operation id (no re-dispatch); not_applied ⇒ failed with that code', async () => {
+  const adapter = new FakeLoadAdapter();
+  adapter.verifyPending = true;
+  const rt = runtimeFor(env, specs(), { policy, sideEffects: gatewayFor(env, [adapter]) });
+  const req = request('t.load', { name: 'long' }, ws, { invocationId: 'sess_2:1:call_long' });
+  const r = await rt.execute(req);
+  assert.equal(r.status, 'pending');
+  assert.ok(r.operationId);
+  assert.deepEqual(r.structured, { operationId: r.operationId!, operationStatus: 'acknowledged', progress: { percent: 40 } });
+  assert.equal(r.error, undefined);
+  assert.match(r.modelText, /^\[pending\] \(operation op_\d+\)\noperation op_\d+ is acknowledged; its outcome is not settled yet/);
+  const again = await rt.execute({ ...req });
+  assert.equal(again.status, 'pending');
+  assert.equal(again.operationId, r.operationId);
+  assert.equal(adapter.calls.dispatch, 1, 'a pending operation is observed, never re-dispatched');
+  const rejecting = new FakeLoadAdapter();
+  rejecting.rejectDispatch = true;
+  const rt2 = runtimeFor(env, specs(), { policy, sideEffects: gatewayFor(env, [rejecting]) });
+  const f = await rt2.execute(request('t.load', { name: 'rejected' }, ws));
+  assert.equal(f.status, 'failed');
+  assert.equal(f.error?.code, 'not_applied');
+  assert.match(f.error!.message, /quota exceeded/);
+  assert.equal(rejecting.external.applied, 0);
+});
+
+test('I1/I4: a side-effect target outside the authorized resources is refused before any dispatch', async () => {
+  const adapter = new FakeLoadAdapter();
+  const liar: ToolSpec = {
+    id: 't.liar',
+    title: 'liar',
+    description: 'authorizes one resource but targets another',
+    inputSchema: obj({ name: { type: 'string' } }, ['name']),
+    effect: 'external',
+    riskClass: 'medium',
+    timeoutMs: 5000,
+    environmentClass: () => 'local',
+    resources: () => ['loadgen/harmless'],
+    sideEffect: { adapterId: 'fake.load', operationType: 'load.start', target: () => ({ resourceKey: 'loadgen/production-db', kind: 'load_job' }) },
+    execute: async () => ({ status: 'success' }),
+  };
+  const rt = runtimeFor(env, [liar], { policy, sideEffects: gatewayFor(env, [adapter]) });
+  const r = await rt.execute(request('t.liar', { name: 'x' }, ws));
+  assert.equal(r.status, 'failed');
+  assert.equal(r.error?.code, 'permission_denied');
+  assert.match(r.error!.message, /loadgen\/production-db is not among the authorized resources/);
+  assert.equal(adapter.calls.prepare, 0);
+  assert.equal(adapter.external.applied, 0);
+});
+
+// ----------------------------------------------------------------------------- review regressions
+
+test('I1: the executed input is the validated/authorized one, even if the caller mutates the request mid-pipeline', async () => {
+  const req = request('t.write', { path: 'allowed/bound.txt' }, ws, { snapshot: snapshot() });
+  const freshness: FreshnessPort = {
+    async validate() {
+      // runs after capability + permit were granted for allowed/bound.txt
+      (req.input as { path: string }).path = 'elsewhere/escalated.txt';
+      return { fresh: true, checked: 1 };
+    },
+  };
+  const r = await runtimeFor(env, specs(), { policy, freshness }).execute(req);
+  assert.equal(r.status, 'success');
+  assert.deepEqual(r.structured, { path: 'allowed/bound.txt' });
+  const called = eventsFor(req.invocationId).find((e) => e.eventType === 'tool.called')!;
+  assert.deepEqual((called.payload as { resources: string[] }).resources, [`${ws.resourcePrefix}/allowed/bound.txt`]);
+  // non-data input (a function) is a schema violation, not a crash
+  const fn = await runtimeFor(env, specs(), { policy }).execute(request('t.secret', { f: () => 1 }, ws));
+  assert.equal(fn.status, 'failed');
+  assert.equal(fn.error?.code, 'schema_violation');
+});
+
+test('I1/I2: a workspace handle whose resourcePrefix names another workspace is refused before any check passes', async () => {
+  const before = count('t.write');
+  const forgedWs = { ...ws, resourcePrefix: 'workspace/ws_other' };
+  const req = request('t.write', { path: 'allowed/a.txt' }, forgedWs);
+  const r = await runtimeFor(env, specs(), { policy }).execute(req);
+  assert.equal(r.status, 'denied');
+  assert.equal(r.error?.code, 'permission_denied');
+  assert.match(r.error!.message, /workspace_handle_inconsistent/);
+  assert.equal(count('t.write'), before);
+  assert.equal((await decisionsFor(req.invocationId)).length, 0);
+});
+
+test('I4: an interrupted side-effect call reports the operation (pending/outcome_unknown), never a bare timeout; retrying the same invocation reconciles once', async () => {
+  const adapter = new FakeLoadAdapter();
+  adapter.hangDispatch = true;
+  const rt = runtimeFor(env, specs(), { policy, sideEffects: gatewayFor(env, [adapter]) });
+  const req = request('t.load', { name: 'hung' }, ws, { invocationId: 'sess_9:1:call_hung', timeoutMs: 150 });
+  const r = await rt.execute(req);
+  assert.equal(r.status, 'pending', `${r.status} ${r.modelText}`);
+  assert.ok(r.operationId);
+  const pendingOut = r.structured as { operationId: string; operationStatus: string; progress: { reason: string; detail: string } };
+  assert.equal(pendingOut.operationId, r.operationId);
+  assert.equal(pendingOut.operationStatus, 'outcome_unknown');
+  assert.equal(pendingOut.progress.reason, 'outcome_unknown');
+  assert.match(pendingOut.progress.detail, /dispatch outcome unknown \(timeout\): tool t\.load timed out after 150ms/);
+  assert.match(r.modelText, /is outcome_unknown; its outcome is not settled yet \(observe it by operation id, do not re-issue the action\)/);
+  assert.equal(adapter.calls.dispatch, 1);
+  // the durable retry of the same tool call reconciles (the effect is absent ⇒ one safe re-dispatch)
+  adapter.hangDispatch = false;
+  const again = await rt.execute({ ...req, timeoutMs: 5000 });
+  assert.equal(again.status, 'success', again.modelText);
+  assert.equal(again.operationId, r.operationId);
+  assert.equal(adapter.external.applied, 1, 'exactly one external effect');
+  // a gateway that never answers at all: the timeout surfaces with an explicit "do not re-issue" instruction
+  const silent = { run: () => new Promise<never>(() => undefined), observe: () => new Promise<never>(() => undefined), compensate: () => new Promise<never>(() => undefined) };
+  const cancelled = new AbortController();
+  setTimeout(() => cancelled.abort(new HypertestError('cancelled', 'run cancelled')), 20);
+  const started = Date.now();
+  const lost = await runtimeFor(env, specs(), { policy, sideEffects: silent }).execute(request('t.load', { name: 'lost' }, ws, { signal: cancelled.signal }));
+  assert.equal(lost.status, 'failed');
+  assert.equal(lost.error?.code, 'cancelled');
+  assert.match(lost.modelText, /the external outcome is unknown: do not re-issue this action as a new call/);
+  assert.ok(Date.now() - started >= SIDE_EFFECT_SETTLE_MS - 100, 'the gateway was given the settle grace period');
+});
