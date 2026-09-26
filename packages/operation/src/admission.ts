@@ -34,7 +34,8 @@ function validateClaim(c: ResourceClaim): void {
 /**
  * Experiment isolation (I12): all-or-nothing admission of hierarchical resource claims. Admission
  * is serialized by a row lock on ht_admission_lock (portable to PGlite), so two conflicting
- * experiments can never both be admitted.
+ * experiments can never both be admitted. (conformance-6) `compatibleHolders` lets a work item share the claims of
+ * the experiment it runs for; every other holder still conflicts.
  */
 export function createResourceAdmission(deps: OperationDeps): ResourceAdmission {
   const { db, clock, ids, logger } = deps;
@@ -43,6 +44,13 @@ export function createResourceAdmission(deps: OperationDeps): ResourceAdmission 
     async admit(request): Promise<AdmissionResult> {
       const { holderId, runId, claims, ttlMs } = request;
       if (typeof holderId !== 'string' || holderId.length === 0) throw new HypertestError('invalid_argument', 'holderId must be a non-empty string');
+      const compatible = new Set<string>();
+      if (request.compatibleHolders !== undefined) {
+        if (!Array.isArray(request.compatibleHolders) || request.compatibleHolders.some((h) => typeof h !== 'string' || h.length === 0)) {
+          throw new HypertestError('invalid_argument', 'compatibleHolders must be an array of non-empty strings');
+        }
+        for (const h of request.compatibleHolders) compatible.add(h);
+      }
       if (typeof runId !== 'string' || runId.length === 0) throw new HypertestError('invalid_argument', 'runId must be a non-empty string');
       if (!Array.isArray(claims)) throw new HypertestError('invalid_argument', 'claims must be an array');
       if (!Number.isFinite(ttlMs) || ttlMs <= 0) throw new HypertestError('invalid_argument', 'ttlMs must be positive');
@@ -55,7 +63,8 @@ export function createResourceAdmission(deps: OperationDeps): ResourceAdmission 
         await tx.query('SELECT lock_id FROM ht_admission_lock WHERE lock_id = 1 FOR UPDATE');
         await tx.query('DELETE FROM ht_resource_claims WHERE expires_at <= $1', [now]);
         const live = await tx.query<ClaimRow>(`SELECT ${CLAIM_COLUMNS} FROM ht_resource_claims WHERE expires_at > $1 ORDER BY created_at, claim_id`, [now]);
-        const others = live.rows.filter((r) => r.holder_id !== holderId);
+        // compatible holders (e.g. the experiment a work item runs for) share their claims with this request
+        const others = live.rows.filter((r) => r.holder_id !== holderId && !compatible.has(r.holder_id));
         const conflicts: Array<{ requested: ResourceClaim; heldBy: string; held: ResourceClaim }> = [];
         for (const requested of claims) {
           for (const row of others) {
@@ -94,6 +103,12 @@ export function createResourceAdmission(deps: OperationDeps): ResourceAdmission 
         await tx.query('SELECT lock_id FROM ht_admission_lock WHERE lock_id = 1 FOR UPDATE');
         await tx.query('DELETE FROM ht_resource_claims WHERE holder_id = $1', [holderId]);
       });
+    },
+
+    async held(holderId: string): Promise<Array<{ runId: string; claim: ResourceClaim; expiresAt: string }>> {
+      if (typeof holderId !== 'string' || holderId.length === 0) throw new HypertestError('invalid_argument', 'holderId must be a non-empty string');
+      const r = await db.query<ClaimRow>(`SELECT ${CLAIM_COLUMNS} FROM ht_resource_claims WHERE holder_id = $1 AND expires_at > $2 ORDER BY created_at, claim_id`, [holderId, clock.isoNow()]);
+      return r.rows.map((row) => ({ runId: row.run_id, claim: rowToClaim(row), expiresAt: toIso(row.expires_at) }));
     },
 
     async active(runId?: string): Promise<Array<{ holderId: string; runId: string; claim: ResourceClaim; expiresAt: string }>> {

@@ -43,6 +43,12 @@ import type { EvalArm, EvalSuite, EvalTask, SuiteOptions, SuiteResult, TrialFixt
  *   - `serve` validates the token and host before opening the store and listens before resuming runs.
  *   - `init` writes the configuration atomically (temp file + exclusive link, or rename with --force).
  *   - New exports: `clientOnlyConfig`, `SANDBOX_ENV`, `MIN_API_TOKEN_LENGTH`, `writeConfigAtomically`.
+ *
+ * (additive, runtime release management)
+ *   - `hypertest runtime list | show | register | record-suite | promote | rollback | migrate` (runtimeCommand): the runtime
+ *     release registry of the store; decisions take `--by <name>` (`human:<name>`, or `ci:<pipeline>`) and are refused
+ *     (`permission_denied`) under `$HYPERTEST_SANDBOX`. New exports `releaseActor`, `parseAllowances`, `parseCanary`,
+ *     `suiteFromEval`.
  */
 
 /** A text sink (process.stdout/stderr or a test collector). */

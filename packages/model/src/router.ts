@@ -6,10 +6,12 @@ import {
   eventFrom,
   projectForRoute,
   type DataClassification,
+  type DomainEventInput,
   type EventContext,
   type ModelCapability,
 } from '@hypertest/domain';
 import type {
+  CircuitSnapshot,
   InvokeOutcome,
   InvokeRequest,
   ModelCallRequest,
@@ -21,13 +23,21 @@ import type {
   ModelCallResponse,
   RouterDeps,
 } from './contracts.ts';
+import { CircuitBreakers, type CircuitTransition, type PriceViolation } from './circuit.ts';
 import { FALLBACK_ELIGIBLE, SAME_ROUTE_RETRYABLE } from './errors.ts';
 import { estimateCostUsd } from './usage.ts';
 
 type OkDecision = Extract<RouteDecision, { ok: true }>;
 
-/** Filter stages in their normative order (I3). `excluded` is reported for routes that already failed. */
-export const ROUTING_STAGES = ['security', 'capability', 'role', 'quality', 'latency', 'cost'] as const;
+/**
+ * Filter stages in their normative order (I3). `excluded` is reported for routes that already failed. (additive)
+ * `availability` (circuit breaker / price guard) comes after quality: it only ever rejects routes every earlier stage
+ * accepted, so it can never admit an ineligible route.
+ */
+export const ROUTING_STAGES = ['security', 'capability', 'role', 'quality', 'availability', 'latency', 'cost'] as const;
+
+/** (additive) L0 events of the circuit breaker (aggregate `model`, aggregateId = routeId). */
+export const MODEL_CIRCUIT_EVENTS = Object.freeze({ opened: 'model.circuit_opened', closed: 'model.circuit_closed' } as const);
 
 /**
  * Attempts to append `model.invoked` after a SUCCESSFUL provider call (with a short backoff): the tokens are spent, so a
@@ -50,6 +60,12 @@ interface Candidate {
 }
 
 type Evaluation = { ok: true; candidate: Candidate } | { ok: false; rejection: RouteRejection };
+
+/** Price-guard observations collected while routing (turned into circuit events). */
+interface PriceNote {
+  profile: ModelCapabilityProfile;
+  violation?: PriceViolation;
+}
 
 export function createModelRouter(deps: RouterDeps): ModelRouter {
   return new DefaultModelRouter(deps);
@@ -121,9 +137,15 @@ function validateRequest(request: RouteRequest): void {
 
 class DefaultModelRouter implements ModelRouter {
   readonly #deps: RouterDeps;
+  readonly #breakers: CircuitBreakers | undefined;
 
   constructor(deps: RouterDeps) {
     this.#deps = deps;
+    this.#breakers = deps.circuitBreaker === false ? undefined : new CircuitBreakers(deps.circuitBreaker ?? {});
+  }
+
+  circuits(): CircuitSnapshot[] {
+    return this.#breakers ? this.#breakers.snapshots(this.#deps.clock.nowMs()) : [];
   }
 
   async route(request: RouteRequest, ctx: EventContext): Promise<RouteDecision> {
@@ -140,11 +162,13 @@ class DefaultModelRouter implements ModelRouter {
     const revision = catalog.revision;
     const rejected: RouteRejection[] = [];
     const candidates: Candidate[] = [];
+    const priceNotes: PriceNote[] = [];
     for (const profile of catalog.list()) {
-      const ev = this.#evaluate(profile, request, classification);
+      const ev = this.#evaluate(profile, request, classification, priceNotes);
       if (ev.ok) candidates.push(ev.candidate);
       else rejected.push(ev.rejection);
     }
+    await this.#notePrices(ctx, request, revision, priceNotes);
 
     const criteria = rankingCriteria(isExecutorLike(request));
     const compare = (a: Candidate, b: Candidate): number => {
@@ -215,7 +239,7 @@ class DefaultModelRouter implements ModelRouter {
   }
 
   /** Runs the ordered filter stages for one route; the first failing stage is recorded. */
-  #evaluate(p: ModelCapabilityProfile, request: RouteRequest, classification: { level: number; name: DataClassification }): Evaluation {
+  #evaluate(p: ModelCapabilityProfile, request: RouteRequest, classification: { level: number; name: DataClassification }, priceNotes?: PriceNote[]): Evaluation {
     const reject = (stage: RouteRejection['stage'], reason: string): Evaluation => ({ ok: false, rejection: { routeId: p.routeId, stage, reason } });
     const policy = request.policy;
 
@@ -253,12 +277,29 @@ class DefaultModelRouter implements ModelRouter {
     if (!Number.isFinite(score)) return reject('quality', 'non-finite quality score');
     if (policy.minQuality !== undefined && !(score >= policy.minQuality)) return reject('quality', `quality ${score} < minQuality ${policy.minQuality}`);
 
-    // 4. latency
+    // 4. availability (circuit breaker, price guard) — after every eligibility stage: it only ever rejects
+    if (this.#breakers) {
+      const v = this.#breakers.availability(p.routeId, this.#deps.clock.nowMs());
+      if (!v.available) return reject('availability', v.reason);
+      const price = this.#breakers.priceCheck(p, request);
+      if (price.applies) {
+        priceNotes?.push(price.violation ? { profile: p, violation: price.violation } : { profile: p });
+        if (price.violation) {
+          const { price: pr, ceiling } = price.violation;
+          return reject(
+            'availability',
+            `circuit open for cost-limited policies: catalog price $${pr.inputPerMillionUsd}/$${pr.outputPerMillionUsd} per M in/out exceeds the ceiling $${ceiling.inputPerMillionUsd ?? '∞'}/$${ceiling.outputPerMillionUsd ?? '∞'}`,
+          );
+        }
+      }
+    }
+
+    // 5. latency
     if (policy.latencyBudgetMs !== undefined && !(p.typicalLatencyMs <= policy.latencyBudgetMs)) {
       return reject('latency', `typical latency ${p.typicalLatencyMs}ms > budget ${policy.latencyBudgetMs}ms`);
     }
 
-    // 5. cost (never first)
+    // 6. cost (never first)
     const cost = estimateCostUsd(p, request.contextTokensEstimate, p.maxOutputTokens);
     if (policy.maxCostPerCallUsd !== undefined && !(cost <= policy.maxCostPerCallUsd)) {
       return reject('cost', `estimated cost $${Number.isFinite(cost) ? cost.toFixed(6) : 'NaN'} > limit $${policy.maxCostPerCallUsd}`);
@@ -279,31 +320,74 @@ class DefaultModelRouter implements ModelRouter {
     let attempts = 0;
     let response: ModelCallResponse;
     let profile: ModelCapabilityProfile;
+    const breakers = this.#breakers;
+    const transitions: CircuitTransition[] = [];
+    /** A half-open probe slot this call holds until the breaker got its verdict. */
+    let probe = false;
+    let probeSettled = false;
     // Only the decision check and the provider call are inside this try: a failure there is a MODEL outcome
     // (reported + possibly a fallback). Anything after the call succeeded (e.g. the audit sink) is a fault.
     try {
+      // the decision is re-validated for THIS request — including the availability stage: an open breaker refuses here,
+      // before any provider call (precondition_failed ⇒ re-validated fallback, or none under fail_closed)
       profile = this.#checkDecision(decision, routeRequest, classification);
+      if (breakers) {
+        const slot = breakers.acquire(decision.routeId, this.#deps.clock.nowMs());
+        if (slot.kind === 'refused') {
+          throw new HypertestError('precondition_failed', `route ${decision.routeId} is not eligible for this request (availability): ${slot.reason}`, {
+            retryable: false,
+            details: { routeId: decision.routeId, stage: 'availability', reason: slot.reason },
+          });
+        }
+        probe = slot.kind === 'probe';
+        if (probe) this.#deps.logger.info('model circuit half-open: this call is the single probe', { routeId: decision.routeId });
+      }
       const provider = this.#deps.providers.get(decision.provider);
       const callRequest = buildCallRequest(call, decision, profile, routeRequest);
       const retryOptions: Parameters<typeof retry>[1] = {
-        attempts: maxAttempts,
+        // a half-open probe is ONE call: no same-route retries
+        attempts: probe ? 1 : maxAttempts,
         baseDelayMs: this.#deps.retry?.baseDelayMs ?? 250,
         maxDelayMs: this.#deps.retry?.maxDelayMs ?? 4000,
-        isRetryable: (e) => e instanceof HypertestError && SAME_ROUTE_RETRYABLE.has(e.code),
+        // never retry into a breaker that opened on this very failure
+        isRetryable: (e) => e instanceof HypertestError && SAME_ROUTE_RETRYABLE.has(e.code) && (!breakers || breakers.mayRetry(decision.routeId, probe)),
       };
       if (call.signal) retryOptions.signal = call.signal;
       response = await retry(async (attempt) => {
         attempts = attempt;
         if (attempt > 1) this.#deps.logger.info('model call retry', { routeId: decision.routeId, attempt });
-        return provider.complete(callRequest, request.onDelta ? { onDelta: request.onDelta } : {});
+        try {
+          return await provider.complete(callRequest, request.onDelta ? { onDelta: request.onDelta } : {});
+        } catch (e) {
+          // every failed provider attempt is an availability signal for the breaker — unless the caller gave up
+          if (breakers && !call.signal?.aborted) {
+            const t = breakers.onFailure(decision.routeId, toHypertestError(e).code, this.#deps.clock.nowMs(), probe);
+            if (probe) probeSettled = true;
+            if (t) {
+              transitions.push(t);
+              this.#deps.logger.warn('model circuit opened', { routeId: decision.routeId, reason: t.kind === 'opened' ? t.reason : undefined, code: toHypertestError(e).code });
+            }
+          }
+          throw e;
+        }
       }, retryOptions);
+      if (breakers) {
+        const t = breakers.onSuccess(decision.routeId, this.#deps.clock.nowMs(), probe);
+        if (probe) probeSettled = true;
+        if (t) {
+          transitions.push(t);
+          this.#deps.logger.info('model circuit closed: the probe succeeded', { routeId: decision.routeId });
+        }
+      }
     } catch (e) {
+      // a probe that ended without a verdict (never sent, cancelled by the caller) frees its slot: the next call probes
+      if (probe && !probeSettled) breakers?.releaseProbe(decision.routeId);
       let err = toHypertestError(e);
       if (call.signal?.aborted && err.code !== 'cancelled') {
         // The caller gave up (whatever its abort reason, e.g. its own turn deadline): not a route failure, no fallback.
         err = new HypertestError('cancelled', `model call cancelled by caller: ${err.message}`, { retryable: false, cause: err });
       }
-      return this.#failed(err, attempts, startedMs, identity, decision, routeRequest, call, ctx);
+      return this.#failed(err, attempts, startedMs, identity, decision, routeRequest, call, ctx, transitions);
     }
     if (response.usage.costUsd === undefined) {
       response.usage.costUsd = estimateCostUsd(profile, response.usage.inputTokens, response.usage.outputTokens);
@@ -331,9 +415,11 @@ class DefaultModelRouter implements ModelRouter {
     // The provider answered: its tokens are spent. An audit append that fails now must not discard the response
     // (the caller would release the budget reservation — usage never charged — and re-pay the call on retry): retry
     // the append, and if the store stays unavailable return the response flagged as audit-pending.
+    const circuitEvents = transitions.map((t) => this.#circuitEvent(ctx, t, decision, routeRequest.contextSnapshotId));
     for (let i = 1; ; i++) {
       try {
-        await this.#emit(ctx, EVENT_TYPES.modelInvoked, routeRequest.agentId, invoked);
+        // one batch: the call and the breaker transition it caused are recorded together (I10)
+        if (this.#deps.events) await this.#deps.events.emit([eventFrom(ctx, EVENT_TYPES.modelInvoked, 'model', routeRequest.agentId, invoked), ...circuitEvents]);
         break;
       } catch (e) {
         const err = toHypertestError(e);
@@ -385,15 +471,19 @@ class DefaultModelRouter implements ModelRouter {
     routeRequest: RouteRequest,
     call: InvokeRequest['call'],
     ctx: EventContext,
+    transitions: CircuitTransition[] = [],
   ): Promise<InvokeOutcome> {
     const error = { code: err.code, message: err.message, retryable: err.retryable };
-    await this.#emit(ctx, EVENT_TYPES.modelInvoked, routeRequest.agentId, {
-      ok: false,
-      ...identity,
-      attempts,
-      error,
-      latencyMs: Math.max(0, this.#deps.clock.nowMs() - startedMs),
-    });
+    if (this.#deps.events) {
+      const failed = eventFrom(ctx, EVENT_TYPES.modelInvoked, 'model', routeRequest.agentId, {
+        ok: false,
+        ...identity,
+        attempts,
+        error,
+        latencyMs: Math.max(0, this.#deps.clock.nowMs() - startedMs),
+      } as Record<string, JsonValue>);
+      await this.#deps.events.emit([failed, ...transitions.map((t) => this.#circuitEvent(ctx, t, decision, routeRequest.contextSnapshotId))]);
+    }
     const outcome: InvokeOutcome = { ok: false, error, attempts };
     if (!FALLBACK_ELIGIBLE.has(err.code)) return outcome;
 
@@ -429,6 +519,40 @@ class DefaultModelRouter implements ModelRouter {
     const p = this.#deps.catalog.get(routeId);
     if (!p) throw new HypertestError('not_found', `unknown route ${routeId}`, { details: { routeId } });
     return estimateCostUsd(p, inputTokens, outputTokens);
+  }
+
+  /** `model.circuit_opened` / `model.circuit_closed` for a breaker transition caused by a call. */
+  #circuitEvent(ctx: EventContext, t: CircuitTransition, decision: OkDecision, snapshotId: string): DomainEventInput<Record<string, JsonValue>> {
+    const base: Record<string, JsonValue> = { routeId: t.routeId, provider: decision.provider, model: decision.model, snapshotId };
+    if (t.kind === 'opened') {
+      return eventFrom(ctx, MODEL_CIRCUIT_EVENTS.opened, 'model', t.routeId, {
+        ...base, reason: t.reason, code: t.code, consecutiveFailures: t.consecutiveFailures, rateLimitsInWindow: t.rateLimitsInWindow, cooldownMs: t.cooldownMs, halfOpenAt: t.reopenAt,
+      });
+    }
+    return eventFrom(ctx, MODEL_CIRCUIT_EVENTS.closed, 'model', t.routeId, { ...base, reason: t.reason, openForMs: t.openForMs });
+  }
+
+  /** Price-guard transitions observed while routing (the guard applies to cost-limited requests only). */
+  async #notePrices(ctx: EventContext, request: RouteRequest, catalogRevision: string, notes: PriceNote[]): Promise<void> {
+    if (!this.#breakers || notes.length === 0) return;
+    const out: Array<DomainEventInput<Record<string, JsonValue>>> = [];
+    for (const n of notes) {
+      const change = this.#breakers.notePrice(n.profile.routeId, catalogRevision, n.violation !== undefined);
+      if (!change) continue;
+      const base: Record<string, JsonValue> = {
+        routeId: n.profile.routeId, provider: n.profile.provider, model: n.profile.model, catalogRevision, snapshotId: request.contextSnapshotId,
+        price: { inputPerMillionUsd: n.profile.costPerMillionInputUsd, outputPerMillionUsd: n.profile.costPerMillionOutputUsd },
+      };
+      if (change === 'opened') {
+        const ceiling = n.violation!.ceiling;
+        this.#deps.logger.warn('model circuit opened by the price guard (cost-limited policies)', { routeId: n.profile.routeId, catalogRevision });
+        out.push(eventFrom(ctx, MODEL_CIRCUIT_EVENTS.opened, 'model', n.profile.routeId, { ...base, reason: 'price_ceiling', appliesTo: 'cost_limited_policies', ceiling: { ...ceiling } as Record<string, JsonValue> }));
+      } else {
+        this.#deps.logger.info('model price guard cleared', { routeId: n.profile.routeId, catalogRevision });
+        out.push(eventFrom(ctx, MODEL_CIRCUIT_EVENTS.closed, 'model', n.profile.routeId, { ...base, reason: 'price_ceiling_cleared' }));
+      }
+    }
+    if (out.length > 0 && this.#deps.events) await this.#deps.events.emit(out);
   }
 
   async #emit(ctx: EventContext, type: string, aggregateId: string, payload: Record<string, JsonValue>): Promise<void> {

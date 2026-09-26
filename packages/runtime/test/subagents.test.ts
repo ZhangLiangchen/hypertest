@@ -371,6 +371,51 @@ describe('SubagentRuntime', () => {
     await assert.rejects(subagents.message('ag_missing', note), code('not_found'));
   });
 
+  test('a background, continuable child: its flags are recorded; each resume for more input is on L0, atomically with the reactivation', async () => {
+    const runId = `run_sa${++n}`;
+    const sink = new InMemoryEventSink();
+    let failResumeEvent = true;
+    const events = {
+      emit: async (evs: Parameters<InMemoryEventSink['emit']>[0]) => {
+        if (failResumeEvent && evs.some((e) => e.eventType === 'agent.resumed')) {
+          failResumeEvent = false;
+          throw new Error('event store unavailable');
+        }
+        return sink.emit(evs);
+      },
+    };
+    const rt = createSubagentRuntime({ ...deps, events, db, agents, sessions, engines: new EngineRegistry([engine]), defaultEngineKind: 'native', maxAgentsPerRun: 10, capabilitySecret: SECRET });
+    let parentCap!: ActionCapability;
+    const parent = await rt.spawn(request(runId, { capability: (id) => (parentCap = rootCap(runId, 'wi_root')(id)) }), ctx(runId));
+    const child = await rt.spawn(
+      request(runId, { workItemId: 'wi_bg', role: 'code_change_analyst', parentAgentId: parent.agentId, depth: 1, continuable: true, background: true, capability: childCap(parentCap, 'wi_bg') }),
+      ctx(runId),
+    );
+    assert.deepEqual([child.continuable, child.background], [true, true]);
+    const spawned = sink.events.find((e) => e.eventType === 'agent.spawned' && e.aggregateId === child.agentId)!;
+    assert.deepEqual([(spawned.payload as { continuable: boolean }).continuable, (spawned.payload as { background: boolean }).background], [true, true]);
+    // task 1 settles; the parent's follow-up is queued; the resume fails with its event and changes nothing
+    await rt.settle(child.agentId, { status: 'completed', summary: 'answer 1', evidenceRefs: [], recordRefs: [] }, ctx(runId));
+    await sessions.setStatus(child.sessionId, 'completed');
+    await rt.message(child.agentId, { role: 'user', content: 'follow-up' });
+    await assert.rejects(rt.resume(child.agentId), /event store unavailable/);
+    assert.equal((await agents.get(child.agentId))!.status, 'completed', 'no reactivation without its event');
+    assert.equal((await sessions.get(child.sessionId))!.status, 'completed');
+    assert.equal((await rt.collect(child.agentId)).summary, 'answer 1', 'the settled result is kept');
+    // the retry reactivates it and records it once
+    assert.equal((await rt.resume(child.agentId)).status, 'active');
+    assert.equal((await rt.resume(child.agentId)).status, 'active', 'resuming an active agent is a no-op');
+    const resumed = sink.events.filter((e) => e.eventType === 'agent.resumed' && e.aggregateId === child.agentId);
+    assert.equal(resumed.length, 1);
+    assert.deepEqual(resumed[0]!.payload, { agentId: child.agentId, from: 'completed', continuable: true, background: true, sessionId: child.sessionId });
+    assert.deepEqual([resumed[0]!.workItemId, resumed[0]!.agentId, resumed[0]!.runId], ['wi_bg', child.agentId, runId]);
+    // depth/count caps are unchanged for background children: depth 2 under a maxDepth-1 cap is refused
+    await assert.rejects(
+      rt.spawn(request(runId, { workItemId: 'wi_deep', parentAgentId: child.agentId, depth: 2, maxDepth: 1, background: true, capability: childCap(parentCap, 'wi_deep') }), ctx(runId)),
+      code('permission_denied'),
+    );
+  });
+
   test('dispose cascades and is terminal', async () => {
     const runId = `run_sa${++n}`;
     const { root, child, grandchild } = await family(runId);

@@ -14,7 +14,7 @@ the real policy engine).
 
 | Export | Purpose |
 |---|---|
-| `runtimeMigrations` | `runtime/001-sessions` (`ht_sessions`, `ht_transcript`, `ht_turns`, `ht_tool_calls`, `ht_agent_inbox`, `ht_compactions`), `runtime/002-agents` (`ht_agents`), `runtime/003-epochs` (`ht_epochs`, `ht_pending_fallbacks`), `runtime/004-turn-outcome-agent-grant` (`ht_turns.outcome`, `ht_agents.capability`, `ht_agents.max_depth`). PGlite + PostgreSQL 16. |
+| `runtimeMigrations` | `runtime/001-sessions` (`ht_sessions`, `ht_transcript`, `ht_turns`, `ht_tool_calls`, `ht_agent_inbox`, `ht_compactions`), `runtime/002-agents` (`ht_agents`), `runtime/003-epochs` (`ht_epochs`, `ht_pending_fallbacks`), `runtime/004-turn-outcome-agent-grant` (`ht_turns.outcome`, `ht_agents.capability`, `ht_agents.max_depth`), `runtime/005-releases` (the runtime release registry: `ht_runtime_releases`, `ht_runtime_release_pointer`, `ht_runtime_release_lock`, append-only `ht_runtime_suite_results`, `ht_runtime_release_transitions`, `ht_runtime_epochs`). PGlite + PostgreSQL 16. |
 | `createSessionStore(deps)` | SQL `SessionStore`: portable transcript, turn records, tool-call settlement, native state, compactions, input inbox. |
 | `createAgentRepository(deps)` | SQL `AgentRepository` over `ht_agents` (a disposed agent is terminal). |
 | `createEpochManager(deps)` | `ModelEpoch`s at safe boundaries (I3), `model.epoch_started`, `providersUsedByRoles`, pending fallbacks. |
@@ -22,11 +22,44 @@ the real policy engine).
 | `NativeEngine` | `kind: 'native'`, `version` = this package's version. The Hypertest agent loop (below). |
 | `createSubagentRuntime(deps)` | spawn/resume/message/interrupt/collect/children/dispose/settle/`capabilityOf` with caps, capability binding and non-amplification (I2). `capabilityAmplification(child, parent)` is the check. |
 | `createAgentRunner(deps)` | `step()` = one turn (the durable activity unit); `run()` = loop with the work budget; both recover an outcome the engine committed but a crash left unapplied (`recoveredResult`, `recoveredWaiting`). `validateBudget`. |
-| `buildRuntimeManifest(input, createdAt)` | Frozen RuntimeManifest, `manifestId = 'rm_' + sha256(canonicalJson(content))` (content excludes `createdAt`; engine/adapter lists sorted). `verifyRuntimeManifest`, `manifestContent`. |
+| `buildRuntimeManifest(input, createdAt)` | Frozen RuntimeManifest, `manifestId = 'rm_' + sha256(canonicalJson(content))` (content excludes `createdAt`; engine/adapter lists sorted). `verifyRuntimeManifest`, `manifestContent` (validates the runtime-BOM fields when present: `hypertest.gitSha` non-empty (the app pins a full commit id), `hypertest.imageDigest` `sha256:<64 hex>`, `agentEngines[].adapter {package, version}`, `defaultEngine` one of the pinned engines, `roleCatalogRevision`). |
+| `toolCatalogRevision(tools, adapters?)` | `tc_<sha256>` over every tool's schemas, effect/risk (`dynamic` when computed), `timeoutMs`, `maxInlineBytes`, side-effect binding (adapter, operation type, lease TTL) and the side-effect adapters' capabilities: a changed timeout, binding or adapter is another runtime (I11). Duplicates and non-positive timeouts are refused. |
+| `createRuntimeReleaseRegistry({ db, ids, clock, logger })` | The runtime release registry (below): `register`, `get`, `list`, `activePointer`, `recordSuiteResult`, `suiteResults`, `promotionReadiness`, `promote`, `rollback`, `retire`, `admit`, `history`, `recordEpoch`, `epochs`. Pure helpers `runtimeCompatibility(source, target, { usedEngines })`, `canarySelects`, `canaryBucket`, `canarySelectionProblems`, `describeSelection`; constants `RELEASE_STATES`, `PROMOTION_PATH`, `SUITE_KINDS`, `MANIFEST_SCHEMA_KEYS`, `RELEASE_MIGRATION`. |
 | `EngineRegistry` | `register` (duplicate kind ⇒ `conflict`), `get` (unknown ⇒ `not_found`), `list`, `has`, `manifestEntries()`, `assertPinned(manifest, kind)` (I11: refuses an engine whose version differs from the pinned manifest). |
 | `engineContractSuite(name, makeEngine, { openDatabase })` | node:test suite every engine must pass (see below). |
 | `FakeModelInvoker`, `FakeDispatcher`, `FakeContextProvider`, `fakeHost`, `fakeSnapshot`, `completeWorkTool`, `failWorkTool` | Deterministic, recording test doubles for engine tests. |
 | constants/helpers | `TEXT_ONLY_NUDGE`, `TOO_MANY_TOOL_CALLS`, `MALFORMED_ARGUMENTS`, `REPETITIVE_LOOP`, `PARALLEL_TOOL_CONCURRENCY` (4), `MAX_CONSECUTIVE_RETRY_BOUNDARIES`, `normalizeResponse`, `toolCallSignature`, `turnCompletedEventId`, `validateLimits`, `safeEpochTurn`, `switchReasonFor`, `decisionFromEpoch`. |
+
+## Runtime release registry (`src/releases.ts`)
+
+Architecture-improvements §Runtime Manifest 与版本钉死 / §回滚与恢复. Every runtime manifest a deployment may run is a
+**release**: `candidate → shadow → canary → active → retiring → retired`, one audited step per `promote` (no skipping,
+no promotion out of `active`/`retiring`/`retired`). Every promotion requires the **latest** recorded result of BOTH
+compatibility suites of that manifest to be a pass: `engine_contract` (the AgentEngine ABI golden suite) and `replay`
+(a replay / golden eval suite id with its pass/fail record); a later failing result blocks the next step. A suite
+result claiming a pass over failed cases, or over zero cases (NOT RUN), is refused.
+
+- **Active pointer** (`ht_runtime_release_pointer`, revisioned): names the release new TestRuns are created under and
+  remembers the previous one. Promotion to active moves the previous active release to `retiring` (its runs continue on
+  it, I11); `retire` finishes it once no live run is pinned to it (the caller checks). At most one active and one canary
+  release (partial unique indexes); every mutation is serialized by a lock row.
+- **Canary** selection (entering canary requires one): a deterministic percentage bucket of the run id
+  (`canaryBucket` = sha256(runId) mod 100) and/or labels (every label must match; own properties only).
+- **Admission** (`admit({ manifestId, runId, labels, requireActive })`): no active release ⇒ unmanaged (any runtime
+  except a retired/rolled-back one; `requireActive` refuses); else only the active release, or the canary when its
+  selection picks the run. Refusals carry the reason, the release state and the active manifest.
+- **Rollback** (`rollback({ by, reason, manifestId? })`): the given release, else the canary, else the active one (to
+  the previous active one, which must not itself be rolled back). The rolled-back release is `retired` with
+  `rolledBack: true` for good (a trigger keeps the flag; never promoted again); the pointer moves back only for an
+  active release. The caller quarantines the release's live runs in the same transaction (`tx`).
+- **Epochs** (`recordEpoch`, `epochs`): the RuntimeEpoch chain of an explicitly migrated run (seq, previous epoch; a new
+  epoch must continue from the last target; every compatibility check must be ok).
+- `runtimeCompatibility(source, target, { usedEngines })`: target active or canary and not rolled back; target manifest
+  verifies; each pinned schema equal or covered by an **explicit** allowed migration of the target release
+  (`allowedMigrations`, recorded at registration, immutable); every engine the run's agents used is pinned with a
+  version; same governing protocol id; the target differs from the source. Every check is reported.
+- Append-only: suite results, transitions and epochs reject UPDATE/DELETE/TRUNCATE; a registered manifest (and its
+  allowed migrations) is immutable and a release is never deleted (database triggers).
 
 ## The turn (NativeEngine.runTurn)
 
@@ -134,7 +167,8 @@ begun, nothing produced). A `model_responded` turn (response with unsettled call
 - `interrupt`/`dispose` cascade to all descendants (children first; settled agents untouched by interrupt); each
   agent's status change and its `agent.interrupted`/`agent.disposed` event commit in one transaction. `resume`
   reactivates interrupted/waiting (completed only when `continuable`) and clears the previous settled result, in one
-  transaction (the continuation settles a new result); `message` queues input; `settle` records only
+  transaction with its `agent.resumed` event (the continuation settles a new result); `message` queues input (also for
+  a completed continuable agent: the control plane's follow-up to a continuable child); `settle` records only
   summary/output/refs/failure (idempotent, different ⇒ `conflict`); `collect` returns only that.
 - `AgentRunner.step`: one `runTurn`; syncs the agent status (`waiting`; `completed`/`failed` via `settle`; an abort
   leaves the agent runnable, an explicit interrupt makes it `interrupted`). **Crash recovery** (a retried step after
@@ -179,8 +213,9 @@ additive: `src` may not depend on `@hypertest/store`.)
 | I12/I10 a paid call whose `model.invoked` append fails keeps its response and settles its usage (never released, never re-called) | `test/epochs-invoker.test.ts` › durability-10 |
 | I1 (integration) out-of-capability call denied by the real ToolRuntime, never executed; permit logged | `test/runner.test.ts` (full stack) |
 | I2 capability bound to the new agent, derived from **and covered by** the parent's recorded capability (8 amplification variants); unrecorded parent refused; signatures verified with `capabilitySecret` | `test/subagents.test.ts` |
-| I10 correlated route/epoch/turn/tool events; interrupt status + event atomic | `test/runner.test.ts`, `test/native-engine.test.ts`, `test/subagents.test.ts` |
-| I11 content-hashed manifest, no engine hot swap, unversioned pins fail closed | `test/manifest.test.ts` |
+| I10 correlated route/epoch/turn/tool events; interrupt status + event atomic; resume of a background continuable child + `agent.resumed` atomic | `test/runner.test.ts`, `test/native-engine.test.ts`, `test/subagents.test.ts` |
+| I11 content-hashed manifest, no engine hot swap, unversioned pins fail closed; the runtime-BOM fields change the id and are validated; tool catalog revision pins timeouts, bindings and adapter capabilities | `test/manifest.test.ts` |
+| I11 runtime releases: promotion only one step at a time and only over the latest passing engine-contract AND replay results; one active / one canary; admission (unmanaged, active, selected canary, refused); rollback moves the pointer back and retires for good; append-only history and immutable manifests (triggers); epoch chain; compatibility verdict | `test/releases.test.ts` (PGlite + PostgreSQL) |
 | I12 depth/agent-count caps (incl. concurrent spawns, inherited depth cap), work budgets | `test/subagents.test.ts`, `test/runner.test.ts` |
 
 ## Contract changes (additive, 0.3)
@@ -195,6 +230,19 @@ Review fixes (additive): `SessionStore.create(record, initialTranscript?)`; `rec
 `TurnOutcome`, `TurnRecord.outcome?`, `CompleteTurnOptions.outcome?`; `SubagentDeps.capabilitySecret?`;
 `SubagentRuntime.capabilityOf?`; documented: completeTurn keeps `interrupted`, a child's `maxDepth` is capped by its
 parent's, a child capability must be covered by the parent's, `routeRequestExtras` can only tighten.
+- (B1 governance completion, behaviour) `SubagentRuntime.resume` emits `agent.resumed` (`{ agentId, from, continuable,
+  background, sessionId }`, correlated by the agent's work item) in the transaction of the reactivation: a resume whose
+  event cannot be written changes nothing (I10). Used by the control plane to resume a continuable child for its
+  parent's follow-up message.
+
+- (runtime release management, additive) `manifestContent` validates the new optional BOM fields of the domain
+  `RuntimeManifest` (`hypertest.imageDigest`, `agentEngines[].adapter`, `defaultEngine`, `roleCatalogRevision`);
+  manifests without them keep their ids and still verify. New exports
+  `toolCatalogRevision`, `GIT_SHA_RE`, `IMAGE_DIGEST_RE`, `TOOL_CATALOG_REVISION_FORMAT`, `ManifestSideEffectAdapter`, the
+  release registry (`createRuntimeReleaseRegistry` and its types/helpers, see above) and migration
+  `runtime/005-releases` appended to `runtimeMigrations`. Domain (additive): `RuntimeEpoch`, `RuntimeCompatibilityCheck`,
+  `PauseReason` `quarantined` | `migrating`, `EVENT_TYPES.runMigrated` (`run.migrated`) / `runQuarantined`
+  (`run.quarantined`), `BuiltinRole` `vision_gui` | `local_private`.
 
 ## Testing
 

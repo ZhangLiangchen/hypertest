@@ -1,6 +1,7 @@
 // White-box tools, runtime, registry, workspaces, sandbox (owned by the tools-core implementer).
 export { ToolRegistry, toolIdToName, toolNameToId, assertValidToolId } from './registry.ts';
-export { createToolRuntime, redactSecrets, utf8Head, utf8Tail, DEFAULT_MAX_INLINE_BYTES, SECRET_KEY_PATTERN, REDACTED, SIDE_EFFECT_SETTLE_MS } from './runtime.ts';
+export { createToolRuntime, evidenceExperimentId, redactSecrets, utf8Head, utf8Tail, DEFAULT_MAX_INLINE_BYTES, SECRET_KEY_PATTERN, REDACTED, SIDE_EFFECT_SETTLE_MS } from './runtime.ts';
+export { UsageMeter, currentMeter, meteredArtifacts, meteredSandbox, runMetered } from './usage-meter.ts';
 export { createEnvironmentRegistry } from './environments.ts';
 export { createSqlEnvironmentRegistry, toolsMigrations } from './sql-environments.ts';
 export { RECORD_EFFECT_ADAPTER_ID, RECORD_EFFECT_RESENDABLE_ADAPTER_ID, bindRecordEffect, recordEffectAdapters, type RecordedToolOutcome } from './record-effects.ts';

@@ -19,6 +19,10 @@ import type { AssistantMessage, ChatMessage, DataClassification, DomainEventSink
  *   estimateCostUsd(profile, inputTokens, outputTokens)   (per-million prices → USD)
  *   MODEL_CAPABILITY_PROFILE_SCHEMA                      (JSON Schema used by ModelCatalog validation)
  *
+ * Circuit breaker (additive): per route, in the router; open routes are rejected at the routing stage `availability`
+ * (after security → capability → role → quality, before latency → cost) and refused by invoke() without a provider call
+ * (precondition_failed ⇒ re-validated fallback unless fail_closed). Emits `model.circuit_opened` / `model.circuit_closed`.
+ *
  * Provider error mapping (HypertestError codes): 429 → rate_limited, 408/5xx/network → unavailable,
  * timeout → timeout, 400 schema/tool errors → provider_error (non-retryable), abort → cancelled.
  * A stream cut mid-event is an incomplete stream (unavailable), never a malformed payload; an exception thrown by
@@ -128,7 +132,12 @@ export interface RouteRequest {
 
 export interface RouteRejection {
   routeId: string;
-  stage: 'security' | 'capability' | 'role' | 'quality' | 'latency' | 'cost' | 'excluded';
+  /**
+   * (additive) `availability`: the route's circuit breaker is open (or half-open with its probe in flight), or its
+   * catalog price is above the configured ceiling for a cost-limited request. Evaluated AFTER security → capability →
+   * role → quality, so an availability rejection is only ever reported for a route that passed all of them.
+   */
+  stage: 'security' | 'capability' | 'role' | 'quality' | 'availability' | 'latency' | 'cost' | 'excluded';
   reason: string;
 }
 
@@ -187,6 +196,58 @@ export interface RouterDeps extends BaseDeps {
   events?: DomainEventSink;
   /** Same-route retry backoff (defaults: base 250ms, max 4000ms). Added in 0.3 (additive). */
   retry?: { baseDelayMs?: number; maxDelayMs?: number };
+  /**
+   * (additive) Per-route circuit breaker + optional price guard (technology-selection §关键风险). Enabled with the
+   * defaults of DEFAULT_CIRCUIT_BREAKER when omitted; `false` disables it (every route stays available).
+   */
+  circuitBreaker?: CircuitBreakerOptions | false;
+}
+
+/** (additive) Catalog price ceiling (USD per million tokens); an absent side is not checked. */
+export interface PriceCeiling {
+  inputPerMillionUsd?: number;
+  outputPerMillionUsd?: number;
+}
+
+/**
+ * (additive) Circuit breaker configuration. A route opens after `failureThreshold` consecutive availability failures
+ * (rate_limited / unavailable / timeout, counted per provider attempt) or after a rate-limit storm (`count` rate_limited
+ * failures within `windowMs`, successes in between notwithstanding); after `cooldownMs` it is half-open and admits ONE
+ * probe call (no same-route retries): success closes it, an availability failure re-opens it with the cooldown multiplied
+ * by `cooldownBackoff` (capped at `maxCooldownMs`). Open routes are rejected at the routing stage `availability`.
+ */
+export interface CircuitBreakerOptions {
+  /** Default 5. */
+  failureThreshold?: number;
+  /** Default { count: 8, windowMs: 60000 }; false disables storm detection. */
+  rateLimitStorm?: { count: number; windowMs: number } | false;
+  /** Default 30000. */
+  cooldownMs?: number;
+  /** Default 2 (≥ 1). */
+  cooldownBackoff?: number;
+  /** Default 600000. */
+  maxCooldownMs?: number;
+  /**
+   * Price-change guard: a route whose catalog price is above its ceiling (`routes[routeId]`, else `default`) is
+   * unavailable to cost-limited requests (policy.maxCostPerCallUsd set; `appliesTo: 'all'` for every request). Recorded
+   * as `model.circuit_opened` / `model.circuit_closed` with reason `price_ceiling`.
+   */
+  priceGuard?: { default?: PriceCeiling; routes?: Record<string, PriceCeiling>; appliesTo?: 'cost_limited' | 'all' };
+}
+
+export type CircuitState = 'closed' | 'open' | 'half_open';
+
+/** (additive) Observable state of one route's breaker (ModelRouter.circuits). */
+export interface CircuitSnapshot {
+  routeId: string;
+  state: CircuitState;
+  consecutiveFailures: number;
+  rateLimitsInWindow: number;
+  probeInFlight: boolean;
+  openedAt?: string;
+  /** When an open breaker becomes half-open. */
+  halfOpenAt?: string;
+  reason?: 'consecutive_failures' | 'rate_limit_storm' | 'probe_failed';
 }
 
 export interface ModelCatalogLike {
@@ -220,6 +281,8 @@ export interface ModelRouter {
   invoke(request: InvokeRequest, routeRequest: RouteRequest): Promise<InvokeOutcome>;
   /** Cost estimate for budget reservation. */
   estimateCostUsd(routeId: string, inputTokens: number, outputTokens: number): number;
+  /** (additive, optional) The circuit breaker state of every route that has one (sorted by route id). */
+  circuits?(): CircuitSnapshot[];
 }
 
 // ----------------------------------------------------------------------------- provider options (additive)

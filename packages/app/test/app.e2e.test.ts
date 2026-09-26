@@ -14,11 +14,11 @@ import { HypertestError, MemoryLogger, canonicalJson } from '@hypertest/core';
 import { recordEvidence, verifyEd25519 } from '@hypertest/evidence';
 import type { Finding } from '@hypertest/domain';
 import { collabMigrations } from '@hypertest/collab';
-import { RUNTIME_PACKAGE_VERSION, verifyRuntimeManifest } from '@hypertest/runtime';
+import { RUNTIME_PACKAGE_VERSION, toolCatalogRevision, verifyRuntimeManifest } from '@hypertest/runtime';
 import { PI_AGENT_CORE_VERSION, RUNTIME_PI_PACKAGE_VERSION } from '@hypertest/runtime-pi';
 import { tempDir } from '@hypertest/testkit';
 import type { RunOutcome } from '@hypertest/durable';
-import { createHypertest, startApiServer, type HypertestConfig, type HypertestInstance } from '../src/index.ts';
+import { createHypertest, hypertestGitSha, startApiServer, type HypertestConfig, type HypertestInstance } from '../src/index.ts';
 import { roleRouter, scriptedConfig, sumRepo, testStore, tinyRunBrains, type BrainView } from './helpers.ts';
 
 const ROOT = join(import.meta.dirname, '..', '..', '..');
@@ -92,15 +92,26 @@ describe('createHypertest: a tiny run end to end', () => {
     assert.equal(pinned.rows.length, 1);
     const rootVersion = (JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')) as { version: string }).version;
     assert.equal(m.hypertest.version, rootVersion);
-    assert.deepEqual(m.agentEngines, [{ kind: 'native', version: RUNTIME_PACKAGE_VERSION }, { kind: 'pi', version: PI_AGENT_CORE_VERSION }]);
+    // runtime BOM: each engine with the Hypertest package adapting it (runtime-pi adapter version), the default engine
+    assert.deepEqual(m.agentEngines, [
+      { kind: 'native', version: RUNTIME_PACKAGE_VERSION, adapter: { package: '@hypertest/runtime', version: RUNTIME_PACKAGE_VERSION } },
+      { kind: 'pi', version: PI_AGENT_CORE_VERSION, adapter: { package: '@hypertest/runtime-pi', version: RUNTIME_PI_PACKAGE_VERSION } },
+    ]);
+    assert.equal(m.defaultEngine, 'native');
     const adapters = m.providerAdapters.map((a) => `${a.provider}|${a.package}|${a.version}`);
     assert.ok(adapters.includes(`engine:pi|@hypertest/runtime-pi|${RUNTIME_PI_PACKAGE_VERSION}`));
     assert.ok(adapters.includes(`engine:pi|@earendil-works/pi-agent-core|${PI_AGENT_CORE_VERSION}`));
     assert.ok(adapters.includes(`engine:native|@hypertest/runtime|${RUNTIME_PACKAGE_VERSION}`));
     assert.ok(adapters.some((a) => a.startsWith('sim|@hypertest/model#scripted|')));
     assert.equal(m.modelCatalogRevision, ht.services.catalog.revision);
-    assert.equal(m.toolCatalogRevision, ht.services.tools.revision());
+    // the tool catalog revision pins every tool's timeout and side-effect binding and every adapter's capabilities
+    assert.equal(m.toolCatalogRevision, toolCatalogRevision(ht.services.tools.list(), ht.services.adapters!.list()));
+    assert.match(m.toolCatalogRevision, /^tc_[0-9a-f]{64}$/);
     assert.equal(m.policyBundleRevision, `${ht.services.policy.revision}+roles:${ht.services.roles.revision()}`);
+    assert.equal(m.roleCatalogRevision, ht.services.roles.revision());
+    // this checkout is not a git repository and no image digest is set in this test: both stay absent (never invented)
+    assert.equal(m.hypertest.gitSha, hypertestGitSha());
+    assert.equal(m.hypertest.imageDigest, undefined);
     assert.deepEqual(m.protocol, { id: 'bugate', version: ht.services.protocol.binding.version, digest: ht.services.protocol.binding.digest });
     assert.equal(m.schemas.event, collabMigrations.map((x) => x.id).sort().at(-1));
     // the catalog completed the route with the defaults and the provider tag
@@ -188,7 +199,7 @@ describe('composition failures fail fast and leave nothing open', () => {
     await assert.rejects(createHypertest(bad, { scriptedBrains: {} }), (e: unknown) => {
       assert.ok(e instanceof HypertestError && e.code === 'invalid_argument');
       assert.deepEqual((e.details as { errors: string[] }).errors, [
-        "unknown configuration key 'bogus' (expected one of version, project, store, bus, durable, artifacts, models, roles, budget, gate, policy, bugate, engines, sandbox, environments, tools, signing, memory, observability, oracles)",
+        "unknown configuration key 'bogus' (expected one of version, project, store, bus, durable, artifacts, models, roles, budget, gate, policy, bugate, engines, sandbox, environments, tools, signing, memory, observability, oracles, runtime)",
         'engines.default: "dsh" is not a registered engine (native, pi)',
       ]);
       return true;

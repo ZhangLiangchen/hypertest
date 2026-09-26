@@ -1,7 +1,8 @@
 export * from './contracts.ts';
 export { ModelCatalog, MODEL_CAPABILITY_PROFILE_SCHEMA } from './catalog.ts';
 export { ProviderRegistry } from './registry.ts';
-export { AUDIT_APPEND_ATTEMPTS, createModelRouter, ROUTING_STAGES, OUTPUT_RESERVE_CAP, type SelectionCriterion } from './router.ts';
+export { AUDIT_APPEND_ATTEMPTS, createModelRouter, MODEL_CIRCUIT_EVENTS, ROUTING_STAGES, OUTPUT_RESERVE_CAP, type SelectionCriterion } from './router.ts';
+export { AVAILABILITY_FAILURES, CircuitBreakers, DEFAULT_CIRCUIT_BREAKER, type CircuitOpenReason, type CircuitTransition } from './circuit.ts';
 export { estimateCostUsd, estimateOutputTokens } from './usage.ts';
 export { ScriptedProvider } from './scripted.ts';
 export { OpenAICompatibleProvider, buildOpenAIBody, toOpenAIMessages, mapOpenAIUsage, mapFinishReason } from './openai.ts';

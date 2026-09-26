@@ -11,6 +11,11 @@ import type { Migration } from '@hypertest/core';
  *  ht_replans          replan bookkeeping: replan ordinal, last reason, gate attempts and pending gate feedback
  *  ht_agent_hosts      what is needed to rebuild an agent's EngineHost after a restart (capability, policies,
  *                      workspace recipe) — the runtime does not store model/tool policies
+ *  002 (governance):
+ *  ht_run_gates        + base_gate (DEFAULT_GATE_SPEC ⊕ config at start), weakened (the fields the run's override weakens),
+ *                      override_by / override_rationale (the recorded human/system authority of a weakening, conformance-9)
+ *  ht_delegations      one row per delegated child work item: parent, background / continuable, the parent's queued
+ *                      messages (delegate.message) and the release of a continuable child
  */
 export const controlMigrations: Migration[] = [
   {
@@ -60,6 +65,30 @@ CREATE TABLE ht_agent_hosts (
   created_at timestamptz NOT NULL
 );
 CREATE INDEX ht_agent_hosts_work_idx ON ht_agent_hosts (work_item_id);
+`,
+  },
+  {
+    id: 'control/002-governance',
+    sql: `
+ALTER TABLE ht_run_gates ADD COLUMN base_gate jsonb;
+ALTER TABLE ht_run_gates ADD COLUMN weakened jsonb;
+ALTER TABLE ht_run_gates ADD COLUMN override_by jsonb;
+ALTER TABLE ht_run_gates ADD COLUMN override_rationale text;
+
+CREATE TABLE ht_delegations (
+  child_work_item_id text PRIMARY KEY,
+  run_id text NOT NULL,
+  parent_work_item_id text NOT NULL,
+  parent_agent_id text NOT NULL,
+  background boolean NOT NULL DEFAULT false,
+  continuable boolean NOT NULL DEFAULT false,
+  messages jsonb NOT NULL DEFAULT '[]'::jsonb,
+  released_at timestamptz,
+  release_reason text,
+  created_at timestamptz NOT NULL
+);
+CREATE INDEX ht_delegations_parent_idx ON ht_delegations (parent_work_item_id);
+CREATE INDEX ht_delegations_run_idx ON ht_delegations (run_id);
 `,
   },
 ];

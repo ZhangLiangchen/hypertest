@@ -114,6 +114,22 @@ the reason. In order:
 (tool-supplied `command`/`target`/`inputsHash` are kept; `toolId`/`toolInvocationId`/`workspaceId` cannot be
 spoofed). Events carry the request's `runId`, `workItemId`, `agentId`, `correlationId`, `causationId`.
 
+**Experiments (unit B2, conformance-6).** `request.experimentId` (set by the control plane for a work item that runs for
+one experiment) is recorded as `provenance.experimentId` of EVERY evidence record the call produces — inside the
+hash-chained metadata, runtime-set (a tool cannot claim or override one; without a request experiment a tool-supplied
+value is dropped) — read it with `evidenceExperimentId(record)`; it is passed to the gateway for side-effect and ledgered
+calls (`RunSideEffectRequest.experimentId` ⇒ the operation records it), included in `tool.called`, and handed to the tool
+as `ToolContext.experimentId`.
+
+**Resource metering (unit B2, conformance-5).** Every `execute` runs inside its own usage meter (AsyncLocalStorage):
+the built-in tools run on a **metered sandbox** (`meteredSandbox`, applied by `whiteboxTools`/`builtinTools`,
+idempotent), which adds each process's wall time (`ProcessResult.durationMs`) to the current call, and the runtime's
+ArtifactStore is **metered** (`meteredArtifacts`): every distinct object a call stores — tool puts, evidence, output
+offload — counts once. `ToolExecutionResult.usage = { computeMs, artifactBytes }` (zero for calls that never executed);
+concurrent calls never mix. `request.limits.maxArtifactBytes` bounds the call's puts BEFORE they are stored: a put that
+would exceed it throws `budget_exhausted` (the tool fails with that code; an offload over budget truncates without an
+artifact); nothing is stored. The control plane charges the usage to the work item and its run.
+
 Idempotency: re-executing an invocation id re-runs read-only tools; for side-effect tools the gateway finds
 the same operation by `(toolInvocationId, operationType)`, so there is never a second external effect.
 
@@ -322,6 +338,8 @@ restores. score = killed / (killed + survived), 0 when nothing was decidable. Th
 | durability-3: after agent A's side effect is verified, agent B acts on the resource at once (no resource_busy, no orphaned `prepared`) | `test/runtime.test.ts` › durability-3 (tools) |
 | conformance-2: test.run records the tool-derived workspace delta (added/modified test files with digests, tree digest); the gate refuses an unregistered generated test and accepts it once a validated artifact has its digest | `test/whitebox-tools.test.ts` › conformance-2 |
 | conformance-7 (I4): external effects without an adapter are executed once per invocation through the ledger; replays (also after a restart) return the recorded outcome; an interrupted call ⇒ manual_review, never re-sent; a gateway without the record adapters fails closed; a POST killed between send and settle is sent exactly once; a kill between receipt and verification recovers the outcome from the compact receipt (L0 event stays small); an `honoursIdempotencyKey` environment gets one resend with the same key (applied once) | `test/runtime.test.ts` › conformance-7, `test/blackbox-http.test.ts` › conformance-7 |
+| conformance-5: computeMs = wall time of the call's sandbox processes (concurrent calls never mix; the built-in tools' sandbox is metered, wrapping idempotent); artifactBytes = distinct stored objects (puts, evidence, offload); `limits.maxArtifactBytes` refuses a put before storing (typed `budget_exhausted`), an offload over budget truncates without storing | `test/usage-experiment.test.ts` |
+| conformance-6: a call made for an experiment records `provenance.experimentId` in every evidence record (verified chain), in `tool.called` and on its operation; a tool cannot claim an experiment itself | `test/usage-experiment.test.ts` |
 | H12: the SQL registry never forgets a bump across restarts (descriptors/secrets never stored), one operation bumps once across processes, concurrent bumps never lose an update, `load`/`refresh` read the store, sync members queue durable writes; env adapters bump through `bumpGenerationAsync` | `test/sql-environments.test.ts` (PGlite and PostgreSQL) |
 
 ### Contract changes (additive, backward compatible)
@@ -357,6 +375,11 @@ restores. score = killed / (killed + survived), 0 when nothing was decidable. Th
   new exports `networkIsolation`, `probeNetworkIsolation`, `resolveProgram`, `loopbackEndpoints`, types
   `NetworkIsolation`, `NetworkIsolationOptions`, `IsolationSpec`. Behaviour: the local sandbox enforces every network profile but `open` with user + network (and,
   where available, PID + mount) namespaces and refuses them where it cannot isolate the network.
+- (unit B2, conformance-5/6) `ToolExecutionRequest.experimentId?`, `ToolExecutionRequest.limits?: { maxArtifactBytes? }`,
+  `ToolExecutionResult.usage?: ToolUsage`, `ToolContext.experimentId?`; new types `ToolUsage`, `ExperimentProvenance`
+  (`Provenance` + `experimentId?` — the domain `Provenance` has no such field yet); new exports `evidenceExperimentId`,
+  `UsageMeter`, `runMetered`, `currentMeter`, `meteredSandbox`, `meteredArtifacts`. Behaviour: `whiteboxTools` /
+  `builtinTools` wrap the given sandbox in `meteredSandbox`; the runtime's artifact store is metered per call.
 - (hardening, security-1) `WorkspaceManager.diff()` / `changedFiles()` no longer trust the worktree's git index or
   repository configuration: they hash the worktree bytes themselves (`worktree-state.ts`: `worktreeChanges`,
   `renderWorktreeDiff`) against the base commit's tree, so skip-worktree / assume-unchanged bits, `git replace`

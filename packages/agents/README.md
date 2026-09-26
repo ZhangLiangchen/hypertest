@@ -11,7 +11,8 @@ Depends only on `@hypertest/core` and `@hypertest/domain`.
 
 | Export | Purpose |
 |---|---|
-| `BUILTIN_ROLES` | The 12 built-in roles (deep-frozen): `lead`, `code_change_analyst`, `architecture_analyst`, `historical_bug_analyst`, `test_designer`, `executor`, `rca`, `fixer`, `reviewer`, `metrics_analyst`, `environment`, `condenser`. |
+| `BUILTIN_ROLES` | The 14 built-in roles (deep-frozen): `lead`, `code_change_analyst`, `architecture_analyst`, `historical_bug_analyst`, `test_designer`, `executor`, `rca`, `fixer`, `reviewer`, `metrics_analyst`, `environment`, `condenser`, `vision_gui`, `local_private`. |
+| `SPECIALIST_ROLES` | (additive) `vision_gui`, `local_private`: roles only a special route can serve (a vision route; a route accepting restricted data, i.e. a local model). `hypertest doctor` reports their route coverage separately. |
 | `new RoleCatalog(roles, overrides?, options?)` | Effective, validated, deep-frozen catalog: `get`, `require` (unknown ⇒ `HypertestError('not_found')`), `list`, `subscriptions()` (flattened with `role`), `revision()` (SHA-256 hex of the canonical effective roles). |
 | `renderTemplate(template, vars)` | Single-pass `{{name}}` substitution; unknown ⇒ `''`; values never re-expanded; own properties only; `$` literal. |
 | `renderRolePrompt(role, {objective, runGoal, protocol?})` | Renders a system prompt; blank inputs become explicit notices (`NO_PROTOCOL_NOTICE`, `NO_OBJECTIVE_NOTICE`, `NO_RUN_GOAL_NOTICE`). |
@@ -20,7 +21,7 @@ Depends only on `@hypertest/core` and `@hypertest/domain`.
 | `KNOWN_TOOL_IDS` (`BUILTIN_TOOL_IDS` + `DOMAIN_TOOL_IDS`), `TERMINAL_TOOLS`, `WORKSPACE_WRITE_TOOL_IDS`, `DYNAMIC_TOOL_NAMESPACES` | Tool ids role allowlists may reference (`mcp.*` is dynamic); the workspace-writing subset. |
 | `matchesToolPattern`, `isKnownToolPattern`, `toolPermitted` | Tool-pattern semantics identical to `@hypertest/policy`. |
 | `ROLE_DEFINITION_SCHEMA`, `validateRoleDefinition(role, options?)` | Structural + semantic role validation (returns issues). |
-| `EVIDENCE_PRODUCER_ROLES` | (additive) The roles whose agents produce evidence, findings, test artifacts or fixes (`executor`, `test_designer`, `rca`, `fixer`, `metrics_analyst`, `environment`); the reviewer's `independentFromRoles`. Use it wherever producers are counted (e.g. the gate's `producerProviders`), so routing and gate agree. |
+| `EVIDENCE_PRODUCER_ROLES` | (additive) The roles whose agents produce evidence, findings, test artifacts or fixes (`executor`, `test_designer`, `rca`, `fixer`, `metrics_analyst`, `environment`, `vision_gui`, `local_private`); the reviewer's `independentFromRoles`. Use it wherever producers are counted (e.g. the gate's `producerProviders`), so routing and gate agree. |
 | `*_OUTPUT_SCHEMA` | Output contracts validated on `complete_work` (JSON Schema 2020-12 incl. `if/then` — meant for Ajv validation of the completion, not for strict provider `response_format`). |
 
 ### Overrides (`hypertest.config.yaml` → `roles:`)
@@ -46,6 +47,8 @@ overridden too. Unknown tools/events can be admitted explicitly with `options.ex
 | metrics_analyst | diagnosis | analyst / scratch | 0.65, medium | `finding.created` (performance, not its own findings) |
 | environment | execution | environment_operator / scratch | tool_use, 0.6, **fail_closed** | – |
 | condenser | analysis | read_only / scratch | tool_use+long_context, **0.5, cost cap $0.5/call** | – |
+| vision_gui | execution | test_executor / scratch | tool_use+structured_output+**vision**, 0.65, taskType `gui_testing`; tools `browser.*`, `http.request`, findings/notes, `evidence.*` (no shell, files or environment control); prompt: DOM first, API second, screenshots judged visually last, computer use only when such a tool is offered (none by default), never guessed coordinates | – |
+| local_private | analysis | test_executor / isolated_worktree | tool_use+structured_output, 0.55, **privacyClass restricted + dataClassification restricted** (the router's security stage admits only routes with `maxDataClassification: restricted`: local models), **fallback fail_closed**; read-repo tools, `test.run`, findings/notes, evidence reads; **deny** `http.request`, `browser.*`, `load.*`, `metrics.*` (no egress, even when a configuration widens the allowlist); prompt: never reproduce a restricted value in a record or output (`withheld` lists the kinds kept out) | – |
 
 All subscriptions carry livelock guards (`maxPerRun`, `maxCausalDepth`); `work.expectedOutput` defaults to
 the role `outputSchema`; `priority` is 0–100, higher = more urgent.
@@ -79,6 +82,18 @@ over to the deterministic condenser instead of producing an unfaithful summary.
 `metrics_analyst` and `environment` (before, a reviewer could be routed to the provider that produced the fix or the
 metric/environment evidence it judged, and the gate would then discard or — counting fewer producers — accept that
 self-review).
+
+(B1 governance completion) `DOMAIN_TOOL_IDS` gains `delegate.status`, `delegate.collect`, `delegate.message` and
+`delegate.release` (the control plane's handles on background / continuable delegated children); the lead — the only
+delegating role — holds them and its prompt explains `background` / `continuable` delegation.
+
+(runtime-roles unit) Two built-in roles (catalog revision changes): `vision_gui` and `local_private` (above), their
+output contracts `GUI_OUTPUT_SCHEMA` (`{summary, checks: [{check, method: dom|api|visual, outcome: passed|failed|error|
+not_run, expected, actual, evidenceIds ≥ 1}], findings, screenshots}`) and `PRIVATE_OUTPUT_SCHEMA` (`{summary,
+observations: [{statement, evidenceIds ≥ 1}], findings, withheld}`), `GUI_CHECK_METHODS`, `SPECIALIST_ROLES`;
+`EVIDENCE_PRODUCER_ROLES` (and so the reviewer's default `independentFromRoles`) includes both; the lead's prompt names
+them. Domain (additive): `BuiltinRole` gains `vision_gui` | `local_private`. Tests: `test/roles.test.ts` (vision_gui /
+local_private sections, prompts, least privilege, reviewer independence), `test/catalog.test.ts`.
 
 ## Testing
 

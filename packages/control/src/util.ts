@@ -1,7 +1,7 @@
 import { HypertestError, type JsonValue } from '@hypertest/core';
 import {
   CLASSIFICATION_ORDER, DEFAULT_WORK_BUDGET, RISK_ORDER, SEVERITY_ORDER, eventFrom,
-  type DomainEventInput, type EventContext, type GateSpec, type ModelPolicy, type RiskClass, type TestRun, type WorkBudget, type WorkItem,
+  type ActorRef, type DomainEventInput, type EventContext, type GateSpec, type ModelPolicy, type RiskClass, type TestRun, type WorkBudget, type WorkItem,
 } from '@hypertest/domain';
 import type { RoleDefinition } from '@hypertest/agents';
 
@@ -60,6 +60,114 @@ export function gateSpecProblems(gate: GateSpec): string[] {
     }
   }
   return out;
+}
+
+/**
+ * Evidence types that are deterministic execution evidence (a test outcome, an HTTP exchange, a metric, coverage, a
+ * mutation score, a trace, a database snapshot, a packet capture, a screen capture): a run may re-target a required
+ * evidence of one such type to another (a black-box run requires api-response instead of test-result) without weakening
+ * the gate; replacing it by narrative or bookkeeping output (stdout, tool-output, model-output, a report) weakens it.
+ */
+export const EXECUTION_EVIDENCE_TYPES: ReadonlySet<string> = new Set(['test-result', 'api-response', 'metric', 'coverage', 'mutation-result', 'trace', 'database-snapshot', 'pcap', 'screenshot', 'video']);
+
+function coverageRatio(v: number | undefined): number | undefined {
+  return v === undefined ? undefined : v > 1 ? v / 100 : v;
+}
+
+/**
+ * (conformance-9) The fields in which `effective` is WEAKER than `base` (DEFAULT_GATE_SPEC ⊕ configuration), each as
+ * `field: base → effective`. Weaker means the effective gate would pass something the base would not:
+ *  - failOnUnresolvedSeverity lowered (P1 → P0: fewer unresolved findings fail), conditionalOnRiskLevel raised;
+ *  - requireDeterministicForCritical / requireIndependentReview disabled, requireOracle set to false;
+ *  - a minCoverage threshold lowered or removed;
+ *  - required evidence removed: every base requirement must be matched by a distinct effective requirement with at least
+ *    its minCount and the same type (or both deterministic execution evidence types: EXECUTION_EVIDENCE_TYPES).
+ * Both specs must be well formed (gateSpecProblems); a stricter or merely re-labelled gate yields [].
+ */
+export function gateWeakenings(base: GateSpec, effective: GateSpec): string[] {
+  const out: string[] = [];
+  const j = (v: unknown) => JSON.stringify(v ?? null);
+  const bSev = SEVERITY_ORDER[base.failOnUnresolvedSeverity];
+  const eSev = SEVERITY_ORDER[effective.failOnUnresolvedSeverity];
+  if (bSev !== undefined && eSev !== undefined && eSev < bSev) out.push(`failOnUnresolvedSeverity: ${base.failOnUnresolvedSeverity} → ${effective.failOnUnresolvedSeverity} (fewer unresolved findings fail the gate)`);
+  const bRisk = RISK_ORDER[base.conditionalOnRiskLevel];
+  const eRisk = RISK_ORDER[effective.conditionalOnRiskLevel];
+  if (bRisk !== undefined && eRisk !== undefined && eRisk > bRisk) out.push(`conditionalOnRiskLevel: ${base.conditionalOnRiskLevel} → ${effective.conditionalOnRiskLevel} (fewer open risks make the verdict conditional)`);
+  for (const k of ['requireDeterministicForCritical', 'requireIndependentReview'] as const) {
+    if (base[k] === true && effective[k] !== true) out.push(`${k}: true → ${j(effective[k])}`);
+  }
+  if (base.requireOracle !== false && effective.requireOracle === false) out.push(`requireOracle: ${j(base.requireOracle ?? true)} → false`);
+  for (const k of ['lines', 'branches'] as const) {
+    const b = coverageRatio(base.minCoverage?.[k]);
+    const e = coverageRatio(effective.minCoverage?.[k]);
+    if (b !== undefined && b > 0 && (e === undefined || e < b)) out.push(`minCoverage.${k}: ${j(base.minCoverage?.[k])} → ${j(effective.minCoverage?.[k])}`);
+  }
+  // required evidence: a maximum bipartite matching of base requirements onto effective ones (Kuhn)
+  const B = base.requiredEvidence ?? [];
+  const E = effective.requiredEvidence ?? [];
+  const covers = (e: (typeof E)[number], b: (typeof B)[number]) =>
+    e.minCount >= b.minCount && (e.evidenceType === b.evidenceType || (EXECUTION_EVIDENCE_TYPES.has(e.evidenceType) && EXECUTION_EVIDENCE_TYPES.has(b.evidenceType)));
+  const owner: number[] = E.map(() => -1);
+  const assign = (bi: number, seen: boolean[]): boolean => {
+    for (let ei = 0; ei < E.length; ei++) {
+      if (seen[ei] || !covers(E[ei]!, B[bi]!)) continue;
+      seen[ei] = true;
+      if (owner[ei] === -1 || assign(owner[ei]!, seen)) {
+        owner[ei] = bi;
+        return true;
+      }
+    }
+    return false;
+  };
+  for (let bi = 0; bi < B.length; bi++) {
+    if (!assign(bi, E.map(() => false))) out.push(`requiredEvidence: ${B[bi]!.minCount}× ${B[bi]!.evidenceType} is no longer required (${E.length === 0 ? 'none required' : `required: ${E.map((e) => `${e.minCount}× ${e.evidenceType}`).join(', ')}`})`);
+  }
+  return out;
+}
+
+/** (conformance-9) The actor kinds that may authorize a weakened gate: a human or a system, never an agent. */
+export const GATE_AUTHORITY_KINDS: ReadonlySet<string> = new Set(['human', 'system']);
+
+/** What the gate path makes of a run's recorded gate authority (see authorizedGateWeakenings). */
+export interface GateAuthorityJudgement {
+  /** The recorded authority, when it is a well-formed human/system authority with a rationale. */
+  authority?: { by: ActorRef; rationale: string };
+  /** Weakenings of the effective gate that the recorded authority covers. */
+  authorized: string[];
+  /** Weakenings of the effective gate that no recorded authority covers (they withhold the verdict). */
+  unauthorized: string[];
+}
+
+/**
+ * (conformance-9, the gate side) Judges the effective gate against its reference — the base recorded with the run's gate
+ * (DEFAULT_GATE_SPEC ⊕ configuration at start), else the current configured base — and the recorded authority: a
+ * weakening is authorized only when a well-formed human/system authority is recorded AND it is one of the weakenings that
+ * authority was given for (a gate weakened further after the fact, or an authority whose record is not human/system with
+ * a rationale, authorizes nothing). Pure.
+ */
+export function authorizedGateWeakenings(
+  reference: GateSpec,
+  effective: GateSpec,
+  recorded: { by?: ActorRef; rationale?: string; weakened?: readonly string[] } | undefined,
+): GateAuthorityJudgement {
+  const weakened = gateWeakenings(reference, effective);
+  const by = recorded?.by;
+  const valid =
+    by !== undefined && by !== null && typeof by === 'object' && typeof by.kind === 'string' && GATE_AUTHORITY_KINDS.has(by.kind) && typeof by.id === 'string' && by.id.trim() !== '' &&
+    typeof recorded?.rationale === 'string' && recorded.rationale.trim() !== '';
+  if (!valid) return { authorized: [], unauthorized: weakened };
+  const covered = new Set(Array.isArray(recorded!.weakened) ? recorded!.weakened : []);
+  return { authority: { by: by!, rationale: recorded!.rationale! }, authorized: weakened.filter((w) => covered.has(w)), unauthorized: weakened.filter((w) => !covered.has(w)) };
+}
+
+/**
+ * The reference a run's gate is judged against at the gate (conformance-9): the base recorded with it at start, else the
+ * configured base DEFAULT_GATE_SPEC ⊕ `defaultGate` (DEFAULT_GATE_SPEC when that is unusable) — never nothing.
+ */
+export function gateReference(recordedBase: GateSpec | undefined, defaultGate: Partial<GateSpec> | undefined, defaults: GateSpec): GateSpec {
+  if (recordedBase !== undefined) return recordedBase;
+  const configured = mergeDefined<GateSpec>(defaults, defaultGate);
+  return gateSpecProblems(configured).length === 0 ? configured : defaults;
 }
 
 /** A work item budget: DEFAULT_WORK_BUDGET ⊕ role default ⊕ overrides. */

@@ -1,6 +1,6 @@
 export * from './contracts.ts';
 export { contextMigrations } from './migrations.ts';
-export { createSnapshotStore, createSnapshotBuilder, snapshotIdFor, environmentVersion, validateReadSetEntry, type SnapshotContent } from './snapshots.ts';
+export { createSnapshotStore, createSnapshotBuilder, snapshotIdFor, environmentVersion, validateReadSetEntry, DEFAULT_MAX_OBSERVED_ENTRIES, type SnapshotContent } from './snapshots.ts';
 export {
   createResolverRegistry,
   functionResolver,
@@ -10,7 +10,22 @@ export {
   recordResolver,
   leaseResolver,
   fileResolver,
+  workspaceFileResolver,
 } from './resolvers.ts';
+export {
+  createObservationLog,
+  observationsOf,
+  observeToolRuntime,
+  observationEntry,
+  metricWindowMs,
+  workspaceFileId,
+  ABSENT_VERSION,
+  DEFAULT_METRIC_WINDOW_MS,
+  type ObservedToolCall,
+  type ObservedToolResult,
+  type ObservationPorts,
+  type ObserveToolRuntimeOptions,
+} from './observations.ts';
 export { createFreshnessGuard, resourceMatches, pinnedEntries, ALWAYS_CHECKED_TYPES, type FreshnessGuardDeps } from './freshness.ts';
 export { PromptAssembler, PROTOCOL_HEADER, CONTEXT_HEADER, TRUNCATION_MARKER } from './assembler.ts';
 export {
@@ -18,15 +33,17 @@ export {
   deterministicSummarizer,
   offloadToolResult,
   cleanCut,
+  softCondensationDue,
   CONDENSE_INSTRUCTIONS,
   SUMMARY_PREFIX,
   type OffloadArtifactStore,
 } from './working.ts';
 export { extractEvidenceIds, extractRecordIds, tokenize, truncateToTokens, resolveLimit } from './util.ts';
 export { ExactSearch, findRipgrep } from './retrieval/exact.ts';
-export { SymbolIndex, extractSymbols, languageOf } from './retrieval/symbols.ts';
+export { SymbolIndex, extractSymbols, languageOf, classifyUsage, extractImports, resolveImport } from './retrieval/symbols.ts';
 export { HashEmbedder, InMemoryVectorIndex, createPgVectorIndex, cosine } from './retrieval/vector.ts';
 export { HybridRetriever, hitKey } from './retrieval/hybrid.ts';
+export { VectorCorpusCache, WorkspaceVectorRetriever, chunkText, gitHeadCommit, type CodeChunk, type WorkspaceVectorOptions } from './retrieval/workspace-vector.ts';
 export { classifyPath, globToRegExp, compileGlobs } from './retrieval/files.ts';
 export {
   createExperienceStore,

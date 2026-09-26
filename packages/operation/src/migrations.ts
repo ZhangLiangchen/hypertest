@@ -10,6 +10,8 @@ import type { Migration } from '@hypertest/core';
  * - ht_admission_lock + ht_resource_claims: experiment isolation claims, admitted under one lock row.
  * - ht_budget_scopes + ht_budget_reservations: budget leases (reserve → settle | release).
  * - 005: ht_budget_reservations.idempotency_key (unique when set): a keyed charge is recorded once.
+ * - 006 (conformance-6): ht_operations.experiment_id — the experiment an operation ran for (NULL: none).
+ * - 007 (conformance-5): index of open reservations by status + creation (openReservations / QPS sweeps).
  */
 export const operationMigrations: Migration[] = [
   {
@@ -112,6 +114,19 @@ CREATE INDEX ht_budget_reservations_status_idx ON ht_budget_reservations (status
     sql: `
 ALTER TABLE ht_budget_reservations ADD COLUMN idempotency_key text;
 CREATE UNIQUE INDEX ht_budget_reservations_idempotency_uq ON ht_budget_reservations (idempotency_key) WHERE idempotency_key IS NOT NULL;
+`,
+  },
+  {
+    id: 'operation/006-operation-experiment',
+    sql: `
+ALTER TABLE ht_operations ADD COLUMN experiment_id text;
+CREATE INDEX ht_operations_run_experiment_idx ON ht_operations (run_id, experiment_id) WHERE experiment_id IS NOT NULL;
+`,
+  },
+  {
+    id: 'operation/007-open-reservations',
+    sql: `
+CREATE INDEX ht_budget_reservations_open_idx ON ht_budget_reservations (created_at, reservation_id) WHERE status = 'reserved';
 `,
   },
 ];

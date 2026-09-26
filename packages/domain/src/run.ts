@@ -42,7 +42,12 @@ export const DEFAULT_BUDGET: BudgetEnvelope = {
 };
 
 export type RunStatus = 'created' | 'running' | 'paused' | 'converging' | 'gating' | 'completed' | 'failed' | 'cancelled';
-export type PauseReason = 'budget' | 'approval' | 'manual_review' | 'operator' | 'model_unavailable';
+/**
+ * (additive) `quarantined`: the runtime release the run is pinned to was rolled back — it stays paused until it is
+ * migrated to a good release (`hypertest runtime migrate`) or cancelled. `migrating`: the checkpoint of an explicit runtime
+ * migration (the run is resumed by the migration).
+ */
+export type PauseReason = 'budget' | 'approval' | 'manual_review' | 'operator' | 'model_unavailable' | 'quarantined' | 'migrating';
 
 export interface ProtocolBindingRef {
   protocolId: string;
@@ -57,7 +62,10 @@ export interface TestRun {
   status: RunStatus;
   pauseReason?: PauseReason;
   budget: BudgetEnvelope;
-  /** Pinned at creation; never changes for a live run (I11). */
+  /**
+   * Pinned at creation; never changes for a live run (I11) — except through an explicit, audited runtime migration
+   * (a RuntimeEpoch + `run.migrated` on L0), never as a hot swap.
+   */
   runtimeManifestId: string;
   policyRevision: string;
   protocolBinding?: ProtocolBindingRef;

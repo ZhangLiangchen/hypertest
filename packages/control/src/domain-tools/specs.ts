@@ -1,13 +1,14 @@
 import { readFile } from 'node:fs/promises';
 import { canonicalJson, sha256Hex, type JsonSchema, type JsonValue } from '@hypertest/core';
 import {
-  ORACLE_CHANGE_INPUT_SCHEMA, SYSTEM_MODEL_INPUT_SCHEMA, TEST_ARTIFACT_INPUT_SCHEMA,
-  type ComponentModel, type DependencyEdge, type EnvironmentRef, type EvidenceRecord, type EvidenceRequirement, type ExperimentSpec, type FaultSpec,
-  type InterfaceModel, type OracleAssertion, type ResourceClaim, type RunnerSpec, type StateMachineModel, type TestArtifact, type TestValidation,
+  EVENT_TYPES, ORACLE_CHANGE_INPUT_SCHEMA, SYSTEM_MODEL_INPUT_SCHEMA, TEST_ARTIFACT_INPUT_SCHEMA,
+  type ComponentModel, type ContaminationRule, type DependencyEdge, type EnvironmentRef, type EvidenceRecord, type EvidenceRequirement, type ExperimentSpec, type FaultSpec,
+  type InterfaceModel, type OracleAssertion, type ResourceClaim, type RunnerSpec, type StateMachineModel, type StopCondition, type TestArtifact, type TestValidation,
   type WorkloadSpec,
 } from '@hypertest/domain';
 import type { ToolSpec } from '@hypertest/tools';
 import type { ControlDeps } from '../deps.ts';
+import { event } from '../util.ts';
 import { Caller, checkEvidence, domainTool, refuse, success } from './common.ts';
 
 interface SystemModelInput {
@@ -36,6 +37,68 @@ interface ExperimentInput {
   isolation?: ExperimentSpec['isolation'];
   evidenceRequirements?: EvidenceRequirement[];
   oracleRefs?: Array<{ oracleId: string; revision: number }>;
+  /** (additive, conformance-6) Fixture references (datasets, seeds files, accounts pools) the experiment uses. */
+  fixtures?: string[];
+  /** (additive, conformance-6) Random seeds; one is generated (retry-stable) and recorded when absent. */
+  randomSeeds?: string[];
+  /** (additive, conformance-6) When the experiment stops; derived from the workload when absent. */
+  stopConditions?: StopCondition[];
+  /** (additive, conformance-6) Contamination rules; derived from the admitted claims when absent. */
+  contaminationRules?: ContaminationRule[];
+}
+
+type Isolation = ExperimentSpec['isolation'];
+
+/**
+ * (conformance-6) The isolation an experiment is admitted with. Without claims, defaults derive from what it does to its
+ * environment `env/<environmentId>` (the key black-box tools act on): a fault plan ⇒ fault_exclusive, a workload or an
+ * exclusive/dedicated mode ⇒ write_exclusive, else read_shared. Declared claims must cover what the experiment does:
+ * a fault plan needs a fault_exclusive claim, a workload a write/fault claim; shared_readonly holds only read_shared
+ * claims and runs neither. Never weakened: a problem refuses the definition.
+ */
+export function experimentIsolation(input: Pick<ExperimentInput, 'isolation' | 'faultPlan' | 'workload'>, environment: EnvironmentRef): { ok: true; isolation: Isolation } | { ok: false; problem: string } {
+  const faults = (input.faultPlan ?? []).length > 0;
+  const writes = faults || input.workload !== undefined;
+  const mode: Isolation['mode'] = input.isolation?.mode ?? (writes ? 'exclusive_write' : 'shared_readonly');
+  if (writes && mode === 'shared_readonly') return { ok: false, problem: `isolation mode shared_readonly cannot run a ${faults ? 'fault plan' : 'workload'}; use exclusive_write or dedicated_environment with ${faults ? 'fault_exclusive' : 'write_exclusive'} claims` };
+  const declared = input.isolation?.resourceClaims ?? [];
+  let claims: ResourceClaim[];
+  if (declared.length === 0) {
+    claims = [{ resourceKey: `env/${environment.environmentId}`, mode: faults ? 'fault_exclusive' : mode === 'shared_readonly' ? 'read_shared' : 'write_exclusive' }];
+  } else {
+    if (faults && !declared.some((c) => c.mode === 'fault_exclusive')) return { ok: false, problem: 'a fault plan needs a fault_exclusive resource claim on the resources the faults hit' };
+    if (writes && !declared.some((c) => c.mode !== 'read_shared')) return { ok: false, problem: 'a workload needs a write_exclusive (or fault_exclusive) resource claim on the resources it loads' };
+    if (mode === 'shared_readonly' && declared.some((c) => c.mode !== 'read_shared')) return { ok: false, problem: 'isolation mode shared_readonly can only hold read_shared claims' };
+    const seen = new Set<string>();
+    claims = [];
+    for (const c of declared) {
+      const k = `${c.resourceKey}\u0000${c.mode}\u0000${c.quantity ?? ''}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      claims.push(c.quantity === undefined ? { resourceKey: c.resourceKey, mode: c.mode } : { resourceKey: c.resourceKey, mode: c.mode, quantity: c.quantity });
+    }
+  }
+  return { ok: true, isolation: { mode, resourceClaims: claims } };
+}
+
+/** (conformance-6) Stop conditions when none are given: the workload's duration; a manual stop for open-ended load or faults. */
+export function defaultStopConditions(input: Pick<ExperimentInput, 'workload' | 'faultPlan'>): StopCondition[] {
+  if (input.workload?.durationMs !== undefined) return [{ kind: 'duration', value: input.workload.durationMs }];
+  if (input.workload !== undefined || (input.faultPlan ?? []).length > 0) return [{ kind: 'manual' }];
+  return [];
+}
+
+/** (conformance-6) Contamination rules when none are given: the admitted claims, enforced by admission while held. */
+export function defaultContaminationRules(isolation: Isolation): ContaminationRule[] {
+  const keys = [...new Set(isolation.resourceClaims.map((c) => c.resourceKey))].sort();
+  if (keys.length === 0) return [];
+  const exclusive = isolation.resourceClaims.some((c) => c.mode !== 'read_shared');
+  return [{
+    description: exclusive
+      ? `admission-enforced: while this experiment holds its claims, no other experiment or work item may use ${keys.join(', ')}`
+      : `admission-enforced: while this experiment holds its claims, no other experiment or work item may write to, load or inject faults into ${keys.join(', ')}`,
+    exclusiveResources: keys,
+  }];
 }
 
 interface RegisterInput {
@@ -59,6 +122,20 @@ const EVIDENCE_REQUIREMENT_SCHEMA = {
   additionalProperties: false,
   required: ['evidenceType', 'minCount'],
   properties: { evidenceType: { type: 'string', minLength: 1 }, minCount: { type: 'integer', minimum: 1 }, description: { type: 'string' }, critical: { type: 'boolean' } },
+} as const;
+
+const STOP_CONDITION_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['kind'],
+  properties: { kind: { type: 'string', enum: ['duration', 'error_rate_above', 'metric_threshold', 'manual'] }, value: { type: 'number' }, metric: { type: 'string', minLength: 1 } },
+} as const;
+
+const CONTAMINATION_RULE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['description', 'exclusiveResources'],
+  properties: { description: { type: 'string', minLength: 1 }, exclusiveResources: { type: 'array', items: { type: 'string', minLength: 1 } } },
 } as const;
 
 const RESOURCE_CLAIM_SCHEMA = {
@@ -149,13 +226,21 @@ function failedCases(e: EvidenceRecord): number {
   return Array.isArray(cases) ? cases.filter((c) => c && typeof c === 'object' && !Array.isArray(c) && (c as Record<string, JsonValue>)['status'] === 'failed').length : 0;
 }
 
+/** What experiment.define returns (also for a replayed call). */
+function experimentSummary(e: ExperimentSpec): Record<string, unknown> {
+  return {
+    experimentId: e.experimentId, revision: e.revision, environment: e.environment, isolation: e.isolation, fixtures: e.fixtures, randomSeeds: e.randomSeeds,
+    stopConditions: e.stopConditions, contaminationRules: e.contaminationRules,
+  };
+}
+
 /** An id derived from the tool invocation: a replayed call (crash before the call settled) addresses the same object. */
 function retryStableId(prefix: string, runId: string, invocationId: string): string {
   return `${prefix}_${sha256Hex(`${runId}\u0000${invocationId}`).slice(0, 26)}`;
 }
 
 export function specTools(deps: ControlDeps): ToolSpec[] {
-  const { specs, runs, oracles, environments, artifacts, workspaces } = deps;
+  const { specs, runs, oracles, environments, workspaces, admission, events } = deps;
 
   return [
     domainTool<SystemModelInput>({
@@ -251,7 +336,8 @@ export function specTools(deps: ControlDeps): ToolSpec[] {
     domainTool<ExperimentInput>({
       id: 'experiment.define',
       title: 'Define an experiment',
-      description: 'Define an ExperimentSpec (hypothesis, environment, workload, fault plan, isolation with resource claims, evidence requirements, oracle refs) before any load, fault or performance run. Subjects come from the run target.',
+      description:
+        'Define an ExperimentSpec (hypothesis, environment, workload, fault plan, isolation with resource claims, fixtures, random seeds, stop conditions, contamination rules, evidence requirements, oracle refs) before any load, fault or performance run. Subjects, environment generation and build digest come from the run and its registered environment. The isolation claims are ADMITTED atomically for the experiment (default: env/<environmentId> — fault_exclusive for a fault plan, write_exclusive for a workload, else read_shared): if another experiment or work item holds conflicting claims the experiment is NOT created and the conflicting holders are returned. Work items that declare the experiment (inputRefs kind experiment) may run write/fault tools only while its claims are held.',
       inputSchema: {
         type: 'object',
         additionalProperties: false,
@@ -288,6 +374,10 @@ export function specTools(deps: ControlDeps): ToolSpec[] {
             type: 'array',
             items: { type: 'object', additionalProperties: false, required: ['oracleId', 'revision'], properties: { oracleId: { type: 'string' }, revision: { type: 'integer', minimum: 1 } } },
           },
+          fixtures: { type: 'array', items: { type: 'string', minLength: 1 } },
+          randomSeeds: { type: 'array', items: { type: 'string', minLength: 1 } },
+          stopConditions: { type: 'array', items: STOP_CONDITION_SCHEMA },
+          contaminationRules: { type: 'array', items: CONTAMINATION_RULE_SCHEMA },
         },
       } as JsonSchema,
       area: 'experiments',
@@ -297,10 +387,12 @@ export function specTools(deps: ControlDeps): ToolSpec[] {
         const envId = input.environmentId ?? run.target.environmentId;
         let environment: EnvironmentRef = { environmentId: envId ?? 'local', environmentClass: 'local', generation: 0 };
         if (envId !== undefined) {
-          const env = environments.get(envId);
+          // the authoritative generation (shared SQL registry when present): the experiment records what it runs against
+          const env = (environments.load ? await environments.load(envId) : undefined) ?? environments.get(envId);
           if (!env) return refuse('not_found', `environment ${envId} is not registered`);
           environment = { environmentId: env.environmentId, environmentClass: env.environmentClass, generation: env.generation };
           if (env.buildDigest !== undefined) environment.buildDigest = env.buildDigest;
+          if (env.control?.target !== undefined) environment.topologyRef = `${env.control.kind}:${env.control.target}${env.control.namespace ? `/${env.control.namespace}` : ''}`;
         }
         const oracleRefs = input.oracleRefs ?? Object.entries(run.oracleRevisions).map(([oracleId, revision]) => ({ oracleId, revision }));
         for (const ref of oracleRefs) {
@@ -311,7 +403,25 @@ export function specTools(deps: ControlDeps): ToolSpec[] {
         // retry-stable id: a replayed call returns the experiment it already defined
         const experimentId = retryStableId('exp', ctx.runId, ctx.invocationId);
         const known = await specs.getExperiment(experimentId);
-        if (known) return success({ experimentId: known.experimentId, revision: known.revision, environment: known.environment });
+        if (known) return success(experimentSummary(known));
+        const iso = experimentIsolation(input, environment);
+        if (!iso.ok) return refuse('isolation_insufficient', `experiment not created: ${iso.problem}`);
+        const isolation = iso.isolation;
+        // conformance-6: the claims are admitted atomically BEFORE the experiment exists (holder = experimentId); a
+        // conflicting holder refuses it — two experiments never invalidate each other's results
+        const claims = isolation.resourceClaims;
+        const request = { holderId: experimentId, runId: run.runId, claims, ttlMs: deps.config.leaseTtlMs ?? 60_000, compatibleHolders: [ctx.workItemId] };
+        const adm = await admission.admit(request);
+        if (!adm.admitted) {
+          const holders = [...new Set(adm.conflicts.map((c) => c.heldBy))].sort();
+          const conflicts = adm.conflicts.map((c) => ({ requested: c.requested, heldBy: c.heldBy, held: c.held }));
+          await events.append([event(ctx.eventContext, EVENT_TYPES.admissionRefused, 'experiment', experimentId, { experimentId, conflicts: conflicts.map((c) => `${c.requested.resourceKey}@${c.heldBy}`).sort(), claims })]);
+          return refuse(
+            'resource_conflict',
+            `experiment not created: its isolation claims conflict with claims held by ${holders.join(', ')} (${conflicts.map((c) => `${c.requested.mode}(${c.requested.resourceKey}) vs ${c.held.mode}(${c.held.resourceKey}) of ${c.heldBy}`).join('; ')}). Wait for them to end, or define an experiment on other resources.`,
+            { admitted: false, holders, conflicts } as unknown as JsonValue,
+          );
+        }
         const spec: Omit<ExperimentSpec, 'revision' | 'createdAt' | 'supersedes'> = {
           experimentId,
           runId: run.runId,
@@ -319,20 +429,29 @@ export function specTools(deps: ControlDeps): ToolSpec[] {
           hypothesis: input.hypothesis,
           subjects: [subject],
           environment,
-          fixtures: [],
+          fixtures: [...new Set(input.fixtures ?? [])],
           faultPlan: input.faultPlan ?? [],
-          randomSeeds: [],
-          isolation: input.isolation ?? { mode: 'shared_readonly', resourceClaims: [] as ResourceClaim[] },
+          // recorded, never empty: a generated seed is derived from the (retry-stable) invocation
+          randomSeeds: input.randomSeeds !== undefined && input.randomSeeds.length > 0 ? [...input.randomSeeds] : [sha256Hex(`${ctx.runId}\u0000${ctx.invocationId}\u0000seed`).slice(0, 16)],
+          isolation,
           evidenceRequirements: input.evidenceRequirements ?? [],
-          stopConditions: [],
-          contaminationRules: [],
+          stopConditions: input.stopConditions ?? defaultStopConditions(input),
+          contaminationRules: input.contaminationRules ?? defaultContaminationRules(isolation),
           createdBy: ctx.agentId,
         };
         if (input.workload !== undefined) spec.workload = input.workload;
         if (run.systemModelRevision !== undefined) spec.systemModelRevision = run.systemModelRevision;
-        const saved = await specs.saveExperiment(spec, ctx.eventContext);
-        await runs.update(run.runId, { experimentIds: [...new Set([...run.experimentIds, saved.experimentId])] }, ctx.eventContext);
-        return success({ experimentId: saved.experimentId, revision: saved.revision, environment: saved.environment });
+        let saved: ExperimentSpec;
+        try {
+          saved = await specs.saveExperiment(spec, ctx.eventContext);
+          await runs.update(run.runId, { experimentIds: [...new Set([...run.experimentIds, saved.experimentId])] }, ctx.eventContext);
+        } catch (e) {
+          // not created: its claims must not outlive it
+          await admission.release(experimentId).catch(() => undefined);
+          throw e;
+        }
+        await events.append([event(ctx.eventContext, EVENT_TYPES.admissionGranted, 'experiment', experimentId, { experimentId, claims, holderId: experimentId, workItemId: ctx.workItemId })]);
+        return success(experimentSummary(saved));
       },
     }),
 
@@ -354,7 +473,8 @@ export function specTools(deps: ControlDeps): ToolSpec[] {
         } catch {
           return refuse('not_found', `test file ${path} does not exist in your workspace`);
         }
-        const ref = await artifacts.put(content, { mimeType: 'text/plain' });
+        // through the call's (metered, budget-bounded) artifact store (conformance-5)
+        const ref = await ctx.artifacts.put(content, { mimeType: 'text/plain' });
         const epoch = await caller.epoch();
         // A test written in this run is never "existing": designers' artifacts are generated (or repaired/mutated).
         const sourceType: TestArtifact['sourceType'] = ctx.role === 'test_designer' && input.sourceType === 'existing' ? 'generated' : input.sourceType;

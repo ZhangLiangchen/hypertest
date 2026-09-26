@@ -128,6 +128,7 @@ export function createWorkingContextManager(options: WorkingContextOptions = {})
   }
 
   return {
+    options: Object.freeze({ ...o }),
     view,
     async condense(input) {
       if (input.level !== 'soft' && input.level !== 'hard') throw new HypertestError('invalid_argument', 'level must be soft or hard');
@@ -194,6 +195,21 @@ export function createWorkingContextManager(options: WorkingContextOptions = {})
       };
     },
   };
+}
+
+/**
+ * SOFT condensation is due (deferrable, never mandatory) when at least `keepRecentTurns + 2` turns lie beyond the last
+ * compaction's cut (or since the start): a soft pass then condenses ≥ 2 turns and keeps `keepRecentTurns` verbatim, so
+ * the view never churns one turn at a time. HARD pressure does not ask this: it is always mandatory.
+ */
+export function softCondensationDue(input: { transcript: readonly TranscriptEntry[]; compactions: readonly Compaction[] }, keepRecentTurns: number): boolean {
+  const transcript = input.transcript ?? [];
+  if (transcript.length === 0) return false;
+  // a loop, not Math.max(...turns): a long session's transcript would overflow the call stack
+  let maxTurn = -Infinity;
+  for (const e of transcript) if (e.turn > maxTurn) maxTurn = e.turn;
+  const lastCut = (input.compactions ?? []).at(-1)?.upToTurn ?? -1;
+  return maxTurn - lastCut >= keepRecentTurns + 2;
 }
 
 function firstSentence(text: string, max = 200): string {

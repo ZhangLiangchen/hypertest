@@ -37,7 +37,7 @@ export const ROUTE_DEFAULTS = Object.freeze({
 
 const TOP_LEVEL_KEYS = new Set([
   'version', 'project', 'store', 'bus', 'durable', 'artifacts', 'models', 'roles', 'budget', 'gate', 'policy', 'bugate', 'engines', 'sandbox',
-  'environments', 'tools', 'signing', 'memory', 'observability', 'oracles',
+  'environments', 'tools', 'signing', 'memory', 'observability', 'oracles', 'runtime',
 ]);
 /** Discriminated sections: a patch with another `kind` replaces the section instead of merging into it. */
 const KIND_SECTIONS = new Set(['store', 'bus', 'durable', 'artifacts', 'memory']);
@@ -526,6 +526,11 @@ function validateSections(errors: Errors, c: Record<string, unknown>): void {
       if ((artifacts['accessKeyIdEnv'] === undefined) !== (artifacts['secretAccessKeyEnv'] === undefined)) errors.push('artifacts: set both accessKeyIdEnv and secretAccessKeyEnv, or neither (default AWS credential chain)');
       if (artifacts['forcePathStyle'] !== undefined && typeof artifacts['forcePathStyle'] !== 'boolean') errors.push('artifacts.forcePathStyle must be a boolean');
     }
+  }
+  const runtime = c['runtime'];
+  if (runtime !== undefined && objectAt(errors, 'runtime', runtime, false)) {
+    unknownKeys(errors, 'runtime', runtime, ['requireActiveRelease']);
+    if (runtime['requireActiveRelease'] !== undefined && typeof runtime['requireActiveRelease'] !== 'boolean') errors.push('runtime.requireActiveRelease must be a boolean');
   }
   const memory = c['memory'];
   if (memory !== undefined && objectAt(errors, 'memory', memory, false) && oneOf(errors, 'memory.kind', memory['kind'], ['sql', 'powercontext'])) {

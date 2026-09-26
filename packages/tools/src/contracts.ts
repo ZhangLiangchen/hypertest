@@ -1,5 +1,5 @@
 import type { BaseDeps, Clock, JsonSchema, JsonValue, Logger, SqlDatabase } from '@hypertest/core';
-import type { ActionCapability, ArtifactRef, ContextSnapshot, DomainEventSink, EventContext, EvidenceInput, EvidenceRecord, EvidenceType, ResourceRef, RiskClass, ToolDefinition, ToolEffect } from '@hypertest/domain';
+import type { ActionCapability, ArtifactRef, ContextSnapshot, DomainEventSink, EventContext, EvidenceInput, EvidenceRecord, EvidenceType, Provenance, ResourceRef, RiskClass, ToolDefinition, ToolEffect } from '@hypertest/domain';
 import type { ArtifactStore, EvidenceLedger } from '@hypertest/evidence';
 import type { SideEffectAdapter, SideEffectGateway } from '@hypertest/operation';
 import type { ActionPermit, PolicyDecisionLog, PolicyEngine } from '@hypertest/policy';
@@ -82,6 +82,8 @@ export interface ToolContext {
    * the call was in flight never writes.
    */
   claim?: ToolClaim;
+  /** (additive, conformance-6) `ToolExecutionRequest.experimentId`. */
+  experimentId?: string;
 }
 
 /** (additive) A work-item claim a tool call runs under: the claim lease's fencing token (and lease id / holder). */
@@ -178,6 +180,31 @@ export interface ToolExecutionRequest {
    * the tool as `ToolContext.claim` so tools that record effects re-check it right before writing.
    */
   claim?: ToolClaim;
+  /**
+   * (additive, conformance-6) The experiment the call runs for (the work item declared it). Recorded on every evidence
+   * record the call produces (`provenance.experimentId`, see ExperimentProvenance), on the operation of a side-effect call
+   * (`RunSideEffectRequest.experimentId`) and in `tool.called`; handed to the tool as `ToolContext.experimentId`.
+   */
+  experimentId?: string;
+  /**
+   * (additive, conformance-5) Resource bounds of this call: `maxArtifactBytes` — the artifact budget left to the caller; a
+   * put that would exceed it is refused (`budget_exhausted`), nothing is stored.
+   */
+  limits?: { maxArtifactBytes?: number };
+}
+
+/** (additive, conformance-5) Resources a call consumed: sandbox process wall time and bytes stored (distinct objects). */
+export interface ToolUsage {
+  computeMs: number;
+  artifactBytes: number;
+}
+
+/**
+ * (additive, conformance-6) Evidence provenance of a call made for an experiment. The runtime records `experimentId` in
+ * the (hash-chained) provenance of every evidence record the call produces; read it with `evidenceExperimentId(record)`.
+ */
+export interface ExperimentProvenance extends Provenance {
+  experimentId?: string;
 }
 
 export interface ToolExecutionResult {
@@ -193,6 +220,8 @@ export interface ToolExecutionResult {
   permit?: ActionPermit;
   durationMs: number;
   error?: { code: string; message: string };
+  /** (additive, conformance-5) What the call consumed (zero for calls that never executed). */
+  usage?: ToolUsage;
 }
 
 /** Structural freshness port (implemented by @hypertest/context FreshnessGuard). */

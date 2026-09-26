@@ -79,3 +79,52 @@ test('decisions: immutable except the one-way reassessment flag; never deleted o
   await assert.rejects(env.db.query("UPDATE ht_decisions SET reassessment_reason = 'nothing happened' WHERE decision_id = 'qd_ao'"), APPEND_ONLY);
   assert.equal((await env.decisions.get('qd_ao'))!.verdict, 'fail');
 });
+
+test('L0 delivery records: an outbox row is immutable except its one-way delivery mark; only delivered rows may be pruned', async () => {
+  const runId = 'ao-outbox';
+  const [e] = await env.events.append([{ runId, eventType: 'finding.created', aggregateType: 'record', aggregateId: 'rec_ao', correlationId: 'c', actorId: 'system', payload: { severity: 'P1' } }]);
+  assert.ok(e);
+  const row = async () =>
+    (await env.db.query<{ id: unknown; subject: string; envelope: unknown; sent_at: unknown }>('SELECT id, subject, envelope, sent_at FROM ht_outbox WHERE event_id = $1', [e.eventId])).rows[0];
+  const before = await row();
+  assert.ok(before, 'the event has its outbox row');
+  assert.equal(before.sent_at, null);
+  // tampering with what is (or will be) delivered is refused: envelope, subject, event id, id, creation time
+  await assert.rejects(env.db.query(`UPDATE ht_outbox SET envelope = jsonb_set(envelope, '{data,payload,severity}', '"P4"') WHERE event_id = $1`, [e.eventId]), APPEND_ONLY, 'envelope rewrite');
+  await assert.rejects(env.db.query("UPDATE ht_outbox SET subject = 'ht.other.run.completed' WHERE event_id = $1", [e.eventId]), APPEND_ONLY, 'subject rewrite');
+  await assert.rejects(env.db.query("UPDATE ht_outbox SET event_id = 'evt_forged' WHERE event_id = $1", [e.eventId]), APPEND_ONLY, 'event id rewrite');
+  await assert.rejects(env.db.query("UPDATE ht_outbox SET created_at = '2020-01-01T00:00:00Z' WHERE event_id = $1", [e.eventId]), APPEND_ONLY, 'created_at rewrite');
+  await assert.rejects(env.db.query("UPDATE ht_outbox SET sent_at = '2026-01-01T00:00:00Z', envelope = '{}'::jsonb WHERE event_id = $1", [e.eventId]), APPEND_ONLY, 'piggy-backing on the delivery mark');
+  // an unsent event can never be dropped before it propagated, and the table cannot be truncated
+  await assert.rejects(env.db.query('DELETE FROM ht_outbox WHERE event_id = $1', [e.eventId]), APPEND_ONLY, 'delete unsent');
+  await assert.rejects(env.db.query('TRUNCATE ht_outbox'), APPEND_ONLY, 'truncate');
+  assert.deepEqual(await row(), before, 'the row is untouched');
+  // the relay's path still works: mark sent once (NULL → timestamp) …
+  await env.db.query('UPDATE ht_outbox SET sent_at = $2 WHERE event_id = $1 AND sent_at IS NULL', [e.eventId, '2026-01-01T00:00:00Z']);
+  assert.notEqual((await row())!.sent_at, null);
+  // … never re-marked or cleared (the delivery record is one-way) …
+  await assert.rejects(env.db.query("UPDATE ht_outbox SET sent_at = '2026-02-01T00:00:00Z' WHERE event_id = $1", [e.eventId]), APPEND_ONLY, 're-mark');
+  await assert.rejects(env.db.query('UPDATE ht_outbox SET sent_at = NULL WHERE event_id = $1', [e.eventId]), APPEND_ONLY, 'clear the mark');
+  // … and a delivered row may be pruned (durability-11); the event itself stays in L0
+  await env.db.query('DELETE FROM ht_outbox WHERE event_id = $1 AND sent_at IS NOT NULL', [e.eventId]);
+  assert.equal(await row(), undefined);
+  assert.deepEqual((await env.events.read(runId)).map((x) => x.eventId), [e.eventId]);
+  // appending keeps working (new rows are inserted unsent)
+  const [e2] = await env.events.append([{ runId, eventType: 'run.completed', aggregateType: 'run', aggregateId: runId, correlationId: 'c', actorId: 'system', payload: {} }]);
+  const r2 = await env.db.query<{ sent_at: unknown }>('SELECT sent_at FROM ht_outbox WHERE event_id = $1', [e2!.eventId]);
+  assert.equal(r2.rows[0]?.sent_at, null);
+  // a row can only be born undelivered: one inserted already marked sent would never be relayed (and could then be pruned)
+  await assert.rejects(
+    env.db.query("INSERT INTO ht_outbox (event_id, subject, envelope, created_at, sent_at) VALUES ('evt_premarked', 's', '{}'::jsonb, now(), now())"),
+    APPEND_ONLY,
+    'insert pre-marked as sent',
+  );
+  // the guard covers every column but sent_at — also a column added by a later migration
+  await env.db.query('ALTER TABLE ht_outbox ADD COLUMN IF NOT EXISTS ht_test_extra text');
+  try {
+    await assert.rejects(env.db.query("UPDATE ht_outbox SET ht_test_extra = 'x' WHERE event_id = $1", [e2!.eventId]), APPEND_ONLY, 'a later column');
+    await env.db.query('UPDATE ht_outbox SET sent_at = now() WHERE event_id = $1 AND sent_at IS NULL', [e2!.eventId]);
+  } finally {
+    await env.db.query('ALTER TABLE ht_outbox DROP COLUMN IF EXISTS ht_test_extra');
+  }
+});

@@ -17,6 +17,11 @@ import { workLeaseKey } from './scheduler.ts';
 import { ControlStore, type WorkspaceQuarantine } from './store.ts';
 import { workScope } from './work-factory.ts';
 import { clip, event, maxRisk } from './util.ts';
+import { POLICY_FLAGGED_EVENT, createPhaseGovernor, flagEventId, type ActionDescription } from './phases.ts';
+import {
+  EXPERIMENT_EXEMPT_TOOLS, EXPERIMENT_GUARDED_EFFECTS, JOB_MAY_RUN, callScopes, declaredExperimentIds, exhaustedScope, experimentClaimsProblem, onToolBudgetExhausted, qpsKey,
+  settleExternalQps,
+} from './isolation.ts';
 
 /** Tools whose effect on test code is classified BEFORE they execute (I8 self-heal governance). */
 export const GOVERNED_TOOL_IDS: readonly string[] = ['fs.write', 'fs.apply_patch', 'git.commit'];
@@ -205,6 +210,7 @@ export function quarantineLifted(q: WorkspaceQuarantine, currentDiff: string): b
 export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput): ToolDispatcher {
   const { registry, toolRuntime, snapshots, sessions, budget, events, approvals, specs, workspaces, logger } = deps;
   const store = new ControlStore(deps.db);
+  const phases = createPhaseGovernor(deps, deps.config);
   const definitions = registry.definitionsFor(input.capability, input.allow, input.deny);
   const offered = new Set(definitions.map((d) => d.name));
   const productFixAuthorized = holdsProductFix(input.capability);
@@ -212,6 +218,25 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
   const driftGuarded = ws.kind === 'isolated_worktree' && !ws.readOnly && ws.baseCommit !== undefined;
   let quarantine: WorkspaceQuarantine | undefined = input.quarantine;
   let pendingGuard = input.guard;
+  /**
+   * (conformance-6) Experiments this item runs for: declared (inputRefs) + defined by this agent. `known` are experiments
+   * of this run (the only ones a call is attributed to); a declared id unknown to the run is kept in `all`, so write/fault
+   * calls fail closed on it. Reset by experiment.define.
+   */
+  let experimentsCache: { all: string[]; known: string[] } | undefined;
+
+  async function itemExperiments(): Promise<{ all: string[]; known: string[] }> {
+    if (experimentsCache === undefined) {
+      const item = await deps.blackboard.getWorkItem(input.workItemId);
+      const declared = item ? declaredExperimentIds(item) : [];
+      const ofRun = await specs.listExperiments(input.runId);
+      const defined = ofRun.filter((e) => e.createdBy === input.agentId).map((e) => e.experimentId);
+      const all = [...new Set([...declared, ...defined])];
+      const runIds = new Set(ofRun.map((e) => e.experimentId));
+      experimentsCache = { all, known: all.filter((id) => runIds.has(id)) };
+    }
+    return experimentsCache;
+  }
 
   /**
    * The requesting agent as an approval subject: role and the model provider of its current epoch — what an independent
@@ -390,10 +415,110 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
     return `[denied] ${verdict.decision === 'forbidden' ? 'forbidden' : 'unapproved'} change by ${toolId} (${verdict.categories.join(', ')}): ${verdict.findings.slice(0, 10).join('; ')}. The worktree is quarantined: test execution, commits, artifact registration and complete_work are refused until ${verdict.paths.join(', ') || 'the changed files'} are restored exactly (e.g. shell.exec git checkout -- <path>); otherwise finish with fail_work. Test and product code may only change through fs.write / fs.apply_patch (governed).`;
   }
 
+  /** How the call is classified when its before_action decision is not on record (best effort; failures fail closed). */
+  function describeAction(toolId: string, args: unknown): ActionDescription {
+    const spec = registry.get(toolId);
+    const out: ActionDescription = { effect: effectOf(toolId, args) ?? 'execute', riskClass: 'high', resources: [] };
+    if (!spec) return out;
+    try {
+      const r = typeof spec.riskClass === 'function' ? spec.riskClass(args as never) : spec.riskClass;
+      if (Object.hasOwn(RISK_ORDER, r)) out.riskClass = r;
+    } catch {
+      // unknown risk: high
+    }
+    try {
+      out.resources = spec.resources(args as never, { workspace: ws, runId: input.runId, environments: deps.environments });
+    } catch {
+      out.resources = [];
+    }
+    try {
+      const c = spec.environmentClass?.(args as never, { environments: deps.environments });
+      if (c !== undefined) out.environmentClass = c;
+    } catch {
+      // no environment class
+    }
+    return out;
+  }
+
+  /**
+   * BUGate after_action: what the executed call produced is judged (e.g. evidence of a type its tool does not declare).
+   * A flagged call gets a note in its result (the model sees why its evidence will not back a completion). The action
+   * already happened: a failure of the check never re-runs it — it is flagged instead (fail closed), best effort.
+   */
+  async function afterAction(toolId: string, invocationId: string, args: unknown, execution: Awaited<ReturnType<typeof toolRuntime.execute>>, snapshotId: string | undefined): Promise<string | undefined> {
+    try {
+      const judged = await phases.afterAction({
+        runId: input.runId, workItemId: input.workItemId, agentId: input.agentId, role: input.role, capability: input.capability, toolId, invocationId, execution,
+        eventContext: input.eventContext, ...(snapshotId !== undefined ? { snapshotId } : {}), describe: () => describeAction(toolId, args),
+      });
+      if (!judged?.flagged) return undefined;
+      return `[flagged after action by policy decision ${judged.permit.decisionId} (${judged.permit.decision}): ${judged.permit.reasons.join('; ') || 'no reason given'}${judged.facts.undeclaredEvidenceTypes.length ? `; undeclared evidence types: ${judged.facts.undeclaredEvidenceTypes.join(', ')}` : ''}. This work item can no longer complete on it.]`;
+    } catch (e) {
+      logger.error('after_action policy check failed; flagging the call (fail closed)', { toolId, invocationId, error: (e as Error).message });
+      try {
+        const eventId = flagEventId(invocationId);
+        if (!(await events.get(eventId))) {
+          await events.append([{ ...event(input.eventContext, POLICY_FLAGGED_EVENT, 'policy', invocationId, { phase: 'after_action', decision: 'deny', toolId, invocationId, reasons: [`after_action_unavailable: ${clip((e as Error).message, 500)}`] }), eventId }]);
+        }
+      } catch (inner) {
+        logger.error('the after_action flag could not be recorded', { toolId, invocationId, error: (inner as Error).message });
+      }
+      return `[flagged after action: the policy check could not be completed (${clip((e as Error).message, 300)})]`;
+    }
+  }
+
   /** A dispatcher-level refusal: the call never reaches the ToolRuntime, but it is on L0 like any tool call (I10). */
   async function deny(call: ToolCall, toolId: string, invocationId: string, errorCode: string, text: string): Promise<DispatchResult> {
     await events.append([event(input.eventContext, 'tool.denied', 'tool', invocationId, { toolId, invocationId, status: 'denied', errorCode, reason: clip(text, 2000) })]);
     return { message: toolMessage(call, text, true) };
+  }
+
+  /**
+   * (conformance-5) After a call: charge what it consumed (sandbox wall time, artifact bytes) to the work item and its
+   * run — recorded in full even past a limit — and apply the exhaustion policy; give back the QPS reservation of a
+   * load.start whose job does not run, and of jobs load.observe / load.stop found ended. Returns notes for the model.
+   */
+  async function settleCallBudget(
+    toolId: string,
+    invocationId: string,
+    args: Record<string, unknown>,
+    execution: Awaited<ReturnType<typeof toolRuntime.execute>>,
+    call: { qpsReservation: string | undefined; computeCapMs: number | undefined },
+  ): Promise<string[]> {
+    const notes: string[] = [];
+    const scopes = callScopes(input.runId, input.workItemId);
+    const u = execution.usage;
+    if (u && (u.computeMs > 0 || u.artifactBytes > 0) && budget.consume) {
+      const amounts: { computeMs?: number; artifactBytes?: number } = {};
+      if (u.computeMs > 0) amounts.computeMs = u.computeMs;
+      if (u.artifactBytes > 0) amounts.artifactBytes = u.artifactBytes;
+      const consumed = await budget.consume([workScope(input.workItemId)], amounts, `tool:${invocationId}`);
+      if (consumed.exhausted) {
+        const x = consumed.exhausted;
+        const compute = x.dimension === 'computeMs';
+        await onToolBudgetExhausted(deps, input.eventContext, input.runId, x, { reason: compute ? 'compute' : 'artifact_bytes', toolId, invocationId });
+        notes.push(`[budget_exhausted: the ${compute ? 'compute' : 'artifact'} budget of ${x.scope} is spent (${x.used}/${x.limit} ${compute ? 'ms of sandbox time' : 'bytes'}); ${compute ? 'no further execution tools run' : 'no further artifacts or evidence can be stored'} — finish with complete_work or fail_work]`);
+      }
+    }
+    if (execution.error?.code === 'budget_exhausted') {
+      // a put refused before it was stored (the call's artifact headroom was spent)
+      const x = await exhaustedScope(deps, scopes, 'artifactBytes');
+      if (x) await onToolBudgetExhausted(deps, input.eventContext, input.runId, x, { reason: 'artifact_bytes', toolId, invocationId });
+    }
+    if (call.computeCapMs !== undefined && execution.status === 'timeout') {
+      const spec = registry.get(toolId);
+      if (spec && call.computeCapMs < spec.timeoutMs) notes.push(`[budget: this call was limited to the ${call.computeCapMs} ms of compute budget left]`);
+    }
+    if (call.qpsReservation !== undefined) {
+      const opStatus = obj(execution.structured)['operationStatus'];
+      const mayRun = execution.operationId !== undefined && (execution.status === 'pending' || (execution.status !== 'success' && (typeof opStatus !== 'string' || JOB_MAY_RUN.has(opStatus))));
+      if (!mayRun) await budget.release(call.qpsReservation);
+    }
+    if ((toolId === 'load.observe' || toolId === 'load.stop') && typeof args['operationId'] === 'string') {
+      const opId = args['operationId'];
+      await settleExternalQps(deps, input.runId, toolId === 'load.stop' && execution.status === 'success' ? { stopped: [opId] } : { operationIds: [opId] });
+    }
+    return notes;
   }
 
   return {
@@ -437,6 +562,15 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
         }
       }
       const effect = effectOf(toolId, call.arguments);
+      // conformance-6: a write/fault call of a work item that runs for experiments needs their admitted claims held —
+      // two experiments must never invalidate each other (a lapsed or released claim is never acted on regardless)
+      const experiments = await itemExperiments();
+      if (experiments.all.length > 0 && effect !== undefined && EXPERIMENT_GUARDED_EFFECTS.has(effect) && !EXPERIMENT_EXEMPT_TOOLS.includes(toolId)) {
+        const problem = await experimentClaimsProblem(deps, input.runId, experiments.all, toolId);
+        if (problem !== undefined) {
+          return deny(call, toolId, invocationId, 'experiment_claims_missing', `[denied] experiment_claims_missing: ${problem}. ${toolId} was NOT executed; do not work around it (another experiment may be using these resources).`);
+        }
+      }
       const guarded = driftGuarded && effect === 'execute';
       if (quarantine && (QUARANTINE_BLOCKED_TOOL_IDS.includes(toolId) || (guarded && toolId !== QUARANTINE_RESTORE_TOOL))) {
         const refusal = await quarantineRefusal(toolId);
@@ -455,6 +589,38 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
         verdict = await govern(toolId, args, invocationId);
         if (!verdict.allowed) return deny(call, toolId, invocationId, verdict.classification.decision === 'forbidden' ? 'test_change_forbidden' : 'approval_required', `[denied] ${verdict.text}`);
       }
+      // conformance-5: compute and artifact headroom (enforced before the resource is spent) …
+      const budgeted = !TERMINAL_TOOL_IDS.includes(toolId);
+      const scopes = callScopes(input.runId, input.workItemId);
+      let computeCapMs: number | undefined;
+      let maxArtifactBytes: number | undefined;
+      if (budgeted && budget.remaining) {
+        const left = await budget.remaining([workScope(input.workItemId)]);
+        if (effect === 'execute' && left.computeMs !== undefined) {
+          if (left.computeMs <= 0) {
+            const exhausted = (await exhaustedScope(deps, scopes, 'computeMs')) ?? { scope: workScope(input.workItemId), dimension: 'computeMs' as const, limit: 0, used: 0, reserved: 0, requested: 0 };
+            await onToolBudgetExhausted(deps, input.eventContext, input.runId, exhausted, { reason: 'compute', toolId, invocationId });
+            return deny(call, toolId, invocationId, 'budget_exhausted', `[denied] budget_exhausted: the compute budget of ${exhausted.scope} is spent (${exhausted.used}/${exhausted.limit} ms of sandbox time); no further execution tools run — finish with complete_work or fail_work`);
+          }
+          computeCapMs = Math.max(1, Math.floor(left.computeMs));
+        }
+        if (left.artifactBytes !== undefined) maxArtifactBytes = left.artifactBytes;
+      }
+      // … and the request rate of a load job, reserved across the run's concurrent jobs while it runs
+      let qpsReservation: string | undefined;
+      if (toolId === 'load.start') {
+        const cap = (await deps.runs.get(input.runId))?.budget.maxExternalQps;
+        const rate = args['ratePerSecond'];
+        if (cap !== undefined && typeof rate === 'number' && Number.isFinite(rate) && rate >= 0) {
+          const reserved = await budget.reserve([workScope(input.workItemId)], { externalQps: rate }, `load:${invocationId}`, { idempotencyKey: qpsKey(invocationId) });
+          if (!reserved.ok) {
+            await onToolBudgetExhausted(deps, input.eventContext, input.runId, reserved.exhausted, { reason: 'external_qps', toolId, invocationId });
+            const left = Math.max(0, reserved.exhausted.limit - reserved.exhausted.used - reserved.exhausted.reserved);
+            return deny(call, toolId, invocationId, 'external_qps_exhausted', `[denied] external_qps_exhausted: running load jobs of this run already hold ${reserved.exhausted.reserved} of its maxExternalQps ${reserved.exhausted.limit} requests per second; ${rate} more do not fit (${left} left). Wait for a job to end (load.observe) or stop one (load.stop), or start this one at ≤ ${left} rps.`);
+          }
+          qpsReservation = reserved.reservationId;
+        }
+      }
       let before: string | undefined;
       if (guarded) {
         if (pendingGuard?.invocationId === invocationId) {
@@ -464,6 +630,7 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
           const d = await worktreeDiff();
           if (typeof d !== 'string') {
             // fail closed: what the command does to test code could not be checked afterwards
+            if (qpsReservation !== undefined) await budget.release(qpsReservation);
             return deny(call, toolId, invocationId, 'governance_unavailable', `[denied] ${toolId} cannot run: the worktree diff needed for test-change governance is unavailable (${d.message})`);
           }
           before = d;
@@ -485,6 +652,10 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
         signal: meta.signal,
       };
       if (snapshot) request.snapshot = snapshot;
+      // conformance-6: the call's evidence and operations name the experiment it runs for (one declared experiment)
+      if (experiments.known.length === 1) request.experimentId = experiments.known[0]!;
+      if (computeCapMs !== undefined) request.timeoutMs = computeCapMs;
+      if (maxArtifactBytes !== undefined) request.limits = { maxArtifactBytes };
       if (input.fencingToken !== undefined) {
         // (H4, I4) the call runs under the work claim: side-effect leases are owned by THIS claim (a stale worker of the
         // same agent is another owner and never reuses the live claim's lease), and record-effect tools re-check the
@@ -493,16 +664,27 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
         request.claim = { workItemId: input.workItemId, fencingToken: input.fencingToken, ownerId: heldClaim?.ownerId ?? deps.config.workerId };
         if (heldClaim?.leaseId) request.claim.leaseId = heldClaim.leaseId;
       }
-      const execution = await toolRuntime.execute(request);
+      let execution: Awaited<ReturnType<typeof toolRuntime.execute>>;
+      try {
+        execution = await toolRuntime.execute(request);
+      } catch (e) {
+        if (qpsReservation !== undefined) await budget.release(qpsReservation).catch(() => undefined);
+        throw e;
+      }
+      const budgetNotes = await settleCallBudget(toolId, invocationId, args, execution, { qpsReservation, computeCapMs });
+      if (toolId === 'experiment.define' && execution.status === 'success') experimentsCache = undefined;
       const drift = before !== undefined ? await checkDrift(toolId, invocationId, before) : undefined;
       if (before !== undefined) {
         pendingGuard = undefined;
         await store.setGuard(input.agentId, null);
       }
+      const flag = await afterAction(toolId, invocationId, call.arguments, execution, snapshot?.snapshotId);
+      const noted = budgetNotes.length > 0 ? `${execution.modelText}\n${budgetNotes.join('\n')}` : execution.modelText;
+      const body = flag !== undefined ? `${noted}\n${flag}` : noted;
       const result: DispatchResult = {
         message: drift !== undefined
-          ? toolMessage(call, `${drift}\n--- tool output ---\n${clip(execution.modelText, 4000)}`, true)
-          : toolMessage(call, execution.modelText, execution.status !== 'success' && execution.status !== 'pending'),
+          ? toolMessage(call, `${drift}\n--- tool output ---\n${clip(body, 4000)}`, true)
+          : toolMessage(call, body, execution.status !== 'success' && execution.status !== 'pending'),
         execution,
       };
       const structured = obj(execution.structured);

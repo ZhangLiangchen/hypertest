@@ -121,8 +121,14 @@ describe('H3: startRun never stores a gate the QualityGate would misread as weak
       await plane.close();
     }
     // valid overrides still start the run
-    const ok = await h.control.startRun({ goal: 'valid gate', target: {}, gate: { failOnUnresolvedSeverity: 'P2', conditionalOnRiskLevel: 'critical' } });
+    // (conformance-9) a valid override that weakens the gate (conditionalOnRiskLevel high → critical) needs a recorded
+    // human/system authority; a stricter one (P1 → P2) does not
+    await rejects(h.control.startRun({ goal: 'valid gate', target: {}, gate: { failOnUnresolvedSeverity: 'P2', conditionalOnRiskLevel: 'critical' } }), 'invalid_argument', /conditionalOnRiskLevel: high → critical/);
+    const ok = await h.control.startRun({
+      goal: 'valid gate', target: {}, gate: { failOnUnresolvedSeverity: 'P2', conditionalOnRiskLevel: 'critical' }, gateOverrideBy: { kind: 'human', id: 'qa-lead' }, gateOverrideRationale: 'critical-only risk tolerance for this release train',
+    });
     assert.equal(ok.status, 'running');
+    assert.equal((await h.control.startRun({ goal: 'stricter gate', target: {}, gate: { failOnUnresolvedSeverity: 'P2' } })).status, 'running');
   });
 });
 
@@ -529,7 +535,7 @@ describe('H7: the independent run review the gate requires is requested before t
   test('not requested when the gate does not require it; requested once per gate attempt when the review never comes (the gate fails safe)', async () => {
     const h = await createHarness({ brains: { lead: readyLead } });
     try {
-      const off = await h.control.startRun({ goal: 'no review required', target: {}, gate: { requireIndependentReview: false } });
+      const off = await h.control.startRun({ goal: 'no review required', target: {}, gate: { requireIndependentReview: false }, gateOverrideBy: { kind: 'human', id: 'qa-lead' }, gateOverrideRationale: 'no reviewer model in this deployment' });
       assert.ok((await drive(h, off.runId, 30)).final);
       assert.deepEqual(await h.deps.events.read(off.runId, { types: ['review.requested'] }), []);
       // no reviewer brain: the review work fails; the gate evaluates anyway and reports C6 (no livelock)
@@ -651,7 +657,7 @@ describe('conformance-4: an oracle superseded during the run', () => {
         changePolicy: { agentMayPropose: true, selfApprove: false as const, invalidatesPriorDecisions: true, approvers: ['human' as const] },
       };
       await h.deps.specs.saveOracle(spec, ctx);
-      const run = await h.control.startRun({ goal: 'mid-run oracle change', target: {}, oracleIds: ['or_mid'], gate: { requireIndependentReview: false } });
+      const run = await h.control.startRun({ goal: 'mid-run oracle change', target: {}, oracleIds: ['or_mid'], gate: { requireIndependentReview: false }, gateOverrideBy: { kind: 'human', id: 'qa-lead' }, gateOverrideRationale: 'no reviewer model in this deployment' });
       assert.deepEqual(run.oracleRevisions, { or_mid: 1 });
       // a human approves a new revision while the run is in flight
       const r2 = await h.deps.specs.saveOracle({ ...spec, assertions: [{ ...spec.assertions[0]!, description: 'totals are exact to the cent' }] }, ctx);
@@ -680,7 +686,7 @@ describe('conformance-11: governed gate waivers', () => {
   test('a human-approved gate_exception waives its criterion at the gate; an agent-decided one is ignored', async () => {
     const h = await createHarness({ brains: { lead: readyLead } });
     try {
-      const run = await h.control.startRun({ goal: 'waiver', target: {}, gate: { requireOracle: false } });
+      const run = await h.control.startRun({ goal: 'waiver', target: {}, gate: { requireOracle: false }, gateOverrideBy: { kind: 'human', id: 'qa-lead' }, gateOverrideRationale: 'exploratory run without an established oracle' });
       const ctx = h.ctx(run.runId);
       const human = await h.deps.approvals.request({ runId: run.runId, kind: 'gate_exception', subject: { criterionId: 'C6' }, requestedBy: { kind: 'system', id: 'cli' }, rationale: 'no reviewer route' }, ctx);
       await h.deps.approvals.decide(human.approvalId, true, { kind: 'human', id: 'alice' }, 'no independent reviewer route this week', ctx);

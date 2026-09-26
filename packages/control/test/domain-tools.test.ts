@@ -27,7 +27,7 @@ describe('createDomainTools', () => {
         assert.match(s.resources({}, { runId: 'run_x', workspace: {} as never, environments: h.deps.environments })[0]!, /^run\/run_x\/[a-z_]+$/);
       }
       const reads = specs.filter((s) => s.effect === 'read').map((s) => s.id).sort();
-      assert.deepEqual(reads, ['blackboard.read', 'evidence.get', 'evidence.query', 'oracle.get', 'oracle.list', 'plan.read']);
+      assert.deepEqual(reads, ['blackboard.read', 'delegate.collect', 'delegate.status', 'evidence.get', 'evidence.query', 'oracle.get', 'oracle.list', 'plan.read']);
     } finally {
       await h.dispose();
     }

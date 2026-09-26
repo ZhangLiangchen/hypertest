@@ -1,10 +1,11 @@
 import { HypertestError, abortReason, compileSchema, throwIfAborted, withTimeout, type JsonValue } from '@hypertest/core';
-import { EFFECT_ORDER, EVENT_TYPES, RISK_ORDER, eventFrom, type ArtifactRef, type EnvironmentRef, type EventContext, type EvidenceRecord, type Provenance, type ResourceRef, type RiskClass, type ToolEffect } from '@hypertest/domain';
+import { EFFECT_ORDER, EVENT_TYPES, RISK_ORDER, eventFrom, type ArtifactRef, type EnvironmentRef, type EventContext, type EvidenceRecord, type ResourceRef, type RiskClass, type ToolEffect } from '@hypertest/domain';
 import { recordEvidence, type RecordEvidenceInput } from '@hypertest/evidence';
 import type { SideEffectGateway, SideEffectOutcome } from '@hypertest/operation';
 import { capabilityAllows, matchesResourcePattern, verifyCapability, type ActionPermit, type ActionRequest } from '@hypertest/policy';
-import type { ToolContext, ToolExecutionRequest, ToolExecutionResult, ToolOutcome, ToolRuntime, ToolRuntimeDeps, ToolSpec, ToolStatus } from '../contracts.ts';
+import type { ExperimentProvenance, ToolContext, ToolExecutionRequest, ToolExecutionResult, ToolOutcome, ToolRuntime, ToolRuntimeDeps, ToolSpec, ToolStatus } from '../contracts.ts';
 import { RECORD_EFFECT_ADAPTER_ID, RECORD_EFFECT_RESENDABLE_ADAPTER_ID, bindRecordEffect, type RecordedToolOutcome } from './record-effects.ts';
+import { UsageMeter, meteredArtifacts, runMetered } from './usage-meter.ts';
 
 /** Default model-visible byte budget before a tool output is offloaded to the ArtifactStore (I9). */
 export const DEFAULT_MAX_INLINE_BYTES = 16 * 1024;
@@ -16,6 +17,15 @@ const EFFECTS_WITHOUT_FRESHNESS: ReadonlySet<ToolEffect> = new Set(['read', 'rec
 /** Effects on the outside world that must go through the Operation Ledger (I4) even without a dedicated adapter. */
 const LEDGERED_EFFECTS: ReadonlySet<ToolEffect> = new Set(['external', 'destructive']);
 const TOOL_STATUSES: ReadonlySet<string> = new Set(['success', 'failed', 'timeout', 'denied', 'pending', 'stale_context']);
+
+/**
+ * (additive, conformance-6) The experiment an evidence record was produced for: `provenance.experimentId`, recorded by the
+ * runtime (inside the hash-chained metadata) for every call made with `ToolExecutionRequest.experimentId`.
+ */
+export function evidenceExperimentId(record: Pick<EvidenceRecord, 'provenance'>): string | undefined {
+  const id = (record.provenance as ExperimentProvenance | undefined)?.experimentId;
+  return typeof id === 'string' && id.length > 0 ? id : undefined;
+}
 
 /** Deep copy of a JSON-like value with every property whose key matches SECRET_KEY_PATTERN replaced. */
 export function redactSecrets(value: unknown, pattern: RegExp = SECRET_KEY_PATTERN): JsonValue {
@@ -164,12 +174,16 @@ interface Stage {
 export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
   if (!deps.capabilitySecret) throw new HypertestError('invalid_argument', 'ToolRuntimeDeps.capabilitySecret is required');
   const { registry, clock } = deps;
+  // (conformance-5) puts made on behalf of a call (tool, evidence, offload) are metered and bounded per call
+  const artifacts = meteredArtifacts(deps.artifacts);
 
-  return {
-    registry,
-    async execute(request: ToolExecutionRequest): Promise<ToolExecutionResult> {
+  const pipeline = {
+    async execute(request: ToolExecutionRequest, meter: UsageMeter): Promise<ToolExecutionResult> {
       if (!request || typeof request !== 'object' || typeof request.toolId !== 'string' || typeof request.invocationId !== 'string' || !request.eventContext || !request.workspace || !request.signal) {
         throw new HypertestError('invalid_argument', 'malformed ToolExecutionRequest');
+      }
+      if (request.experimentId !== undefined && (typeof request.experimentId !== 'string' || request.experimentId.length === 0)) {
+        throw new HypertestError('invalid_argument', 'malformed ToolExecutionRequest: experimentId must be a non-empty string');
       }
       if (request.leaseOwner !== undefined && (typeof request.leaseOwner !== 'string' || request.leaseOwner.length === 0)) {
         throw new HypertestError('invalid_argument', 'malformed ToolExecutionRequest: leaseOwner must be a non-empty string');
@@ -206,6 +220,7 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
         if (stage.operationId !== undefined) r.operationId = stage.operationId;
         if (permit) r.permit = permit;
         if (stage.error) r.error = stage.error;
+        r.usage = meter.usage();
         return r;
       };
 
@@ -375,6 +390,7 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
       // 7 tool.called (audit before any effect)
       try {
         const called: Record<string, JsonValue> = { toolId: spec.id, invocationId: request.invocationId, effect, riskClass, resources, permitDecisionId: permit.decisionId };
+        if (request.experimentId !== undefined) called['experimentId'] = request.experimentId;
         // (audit) a stale replay: this call only settles the operation it dispatched before (reconcile-only)
         if (replayOf !== undefined) called['replayOfOperation'] = replayOf;
         await emit(EVENT_TYPES.toolCalled, called);
@@ -386,10 +402,13 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
       // 8 execute
       const produced: EvidenceRecord[] = [];
       const recordEv: ToolContext['recordEvidence'] = async (inp) => {
-        const provenance: Provenance = { ...(inp.provenance ?? {}), toolId: spec.id, toolInvocationId: request.invocationId, workspaceId: request.workspace.workspaceId };
+        const provenance: ExperimentProvenance = { ...(inp.provenance ?? {}), toolId: spec.id, toolInvocationId: request.invocationId, workspaceId: request.workspace.workspaceId };
         const commit = inp.provenance?.commit ?? request.workspace.baseCommit;
         if (commit !== undefined) provenance.commit = commit;
         else delete provenance.commit;
+        // conformance-6: evidence of a call made for an experiment names it (runtime-set, never the tool's say)
+        if (request.experimentId !== undefined) provenance.experimentId = request.experimentId;
+        else delete provenance.experimentId;
         const evInput: RecordEvidenceInput = {
           runId: request.runId,
           evidenceType: inp.evidenceType,
@@ -409,7 +428,7 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
         if (inp.parentEvidenceIds !== undefined) evInput.parentEvidenceIds = inp.parentEvidenceIds;
         const eventContext: Partial<Omit<EventContext, 'runId'>> = { correlationId: evCtx.correlationId, actorId: evCtx.actorId, workItemId: request.workItemId, agentId: request.agentId };
         if (evCtx.causationId !== undefined) eventContext.causationId = evCtx.causationId;
-        const rec = await recordEvidence(deps.evidence, deps.artifacts, evInput, undefined, { eventContext });
+        const rec = await recordEvidence(deps.evidence, artifacts, evInput, undefined, { eventContext });
         produced.push(rec);
         return rec;
       };
@@ -444,6 +463,7 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
                 lease: { resourceKey: target.resourceKey, ttlMs: binding.leaseTtlMs ?? Math.max(spec.timeoutMs, 60_000), owner: leaseOwner },
                 ctx: evCtx,
                 signal,
+                ...(request.experimentId !== undefined ? { experimentId: request.experimentId } : {}),
                 // a replay settles its operation; a (re-)dispatch would be a new decision on a snapshot nobody validated
                 ...(replayOf !== undefined ? { reconcileOnly: true } : {}),
               }),
@@ -475,6 +495,7 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
                   target: { resourceKey: resources[0] ?? `tool/${spec.id}`, kind: 'tool_effect' },
                   ctx: evCtx,
                   signal,
+                  ...(request.experimentId !== undefined ? { experimentId: request.experimentId } : {}),
                   ...(replayOf !== undefined ? { reconcileOnly: true } : {}),
                 }),
               timeoutMs,
@@ -603,7 +624,7 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
           role: request.role,
           invocationId: request.invocationId,
           workspace: request.workspace,
-          artifacts: deps.artifacts,
+          artifacts,
           // evidence of a ledgered call names its operation (L5: evidence → operation) unless the tool names one
           recordEvidence: operationId === undefined ? recordEv : (inp) => recordEv(inp.operationId !== undefined ? inp : { ...inp, operationId }),
           eventContext: evCtx,
@@ -614,10 +635,25 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
           leaseOwner,
         };
         if (request.claim) ctx.claim = { ...request.claim };
+        if (request.experimentId !== undefined) ctx.experimentId = request.experimentId;
         if (request.snapshot) ctx.snapshot = request.snapshot;
         if (deps.sideEffects) ctx.sideEffects = spec!.sideEffect ? deps.sideEffects : observeOnly(deps.sideEffects);
         return ctx;
       }
+    },
+  };
+
+  return {
+    registry,
+    execute(request: ToolExecutionRequest): Promise<ToolExecutionResult> {
+      let meter: UsageMeter;
+      try {
+        meter = new UsageMeter(request && typeof request === 'object' ? request.limits : undefined);
+      } catch (e) {
+        return Promise.reject(e);
+      }
+      // everything the call does (processes, puts) is attributed to this meter — concurrent calls never mix
+      return runMetered(meter, () => pipeline.execute(request, meter));
     },
   };
 }

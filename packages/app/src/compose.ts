@@ -27,9 +27,10 @@ import {
   type ModelCapabilityProfile, type ModelProvider, type ModelRouter, type RouteRequest,
 } from '@hypertest/model';
 import {
-  ExactSearch, HybridRetriever, PowerContextClient, SymbolIndex, contextMigrations, createExperienceStore, createFreshnessGuard, createProvenanceService,
-  createResolverRegistry, createSnapshotBuilder, createSnapshotStore, createWorkingContextManager, environmentResolver, experimentResolver, leaseResolver,
-  oracleResolver, recordResolver, type DurableMemory, type Retriever,
+  ExactSearch, HashEmbedder, HybridRetriever, PowerContextClient, SymbolIndex, VectorCorpusCache, WorkspaceVectorRetriever, contextMigrations, createExperienceStore, createFreshnessGuard,
+  createObservationLog, createPgVectorIndex, createProvenanceService, createResolverRegistry, createSnapshotBuilder, createSnapshotStore, createWorkingContextManager,
+  environmentResolver, environmentVersion, experimentResolver, leaseResolver, observeToolRuntime, oracleResolver, recordResolver, workspaceFileResolver,
+  type DurableMemory, type Embedder, type Retriever, type VectorIndex,
 } from '@hypertest/context';
 import {
   ToolRegistry, builtinSideEffectAdapters, builtinTools, closeBlackboxResources, createEnvironmentRegistry, createLocalSandbox, createOciSandbox,
@@ -37,12 +38,12 @@ import {
   type ToolRuntimeDeps,
 } from '@hypertest/tools';
 import {
-  EngineRegistry, NativeEngine, RUNTIME_PACKAGE_VERSION, buildRuntimeManifest, createAgentRepository, createAgentRunner, createEpochManager,
-  createSessionStore, createSubagentRuntime, runtimeMigrations, type AgentEngine,
+  EngineRegistry, NativeEngine, RUNTIME_PACKAGE_VERSION, buildRuntimeManifest, createAgentRepository, createAgentRunner, createEpochManager, createRuntimeReleaseRegistry,
+  createSessionStore, createSubagentRuntime, runtimeMigrations, toolCatalogRevision, type AgentEngine,
 } from '@hypertest/runtime';
 import { PI_AGENT_CORE_VERSION, PiEngine, RUNTIME_PI_PACKAGE_VERSION } from '@hypertest/runtime-pi';
 import { BUILTIN_ROLES, RoleCatalog, type RoleCatalogLike } from '@hypertest/agents';
-import { controlMigrations, createControlPlane, createDomainTools, type ControlConfig, type ControlDeps, type ControlPlane, type StartRunInput } from '@hypertest/control';
+import { ControlStore, controlMigrations, createControlPlane, createDomainTools, type ControlConfig, type ControlDeps, type ControlPlane, type StartRunInput } from '@hypertest/control';
 import {
   DEFAULT_TEMPORAL_NAMESPACE, DEFAULT_TEMPORAL_TASK_QUEUE, LocalDurableRuntime, RESUMABLE_RUN_STATUSES, TemporalDurableRuntime, type DurableHooks, type DurableRuntime,
   type RunOutcome, type TemporalDurableOptions,
@@ -55,6 +56,9 @@ import { ENVIRONMENT_STATE_FILE, persistentEnvironmentRegistry, resolveEnvironme
 import { recordedFailureFlipDetector } from './governance.ts';
 import { keysDir, loadCapabilitySecret, loadSigningKeys } from './keys.ts';
 import { acquireDirectoryLock, lockFileFor } from './lock.ts';
+import {
+  agentClassification, condenserPrivacyFloor, createReleaseService, hypertestGitSha, imageDigestFrom, releaseGovernedControlPlane, runtimeReleaseNotes, withRuntimeReleaseNotes,
+} from './releases.ts';
 import type { HypertestConfig, HypertestInstance, HypertestOverrides, HypertestServices, ProviderConfig } from './contracts.ts';
 
 /** Every migration of the stateful packages, in dependency order (applied idempotently at startup). */
@@ -353,18 +357,41 @@ function singleLineOnly(inner: Retriever): Retriever {
   };
 }
 
-/** Per-root retrievers (symbol index + exact search, RRF-fused), cached so the symbol index is built once per root. */
-function cachedRetrievers(logger: Logger): (root: string) => Retriever {
+/**
+ * Per-root L3 retrievers — symbol graph + exact search + semantic vectors, RRF-fused — cached so the symbol index and
+ * the vector corpus are built once per root (the vector corpus again when the root's commit changes). Vectors live in
+ * pgvector when the store has it (feature-detected once, lazily: `sharedIndex`), else in memory per corpus.
+ */
+function cachedRetrievers(logger: Logger, vectors: { embedder: Embedder; sharedIndex: () => Promise<VectorIndex | undefined> }): (root: string) => Retriever {
   const cache = new Map<string, Retriever>();
+  // at most 8 workspace corpora in this process (LRU), whatever the number of parallel worktrees
+  const corpora = new VectorCorpusCache({ maxCorpora: 8, logger });
   return (root) => {
     let r = cache.get(root);
     if (!r) {
-      r = new HybridRetriever([new SymbolIndex({ root }), singleLineOnly(new ExactSearch({ root }))], { logger });
+      const vector = new WorkspaceVectorRetriever({ root, embedder: vectors.embedder, sharedIndex: vectors.sharedIndex, cache: corpora, logger });
+      r = new HybridRetriever([new SymbolIndex({ root }), singleLineOnly(new ExactSearch({ root })), vector], { logger });
       cache.set(root, r);
       if (cache.size > 64) cache.delete(cache.keys().next().value!);
     }
     return r;
   };
+}
+
+/** pgvector when the store offers the extension (PGlite with `vector`, PostgreSQL with pgvector), else undefined (in memory). */
+function pgVectorProbe(db: SqlDatabase, embedder: Embedder, logger: Logger): () => Promise<VectorIndex | undefined> {
+  let probe: Promise<VectorIndex | undefined> | undefined;
+  return () =>
+    (probe ??= createPgVectorIndex(db, embedder).then(
+      (index) => {
+        logger.info('L3 vectors: pgvector index in use', { modelId: embedder.modelId });
+        return index;
+      },
+      (e: unknown) => {
+        logger.info('L3 vectors: pgvector unavailable; workspace corpora are kept in memory', { error: (e as Error).message });
+        return undefined;
+      },
+    ));
 }
 
 /** The durable runtime of the configuration: LocalDurableRuntime (in-process) or TemporalDurableRuntime. */
@@ -406,7 +433,7 @@ export interface PinLookup {
  * runtimes treat as non-retryable). Finished runs stay readable (their outcome, reconciliation of their operations).
  * Every other member is the wrapped control plane's.
  */
-export function pinnedControlPlane(control: ControlPlane, manifestId: string, lookup: PinLookup): ControlPlane {
+export function pinnedControlPlane(control: ControlPlane, manifestId: string, lookup: PinLookup): ControlPlane & { forgetPin(runId: string): void } {
   const pinnedHere = new Set<string>();
   const runOfItem = new Map<string, string>();
   const bounded = (size: number, evict: () => void) => {
@@ -417,7 +444,9 @@ export function pinnedControlPlane(control: ControlPlane, manifestId: string, lo
     const run = await lookup.getRun(runId);
     if (!run) return; // the control plane reports not_found
     if (run.runtimeManifestId === manifestId) {
-      pinnedHere.add(runId); // the pin of a run never changes
+      // the pin of a run changes only through an explicit migration (forgetPin evicts it here; the control plane itself
+      // re-checks the pin of every tick and turn from the stored run, so a migration in another process is never missed)
+      pinnedHere.add(runId);
       bounded(pinnedHere.size, () => pinnedHere.delete(pinnedHere.values().next().value!));
       return;
     }
@@ -434,8 +463,11 @@ export function pinnedControlPlane(control: ControlPlane, manifestId: string, lo
     }
     await assertRun(runId);
   }
-  const pinned: ControlPlane = {
+  const pinned: ControlPlane & { forgetPin(runId: string): void } = {
     ...control,
+    forgetPin(runId: string) {
+      pinnedHere.delete(runId);
+    },
     async tick(runId, options) {
       await assertRun(runId);
       return control.tick(runId, options);
@@ -507,7 +539,8 @@ export async function decisionProblems(
  * side-effect adapters, the policy engine (+ OPA), decision log, approvals, oracle governance, QualityGate and the
  * BUGate binding, the model providers/catalog/router, the context services and freshness resolvers, the tool
  * registry/runtime/workspaces/sandbox, the runtime (sessions, agents, epochs, native + pi engines, subagents, runner),
- * the role catalog, the RuntimeManifest (I11), the control plane and the durable runtime. Anything opened before a
+ * the role catalog, the RuntimeManifest (I11, the runtime BOM), the control plane (pinned to the manifest, governed by the
+ * runtime release registry) and the durable runtime, and the runtime release service. Anything opened before a
  * failure is closed again. Runs are NOT resumed automatically: call `resumeIncomplete()` (e.g. `hypertest resume`).
  */
 export async function createHypertest(input: HypertestConfig, overrides: HypertestOverrides = {}): Promise<HypertestInstance> {
@@ -522,7 +555,9 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
   const dataDir = config.project.dataDir;
   const base = { ids, clock, logger };
 
-  // Pure construction first: a missing scripted brain, a bad provider or route fails before anything is created.
+  // Pure construction first: a missing scripted brain, a bad provider or route, a malformed image digest fails before
+  // anything is created.
+  const imageDigest = imageDigestFrom(env);
   const providers = buildProviders(config, overrides, env, logger);
   for (const p of config.models.providers) {
     if (p.maxRetries !== undefined) logger.warn('models.providers[].maxRetries is not supported: retries and fail-closed fallback are the model router\'s; the value is ignored', { provider: p.id });
@@ -634,6 +669,9 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
 
     // ---- context engine
     const snapshots = createSnapshotStore({ ...base, db, events });
+    // what agents observed through their tool calls (fed by the observing tool runtime below): the next turn's read set,
+    // and the intra-turn refinement of the freshness guard
+    const observations = createObservationLog({ ...base, db });
     const resolvers = createResolverRegistry([
       // the authoritative generation (the shared store when the registry has one: H12), not this process's view
       environmentResolver((id) => (environments.load ? environments.load(id) : environments.get(id))),
@@ -642,13 +680,14 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
       recordResolver((lineage) => blackboard.head(lineage)),
       leaseResolver((key) => leases.current(key)),
     ]);
-    const freshness = createFreshnessGuard({ ...base, db, events, snapshots, resolvers });
+    const freshness = createFreshnessGuard({ ...base, db, events, snapshots, resolvers, observations });
     const snapshotBuilder = createSnapshotBuilder({
       ...base,
       db,
       events,
       snapshots,
       resolvers,
+      observations,
       sources: {
         getRun: (runId) => runs.get(runId),
         lastEventSeq: (runId) => events.lastSeq(runId),
@@ -665,11 +704,15 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
       memory = createExperienceStore({ ...base, db, events });
     }
     const provenance = createProvenanceService({ evidence, events, records: blackboard });
+    // L3 semantic retrieval: deterministic feature-hashing embeddings (no provider embedding route is configured)
+    const vectorEmbedder = new HashEmbedder();
 
     // ---- tools
     const profile = sandboxProfile(config);
     const workspacesDir = join(dataDir, 'workspaces');
     const workspaces = createWorkspaceManager({ ...base, baseDir: workspacesDir, defaultSandbox: profile });
+    // file read-set entries (`workspace/<id>/<path>`, sha256) of the workspaces this process opened
+    resolvers.register(workspaceFileResolver((workspaceId) => workspaces.get(workspaceId)?.root));
     const sandbox =
       profile.kind === 'oci'
         ? createOciSandbox({ image: profile.image! })
@@ -697,7 +740,16 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
       workerId,
       capabilitySecret,
     };
-    const toolRuntime = createToolRuntime(toolDeps);
+    // every tool result feeds the observation log before it returns (tool results → read-set entries)
+    const toolRuntime = observeToolRuntime(createToolRuntime(toolDeps), {
+      log: observations,
+      logger,
+      now: () => clock.isoNow(),
+      environmentVersion: async (id) => {
+        const env = environments.load ? await environments.load(id) : environments.get(id);
+        return env ? environmentVersion(env) : undefined;
+      },
+    });
 
     // ---- agent runtime
     const sessions = createSessionStore({ ...base, db, events });
@@ -732,8 +784,9 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
       ledger, leases, gateway, reconciler, admission, budget, adapters,
       artifacts, evidence, signer,
       policy, decisionLog, approvals, oracles, gate: new QualityGate(), protocol,
-      router, catalog,
-      snapshots, snapshotBuilder, freshness, resolvers, workingContext: createWorkingContextManager(), retrieverFactory: cachedRetrievers(logger), memory, provenance,
+      // the condenser of a restricted agent's context routes with that agent's classification (local_private stays local)
+      router: condenserPrivacyFloor(router, agentClassification({ controlStore: new ControlStore(db), agents, roles })), catalog,
+      snapshots, snapshotBuilder, freshness, resolvers, workingContext: createWorkingContextManager(), retrieverFactory: cachedRetrievers(logger, { embedder: vectorEmbedder, sharedIndex: pgVectorProbe(db, vectorEmbedder, logger) }), memory, provenance,
       toolRuntime, registry, workspaces, environments,
       sessions, agents, epochs, engines, subagents, runner, roles,
       config: controlConfig,
@@ -745,10 +798,20 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
       engineAdapters.push({ provider: 'engine:pi', package: '@hypertest/runtime-pi', version: RUNTIME_PI_PACKAGE_VERSION });
       engineAdapters.push({ provider: 'engine:pi', package: '@earendil-works/pi-agent-core', version: PI_AGENT_CORE_VERSION });
     }
+    // runtime BOM: the installation (version, source digest, git commit, image digest) and each engine with its adapter
+    const hypertestBom: RuntimeManifest['hypertest'] = { version: HYPERTEST_VERSION, sourceDigest: hypertestSourceDigest() };
+    const gitSha = hypertestGitSha();
+    if (gitSha) hypertestBom.gitSha = gitSha;
+    if (imageDigest) hypertestBom.imageDigest = imageDigest;
+    const engineAdapter: Record<string, { package: string; version: string }> = {
+      native: { package: '@hypertest/runtime', version: RUNTIME_PACKAGE_VERSION },
+      pi: { package: '@hypertest/runtime-pi', version: RUNTIME_PI_PACKAGE_VERSION },
+    };
     const manifest = buildRuntimeManifest(
       {
-        hypertest: { version: HYPERTEST_VERSION, sourceDigest: hypertestSourceDigest() },
-        agentEngines: engines.manifestEntries(),
+        hypertest: hypertestBom,
+        agentEngines: engines.manifestEntries().map((e) => (Object.hasOwn(engineAdapter, e.kind) ? { ...e, adapter: engineAdapter[e.kind]! } : e)),
+        defaultEngine: defaultEngineKind,
         providerAdapters: [...providers.adapters(), ...engineAdapters],
         modelCatalogRevision: catalog.revision,
         schemas: {
@@ -760,7 +823,9 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
         },
         // the governance bundle: policy rules (+ OPA) and the role catalog (tool policies, permission profiles, model policies)
         policyBundleRevision: `${policy.revision}+roles:${roles.revision()}`,
-        toolCatalogRevision: registry.revision(),
+        roleCatalogRevision: roles.revision(),
+        // every tool's schemas, effect, risk, timeout and side-effect binding + the adapters' capabilities
+        toolCatalogRevision: toolCatalogRevision(registry.list(), adapters.list()),
         protocol: { id: protocol.binding.protocolId, version: protocol.binding.version, digest: protocol.binding.digest },
       },
       clock.isoNow(),
@@ -770,9 +835,18 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
     const plane = createControlPlane(deps);
     pending.push({ name: 'control', close: () => plane.close() });
     // I11: what the durable runtime drives (and what the facade exposes) never drives a live run of another manifest
-    const control = pinnedControlPlane(plane, manifest.manifestId, {
+    const pinned = pinnedControlPlane(plane, manifest.manifestId, {
       getRun: (id) => runs.get(id),
       runOf: async (id) => (await blackboard.getWorkItem(id))?.runId,
+    });
+    // runtime releases: new runs only under the active release (or a canary selecting them); quarantined runs stay paused
+    const releaseRegistry = createRuntimeReleaseRegistry({ ...base, db });
+    const control = releaseGovernedControlPlane(pinned, {
+      manifestId: manifest.manifestId,
+      registry: releaseRegistry,
+      requireActive: config.runtime?.requireActiveRelease === true,
+      newRunId: () => ids.next('run'),
+      getRun: (id) => runs.get(id),
     });
     relay.start();
     pending.push({ name: 'relay', close: () => relay.stop() });
@@ -792,8 +866,13 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
 
     const services: HypertestServices = {
       db, bus, relay, events, runs, blackboard, specs, decisions, operations: ledger, artifacts, evidence, signer, publicKeys: keys.publicKeys,
-      policy, decisionLog, approvals, oracles, protocol, providers, catalog, router, memory, tools: registry, environments, roles, workerId, logger, clock, ids,
+      policy, decisionLog, approvals, oracles, protocol, providers, catalog, router, memory, provenance, tools: registry, environments, roles, workerId, logger, clock, ids,
+      adapters,
     };
+    const releases = createReleaseService({
+      db, registry: releaseRegistry, manifest, runs, events, blackboard, leases, ledger, reconciler, agents, control: plane, durable,
+      forgetPin: (runId) => pinned.forgetPin(runId), clock, logger: logger.child({ component: 'releases' }),
+    });
     const ctx = (runId: string, actorId: string, correlationId = runId): EventContext => ({ runId, correlationId, actorId });
 
     /** Fail fast when the lead cannot be routed at all (a run would only fail its first work item). */
@@ -837,6 +916,7 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
       durable,
       manifest,
       services,
+      releases,
       async start(runInput: StartRunInput): Promise<TestRun> {
         if (closing) throw new HypertestError('unavailable', 'this Hypertest instance is closed');
         const runId = runInput?.runId;
@@ -885,7 +965,12 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
         return resumed;
       },
       status: (runId) => runs.get(runId),
-      report: (runId) => control.report(runId),
+      async report(runId) {
+        // the control plane's report + the run's runtime-release notes (quarantine, migrations)
+        const report = await control.report(runId);
+        const notes = runtimeReleaseNotes(await events.read(runId, { types: ['run.quarantined', 'run.migrated'] }));
+        return withRuntimeReleaseNotes(report, await runs.get(runId), notes);
+      },
       async verifyEvidence(runId) {
         const run = await runs.get(runId);
         if (!run) throw new HypertestError('not_found', `run ${runId} not found`);

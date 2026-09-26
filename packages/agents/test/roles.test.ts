@@ -7,6 +7,7 @@ import {
   EVIDENCE_PRODUCER_ROLES,
   KNOWN_TOOL_IDS,
   RoleCatalog,
+  SPECIALIST_ROLES,
   TERMINAL_TOOLS,
   WORKSPACE_WRITE_TOOL_IDS,
   isKnownToolPattern,
@@ -20,7 +21,7 @@ import {
 
 const EXPECTED_ROLES = [
   'lead', 'code_change_analyst', 'architecture_analyst', 'historical_bug_analyst', 'test_designer', 'executor', 'rca', 'fixer',
-  'reviewer', 'metrics_analyst', 'environment', 'condenser',
+  'reviewer', 'metrics_analyst', 'environment', 'condenser', 'vision_gui', 'local_private',
 ];
 
 /**
@@ -42,7 +43,8 @@ const TOOL_MAX_EFFECT: Record<KnownToolId, ToolEffect> = {
   'oracle.get': 'read', 'oracle.list': 'read', 'oracle.propose_change': 'record', 'experiment.define': 'record',
   'test_artifact.register': 'record', 'test_artifact.validate': 'execute',
   'evidence.get': 'read', 'evidence.query': 'read', 'evidence.claim': 'record',
-  delegate: 'record', request_approval: 'record', complete_work: 'record', fail_work: 'record',
+  delegate: 'record', 'delegate.status': 'read', 'delegate.collect': 'read', 'delegate.message': 'record', 'delegate.release': 'record',
+  request_approval: 'record', complete_work: 'record', fail_work: 'record',
 };
 
 /** Allowed effects of the policy package's PERMISSION_PROFILES (the capability layer enforces them). */
@@ -79,7 +81,7 @@ function mentionedTools(text: string): string[] {
   return out;
 }
 
-test('BUILTIN_ROLES contains exactly the twelve built-in roles, in order', () => {
+test('BUILTIN_ROLES contains exactly the fourteen built-in roles, in order', () => {
   assert.deepEqual(BUILTIN_ROLES.map((r) => r.role), EXPECTED_ROLES);
 });
 
@@ -133,6 +135,8 @@ test('governance tools are narrowly held: plans (lead), oracle proposals and tes
   assert.deepEqual(holders('plan.propose_revision'), ['lead']);
   assert.deepEqual(holders('work.propose'), ['lead']);
   assert.deepEqual(holders('delegate'), ['lead']);
+  // the subagent handles (status, collect, follow-up messages, release) go with delegation, to the delegating role only
+  for (const t of ['delegate.status', 'delegate.collect', 'delegate.message', 'delegate.release'] as const) assert.deepEqual(holders(t), ['lead'], t);
   assert.deepEqual(holders('oracle.propose_change'), ['test_designer']);
   assert.deepEqual(holders('test_artifact.register'), ['test_designer']);
   assert.deepEqual(holders('blackboard.post_review'), ['reviewer']);
@@ -161,7 +165,7 @@ test('lead: plans and delegates to analysts but never executes tests', () => {
 
 test('reviewer: independent from producers, structured reasoning, evidence tools, no production tools', () => {
   const reviewer = role('reviewer');
-  assert.deepEqual(reviewer.defaultModelPolicy.independentFromRoles, ['executor', 'test_designer', 'rca', 'fixer', 'metrics_analyst', 'environment']);
+  assert.deepEqual(reviewer.defaultModelPolicy.independentFromRoles, ['executor', 'test_designer', 'rca', 'fixer', 'metrics_analyst', 'environment', 'vision_gui', 'local_private']);
   for (const c of ['structured_output', 'reasoning'] as const) assert.ok(reviewer.defaultModelPolicy.requiredCapabilities?.includes(c), c);
   for (const t of ['evidence.get', 'evidence.query', 'blackboard.post_review', 'oracle.get', 'test.run'] as const) assert.equal(toolPermitted(reviewer.toolPolicy, t), true, t);
   for (const t of ['blackboard.post_finding', 'oracle.propose_change', 'test_artifact.validate', 'shell.exec'] as const) assert.equal(toolPermitted(reviewer.toolPolicy, t), false, t);
@@ -261,6 +265,8 @@ test('role prompts state their key operational rules', () => {
     metrics_analyst: ['dataSufficient', 'never a pass', 'metrics.query'],
     environment: ['never issue it again', 'request_approval', 'Never touch production', 'environmentReady is false while any action is pending or outcome_unknown'],
     condenser: ['verbatim', 'Never add facts', 'fail_work'],
+    vision_gui: ['DOM first, API second, pixels last', 'Never guess coordinates', 'computer-use tool', 'weaker evidence', 'not_run'],
+    local_private: ['never by value', 'Never copy secrets', 'local model', 'withheld', 'no network tools'],
   };
   for (const [name, needles] of Object.entries(expectations)) for (const n of needles) assert.ok(role(name).systemPrompt.includes(n), `${name}: ${n}`);
 });
@@ -287,7 +293,7 @@ test('subscriptions use EVENT_TYPES values and the specified triggers', () => {
   assert.deepEqual(ma.map((s) => [s.eventTypes, s.filter, s.work.title]), [
     [['finding.created'], { categories: ['performance'], excludeFromRoles: ['metrics_analyst'] }, 'Analyse metrics for {{title}}'],
   ]);
-  for (const name of ['lead', 'code_change_analyst', 'architecture_analyst', 'historical_bug_analyst', 'executor', 'fixer', 'environment', 'condenser']) {
+  for (const name of ['lead', 'code_change_analyst', 'architecture_analyst', 'historical_bug_analyst', 'executor', 'fixer', 'environment', 'condenser', 'vision_gui', 'local_private']) {
     assert.deepEqual(role(name).subscriptions, [], `${name} is planned, not reactive`);
   }
   for (const r of BUILTIN_ROLES) {
@@ -313,6 +319,8 @@ test('phases, workspaces and permission profiles match the design', () => {
     ['metrics_analyst', 'diagnosis', 'scratch', 'analyst'],
     ['environment', 'execution', 'scratch', 'environment_operator'],
     ['condenser', 'analysis', 'scratch', 'read_only'],
+    ['vision_gui', 'execution', 'scratch', 'test_executor'],
+    ['local_private', 'analysis', 'isolated_worktree', 'test_executor'],
   ]);
   assert.deepEqual(role('condenser').toolPolicy.allow, ['complete_work', 'fail_work']);
 });
@@ -461,4 +469,64 @@ test('metrics, environment and condenser output contracts', () => {
   assert.equal(valid('condenser', { ...cond, evidenceRefs: ['1'] }), false, 'evidence ids are kept verbatim');
   const { decisions: _d, ...missing } = cond;
   assert.equal(valid('condenser', missing), false);
+});
+
+test('vision_gui: browser + API + screenshot evidence, a vision route, no workspace, shell or environment control', () => {
+  const gui = role('vision_gui');
+  assert.deepEqual(gui.defaultModelPolicy.requiredCapabilities, ['tool_use', 'structured_output', 'vision']);
+  assert.equal(gui.taskType.includes('execute'), false, 'GUI routes are ranked by quality, not tool reliability alone');
+  for (const t of ['browser.navigate', 'browser.click', 'browser.fill', 'browser.text', 'browser.screenshot', 'http.request', 'evidence.get', 'blackboard.post_finding'] as const) {
+    assert.equal(toolPermitted(gui.toolPolicy, t), true, t);
+  }
+  for (const t of ['fs.write', 'fs.read', 'shell.exec', 'test.run', 'env.deploy', 'env.restart', 'load.start', 'oracle.propose_change', 'git.commit'] as const) {
+    assert.equal(toolPermitted(gui.toolPolicy, t), false, t);
+  }
+  assert.ok(gui.systemPrompt.indexOf('`browser.text`') < gui.systemPrompt.indexOf('`http.request`'), 'DOM is described before the API');
+  assert.ok(gui.systemPrompt.indexOf('`http.request`') < gui.systemPrompt.indexOf('Computer use is a last resort'), 'computer use comes last');
+});
+
+test('vision_gui output contract: every check cites evidence with a known method and a distinct outcome', () => {
+  const check = { check: 'checkout button submits the order', method: 'dom', outcome: 'passed', expected: 'Order #', actual: 'Order #1042 placed', evidenceIds: ['ev_1'] };
+  assert.equal(valid('vision_gui', { summary: 's', checks: [check], findings: [], screenshots: ['ev_2'] }), true);
+  assert.equal(valid('vision_gui', { summary: 's', checks: [{ ...check, evidenceIds: [] }], findings: [], screenshots: [] }), false, 'no evidence, no check');
+  assert.equal(valid('vision_gui', { summary: 's', checks: [{ ...check, method: 'gut_feeling' }], findings: [], screenshots: [] }), false);
+  assert.equal(valid('vision_gui', { summary: 's', checks: [{ ...check, outcome: 'looks_ok' }], findings: [], screenshots: [] }), false);
+  assert.equal(valid('vision_gui', { summary: 's', checks: [{ ...check, outcome: 'not_run', method: 'visual' }], findings: [], screenshots: ['ev_2'] }), true, 'NOT RUN is reportable');
+  assert.equal(valid('vision_gui', { summary: 's', checks: [check], findings: [] }), false, 'screenshots are listed (possibly empty)');
+  assert.equal(valid('vision_gui', { summary: 's', checks: [check], findings: [], screenshots: ['shot.png'] }), false, 'screenshot evidence ids, not file names');
+});
+
+test('local_private: restricted data routed only to restricted (local) routes, fail-closed fallback, no egress tool even by override', () => {
+  const lp = role('local_private');
+  assert.equal(lp.dataClassification, 'restricted');
+  assert.equal(lp.defaultModelPolicy.privacyClass, 'restricted');
+  assert.equal(lp.defaultModelPolicy.fallback, 'fail_closed');
+  for (const t of ['http.request', 'browser.navigate', 'browser.screenshot', 'load.start', 'metrics.query', 'metrics.scrape', 'env.deploy', 'shell.exec', 'fs.write', 'delegate'] as const) {
+    assert.equal(toolPermitted(lp.toolPolicy, t), false, t);
+  }
+  for (const t of ['fs.read', 'git.diff', 'code.symbols', 'test.run', 'blackboard.post_finding', 'evidence.query'] as const) assert.equal(toolPermitted(lp.toolPolicy, t), true, t);
+  // an operator widening the allowlist still cannot hand it an egress tool: the role's deny list wins
+  const widened = new RoleCatalog(BUILTIN_ROLES, { roles: { local_private: { toolPolicy: { allow: [...lp.toolPolicy.allow, 'http.request', 'browser.*'] } } } }).require('local_private');
+  for (const t of ['http.request', 'browser.navigate'] as const) assert.equal(toolPermitted(widened.toolPolicy, t), false, `${t} stays denied`);
+  // every other role's context may be shown to hosted models: only local_private carries restricted data
+  for (const r of BUILTIN_ROLES.filter((x) => x.role !== 'local_private')) {
+    assert.notEqual(r.dataClassification, 'restricted', r.role);
+    assert.notEqual(r.defaultModelPolicy.privacyClass, 'restricted', r.role);
+  }
+});
+
+test('local_private output contract: observations cite evidence; the withheld kinds are listed', () => {
+  const ok = { summary: 's', observations: [{ statement: 'an API key is committed in config/prod.env line 12', evidenceIds: ['ev_1'] }], findings: ['rec_1'], withheld: ['API key value'] };
+  assert.equal(valid('local_private', ok), true);
+  assert.equal(valid('local_private', { ...ok, observations: [{ statement: 'x', evidenceIds: [] }] }), false);
+  const { withheld: _w, ...noWithheld } = ok;
+  assert.equal(valid('local_private', noWithheld), false, 'withheld is required (possibly empty)');
+  assert.equal(valid('local_private', { ...ok, withheld: [] }), true);
+});
+
+test('SPECIALIST_ROLES names exactly the roles only a special route can serve', () => {
+  assert.deepEqual([...SPECIALIST_ROLES], ['vision_gui', 'local_private']);
+  assert.ok(Object.isFrozen(SPECIALIST_ROLES));
+  assert.ok(role('vision_gui').defaultModelPolicy.requiredCapabilities?.includes('vision'));
+  assert.equal(role('local_private').defaultModelPolicy.privacyClass, 'restricted');
 });

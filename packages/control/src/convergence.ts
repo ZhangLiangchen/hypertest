@@ -4,15 +4,16 @@ import {
   type BlackboardRecord, type CoverageGap, type EventContext, type Finding, type Hypothesis, type PlanRevision, type QualityDecision, type Review, type Risk,
   type TestRun, type WorkItem,
 } from '@hypertest/domain';
-import { DEFAULT_GATE_SPEC, type GateInput } from '@hypertest/policy';
+import { DEFAULT_GATE_SPEC, acceptanceFacts, applyPhasePermit, withPolicyHold, type GateInput } from '@hypertest/policy';
 import type { NewWorkItem } from '@hypertest/collab';
 import { EVIDENCE_PRODUCER_ROLES } from '@hypertest/agents';
 import type { ConvergenceState } from './contracts.ts';
 import type { ControlDeps, ResolvedControlConfig } from './deps.ts';
 import { acceptedPlanCount } from './domain-tools/plan.ts';
+import { createPhaseGovernor } from './phases.ts';
 import { ControlStore, type GateFeedback, type ReplanState } from './store.ts';
 import { WorkFactory, runScope } from './work-factory.ts';
-import { clip, compact, event, runCtx, workBudgetFor } from './util.ts';
+import { authorizedGateWeakenings, clip, compact, event, gateReference, runCtx, workBudgetFor } from './util.ts';
 
 /** Criteria whose `unknown` status a replan can address by gathering more evidence (gate feedback loop). */
 export const FEEDBACK_CRITERIA: ReadonlySet<string> = new Set(['C3', 'C4', 'C6', 'C8']);
@@ -77,13 +78,15 @@ export function createConvergenceMonitor(deps: ControlDeps, config: ResolvedCont
   const { db, blackboard, runs, specs, decisions, evidence, epochs, budget, gate, signer, memory, events, ids, clock, logger, roles } = deps;
   const store = new ControlStore(db);
   const factory = new WorkFactory(deps);
+  const phases = createPhaseGovernor(deps, config);
   const workerId = config.workerId;
 
   async function exhaustion(run: TestRun): Promise<'budget' | 'wall_clock' | undefined> {
     if (clock.nowMs() - Date.parse(run.createdAt) > run.budget.maxWallClockMs) return 'wall_clock';
     const usage = await budget.usage(runScope(run.runId));
     if (!usage) return undefined;
-    for (const d of ['tokens', 'costUsd', 'toolCalls'] as const) {
+    // conformance-5: sandbox compute and stored artifact bytes are consumable run budgets too (never a silent overrun)
+    for (const d of ['tokens', 'costUsd', 'toolCalls', 'computeMs', 'artifactBytes'] as const) {
       const limit = usage.limits[d];
       if (limit !== undefined && (usage.used[d] ?? 0) >= limit) return 'budget';
     }
@@ -364,10 +367,46 @@ export function createConvergenceMonitor(deps: ControlDeps, config: ResolvedCont
   async function gateRun(start: TestRun): Promise<GateOutcome> {
     const ctx = runCtx(start.runId, workerId);
     let run = start;
+    // BUGate before_transition (run → gating), every gate attempt: the scheduler keeps convergence authority (the run is
+    // gated regardless), but a refusal withholds the verdict (at best inconclusive, human review)
+    const items = await blackboard.listWorkItems({ runId: run.runId });
+    const byState: Record<string, number> = {};
+    for (const w of items) byState[w.state] = (byState[w.state] ?? 0) + 1;
+    const gating = await phases.beforeTransition({
+      runId: run.runId,
+      transition: { subject: 'run', subjectId: run.runId, from: run.status, to: 'gating', details: { workItems: byState, attempt: (await store.replans(run.runId)).gateAttempts + 1 } },
+      ctx,
+    });
     if (run.status === 'running' || run.status === 'paused') run = await runs.update(run.runId, { status: 'converging' }, ctx);
     if (run.status === 'converging') run = await runs.update(run.runId, { status: 'gating' }, ctx);
     const input = await gateInput(run, ctx);
     let decision = gate.evaluate(input);
+    // conformance-9: the recorded authority of a weakened gate is part of the signed decision; a weakening it does not
+    // cover withholds the verdict — a gate row written around startRun (no authority, or none on record at all: then the
+    // configured base is the reference), an authority record that is not a human/system one with a rationale, or a gate
+    // weakened beyond what the authority was given for
+    const recorded = await store.gateAuthority(run.runId);
+    const judged = authorizedGateWeakenings(gateReference(recorded?.baseGate, config.defaultGate, DEFAULT_GATE_SPEC), input.gate, recorded);
+    if (judged.authority) {
+      const { by, rationale } = judged.authority;
+      decision = { ...decision, reasons: [...decision.reasons, `gate override authorized by ${by.kind}:${by.id}: ${rationale}${judged.authorized.length > 0 ? ` (weakened: ${judged.authorized.join('; ')})` : ''}`] };
+    }
+    if (judged.unauthorized.length > 0) {
+      decision = withPolicyHold(decision, {
+        criterionId: 'gate.override_authority',
+        description: 'gate override authority',
+        detail: `the run's gate is weakened without a recorded human/system authority: ${judged.unauthorized.join('; ')}`,
+      });
+    }
+    decision = applyPhasePermit(decision, gating, 'before_transition', 'run:gating');
+    // BUGate before_acceptance: the gate input digest and the verdict go to the policy; a refusal caps the verdict
+    const acceptanceAuthority = judged.authority ? { ...judged.authority, weakened: judged.authorized } : undefined;
+    const acceptance = await phases.beforeAcceptance({
+      runId: run.runId,
+      facts: acceptanceFacts(input, decision, { flaggedActions: await phases.flaggedActions(run.runId), ...(acceptanceAuthority ? { gateOverrideAuthority: acceptanceAuthority } : {}) }),
+      ctx,
+    });
+    decision = applyPhasePermit(decision, acceptance, 'before_acceptance');
     if (signer) {
       const { signature: _s, ...unsigned } = decision;
       const value = await signer.sign(canonicalJson(unsigned));
@@ -416,6 +455,9 @@ export function createConvergenceMonitor(deps: ControlDeps, config: ResolvedCont
         signed: d.signature !== undefined,
         attempt: attempts,
         final: !loop,
+        // BUGate: the phase decisions this verdict passed through (and any hold they put on it)
+        policy: { gating: gating.decisionId, acceptance: acceptance.decisionId, holds: d.unknownCriteria.filter((c) => !c.criterionId.startsWith('C')).map((c) => c.criterionId) },
+        ...(acceptanceAuthority ? { gateOverrideBy: acceptanceAuthority.by } : {}),
       };
       await events.append(
         [event(ctx, 'gate.evaluated', 'decision', d.decisionId, payload), event(ctx, d.verdict === 'pass' ? 'gate.passed' : 'gate.failed', 'decision', d.decisionId, { decisionId: d.decisionId, verdict: d.verdict, final: !loop })],

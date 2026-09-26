@@ -17,3 +17,6 @@ export { DEFAULT_GATE_SPEC, GATE_CRITERIA, QualityGate, currentRecords, evaluate
 export { DEFAULT_PROTOCOL_CONTEXT_BYTES, extractMarkdownSections, prepareProtocolContext, resolveProtocolBinding } from './bugate.ts';
 export { EMBEDDED_PRINCIPLES, EMBEDDED_PROTOCOL_VERSION, PREPARED_PROTOCOL_CONTEXT_SCHEMA } from './bugate-embedded.ts';
 export { policyMigrations } from './migrations.ts';
+export {
+  IMPLICIT_EVIDENCE_TYPES, POLICY_PHASES, acceptanceFacts, actionOutcomeFacts, applyPhasePermit, flaggedActionsOf, requestPhase, withPolicyHold, type PolicyHold,
+} from './phases.ts';

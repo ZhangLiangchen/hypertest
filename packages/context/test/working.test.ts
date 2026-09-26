@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { SequentialIdGenerator, jsonClone } from '@hypertest/core';
 import { estimateTokens, textOf, type ChatMessage, type ToolResultMessage } from '@hypertest/domain';
 import { MemoryArtifactStore } from '@hypertest/evidence';
-import { createWorkingContextManager, deterministicSummarizer, offloadToolResult, type Compaction, type Summarizer, type TranscriptEntry } from '../src/index.ts';
+import { createWorkingContextManager, deterministicSummarizer, offloadToolResult, softCondensationDue, type Compaction, type Summarizer, type TranscriptEntry } from '../src/index.ts';
 import { at, orphanedToolResults, rejectsWith, result, say, user } from './helpers.ts';
 
 /**
@@ -203,4 +203,26 @@ test('options and inputs are validated', async () => {
   const ctrl = new AbortController();
   ctrl.abort();
   await rejectsWith(m.condense({ transcript: transcript(), compactions: [], level: 'hard', summarizer: deterministicSummarizer, budgetTokens: 100, ids: ids(), now: 'n', signal: ctrl.signal }), 'cancelled');
+});
+
+test('SOFT condensation is due only with ≥ keepRecentTurns + 2 turns beyond the last cut; the manager exposes its resolved options', async () => {
+  const m = createWorkingContextManager({ keepRecentTurns: 2 });
+  assert.deepEqual(m.options, { keepRecentTurns: 2, softRatio: 0.7, hardRatio: 0.95, summaryRatio: 0.2, maxToolResultTokens: 8000 });
+  assert.throws(() => (m.options as { keepRecentTurns: number }).keepRecentTurns = 9, TypeError, 'the options are frozen');
+  const turns = (n: number): TranscriptEntry[] => Array.from({ length: n }, (_, t) => at(t, say(`step ${t}`)));
+  // turns 0..3 (maxTurn 3): 3 − (−1) = 4 = keep + 2 → due; turns 0..2 → not yet
+  assert.equal(softCondensationDue({ transcript: turns(3), compactions: [] }, 2), false);
+  assert.equal(softCondensationDue({ transcript: turns(4), compactions: [] }, 2), true);
+  assert.equal(softCondensationDue({ transcript: [], compactions: [] }, 2), false);
+  // after a compaction up to turn 3, turns 4..6 are not enough (6 − 3 = 3 < 4); turn 7 makes it due
+  const c: Compaction = { compactionId: 'cmp_1', level: 'soft', upToTurn: 3, summary: 's', evidenceRefs: [], createdAt: '2026-01-01T00:00:00.000Z' };
+  assert.equal(softCondensationDue({ transcript: turns(7), compactions: [c] }, 2), false);
+  assert.equal(softCondensationDue({ transcript: turns(8), compactions: [c] }, 2), true);
+  // a long session (a transcript of 200k entries) is no special case: never a stack overflow, never an unsorted miss
+  const long: TranscriptEntry[] = Array.from({ length: 200_000 }, (_, i) => at(199_999 - i, say('s')));
+  assert.equal(softCondensationDue({ transcript: long, compactions: [{ ...c, upToTurn: 199_990 }] }, 2), true);
+  assert.equal(softCondensationDue({ transcript: long, compactions: [{ ...c, upToTurn: 199_996 }] }, 2), false);
+  // when due, a soft pass advances the cut (it condenses ≥ 2 turns and keeps keepRecentTurns verbatim)
+  const done = await m.condense({ transcript: turns(8), compactions: [c], level: 'soft', summarizer: deterministicSummarizer, budgetTokens: 10_000, ids: new SequentialIdGenerator(), now: '2026-01-01T00:00:00.000Z' });
+  assert.deepEqual([done.level, done.upToTurn], ['soft', 5]);
 });

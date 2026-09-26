@@ -1,9 +1,12 @@
-import { HypertestError, fromJsonColumn, type SqlExecutor } from '@hypertest/core';
-import type { BudgetAmounts, BudgetDimension, BudgetLedger, BudgetUsage, OperationDeps, ReserveOutcome } from './contracts.ts';
+import { HypertestError, fromJsonColumn, toIso, type SqlExecutor } from '@hypertest/core';
+import type { BudgetAmounts, BudgetDimension, BudgetExhaustion, BudgetLedger, BudgetUsage, ConsumeOutcome, OpenReservation, OperationDeps, ReserveOutcome } from './contracts.ts';
 import { jsonParam } from './ledger.ts';
 
-/** Canonical dimension order: the first violated dimension of a scope is reported in this order. */
-export const BUDGET_DIMENSIONS: readonly BudgetDimension[] = ['tokens', 'costUsd', 'toolCalls', 'computeMs', 'artifactBytes', 'agents', 'workItems', 'wallClockMs'];
+/**
+ * Canonical dimension order: the first violated dimension of a scope is reported in this order. (additive) `externalQps`
+ * is appended last, so the order of the existing dimensions is unchanged.
+ */
+export const BUDGET_DIMENSIONS: readonly BudgetDimension[] = ['tokens', 'costUsd', 'toolCalls', 'computeMs', 'artifactBytes', 'agents', 'workItems', 'wallClockMs', 'externalQps'];
 const DIMENSION_SET: ReadonlySet<string> = new Set(BUDGET_DIMENSIONS);
 const EPSILON = 1e-9;
 
@@ -20,6 +23,15 @@ interface ReservationRow {
   scopes: unknown;
   amounts: unknown;
   status: 'reserved' | 'settled' | 'released';
+}
+
+interface OpenReservationRow {
+  reservation_id: string;
+  scopes: unknown;
+  amounts: unknown;
+  reason: string;
+  idempotency_key: string | null;
+  created_at: unknown;
 }
 
 /** Integers stay exact; fractional amounts (costUsd) are rounded to 1e-9 to avoid drift. */
@@ -165,6 +177,24 @@ export function createBudgetLedger(deps: OperationDeps): BudgetLedger {
     });
   }
 
+  /**
+   * The first scope (chain order) and dimension (BUDGET_DIMENSIONS order, among `dims`) whose used amount reached its
+   * limit — nothing is left of it (used ≥ limit). Reservations do not count: they settle to actual use.
+   */
+  function firstExhausted(chain: string[], rows: Map<string, { limits: BudgetAmounts; used: BudgetAmounts; reserved: BudgetAmounts }>, dims: ReadonlySet<BudgetDimension>, requested: BudgetAmounts): BudgetExhaustion | undefined {
+    for (const scope of chain) {
+      const row = rows.get(scope)!;
+      for (const d of BUDGET_DIMENSIONS) {
+        if (!dims.has(d)) continue;
+        const limit = row.limits[d];
+        if (limit === undefined) continue;
+        const used = row.used[d] ?? 0;
+        if (used + EPSILON >= limit) return { scope, dimension: d, limit, used, reserved: row.reserved[d] ?? 0, requested: requested[d] ?? 0 };
+      }
+    }
+    return undefined;
+  }
+
   async function finish(reservationId: string, actualRaw: BudgetAmounts | undefined): Promise<void> {
     const actual = actualRaw === undefined ? undefined : normalizeAmounts(actualRaw, 'actual');
     await db.transaction(async (tx) => {
@@ -229,8 +259,8 @@ export function createBudgetLedger(deps: OperationDeps): BudgetLedger {
       });
     },
 
-    reserve(scopes, amounts, reason): Promise<ReserveOutcome> {
-      return reserveOrCharge(scopes, amounts, reason, 'reserve');
+    reserve(scopes, amounts, reason, options): Promise<ReserveOutcome> {
+      return reserveOrCharge(scopes, amounts, reason, 'reserve', options?.idempotencyKey);
     },
 
     async settle(reservationId: string, actual: BudgetAmounts): Promise<void> {
@@ -256,6 +286,70 @@ export function createBudgetLedger(deps: OperationDeps): BudgetLedger {
       }
       if (released.length > 0) logger.info('released open budget reservations', { scope, released });
       return released;
+    },
+
+    async consume(scopes: string[], rawAmounts: BudgetAmounts, reason: string): Promise<ConsumeOutcome> {
+      requireScopes(scopes);
+      const amounts = normalizeAmounts(rawAmounts, 'amounts');
+      if (typeof reason !== 'string') throw new HypertestError('invalid_argument', 'reason must be a string');
+      const dims = new Set(Object.keys(amounts) as BudgetDimension[]);
+      return db.transaction(async (tx) => {
+        const chain = await expandChain(tx, scopes);
+        const rows = await lockScopes(tx, chain);
+        // the resource was already spent: always recorded (like settle), never refused
+        for (const scope of chain) {
+          const row = rows.get(scope)!;
+          row.used = add(row.used, amounts, 1);
+          await writeScope(tx, scope, row.used, row.reserved);
+        }
+        const reservationId = ids.next('bres');
+        const now = clock.isoNow();
+        await tx.query(
+          `INSERT INTO ht_budget_reservations (reservation_id, scopes, amounts, actual, status, reason, created_at, updated_at)
+           VALUES ($1, $2::jsonb, $3::jsonb, $3::jsonb, 'settled', $4, $5, $5)`,
+          [reservationId, jsonParam(chain), jsonParam(amounts), reason, now],
+        );
+        const exhausted = firstExhausted(chain, rows, dims, amounts);
+        if (exhausted) {
+          logger.info('budget exhausted by recorded usage', { reason, ...exhausted });
+          return { reservationId, exhausted };
+        }
+        return { reservationId };
+      });
+    },
+
+    async remaining(scopes: string[]): Promise<BudgetAmounts> {
+      requireScopes(scopes);
+      return db.transaction(async (tx) => {
+        const chain = await expandChain(tx, scopes);
+        const r = await tx.query<ScopeRow>('SELECT scope, parent_scope, limits, used, reserved FROM ht_budget_scopes WHERE scope = ANY($1::text[])', [[...chain]]);
+        const out: BudgetAmounts = {};
+        for (const row of r.rows) {
+          const limits = fromJsonColumn<BudgetAmounts>(row.limits);
+          const used = fromJsonColumn<BudgetAmounts>(row.used);
+          const reserved = fromJsonColumn<BudgetAmounts>(row.reserved);
+          for (const d of BUDGET_DIMENSIONS) {
+            const limit = limits[d];
+            if (limit === undefined) continue;
+            const left = Math.max(0, round(limit - (used[d] ?? 0) - (reserved[d] ?? 0)));
+            out[d] = out[d] === undefined ? left : Math.min(out[d]!, left);
+          }
+        }
+        return out;
+      });
+    },
+
+    async openReservations(scope: string): Promise<OpenReservation[]> {
+      if (typeof scope !== 'string' || scope.length === 0) throw new HypertestError('invalid_argument', 'scope must be a non-empty string');
+      const r = await db.query<OpenReservationRow>(
+        "SELECT reservation_id, scopes, amounts, reason, idempotency_key, created_at FROM ht_budget_reservations WHERE status = 'reserved' AND scopes @> $1::jsonb ORDER BY created_at, reservation_id",
+        [jsonParam([scope])],
+      );
+      return r.rows.map((row) => {
+        const out: OpenReservation = { reservationId: row.reservation_id, scopes: fromJsonColumn<string[]>(row.scopes), amounts: fromJsonColumn<BudgetAmounts>(row.amounts), reason: row.reason, createdAt: toIso(row.created_at) };
+        if (row.idempotency_key !== null && row.idempotency_key !== undefined) out.idempotencyKey = row.idempotency_key;
+        return out;
+      });
     },
 
     async usage(scope: string): Promise<BudgetUsage | undefined> {

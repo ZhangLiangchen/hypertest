@@ -25,9 +25,10 @@ test('KNOWN_TOOL_IDS is exactly the built-in (tools) and domain (control) tool c
     'blackboard.read', 'blackboard.post_finding', 'blackboard.post_hypothesis', 'blackboard.report_coverage_gap', 'blackboard.post_risk',
     'blackboard.post_review', 'blackboard.post_note', 'plan.propose_revision', 'plan.read', 'work.propose', 'system_model.record',
     'oracle.get', 'oracle.list', 'oracle.propose_change', 'experiment.define', 'test_artifact.register', 'test_artifact.validate',
-    'evidence.get', 'evidence.query', 'evidence.claim', 'delegate', 'request_approval', 'complete_work', 'fail_work',
+    'evidence.get', 'evidence.query', 'evidence.claim', 'delegate', 'delegate.status', 'delegate.collect', 'delegate.message', 'delegate.release',
+    'request_approval', 'complete_work', 'fail_work',
   ]);
-  assert.equal(KNOWN_TOOL_IDS.length, 55);
+  assert.equal(KNOWN_TOOL_IDS.length, 59);
   assert.equal(new Set(KNOWN_TOOL_IDS).size, KNOWN_TOOL_IDS.length, 'tool ids are unique');
   assert.deepEqual([...KNOWN_TOOL_IDS], [...BUILTIN_TOOL_IDS, ...DOMAIN_TOOL_IDS]);
 });

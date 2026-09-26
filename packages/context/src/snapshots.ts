@@ -151,10 +151,15 @@ export function environmentVersion(env: { generation: number; buildDigest?: stri
   return `${env.generation}:${env.buildDigest ?? ''}`;
 }
 
+/** Default cap of observed entries joining one snapshot (most recent kept). */
+export const DEFAULT_MAX_OBSERVED_ENTRIES = 256;
+
 /**
  * Builds a snapshot from canonical sources. The read set always contains one exact_version entry per run
  * oracle (version = revision) and one for the environment (when given), plus the caller's observed entries.
  * The read set is sorted and de-duplicated so equal observations give equal snapshot ids.
+ * (additive) With `input.observer` and an ObservationLog, the observer agent's latest observation of every resource it
+ * read or wrote through a tool (at most `maxObservedEntries`) joins the read set.
  */
 export function createSnapshotBuilder(deps: SnapshotBuilderDeps): SnapshotBuilder {
   const { sources, snapshots, clock } = deps;
@@ -189,6 +194,16 @@ export function createSnapshotBuilder(deps: SnapshotBuilderDeps): SnapshotBuilde
         validateReadSetEntry(e, `input.readSet[${i}]`);
         entries.push(e);
       });
+      // (additive) what the observer agent saw or wrote through its tool calls: its latest observation of each resource
+      if (input.observer !== undefined) {
+        requireText(input.observer?.agentId, 'input.observer.agentId');
+        if (deps.observations) {
+          const limit = deps.maxObservedEntries ?? DEFAULT_MAX_OBSERVED_ENTRIES;
+          for (const o of await deps.observations.latest({ runId: input.runId, agentId: input.observer.agentId, limit })) {
+            entries.push({ resourceType: o.resourceType, resourceId: o.resourceId, observedVersion: o.observedVersion, observedAt: o.observedAt, freshness: o.freshness });
+          }
+        }
+      }
       const seen = new Set<string>();
       const readSet = entries
         .filter((e) => {

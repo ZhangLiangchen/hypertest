@@ -7,9 +7,25 @@ import type { NewWorkItem } from '@hypertest/collab';
 import type { ToolSpec } from '@hypertest/tools';
 import type { ControlDeps } from '../deps.ts';
 import { validatePlan } from '../plan-validator.ts';
+import { CAPABILITY_REQUIREMENT_SCHEMA } from '../capability-grant.ts';
+import { createPhaseGovernor } from '../phases.ts';
 import { WorkFactory, workScope } from '../work-factory.ts';
 import { workBudgetFor } from '../util.ts';
 import { Caller, domainTool, refuse, success } from './common.ts';
+
+/**
+ * The plan.propose_revision input: the domain's PLAN_PROPOSAL_SCHEMA with planned work items that may state their
+ * `capabilityRequirements` (WorkItem field, I2: intersected with the role/parent/environment grant; the excess is
+ * reported to the agent) — added here when the domain schema does not list them yet.
+ */
+export const PLAN_PROPOSAL_INPUT_SCHEMA: JsonSchema = withCapabilityRequirements(PLAN_PROPOSAL_SCHEMA);
+
+function withCapabilityRequirements(schema: JsonSchema): JsonSchema {
+  const s = structuredClone(schema) as { properties?: { workItems?: { items?: { properties?: Record<string, unknown> } } } };
+  const props = s.properties?.workItems?.items?.properties;
+  if (props && props['capabilityRequirements'] === undefined) props['capabilityRequirements'] = { type: 'array', maxItems: 20, items: CAPABILITY_REQUIREMENT_SCHEMA };
+  return s as JsonSchema;
+}
 
 interface ProposalInput {
   rationale: string;
@@ -50,6 +66,7 @@ function planSummary(p: PlanRevision): Record<string, unknown> {
 export function planTools(deps: ControlDeps): ToolSpec[] {
   const { blackboard, runs, roles, ids, db, leases, admission, subagents, agents } = deps;
   const factory = new WorkFactory(deps);
+  const phases = createPhaseGovernor(deps, deps.config);
 
   /** The result a replayed plan.propose_revision call returns: the outcome recorded by its first execution. */
   async function replayedOutcome(plan: PlanRevision) {
@@ -96,7 +113,7 @@ export function planTools(deps: ControlDeps): ToolSpec[] {
       title: 'Propose a plan revision',
       description:
         'Lead only. Propose the next typed plan revision (Plan IR): rationale, objectives, workItems (localId, title, objective, role, dependsOn, objectiveIds, optional inputRefs, expectedOutput, evidenceRequirements, budget, priority, toolPolicy, resourceClaims), cancelWorkItems, assumptions, readyForGate. The revision is validated deterministically; a valid revision is accepted and its work items are created at once, an invalid one is recorded as rejected with its issues.',
-      inputSchema: PLAN_PROPOSAL_SCHEMA,
+      inputSchema: PLAN_PROPOSAL_INPUT_SCHEMA,
       area: 'plan',
       async execute(input, ctx) {
         const caller = new Caller(deps, ctx);
@@ -105,6 +122,8 @@ export function planTools(deps: ControlDeps): ToolSpec[] {
         // Retry-stable plan id: a replayed call (crash after the plan committed, before the tool call settled) finds
         // the revision it already recorded instead of accepting a second copy with duplicate work (I5).
         const planId = `plan_${sha256Hex(`${run.runId}\u0000${ctx.invocationId}`).slice(0, 26)}`;
+        const already = (await blackboard.listPlans(run.runId)).find((p) => p.planId === planId);
+        if (already) return replayedOutcome(already);
         const objectives: Objective[] = input.objectives.map((o) => ({
           objectiveId: o.objectiveId,
           description: o.description,
@@ -120,6 +139,22 @@ export function planTools(deps: ControlDeps): ToolSpec[] {
           cancelWorkItems: input.cancelWorkItems ?? [],
           readyForGate: input.readyForGate ?? false,
         };
+        // BUGate before_transition (plan → accepted), judged on the proposal before it is recorded; a refusal rejects the
+        // revision with the policy's reasons (the lead can revise it)
+        const permit = await phases.beforeTransition({
+          runId: run.runId,
+          transition: {
+            subject: 'plan', subjectId: planId, from: 'proposed', to: 'accepted',
+            details: {
+              readyForGate: proposal.readyForGate, workItems: proposal.workItems.length, roles: [...new Set(proposal.workItems.map((w) => w.role))].sort(),
+              cancelWorkItems: proposal.cancelWorkItems.length, objectives: objectives.length, openObjectives: objectives.filter((o) => o.status === 'open').length,
+            },
+          },
+          workItemId: ctx.workItemId,
+          requestedBy: { agentId: ctx.agentId, role: ctx.role },
+          ctx: evCtx,
+        });
+        const policyIssues = permit.decision === 'allow' ? [] : [`policy (before_transition plan:accepted, ${permit.decision}, decision ${permit.decisionId}): ${permit.reasons.join('; ') || 'no reason given'}`];
         const toInterrupt: WorkItem[] = [];
         // (H4) the replay lookup, the validation and the write happen under the run's work-creation lock in ONE
         // transaction: two concurrent executions of one replayed invocation cannot both accept a revision
@@ -130,7 +165,8 @@ export function planTools(deps: ControlDeps): ToolSpec[] {
           const existing = await blackboard.listWorkItems({ runId: run.runId });
           const plans = await blackboard.listPlans(run.runId);
           const latest = await blackboard.latestAcceptedPlan(run.runId);
-          const validation = validatePlan({ run, proposal, existingWorkItems: existing, roles, acceptedPlanCount: acceptedPlanCount(plans), proposerRole: ctx.role });
+          const checked = validatePlan({ run, proposal, existingWorkItems: existing, roles, acceptedPlanCount: acceptedPlanCount(plans), proposerRole: ctx.role });
+          const validation = { valid: checked.valid && policyIssues.length === 0, issues: [...checked.issues, ...policyIssues] };
           const base: Omit<PlanRevision, 'revision' | 'status' | 'createdAt' | 'validationIssues' | 'decidedAt'> = {
             planId,
             runId: run.runId,

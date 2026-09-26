@@ -3,6 +3,7 @@ import { RISK_ORDER } from '@hypertest/domain';
 import { capabilityAllows, verifyCapability } from './capabilities.ts';
 import type { ActionPermit, ActionRequest, PermitConstraints, PolicyEngine, PolicyEngineOptions, PolicyRule } from './contracts.ts';
 import { intersectPatterns, matchesResourcePattern, matchesToolPattern } from './patterns.ts';
+import { POLICY_PHASES, flaggedActionsOf, requestPhase } from './phases.ts';
 
 type Decision = ActionPermit['decision'];
 const DECISION_RANK: Record<Decision, number> = { allow: 0, approval_required: 1, deny: 2 };
@@ -45,6 +46,11 @@ export const POLICY_RULE_SCHEMA: JsonSchema = {
         roles: stringList,
         environmentClasses: stringList,
         resources: stringList,
+        phases: { type: 'array', minItems: 1, items: { enum: [...POLICY_PHASES] } },
+        transitions: stringList,
+        undeclaredEvidence: { type: 'boolean' },
+        flaggedActions: { type: 'boolean' },
+        verdicts: { type: 'array', minItems: 1, items: { enum: ['pass', 'fail', 'conditional', 'inconclusive'] } },
       },
     },
     decision: { enum: ['allow', 'deny', 'approval_required'] },
@@ -54,7 +60,10 @@ export const POLICY_RULE_SCHEMA: JsonSchema = {
 
 /**
  * Default rule set (fail closed: anything not allowed here is denied).
- * Rule ids are stable API (they appear in permit reasons and decision logs).
+ * Rule ids are stable API (they appear in permit reasons and decision logs). The action rules carry no `phases`
+ * (before_action only); each other BUGate time point has its own defaults: after_action allows and flags evidence of
+ * a type the tool does not declare; before_transition allows and refuses the completion of a work item whose calls were
+ * flagged; before_acceptance allows and sends a run with flagged calls to human review (never `pass`).
  */
 export const DEFAULT_POLICY_RULES: PolicyRule[] = deepFreeze<PolicyRule[]>([
   { id: 'allow-read-record', description: 'reads and blackboard/evidence records are allowed everywhere', match: { effects: ['read', 'record'] }, decision: 'allow' },
@@ -88,11 +97,48 @@ export const DEFAULT_POLICY_RULES: PolicyRule[] = deepFreeze<PolicyRule[]>([
     match: { tools: ['oracle.approve*', 'approval.decide*', 'oracle.decide*'] },
     decision: 'deny',
   },
+  // after_action: what did the call produce?
+  { id: 'allow-after-action', description: 'an executed call whose outcome no rule flags passes the after_action check', match: { phases: ['after_action'] }, decision: 'allow' },
+  {
+    id: 'flag-undeclared-evidence',
+    description: 'a call that produced evidence of a type its tool does not declare is flagged (evidence must come from the tool that is entitled to produce it)',
+    match: { phases: ['after_action'], undeclaredEvidence: true },
+    decision: 'deny',
+  },
+  // before_transition: may the work item complete, the plan be accepted, the run be gated?
+  { id: 'allow-transitions', description: 'state transitions are allowed unless a rule refuses them', match: { phases: ['before_transition'] }, decision: 'allow' },
+  {
+    id: 'deny-completion-with-flagged-actions',
+    description: 'a work item whose calls were flagged after action cannot complete (fail it; the flagged evidence never backs a completion)',
+    match: { phases: ['before_transition'], transitions: ['work_item:completed'], flaggedActions: true },
+    decision: 'deny',
+  },
+  // before_acceptance: may the run claim its verdict?
+  { id: 'allow-acceptance', description: 'the gate verdict stands unless a rule withholds it', match: { phases: ['before_acceptance'] }, decision: 'allow' },
+  {
+    id: 'review-flagged-actions',
+    description: 'a run with calls flagged after action needs human review before its verdict is accepted (at best inconclusive)',
+    match: { phases: ['before_acceptance'], flaggedActions: true },
+    decision: 'approval_required',
+  },
 ]);
 
-/** True when the rule's match block applies to the request (see PolicyRule for resource semantics). */
+/**
+ * True when the rule's match block applies to the request (see PolicyRule for resource semantics). Phase first: a rule
+ * without `phases` applies to before_action only; the phase facts (`transitions`, `undeclaredEvidence`,
+ * `flaggedActions`, `verdicts`) match only requests that carry the corresponding facts (a missing fact never matches a
+ * positive condition).
+ */
 export function ruleMatches(rule: PolicyRule, req: ActionRequest): boolean {
   const m = rule.match;
+  if (!(m.phases ?? ['before_action']).includes(requestPhase(req))) return false;
+  if (m.transitions) {
+    const t = req.transition;
+    if (!t || !m.transitions.some((p) => matchesToolPattern(p, `${t.subject}:${t.to}`))) return false;
+  }
+  if (m.undeclaredEvidence !== undefined && ((req.outcome?.undeclaredEvidenceTypes?.length ?? 0) > 0) !== m.undeclaredEvidence) return false;
+  if (m.flaggedActions !== undefined && (flaggedActionsOf(req) > 0) !== m.flaggedActions) return false;
+  if (m.verdicts && (!req.acceptance || !m.verdicts.includes(req.acceptance.verdict))) return false;
   if (m.tools && !m.tools.some((p) => matchesToolPattern(p, req.tool))) return false;
   if (m.effects && !m.effects.includes(req.effect)) return false;
   if (m.minRisk && !(RISK_ORDER[req.riskClass] >= RISK_ORDER[m.minRisk])) return false;
@@ -155,6 +201,12 @@ function malformedRequest(request: ActionRequest): string | undefined {
   for (const k of ['environmentClass', 'role', 'agentId', 'workItemId'] as const) {
     if (request[k] !== undefined && typeof request[k] !== 'string') return k;
   }
+  if (request.phase !== undefined && !(POLICY_PHASES as readonly string[]).includes(request.phase)) return `phase ${String(request.phase)}`;
+  if (request.outcome !== undefined && (!request.outcome || typeof request.outcome !== 'object' || !isStringList(request.outcome.undeclaredEvidenceTypes))) return 'outcome';
+  if (request.transition !== undefined && (!request.transition || typeof request.transition !== 'object' || typeof request.transition.subject !== 'string' || typeof request.transition.to !== 'string')) {
+    return 'transition';
+  }
+  if (request.acceptance !== undefined && (!request.acceptance || typeof request.acceptance !== 'object' || typeof request.acceptance.verdict !== 'string')) return 'acceptance';
   return undefined;
 }
 

@@ -76,18 +76,19 @@ Judge whether the execution evidence supports the finding exactly as stated (beh
 
 /**
  * Roles whose agents produce what the reviewer judges and what the QualityGate counts: execution evidence (executor,
- * environment, metrics analyst), findings and hypotheses (rca, metrics analyst), test artifacts (test designer) and
- * fixes (fixer). The reviewer routes to a model provider none of them used in the run (I3 heterogeneity), so a review
- * the gate counts as independent (C6: provider not among the producers' providers) is also routable.
+ * environment, metrics analyst, the GUI tester's browser/API/screenshot evidence, the private-data analyst's test runs),
+ * findings and hypotheses (rca, metrics analyst, vision_gui, local_private), test artifacts (test designer) and fixes
+ * (fixer). The reviewer routes to a model provider none of them used in the run (I3 heterogeneity), so a review the gate
+ * counts as independent (C6: provider not among the producers' providers) is also routable.
  */
-export const EVIDENCE_PRODUCER_ROLES: readonly string[] = Object.freeze(['executor', 'test_designer', 'rca', 'fixer', 'metrics_analyst', 'environment']);
+export const EVIDENCE_PRODUCER_ROLES: readonly string[] = Object.freeze(['executor', 'test_designer', 'rca', 'fixer', 'metrics_analyst', 'environment', 'vision_gui', 'local_private']);
 
 export const REVIEWER_ROLE: RoleDefinition = {
   role: 'reviewer',
   description: 'Independently judges findings, test artifacts, fixes and claims from the evidence, on a provider different from the producers.',
   systemPrompt: composePrompt({
     title: 'independent reviewer',
-    mission: `You independently judge whether a claim is supported by evidence: a finding, a test artifact, a fix, a root-cause statement or a readiness claim. You run on a model provider different from every agent that produced this run's evidence, findings, tests or fixes (executor, test designer, root-cause, fixer, metrics analyst, environment), so your judgement is an independent check. You judge the evidence, never the producer's narrative, and you are free to answer "unknown".`,
+    mission: `You independently judge whether a claim is supported by evidence: a finding, a test artifact, a fix, a root-cause statement or a readiness claim. You run on a model provider different from every agent that produced this run's evidence, findings, tests or fixes (executor, test designer, root-cause, fixer, metrics analyst, environment, GUI tester, private-data analyst), so your judgement is an independent check. You judge the evidence, never the producer's narrative, and you are free to answer "unknown".`,
     body: BODY,
     allow: REVIEWER_TOOLS,
   }),

@@ -2,14 +2,15 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import { isHypertestError } from '@hypertest/core';
 import type { RuntimeManifest } from '@hypertest/domain';
-import { EngineRegistry, NativeEngine, buildRuntimeManifest, createSessionStore, verifyRuntimeManifest, type AgentEngine } from '../src/index.ts';
+import type { ToolSpec } from '@hypertest/tools';
+import { EngineRegistry, NativeEngine, buildRuntimeManifest, createSessionStore, toolCatalogRevision, verifyRuntimeManifest, type AgentEngine } from '../src/index.ts';
 import { baseDeps } from './helpers.ts';
 
 type Content = Omit<RuntimeManifest, 'manifestId' | 'createdAt'>;
 
 function content(): Content {
   return {
-    hypertest: { version: '0.3.0', gitSha: 'abc123' },
+    hypertest: { version: '0.3.0', gitSha: 'a'.repeat(40) },
     agentEngines: [{ kind: 'native', version: '0.3.0' }, { kind: 'pi', version: '1.2.0' }],
     providerAdapters: [{ provider: 'anthropic', package: '@hypertest/model#anthropic', version: '0.3.0' }, { provider: 'openai', package: '@hypertest/model#openai', version: '0.3.0' }],
     modelCatalogRevision: 'mc_1',
@@ -42,6 +43,12 @@ describe('RuntimeManifest (I11)', () => {
       (c) => (c.toolCatalogRevision = 'tools_2'),
       (c) => (c.protocol!.digest = 'sha256:bb'),
       (c) => delete c.protocol,
+      // runtime BOM fields
+      (c) => (c.hypertest.gitSha = 'b'.repeat(40)),
+      (c) => (c.hypertest.imageDigest = `sha256:${'c'.repeat(64)}`),
+      (c) => (c.agentEngines[1]!.adapter = { package: '@hypertest/runtime-pi', version: '0.3.1' }),
+      (c) => (c.defaultEngine = 'pi'),
+      (c) => (c.roleCatalogRevision = 'roles_2'),
     ];
     const ids = variants.map((mutate) => {
       const c = content();
@@ -76,6 +83,13 @@ describe('RuntimeManifest (I11)', () => {
       ['empty version', (c) => (c.hypertest.version = '')],
       ['adapter without package', (c) => delete (c.providerAdapters[0] as { package?: string }).package],
       ['missing schema', (c) => delete (c.schemas as { evidence?: string }).evidence],
+      ['empty git sha', (c) => (c.hypertest.gitSha = '')],
+      ['image digest without algorithm', (c) => (c.hypertest.imageDigest = 'c'.repeat(64))],
+      ['uppercase image digest', (c) => (c.hypertest.imageDigest = `sha256:${'C'.repeat(64)}`)],
+      ['empty engine image digest', (c) => (c.agentEngines[0]!.imageDigest = '')],
+      ['adapter without version', (c) => (c.agentEngines[1]!.adapter = { package: '@hypertest/runtime-pi' } as never)],
+      ['default engine not pinned', (c) => (c.defaultEngine = 'dsh')],
+      ['empty role catalog revision', (c) => (c.roleCatalogRevision = '')],
     ];
     for (const [what, mutate] of bad) {
       const c = content();
@@ -83,6 +97,55 @@ describe('RuntimeManifest (I11)', () => {
       assert.throws(() => buildRuntimeManifest(c, '2026-01-01T00:00:00.000Z'), (e: unknown) => isHypertestError(e, 'invalid_argument'), what);
     }
     assert.throws(() => buildRuntimeManifest(content(), 'yesterday'), (e: unknown) => isHypertestError(e, 'invalid_argument'));
+  });
+});
+
+describe('RuntimeManifest BOM: backward compatibility of the optional fields', () => {
+  test('a manifest built without the runtime-BOM fields keeps verifying (ids of pinned runs stay valid)', () => {
+    const c = content();
+    delete c.hypertest.gitSha;
+    const m = buildRuntimeManifest(c, '2026-01-01T00:00:00.000Z');
+    assert.equal(verifyRuntimeManifest(m), true);
+    assert.equal('defaultEngine' in m, false);
+    assert.equal('roleCatalogRevision' in m, false);
+  });
+});
+
+describe('toolCatalogRevision (runtime BOM: bindings, timeouts, adapters)', () => {
+  const tool = (id: string, extra: Partial<ToolSpec> = {}): ToolSpec =>
+    ({
+      id, title: id, description: id, inputSchema: { type: 'object' }, effect: 'read', riskClass: 'low', timeoutMs: 30_000, resources: () => [], execute: async () => ({ status: 'success', output: null }), ...extra,
+    }) as unknown as ToolSpec;
+  const binding = { adapterId: 'env.process', operationType: 'env.restart', target: () => ({ kind: 'environment', resourceKey: 'env/e' }) } as unknown as NonNullable<ToolSpec['sideEffect']>;
+  const adapters = [{ adapterId: 'env.process', capabilities: { supportsNativeIdempotency: false, supportsExternalLookupByOperationId: true, supportsFencing: true, supportsCompensation: false, reconciliationClass: 'deterministic', riskClass: 'high' } }];
+  const catalog = () => [tool('fs.read'), tool('env.restart', { effect: 'destructive', riskClass: 'high', sideEffect: binding, timeoutMs: 120_000 })];
+
+  test('content-addressed and order-independent', () => {
+    const r = toolCatalogRevision(catalog(), adapters);
+    assert.match(r, /^tc_[0-9a-f]{64}$/);
+    assert.equal(toolCatalogRevision([...catalog()].reverse(), adapters), r);
+  });
+
+  test('a changed timeout, side-effect binding, lease TTL, effect, schema or adapter capability is another revision', () => {
+    const base = toolCatalogRevision(catalog(), adapters);
+    const variants = [
+      toolCatalogRevision([tool('fs.read', { timeoutMs: 31_000 }), catalog()[1]!], adapters),
+      toolCatalogRevision([tool('fs.read'), tool('env.restart', { effect: 'destructive', riskClass: 'high', timeoutMs: 120_000, sideEffect: { ...binding, operationType: 'env.redeploy' } })], adapters),
+      toolCatalogRevision([tool('fs.read'), tool('env.restart', { effect: 'destructive', riskClass: 'high', timeoutMs: 120_000, sideEffect: { ...binding, leaseTtlMs: 5_000 } })], adapters),
+      toolCatalogRevision([tool('fs.read'), tool('env.restart', { effect: 'destructive', riskClass: 'high', timeoutMs: 120_000 })], adapters),
+      toolCatalogRevision([tool('fs.read', { effect: () => 'read' }), catalog()[1]!], adapters),
+      toolCatalogRevision([tool('fs.read', { inputSchema: { type: 'object', required: ['path'] } }), catalog()[1]!], adapters),
+      toolCatalogRevision(catalog(), [{ adapterId: 'env.process', capabilities: { ...adapters[0]!.capabilities, reconciliationClass: 'best_effort' } }]),
+      toolCatalogRevision(catalog(), []),
+    ];
+    for (const v of variants) assert.notEqual(v, base);
+    assert.equal(new Set(variants).size, variants.length);
+  });
+
+  test('refuses duplicate ids and tools without a positive timeout (they could not be pinned faithfully)', () => {
+    assert.throws(() => toolCatalogRevision([tool('fs.read'), tool('fs.read')]), (e: unknown) => isHypertestError(e, 'invalid_argument'));
+    assert.throws(() => toolCatalogRevision([tool('fs.read', { timeoutMs: 0 })]), (e: unknown) => isHypertestError(e, 'invalid_argument'));
+    assert.throws(() => toolCatalogRevision([tool('fs.read')], [...adapters, ...adapters]), (e: unknown) => isHypertestError(e, 'invalid_argument'));
   });
 });
 

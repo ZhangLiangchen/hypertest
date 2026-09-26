@@ -16,14 +16,19 @@ and `agents` (implemented packages; their real behaviour is relied on). The bind
 | Export | Purpose |
 |---|---|
 | `createControlPlane(deps: ControlDeps)` | The `ControlPlane` facade (+ `scheduler`, `reactors`, `convergence`, `worker`, `config`, `close()`): `startRun`, `tick`, `executeTurn`, `observeWaiting`, `recover`, `cancelRun`, `pauseRun`, `resumeRun`, `snapshot`, `report`. Registers the domain tools in the shared registry (idempotent) and the FreshnessGuard resolvers (`experiment`, `environment`, `oracle`, `record`, `finding`, `lease`) when missing. |
-| `controlMigrations` | `control/001-control`: `ht_manifests`, `ht_run_gates`, `ht_reactor_cursors`, `ht_claims`, `ht_replans`, `ht_agent_hosts` (PGlite + PostgreSQL 16). |
+| `controlMigrations` | `control/001-control`: `ht_manifests`, `ht_run_gates`, `ht_reactor_cursors`, `ht_claims`, `ht_replans`, `ht_agent_hosts`; `control/002-governance`: gate authority columns of `ht_run_gates`, `ht_delegations` (PGlite + PostgreSQL 16). |
 | `validatePlan(input)` | Pure Plan IR validation (see below). |
 | `createScheduler`, `createReactorService`, `createConvergenceMonitor`, `createAgentWorker` | The parts (exported for durable runtimes and tests). |
-| `createDomainTools(deps)` | `blackboard.*`, `plan.read`, `plan.propose_revision`, `work.propose`, `system_model.record`, `oracle.get|list|propose_change`, `experiment.define`, `test_artifact.register|validate`, `evidence.get|query|claim`, `delegate`, `request_approval`, `complete_work`, `fail_work` — exactly `DOMAIN_TOOL_IDS` of `@hypertest/agents`. |
+| `createDomainTools(deps)` | `blackboard.*`, `plan.read`, `plan.propose_revision`, `work.propose`, `system_model.record`, `oracle.get|list|propose_change`, `experiment.define`, `test_artifact.register|validate`, `evidence.get|query|claim`, `delegate`, `delegate.status|collect|message|release`, `request_approval`, `complete_work`, `fail_work` — exactly `DOMAIN_TOOL_IDS` of `@hypertest/agents`. |
+| `createPhaseGovernor(deps, config)` | BUGate time points evaluated by the control plane: `afterAction`, `beforeTransition`, `beforeAcceptance`, `flaggedActions` (see below). `TOOL_EVIDENCE_TYPES` / `declaredEvidenceTypes`, `POLICY_FLAGGED_EVENT`, `flagEventId`. |
+| `workItemConstraint`, `unmetRequirements`, `describeUnmet`, `requirementProblems`, `addressesEnvironments`, `ENVIRONMENT_FREE_NAMESPACES`, `BASELINE_EFFECTS`, `CAPABILITY_REQUIREMENT_SCHEMA` | I2: the work item's share of parent ∩ role ∩ work item ∩ environment, and the report of what exceeds the grant. |
+| `gateWeakenings(base, effective)`, `EXECUTION_EVIDENCE_TYPES`, `authorizedGateWeakenings(reference, effective, recorded)`, `gateReference`, `GATE_AUTHORITY_KINDS` | conformance-9: the fields in which a run's gate is weaker than its base (DEFAULT_GATE_SPEC ⊕ config), and which of them a recorded human/system authority covers (the gate path and the report judge alike). |
+| `inputWaitOperationId`, `parseInputWaitOperationId`, `isAwaitingInput`, `delegationSettled`, `delegationChatMessage`, `unreadMessages` | Background / continuable delegation helpers. `PLAN_PROPOSAL_INPUT_SCHEMA`: the plan tool's input (domain schema + `capabilityRequirements`). |
 | `createReportBuilder(deps)` | `RunReport` with markdown + json. |
 | `createToolDispatcher`, `createContextProvider`, `condenserSummarizer`, `agentHeader`/`parseAgentHeader`, `unifiedDiff`, `WorkFactory`, `ControlStore` | Building blocks of the EngineHost and the stores (exported for reuse/tests). |
 | `classifyDrift`, `quarantineLifted`, `diffSections`, `invertSection`, `sectionPaths` | Post-execution test-change governance of execution tools (see ToolDispatcher). |
 | `tightenModelPolicy(role, item)` | The effective model policy of a work item's agent: the role's policy tightened, never weakened, by the item's. |
+| `declaredExperimentIds`, `runExperimentIds`, `heldClaims`, `experimentClaimsProblem`, `syncExperimentClaims`, `releaseRunIsolation`, `settleExternalQps`, `qpsKey`, `onToolBudgetExhausted`, `experimentIsolation`, `defaultStopConditions`, `defaultContaminationRules`, `EXPERIMENT_GUARDED_EFFECTS`, `EXPERIMENT_EXEMPT_TOOLS`, `FAULT_TOOLS`, `QPS_KEY_PREFIX` | Unit B2: experiment isolation (conformance-6) and budget leases (conformance-5) — see "Experiments and budget leases". |
 | constants | `REACTOR_CONSUMER` (`reactors`), `REACTOR_SUBJECTS` (`ht.*.>`), `FEEDBACK_CRITERIA` (C3, C4, C6, C8), `MAX_GATE_ATTEMPTS` (2), `PRODUCER_ROLES`, `GOVERNED_TOOL_IDS`, `QUARANTINE_BLOCKED_TOOL_IDS`, `TERMINAL_TOOL_IDS`, `CONFIRMING_ROLES`, `RESOLVING_FINDING_STATUSES`, `DEFAULT_TURN_LIMITS`. |
 
 `ControlConfig`: `capabilitySecret`, `runtimeManifest`, `workerId`, `defaultEngineKind`, `leaseTtlMs` (60000),
@@ -38,10 +43,82 @@ fails `lease_lost` instead of being requeued again). `ControlDeps.catalog?` (add
 `budget = DEFAULT_BUDGET ⊕ config.defaultBudget ⊕ input.budget`, pinned `runtimeManifestId`, `policyRevision`,
 `protocolBinding`, `oracleRevisions` (current revision of each `oracleIds`; unknown ⇒ `invalid_argument`, nothing
 written), `gate = DEFAULT_GATE_SPEC ⊕ config.defaultGate ⊕ input.gate` (`ht_run_gates`), budget scope `run:<id>`
-{tokens, costUsd?, toolCalls, workItems} (+ `budget.reserved`), and the lead `initial_plan` work item (objective =
+{tokens, costUsd?, toolCalls, workItems, computeMs?, artifactBytes?, externalQps?} (+ `budget.reserved`), and the lead `initial_plan` work item (objective =
 goal + target + instructions for Plan v1; role budget; lead output schema). Retrying with the same `runId` returns
 the stored run. Budget caps are validated (`invalid_argument`): counts/limits are integers ≥ 1 (`maxAgentDepth` ≥ 0),
 optional cost/compute/QPS/bytes finite ≥ 0 — a zero concurrency or work-item cap would only stall the run.
+
+**Gate override authority (conformance-9)** — `startRun` compares the effective gate with its base
+(`DEFAULT_GATE_SPEC ⊕ config.defaultGate`; the default gate when the configured one is unusable): `gateWeakenings`
+names a lowered `failOnUnresolvedSeverity`, a raised `conditionalOnRiskLevel`, a disabled
+`requireDeterministicForCritical` / `requireIndependentReview` / `requireOracle`, a lowered or removed coverage
+threshold, and required evidence no longer required (a bipartite matching: every base requirement needs a distinct
+effective one with ≥ its `minCount` and the same type, or both deterministic execution evidence types — so a black-box
+run may require `api-response` / `metric` instead of `test-result`, but not `stdout`). A weakening needs
+`gateOverrideBy` (human or system `ActorRef`) + `gateOverrideRationale`: missing ⇒ `invalid_argument`; an agent
+(`kind: 'agent'`, or a call whose event context names an `agentId`) ⇒ `permission_denied`; nothing is written. The
+base, the weakened fields and the authority are stored with the gate (`ht_run_gates`), emitted as
+`gate.override_authorized` and bound into every decision of the run (a reason line inside the signed content,
+`gate.evaluated.gateOverrideBy`, the report's `Gate override authority` line). At the gate the effective gate is judged
+again (`authorizedGateWeakenings`) against the recorded base — the configured base when no base is on record — and a
+weakening the recorded authority does not cover withholds the verdict (`gate.override_authority`, see holds below): a
+gate row written around `startRun`, an authority record that is not a human/system actor with a rationale, or a gate
+weakened beyond the weakenings the authority was given for.
+
+**BUGate time points (technology-selection §BUGate)** — the ToolRuntime evaluates `before_action`; the control plane
+evaluates the other three through `createPhaseGovernor`, each decision recorded in the policy decision log (request +
+permit + policy revision: replayable) and emitted as `policy.decided` with its `phase`:
+- `after_action` (dispatcher, every executed call with an outcome to judge — it wrote or cited evidence, or its tool
+  declares evidence types; bookkeeping calls that touch no evidence are not judged): the request the call was
+  authorized with, plus
+  `outcome` = the types of the evidence the call wrote vs the types its tool declares (`ToolSpec.evidenceTypes` when a
+  spec carries it, else `TOOL_EVIDENCE_TYPES`; domain, `mcp.*` and every other undeclared tool declare none — fail
+  closed: a deployment tool that records evidence must declare its types; `tool-output` is implicit). A call is judged
+  whatever status it reports once it wrote evidence (a tool that reports `denied` after writing is judged too). A
+  non-allow permit FLAGS the call: `policy.flagged` (one per invocation), a note in the tool result. A failed check
+  flags the call (fail closed), it never re-runs it.
+- `before_transition`: `work_item:completed` in `complete_work` (refused ⇒ `policy_denied`, the agent may fail its
+  item) and again at the transition itself when the item has flagged calls (a call of the completing turn dispatched
+  after `complete_work` is judged there: refused ⇒ the item fails `policy_denied`, a continuable task does not settle), `plan:accepted` in `plan.propose_revision` (refused ⇒ the revision is rejected with the policy's reasons),
+  `run:gating` at every gate attempt (the run is gated regardless — the scheduler keeps convergence authority — but a
+  refusal withholds the verdict). Facts: subject, from/to, the subject's flagged calls, requester, details.
+- `before_acceptance`: `acceptanceFacts` (policy) — the gate input digest (evidence counted by type, never payloads;
+  findings, risks, reviews, work items by state, claims, oracle revisions, gate overrides and their authority, flagged
+  calls) and the deterministic verdict. A refusal withholds the verdict.
+- A withheld verdict (`applyPhasePermit` / `withPolicyHold`): pass/conditional/inconclusive ⇒ `inconclusive`, fail
+  stays fail, `requiresHumanReview`, the hold is an unknown criterion (`policy.before_transition`,
+  `policy.before_acceptance`, `gate.override_authority`); applied before signing. Never `pass`.
+- Default rules (policy `DEFAULT_POLICY_RULES`): after_action allows and flags undeclared evidence; transitions are
+  allowed except the completion of a work item with flagged calls; acceptance is allowed except a run with flagged
+  calls (approval_required). Non-action requests carry a short-lived signed system capability (subject
+  `system:control:<workerId>`, `record` on `run/<runId>/**`, tool `transition.<subject>` / `gate.accept`). OPA receives
+  the phase and the facts in its input.
+
+**Capability grant (I2)** — an agent's capability is parent (or the root profile) ∩ role ∩ WorkItem.capabilityRequirements
+∩ environment policy (registered environment classes ∪ `local`). With requirements, the work item's constraint is the
+least flat capability covering them plus the baseline every agent needs (read/record, its own workspace and the run's
+records): effects = baseline ∪ required, scopes = baseline ∪ required, classes = the named ones (if any, and unless a
+requirement without a class may address environments — its scopes reach beyond `workspace/…` and `run/…` — which asks
+for every class the other operands allow; a classless requirement is never silently confined). Requirements
+beyond the grant are never granted; the missing part (effect, scope — with the part that was granted — or class) is
+listed in the agent's task message (`## Capability requirements NOT granted`) and on L0
+(`capability.requirements_unmet`). A root grant is narrowed in place (no parent id); a child is attenuated from its
+parent's recorded capability. Requirements come from plans (`plan.propose_revision` accepts `capabilityRequirements` per
+work item; malformed ones reject the plan) and from `delegate`.
+
+**Delegation (subagents)** — `delegate` creates a child work item (+ an `ht_delegations` row, one transaction). By
+default the parent waits (`pending` on `work:<child>`). `background: true` returns the child id at once; the parent
+keeps working, reads the child with `delegate.status` / `delegate.collect` (the result channel only: summary, output,
+cited ids, failure — never the transcript) and gets an inbox note (`[delegation <id> (<role>) completed] …`) when a task
+ends. `continuable: true`: after `complete_work` the child's item waits on `input:<child>` with its task result recorded
+(a foreground parent waiting on `work:<child>` resumes then); `delegate.message` queues a follow-up (the child's session
+inbox via `SubagentRuntime.message`, or its initial messages when it has not started; retry-stable message id);
+`observeWaiting` of the waiting child resumes it (`SubagentRuntime.resume`) when a message is unread, and completes it
+with its last result (agent disposed) once released — by `delegate.release`, by the parent's work item ending
+(`tick` auto-release, `delegation.released` `auto: true`) or by its wall clock. Refusals: a child of another work item
+(`not_found`), messages to non-continuable / released / ended children (`precondition_failed`), releasing a
+non-continuable child (`invalid_argument`). Depth and count caps are unchanged; a background child's crash is
+recovered like any work item (requeue, new fencing token, same agent and session).
 
 **tick(runId)** — serialized per run in-process and across processes by the run lease `run/<runId>` (owner =
 `workerId`); another live owner ⇒ idle, nothing written. Steps: terminal ⇒ final result; paused ⇒ idle; converging/
@@ -239,6 +316,59 @@ such, never as the verdict), decision + reasons, findings table (ids, severity, 
 and provenance completeness for critical claims (`provenance.traceClaim`), plan evolution, work items by role, model
 routes per role from the epochs (turns), evidence count/root/seal (verified), recovery log.
 
+## Experiments and budget leases (unit B2)
+
+**experiment.define (conformance-6)** — records the environment the experiment runs against (the authoritative
+generation — `EnvironmentRegistry.load` when present —, build digest, `topologyRef` from the environment's control
+target), subjects, the workload and fault plan, `fixtures` (deduplicated), `randomSeeds` (one is generated —
+`sha256(runId, invocationId, 'seed')[0..16]`, retry-stable — when none is given), `stopConditions` (default: the
+workload's duration; a manual stop for open-ended load or faults), `contaminationRules` (default: the admitted claims,
+admission-enforced while held) and its isolation. Isolation defaults (`experimentIsolation`) derive from what the
+experiment does to `env/<environmentId>` (the key black-box tools act on): a fault plan ⇒ `fault_exclusive`, a workload
+or an exclusive / dedicated mode ⇒ `write_exclusive`, else `read_shared`; declared claims must cover it (a fault plan
+needs a `fault_exclusive` claim, a workload a write/fault claim, `shared_readonly` holds only `read_shared` claims)
+— else `isolation_insufficient`, nothing admitted. The claims are then admitted ATOMICALLY through ResourceAdmission
+with holder = experimentId (compatible with the defining work item's own claims): a conflict refuses the experiment
+(`resource_conflict`, structured `{ admitted: false, holders, conflicts }`, `admission.refused` aggregate `experiment`)
+— it is NOT created (no spec, no `experiment.defined`, not on the run). Admitted ⇒ `admission.granted` (aggregate
+`experiment`); a save that fails releases the claims. A replayed call returns the recorded experiment.
+
+**Claims follow their owners** — the owners of an experiment are the work item that defined it and every work item of
+the run that declares it (`inputRefs` kind `experiment`). Every tick (`Scheduler.syncIsolation`, before admission)
+renews the claims (TTL `leaseTtlMs`; compatible with the owners' own claims) while an owner is not terminal, and
+releases them once none is (`admission.released`, reason `owners_ended`) or the run ended (`run_ended`: the gate's
+final tick, `cancelRun`, and every later tick of a finished run — idempotent). A renewal refused by another holder is
+recorded once per conflict set (`admission.lapsed`, aggregate `experiment`, phase `experiment_renewal`). A paused run
+is not ticked: its claims lapse after the TTL and are re-admitted (if still free) when it resumes. Work-item
+admission (scheduler, heartbeat renewal) treats the claims of the item's declared experiments OF ITS RUN as compatible
+(`runExperimentIds`) — an item that runs for an experiment is never refused by it; naming another run's experiment
+shares nothing.
+
+**Write/fault tools need the claims held** — the dispatcher resolves the experiments a work item runs for (declared +
+defined by its agent). A call whose effect is `external` or `destructive` (http non-GET, load.start, env.*, browser
+clicks, MCP) is refused `experiment_claims_missing` (a `tool.denied`, never executed) when an experiment is unknown to
+the run, holds no write/fault claim (`env.inject_fault` needs `fault_exclusive`), or its claims are not all held right
+now (lapsed, released, taken). `load.stop` is exempt (it only ends an effect). When the item runs for exactly one
+experiment of its run, every call names it (`ToolExecutionRequest.experimentId`): its evidence carries
+`provenance.experimentId` and its operations `experimentId`, so the gate can judge experiment validity.
+
+**Budget leases (conformance-5)** — the run scope carries `computeMs` (`maxComputeMinutes` × 60000), `artifactBytes`
+(`maxArtifactBytes`) and `externalQps` (`maxExternalQps`). Before a non-terminal call the dispatcher reads the headroom
+(`BudgetLedger.remaining`): an `execute` tool with no compute left is refused `budget_exhausted` before it runs (else
+its timeout is capped at the compute left); the call's artifact puts are bounded by `limits.maxArtifactBytes`. After
+the call, its metered usage (`ToolExecutionResult.usage`: sandbox wall time, distinct stored bytes) is recorded on
+`work:<id>` and the run (`BudgetLedger.consume`: in full, never refused). An exhaustion — recorded, pre-checked, or a
+refused put — is typed: `budget.exhausted` `{ scope, dimension, limit, used, reserved, requested, reason:
+compute | artifact_bytes | external_qps, toolId, invocationId }` and a note to the model; a RUN-scope exhaustion pauses
+the run under `onBudgetExhausted: 'pause'`, and under `'gate'` the convergence monitor reports `budget` (it now checks
+`computeMs` and `artifactBytes` too): pending work is cancelled, the gate decides — never a silent downgrade.
+`load.start` reserves its `ratePerSecond` as `externalQps` (key `qps:<invocationId>`, idempotent for replays) against
+the run's `maxExternalQps` across all concurrent jobs: a job that does not fit is refused `external_qps_exhausted`
+(transient: never exhausts the run). The rate is released when the call started no job (not applied, denied, failed
+without an operation), when `load.stop` verified the stop, when `load.observe` or the tick's sweep finds the job's
+operation settled (verified / failed / not_applied / compensated), when its work item ended without a job, and when
+the run ends; an operation in `manual_review` keeps it (the job may run).
+
 ## Invariants and where they are proven
 
 | Invariant | Test |
@@ -250,6 +380,11 @@ routes per role from the epochs (turns), evidence count/root/seal (verified), re
 | I5 replayed tool calls (same invocation id) never duplicate plans, work, experiments, approvals, claims or records | `test/record-governance.test.ts` |
 | I3 a plan cannot weaken a role's routing policy (reviewer independence, quality floor, privacy class) | `test/robustness.test.ts` |
 | I2 delegation children are attenuated from the parent's recorded capability | `test/worker.test.ts` (delegation) |
+| I2 parent ∩ role ∩ work-item requirements ∩ environment: seeded property over generated requirements (never amplified, inside each operand, a requirement granted iff the other operands allow it — a classless requirement on environment-addressable scopes in every class they allow —, exact unmet report); a child and a planned root item get no excess and are told what is missing; malformed requirements reject a plan | `test/capability-grant.test.ts` |
+| Subagents: background delegation (status, collect, inbox note, no trace), continuable children (message → resume, release, auto-release when the parent ends), refusals, crash/resume of a background child (new token, same agent) | `test/subagents.test.ts` |
+| BUGate four time points: undeclared evidence flagged after action ⇒ completion refused ⇒ a verdict the gate alone would pass is withheld (inconclusive + human review); a tool that declares nothing and a call that reports `denied` after writing are judged too; a flagged call dispatched after `complete_work` in the same turn fails the item at the transition; the same run without the forgery passes; operator rules on `plan:*` and `run:gating`; every phase decision logged with its phase | `test/phases.test.ts` |
+| conformance-9 gate override authority: weakenings named; missing / agent authority refused; recorded, on L0, signed into the decision, in the report; a weakened gate row without authority, a whole authority record gone, an agent-named record or a gate weakened beyond its authority withholds the verdict | `test/gate-authority.test.ts` |
+| Never pass from agent text: success claimed in summary, output, a critical claim, an approving review and the lead's plan while the only test-result failed ⇒ fail (C3) | `test/evidence-verdict.e2e.test.ts` |
 | I4 fencing: stale token ⇒ `lease_lost` with no writes; a reassigned worker's tool calls are refused; the new owner continues; settled results adopted after a crash | `test/scheduler.test.ts` |
 | I4 waiting on external operations: observed, never re-dispatched; recover reconciles first, takes over orphaned claims with new tokens (other worker, restarted process) | `test/operations.test.ts` |
 | Recovery audit: a recovery pass is recorded (run.recovered) and explained in the report — re-runs and waiting items re-attached by a restarted process of the same worker; nothing recorded when nothing was recovered; idempotent per process | `test/operations.test.ts` › recovery is auditable |
@@ -265,6 +400,8 @@ routes per role from the epochs (turns), evidence count/root/seal (verified), re
 | Evidence-first domain tools (unevidenced defects, unknown evidence, role-gated confirm, completion evidence requirements) | `test/worker.test.ts` |
 | Plan IR validation (each issue), plan acceptance with mapped dependencies, rejected plans create nothing | `test/plan-validator.test.ts`, `test/worker.test.ts` |
 | Durable idempotency (`expectedTurn`), single run-lease owner under concurrent ticks | `test/context.test.ts`, `test/postgres.int.test.ts` |
+| conformance-6 (chaos: two fault experiments compete): admission rejects the second (not created, holder named, audited); a different service is admitted; recorded environment/fixtures/seed/stop/contamination/default claims; replay admits once; insufficient isolation refused; write/fault tools refused while claims are lapsed/taken/released or the experiment is read-only / unknown / foreign, reads and load.stop still run, calls name the experiment; claims renewed/re-admitted while an owner lives, lapse recorded once, released when owners end or the run ends; same-run items share claims, foreign items do not | `test/isolation-budget.test.ts` |
+| conformance-5: run scope limits; real sandbox metering charged to work + run; compute headroom caps / refuses execute tools, recorded in full, convergence `budget`; artifact headroom passed as limits, exhaustion recorded; pause policy pauses the run; externalQps reserved across concurrent jobs (typed refusal, transient), released on settle / stop / not-applied / observe / run end | `test/isolation-budget.test.ts` |
 | Full product loop: plan v1 (parallel analysts) → drain replan v2 (executor, real node:test in a git repo) → finding → RCA + TestDesigner via reactors → v3 readyForGate → verdict fail; report | `test/control.e2e.test.ts` |
 
 ## How to run
@@ -332,6 +469,43 @@ observeWaiting). `test/fixture.ts` is a git repo with a seeded pricing regressio
   `workspaceDelta` must be the registered content, and known-good / known-bad must have run on different code
   (`TestValidation.codeDigest`, domain, additive). conformance-11: the gate input's `exceptions` are the run's
   approved `gate_exception` approvals (they were hard-coded empty).
+
+- (B1 governance completion) `StartRunInput.gateOverrideBy?: ActorRef` and `gateOverrideRationale?: string`
+  (conformance-9). **Behaviour:** a run-level `gate` override that weakens the gate relative to
+  `DEFAULT_GATE_SPEC ⊕ config.defaultGate` is refused without them (`invalid_argument`) or with an agent authority
+  (`permission_denied`); callers that weaken a run's gate (e.g. `gate: { requireOracle: false }` or
+  `requireIndependentReview: false` in `StartRunInput`) must now name the human/system authority — configured defaults
+  need none. Migration `control/002-governance` (`ht_run_gates` authority columns, `ht_delegations`); `ControlStore`
+  gains `putGate(…, authority?)`, `gateAuthority`, `putDelegation`, `delegation`, `delegations`,
+  `setDelegationMessages`, `releaseDelegation`. New domain tools `delegate.status`, `delegate.collect`,
+  `delegate.message`, `delegate.release`; `delegate` accepts `background`, `continuable`, `capabilityRequirements`;
+  `plan.propose_revision` accepts `capabilityRequirements` per work item. New L0 event types (strings, not in the
+  domain catalog): `gate.override_authorized`, `policy.flagged`, `capability.requirements_unmet`,
+  `delegation.message_queued`, `delegation.released`; `gate.evaluated` gains `policy` (phase decision ids and holds) and
+  `gateOverrideBy`. Worker: the spawn carries `continuable` / `background` of the delegation; the capability is
+  intersected with the work item's requirements. New exports listed in the API table. No change to the existing
+  `src/contracts.ts` types beyond the two optional fields.
+- (B1 review fixes, behaviour) `declaredEvidenceTypes` never returns undefined: a tool that declares nothing declares
+  `[]` and is judged at after_action (fail closed); a call that reports `denied` / `stale_context` after writing
+  evidence is judged; the worker re-evaluates `before_transition work_item:completed` at the transition when the item
+  has flagged calls (a flagged call dispatched after `complete_work` in the same turn fails the item `policy_denied`);
+  the gate path and the report judge a run's gate with `authorizedGateWeakenings` (configured base when no base is on
+  record; only a human/system authority with a rationale; only the weakenings it was given for); a classless
+  requirement on environment-addressable scopes keeps every environment class the other operands allow. New exports:
+  `addressesEnvironments`, `ENVIRONMENT_FREE_NAMESPACES`, `authorizedGateWeakenings`, `gateReference`,
+  `GATE_AUTHORITY_KINDS`, `GateAuthorityJudgement`.
+
+- (unit B2, conformance-5/6) Optional `Scheduler.syncIsolation?(run, items)` and `Scheduler.releaseRun?(runId)`; new
+  module `isolation.ts` (exports in the API table); `experiment.define` input gains `fixtures`, `randomSeeds`,
+  `stopConditions`, `contaminationRules` and returns `isolation`, `fixtures`, `randomSeeds`, `stopConditions`,
+  `contaminationRules`. **Behaviour:** `experiment.define` admits its claims (refusal `resource_conflict` /
+  `isolation_insufficient`, experiment not created) and always records at least one claim; write/fault tools of a work
+  item running for an experiment are refused `experiment_claims_missing` unless its claims are held; calls name their
+  experiment; the run scope gets `computeMs` / `artifactBytes` / `externalQps` limits from the budget envelope and tool
+  usage is charged; `load.start` reserves QPS (`external_qps_exhausted`); convergence exhaustion includes `computeMs`
+  and `artifactBytes`; run end releases experiment claims and QPS reservations. New L0 event strings (not in the domain
+  catalog): `admission.released`; `admission.granted|refused|lapsed` are also emitted with aggregate `experiment`.
+  No change to `src/contracts.ts`.
 
 ## Notes for integrators
 

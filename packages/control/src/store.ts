@@ -1,5 +1,5 @@
-import { fromJsonColumn, toNumber, type SqlDatabase, type SqlExecutor } from '@hypertest/core';
-import type { ActionCapability, GateSpec, ModelPolicy, ReportClaim, RuntimeManifest, ToolPolicy } from '@hypertest/domain';
+import { fromJsonColumn, toIso, toNumber, type SqlDatabase, type SqlExecutor } from '@hypertest/core';
+import type { ActionCapability, ActorRef, GateSpec, ModelPolicy, ReportClaim, RuntimeManifest, ToolPolicy } from '@hypertest/domain';
 
 /** Gate feedback recorded when an inconclusive gate asks for more evidence (drives a `gate_feedback` replan). */
 export interface GateFeedback {
@@ -64,6 +64,75 @@ export interface AgentHostSpec {
   guard?: { invocationId: string; before: string };
 }
 
+/**
+ * (conformance-9) How a run's gate came about: the base it was derived from (DEFAULT_GATE_SPEC ⊕ configuration), the
+ * fields the run's own override weakens relative to it, and the human/system authority recorded for that weakening.
+ */
+export interface GateAuthority {
+  baseGate?: GateSpec;
+  /** `field: base → effective` of each weakened field (empty: the run's gate is at least as strict as its base). */
+  weakened: string[];
+  by?: ActorRef;
+  rationale?: string;
+}
+
+/** A parent's message to a continuable child (delegate.message), delivered as a user message of the child's session. */
+export interface DelegationMessage {
+  messageId: string;
+  text: string;
+  from: { agentId: string; role: string; workItemId: string };
+  at: string;
+  /** True once handed to the child's session (inbox or initial messages); the transcript then shows when it was read. */
+  enqueued: boolean;
+}
+
+/** One delegated child work item (the delegate tool): its parent, its mode and the parent's messages. */
+export interface Delegation {
+  childWorkItemId: string;
+  runId: string;
+  parentWorkItemId: string;
+  parentAgentId: string;
+  /** The parent did not wait: delegate returned at once (delegate.status / delegate.collect report on the child). */
+  background: boolean;
+  /** The child stays waiting for more input after each task until it is released (delegate.release / parent ended). */
+  continuable: boolean;
+  messages: DelegationMessage[];
+  releasedAt?: string;
+  releaseReason?: string;
+  createdAt: string;
+}
+
+interface DelegationRow {
+  child_work_item_id: string;
+  run_id: string;
+  parent_work_item_id: string;
+  parent_agent_id: string;
+  background: boolean;
+  continuable: boolean;
+  messages: unknown;
+  released_at: unknown;
+  release_reason: string | null;
+  created_at: unknown;
+}
+
+function toDelegation(r: DelegationRow): Delegation {
+  const d: Delegation = {
+    childWorkItemId: r.child_work_item_id,
+    runId: r.run_id,
+    parentWorkItemId: r.parent_work_item_id,
+    parentAgentId: r.parent_agent_id,
+    background: r.background === true,
+    continuable: r.continuable === true,
+    messages: fromJsonColumn<DelegationMessage[]>(r.messages) ?? [],
+    createdAt: toIso(r.created_at),
+  };
+  if (r.released_at !== null && r.released_at !== undefined) d.releasedAt = toIso(r.released_at);
+  if (r.release_reason !== null) d.releaseReason = r.release_reason;
+  return d;
+}
+
+const DELEGATION_COLUMNS = 'child_work_item_id, run_id, parent_work_item_id, parent_agent_id, background, continuable, messages, released_at, release_reason, created_at';
+
 function q(db: SqlDatabase, tx?: SqlExecutor): SqlExecutor {
   return tx ?? db;
 }
@@ -86,13 +155,69 @@ export class ControlStore {
     return r.rows[0] ? fromJsonColumn<RuntimeManifest>(r.rows[0].manifest) : undefined;
   }
 
-  async putGate(runId: string, gate: GateSpec, tx?: SqlExecutor): Promise<void> {
-    await q(this.#db, tx).query('INSERT INTO ht_run_gates (run_id, gate) VALUES ($1, $2::jsonb) ON CONFLICT (run_id) DO NOTHING', [runId, JSON.stringify(gate)]);
+  /** Records the run's effective gate and (additive, conformance-9) how it came about: its base, weakenings and authority. */
+  async putGate(runId: string, gate: GateSpec, tx?: SqlExecutor, authority?: GateAuthority): Promise<void> {
+    await q(this.#db, tx).query(
+      `INSERT INTO ht_run_gates (run_id, gate, base_gate, weakened, override_by, override_rationale) VALUES ($1, $2::jsonb, $3::jsonb, $4::jsonb, $5::jsonb, $6)
+       ON CONFLICT (run_id) DO NOTHING`,
+      [
+        runId, JSON.stringify(gate), authority?.baseGate ? JSON.stringify(authority.baseGate) : null, authority ? JSON.stringify(authority.weakened) : null,
+        authority?.by ? JSON.stringify(authority.by) : null, authority?.rationale ?? null,
+      ],
+    );
   }
 
   async getGate(runId: string): Promise<GateSpec | undefined> {
     const r = await this.#db.query<{ gate: unknown }>('SELECT gate FROM ht_run_gates WHERE run_id = $1', [runId]);
     return r.rows[0] ? fromJsonColumn<GateSpec>(r.rows[0].gate) : undefined;
+  }
+
+  /** (conformance-9) The recorded base, weakenings and authority of the run's gate (undefined: no gate row, or one without). */
+  async gateAuthority(runId: string): Promise<GateAuthority | undefined> {
+    const r = await this.#db.query<{ base_gate: unknown; weakened: unknown; override_by: unknown; override_rationale: string | null }>(
+      'SELECT base_gate, weakened, override_by, override_rationale FROM ht_run_gates WHERE run_id = $1',
+      [runId],
+    );
+    const row = r.rows[0];
+    if (!row || row.weakened === null || row.weakened === undefined) return undefined;
+    const out: GateAuthority = { weakened: fromJsonColumn<string[]>(row.weakened) ?? [] };
+    if (row.base_gate !== null && row.base_gate !== undefined) out.baseGate = fromJsonColumn<GateSpec>(row.base_gate);
+    if (row.override_by !== null && row.override_by !== undefined) out.by = fromJsonColumn<ActorRef>(row.override_by);
+    if (row.override_rationale !== null) out.rationale = row.override_rationale;
+    return out;
+  }
+
+  // ------------------------------------------------------------------------------------------------ delegations
+
+  /** Records a delegated child (idempotent: a replayed delegate call finds the first row). */
+  async putDelegation(d: Omit<Delegation, 'messages' | 'releasedAt' | 'releaseReason'>, tx?: SqlExecutor): Promise<void> {
+    await q(this.#db, tx).query(
+      `INSERT INTO ht_delegations (child_work_item_id, run_id, parent_work_item_id, parent_agent_id, background, continuable, messages, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, '[]'::jsonb, $7) ON CONFLICT (child_work_item_id) DO NOTHING`,
+      [d.childWorkItemId, d.runId, d.parentWorkItemId, d.parentAgentId, d.background, d.continuable, d.createdAt],
+    );
+  }
+
+  /** The delegation of a child work item; `forUpdate` locks the row for the caller's transaction (messages, release). */
+  async delegation(childWorkItemId: string, tx?: SqlExecutor, forUpdate = false): Promise<Delegation | undefined> {
+    const r = await q(this.#db, tx).query<DelegationRow>(`SELECT ${DELEGATION_COLUMNS} FROM ht_delegations WHERE child_work_item_id = $1${forUpdate ? ' FOR UPDATE' : ''}`, [childWorkItemId]);
+    return r.rows[0] ? toDelegation(r.rows[0]) : undefined;
+  }
+
+  /** The run's delegations (oldest first). */
+  async delegations(runId: string): Promise<Delegation[]> {
+    const r = await this.#db.query<DelegationRow>(`SELECT ${DELEGATION_COLUMNS} FROM ht_delegations WHERE run_id = $1 ORDER BY created_at, child_work_item_id`, [runId]);
+    return r.rows.map(toDelegation);
+  }
+
+  async setDelegationMessages(childWorkItemId: string, messages: DelegationMessage[], tx?: SqlExecutor): Promise<void> {
+    await q(this.#db, tx).query('UPDATE ht_delegations SET messages = $2::jsonb WHERE child_work_item_id = $1', [childWorkItemId, JSON.stringify(messages)]);
+  }
+
+  /** Releases a continuable child once (true when this call released it). */
+  async releaseDelegation(childWorkItemId: string, reason: string, at: string, tx?: SqlExecutor): Promise<boolean> {
+    const r = await q(this.#db, tx).query('UPDATE ht_delegations SET released_at = $2, release_reason = $3 WHERE child_work_item_id = $1 AND released_at IS NULL', [childWorkItemId, at, reason]);
+    return r.rowCount > 0;
   }
 
   async cursor(runId: string, consumer: string, tx?: SqlExecutor): Promise<number> {

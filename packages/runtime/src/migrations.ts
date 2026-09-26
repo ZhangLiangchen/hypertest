@@ -1,4 +1,5 @@
 import type { Migration } from '@hypertest/core';
+import { RELEASE_MIGRATION } from './releases.ts';
 
 /**
  * Runtime schema (PGlite + PostgreSQL 16).
@@ -14,6 +15,9 @@ import type { Migration } from '@hypertest/core';
  * - 004: `ht_turns.outcome` (the engine's turn decision, committed with the completion), `ht_agents.capability` and
  *   `ht_agents.max_depth` (the grant recorded at spawn; a child's capability must be covered by it, I2, and its depth
  *   cap can only shrink, I12).
+ * - 005 (runtime release registry, `releases.ts`): `ht_runtime_releases` (registered manifests and their release state;
+ *   the manifest is immutable), `ht_runtime_release_pointer` (the active pointer), `ht_runtime_release_lock`,
+ *   `ht_runtime_suite_results` / `ht_runtime_release_transitions` / `ht_runtime_epochs` (append-only).
  */
 export const runtimeMigrations: Migration[] = [
   {
@@ -172,4 +176,5 @@ ALTER TABLE ht_agents ADD COLUMN IF NOT EXISTS capability jsonb;
 ALTER TABLE ht_agents ADD COLUMN IF NOT EXISTS max_depth integer CHECK (max_depth >= 0);
 `,
   },
+  RELEASE_MIGRATION,
 ];

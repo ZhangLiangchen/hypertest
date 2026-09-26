@@ -238,7 +238,16 @@ export function createSubagentRuntime(deps: SubagentDeps): SubagentRuntime {
         // cleared — the continuation settles a NEW result (collect never returns the stale one as current).
         await sessions.setStatus(agent.sessionId, 'active');
         await tx.query(`UPDATE ht_agents SET result = NULL WHERE agent_id = $1`, [agentId]);
-        return agents.update(agentId, { status: 'active' });
+        const resumed = await agents.update(agentId, { status: 'active' });
+        // (I10) the reactivation (e.g. a continuable child resumed for its parent's follow-up) is on L0 with the state change
+        await emit(
+          { runId: agent.runId, correlationId: agent.workItemId, actorId: 'system:runtime', workItemId: agent.workItemId },
+          EVENT_TYPES.agentResumed,
+          resumed,
+          { agentId, from: agent.status, continuable: agent.continuable, background: agent.background, sessionId: agent.sessionId },
+          tx,
+        );
+        return resumed;
       });
     },
 

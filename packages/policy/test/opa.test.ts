@@ -125,3 +125,33 @@ test('the OPA decision path is restricted to package segments', () => {
   }
   assert.equal(opa({ path: '/hypertest.authz_v2/' }).endpoint, `${base}/v1/data/hypertest/authz_v2`);
 });
+
+test('BUGate phases: OPA always receives the phase (absent ⇒ before_action) and the phase facts in its input', async () => {
+  seen.length = 0;
+  handler = (b, _req, res) => {
+    const input = b['input'] as Record<string, unknown>;
+    // a phase-aware document: flag after_action evidence the tool does not declare, withhold a flagged acceptance
+    const outcome = input['outcome'] as { undeclaredEvidenceTypes?: string[] } | undefined;
+    const acceptance = input['acceptance'] as { flaggedActions?: number } | undefined;
+    if (input['phase'] === 'after_action' && (outcome?.undeclaredEvidenceTypes?.length ?? 0) > 0) return json(res, 200, { result: { allow: false, reasons: ['undeclared evidence'] } });
+    if (input['phase'] === 'before_acceptance' && (acceptance?.flaggedActions ?? 0) > 0) return json(res, 200, { result: { allow: false, approval_required: true, reasons: ['flagged run'] } });
+    return json(res, 200, { result: { allow: true, reasons: [`ok ${String(input['phase'])}`] } });
+  };
+  const e = opa();
+  assert.deepEqual((await e.evaluate(request())).reasons, ['ok before_action']);
+  const after = await e.evaluate(request({ phase: 'after_action', outcome: { status: 'success', evidenceTypes: ['test-result'], evidenceIds: ['ev_1'], declaredEvidenceTypes: ['stdout'], undeclaredEvidenceTypes: ['test-result'] } }));
+  assert.deepEqual([after.decision, after.reasons], ['deny', ['undeclared evidence']]);
+  const transition = await e.evaluate(request({ phase: 'before_transition', transition: { subject: 'plan', subjectId: 'plan_1', from: 'proposed', to: 'accepted', flaggedActions: 0 } }));
+  assert.deepEqual(transition.reasons, ['ok before_transition']);
+  const acceptance = await e.evaluate(request({
+    phase: 'before_acceptance',
+    acceptance: {
+      gateId: 'g', gateOverrides: [], verdict: 'pass', requiresHumanReview: false, satisfiedCriteria: [], violatedCriteria: [], unknownCriteria: [], evidence: { count: 0, rootHash: 'r', byType: {} },
+      findings: { total: 0, unresolved: [] }, risks: { total: 0, unresolved: [] }, reviews: [], oracleRevisions: {}, workItems: {}, claims: { total: 0, critical: 0 }, exceptions: [], flaggedActions: 1,
+    },
+  }));
+  assert.equal(acceptance.decision, 'approval_required');
+  const phases = seen.map((s) => (s.body['input'] as Record<string, unknown>)['phase']);
+  assert.deepEqual(phases, ['before_action', 'after_action', 'before_transition', 'before_acceptance']);
+  assert.deepEqual(((seen[2]!.body['input'] as Record<string, unknown>)['transition'] as Record<string, unknown>)['to'], 'accepted');
+});

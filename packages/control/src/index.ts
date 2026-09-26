@@ -23,5 +23,27 @@ export {
 export { createReportBuilder } from './report.ts';
 export { diffSections, invertSection, sectionPaths, unifiedDiff } from './diff.ts';
 export { WorkFactory, runScope, workScope, type CreateWorkOutcome } from './work-factory.ts';
-export { assertRunPinned, gateSpecProblems, tightenModelPolicy } from './util.ts';
-export { ControlStore, type AgentHostSpec, type GateFeedback, type ReplanState, type WorkspaceQuarantine, type WorkspaceRecipe } from './store.ts';
+export {
+  EXPERIMENT_EXEMPT_TOOLS, EXPERIMENT_GUARDED_EFFECTS, FAULT_TOOLS, QPS_KEY_PREFIX, declaredExperimentIds, experimentClaimsProblem, heldClaims, onToolBudgetExhausted, qpsKey,
+  releaseRunIsolation, runExperimentIds, settleExternalQps, syncExperimentClaims, type ExperimentSync,
+} from './isolation.ts';
+export { defaultContaminationRules, defaultStopConditions, experimentIsolation } from './domain-tools/specs.ts';
+export {
+  EXECUTION_EVIDENCE_TYPES, GATE_AUTHORITY_KINDS, assertRunPinned, authorizedGateWeakenings, gateReference, gateSpecProblems, gateWeakenings, tightenModelPolicy,
+  type GateAuthorityJudgement,
+} from './util.ts';
+export {
+  ControlStore, type AgentHostSpec, type Delegation, type DelegationMessage, type GateAuthority, type GateFeedback, type ReplanState, type WorkspaceQuarantine, type WorkspaceRecipe,
+} from './store.ts';
+export {
+  POLICY_FLAGGED_EVENT, TOOL_EVIDENCE_TYPES, createPhaseGovernor, declaredEvidenceTypes, flagEventId,
+  type ActionDescription, type AfterActionInput, type AfterActionOutcome, type PhaseGovernor, type TransitionInput,
+} from './phases.ts';
+export {
+  BASELINE_EFFECTS, CAPABILITY_REQUIREMENT_SCHEMA, ENVIRONMENT_FREE_NAMESPACES, addressesEnvironments, describeUnmet, requirementProblems, unmetRequirements, workItemConstraint,
+  type UnmetRequirement,
+} from './capability-grant.ts';
+export {
+  delegationChatMessage, delegationSettled, inputWaitOperationId, isAwaitingInput, parseInputWaitOperationId, unreadMessages,
+} from './delegation.ts';
+export { PLAN_PROPOSAL_INPUT_SCHEMA } from './domain-tools/plan.ts';

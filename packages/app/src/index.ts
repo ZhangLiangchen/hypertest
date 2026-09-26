@@ -12,4 +12,8 @@ export { acquireDirectoryLock, lockFileFor, lockHolder, processAlive, type Direc
 export { CAPABILITY_SECRET_FILE, SIGNING_KEY_FILE, keysDir, loadCapabilitySecret, loadSigningKeys, publicKeyFileName, type SigningKeys } from './keys.ts';
 export { changedAssertions, flipsRecordedViolation, recordedFailureFlipDetector, testCaseMatches, type FlipDetectorDeps } from './governance.ts';
 export { startApiServer, isLoopbackHost } from './api.ts';
-export { diagnose } from './diagnose.ts';
+export { diagnose, providerLocality } from './diagnose.ts';
+export {
+  DEFAULT_CHECKPOINT_TIMEOUT_MS, IMAGE_DIGEST_ENV, agentClassification, condenserPrivacyFloor, createReleaseService, hypertestGitSha, imageDigestFrom, releaseGovernedControlPlane,
+  runtimeReleaseNotes, withRuntimeReleaseNotes, type ReleaseServiceDeps,
+} from './releases.ts';

@@ -2,7 +2,7 @@ import type { BaseDeps, Clock, JsonValue, SqlDatabase } from '@hypertest/core';
 import type {
   ActionCapability, ActorRef, ApprovedException, BlackboardRecord, CoverageGap, DomainEventSink, EventContext, EvidenceRecord,
   ExperimentSpec, Finding, GateSpec, Objective, OracleAssertion, OracleChangeProposal, OracleSpec, PermissionProfile, QualityDecision,
-  ReportClaim, Review, Risk, RiskClass, TestArtifact, TestRun, ToolEffect, WorkItem,
+  QualityVerdict, ReportClaim, Review, Risk, RiskClass, TestArtifact, TestRun, ToolEffect, WorkItem,
 } from '@hypertest/domain';
 
 /**
@@ -28,6 +28,8 @@ import type {
  *   resolveProtocolBinding(options: { bugatePath?: string }): Promise<ResolvedProtocol>
  *   prepareProtocolContext(protocol: ResolvedProtocol, request: ProtocolContextRequest): PreparedProtocolContext
  *   policyMigrations: Migration[]  (ht_policy_decisions, ht_approvals)
+ *   (additive, phases) POLICY_PHASES, requestPhase, flaggedActionsOf, IMPLICIT_EVIDENCE_TYPES, actionOutcomeFacts,
+ *   acceptanceFacts, applyPhasePermit, withPolicyHold — the BUGate four time points (see PolicyPhase)
  */
 
 // ----------------------------------------------------------------------------- capabilities
@@ -96,6 +98,79 @@ export interface ChildCapabilityIdentity {
 
 // ----------------------------------------------------------------------------- permits
 
+/**
+ * (additive) The four BUGate time points at which the PolicyEngine is evaluated (technology-selection §BUGate):
+ *  - `before_action`     may this tool call run? (the ToolRuntime; the only phase that authorizes an effect);
+ *  - `after_action`      what did the executed call produce? (e.g. evidence of a type its tool does not declare) — a
+ *                        non-allow permit FLAGS the call (it already happened); flags feed the later phases;
+ *  - `before_transition` may the work item complete / the plan be accepted / the run be gated?
+ *  - `before_acceptance` may the run claim its gate verdict? (the gate input digest + the gate's verdict) — a non-allow
+ *                        permit caps the verdict at `inconclusive` with requiresHumanReview, never `pass`.
+ * A request without `phase` is `before_action`; a rule without `match.phases` applies to `before_action` only (every
+ * rule set written before the phases existed keeps its meaning).
+ */
+export type PolicyPhase = 'before_action' | 'after_action' | 'before_transition' | 'before_acceptance';
+
+/** (additive) after_action facts: what an executed tool call produced. */
+export interface ActionOutcomeFacts {
+  /** The tool call's status (success, failed, timeout, pending …). */
+  status: string;
+  /** Types of the evidence records written by this very call (sorted, unique). */
+  evidenceTypes: string[];
+  evidenceIds: string[];
+  /**
+   * The evidence types the tool declares (the runtime's implicit `tool-output` offload included); absent when the tool
+   * declares none — its evidence is then not judged (`undeclaredEvidenceTypes` is empty).
+   */
+  declaredEvidenceTypes?: string[];
+  /** evidenceTypes the tool does not declare (sorted, unique). */
+  undeclaredEvidenceTypes: string[];
+}
+
+/** (additive) before_transition facts: the state change asked for. */
+export interface TransitionFacts {
+  subject: 'work_item' | 'plan' | 'run';
+  subjectId: string;
+  from: string;
+  to: string;
+  /** Calls of the subject (the work item's own, the run's for a plan or the run) flagged at after_action. */
+  flaggedActions: number;
+  /** The agent asking for the transition (absent for system transitions such as run gating). */
+  requestedBy?: { agentId: string; role: string };
+  details?: Record<string, JsonValue>;
+}
+
+/** (additive) before_acceptance facts: a bounded digest of the QualityGate input and the gate's own verdict. */
+export interface AcceptanceFacts {
+  gateId: string;
+  gateSpecDigest?: string;
+  /** `field=value` of each effective gate field that differs from DEFAULT_GATE_SPEC. */
+  gateOverrides: string[];
+  /** The recorded human/system authority of a weakened gate (conformance-9), when the run has one. */
+  gateOverrideAuthority?: { by: ActorRef; rationale: string; weakened: string[] };
+  /**
+   * The verdict up for acceptance: the deterministic gate's, after any hold placed before acceptance (an unauthorized gate
+   * weakening, a refused run gating — each listed in unknownCriteria); never raised by those holds.
+   */
+  verdict: QualityVerdict;
+  requiresHumanReview: boolean;
+  satisfiedCriteria: string[];
+  violatedCriteria: string[];
+  unknownCriteria: string[];
+  evidence: { count: number; rootHash: string; byType: Record<string, number> };
+  findings: { total: number; unresolved: string[] };
+  risks: { total: number; unresolved: string[] };
+  reviews: Array<{ recordId: string; verdict: string; modelProvider?: string }>;
+  oracleRevisions: Record<string, number>;
+  /** Work items by state. */
+  workItems: Record<string, number>;
+  claims: { total: number; critical: number };
+  /** Criteria waived by an applied exception. */
+  exceptions: string[];
+  /** Calls of the run flagged at after_action. */
+  flaggedActions: number;
+}
+
 export interface ActionRequest {
   requestId: string;
   runId: string;
@@ -110,8 +185,15 @@ export interface ActionRequest {
   capability: ActionCapability;
   /** Redacted tool input (secrets removed) for policy evaluation and decision logs. */
   input?: JsonValue;
-  phase?: 'before_action' | 'after_action' | 'before_transition' | 'before_acceptance';
+  /** The BUGate time point (absent ⇒ `before_action`); see PolicyPhase. */
+  phase?: PolicyPhase;
   snapshotId?: string;
+  /** (additive) after_action: what the executed call produced. */
+  outcome?: ActionOutcomeFacts;
+  /** (additive) before_transition: the state change asked for. */
+  transition?: TransitionFacts;
+  /** (additive) before_acceptance: the gate input digest and the gate's verdict. */
+  acceptance?: AcceptanceFacts;
 }
 
 export interface PermitConstraints {
@@ -174,6 +256,16 @@ export interface PolicyRule {
     roles?: string[];
     environmentClasses?: string[];
     resources?: string[];
+    /** (additive) The phases the rule applies to; absent ⇒ `['before_action']` (an action permit rule). */
+    phases?: PolicyPhase[];
+    /** (additive) before_transition: `<subject>:<to>` patterns with tool-pattern semantics (`work_item:completed`, `plan:*`). */
+    transitions?: string[];
+    /** (additive) after_action: true matches a call that produced evidence of a type its tool does not declare (false: none). */
+    undeclaredEvidence?: boolean;
+    /** (additive) before_transition / before_acceptance: true matches a subject with flagged calls (false: none). */
+    flaggedActions?: boolean;
+    /** (additive) before_acceptance: the deterministic gate verdicts the rule applies to. */
+    verdicts?: QualityVerdict[];
   };
   decision: 'allow' | 'deny' | 'approval_required';
   constraints?: PermitConstraints;

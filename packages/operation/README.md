@@ -10,15 +10,15 @@ Depends on `@hypertest/core` and `@hypertest/domain` only. The ABI is `src/contr
 
 | Export | Purpose |
 |---|---|
-| `operationMigrations` | `operation/001-operations` … `004-budgets`: `ht_operations`, `ht_fences`, `ht_leases`, `ht_admission_lock`, `ht_resource_claims`, `ht_budget_scopes`, `ht_budget_reservations` (PGlite + PostgreSQL 16). |
+| `operationMigrations` | `operation/001-operations` … `007-open-reservations`: `ht_operations` (+ `experiment_id`, 006), `ht_fences`, `ht_leases`, `ht_admission_lock`, `ht_resource_claims`, `ht_budget_scopes`, `ht_budget_reservations` (+ idempotency key 005, open-reservation index 007) (PGlite + PostgreSQL 16). |
 | `createOperationLedger(deps)` | `prepare` (idempotent by `idempotencyKey` and by `(toolInvocationId, operationType)`), `get`, `findBy*`, `transition` (domain state machine + optimistic concurrency), `list`, `listUnsettled`. Emits `operation.*` events in the same transaction. |
 | `createLeaseService(deps)` | Write leases with monotonic fencing tokens: `acquire`, `renew`, `release`, `current`, `checkFence`. |
 | `createSideEffectGateway(deps)` | `run` (retry switch), `observe` (durable polling), `compensate`. |
 | `createReconciler(deps)` | `reconcile({ runId? })`: settles unsettled operations by observation on startup/resume; never dispatches. |
-| `createResourceAdmission(deps)` | All-or-nothing admission of hierarchical `ResourceClaim`s (`read_shared` / `write_exclusive` / `fault_exclusive`). |
-| `createBudgetLedger(deps)` | Budget leases: `open`, `reserve` → `settle` \| `release`, `charge`, `usage`. |
+| `createResourceAdmission(deps)` | All-or-nothing admission of hierarchical `ResourceClaim`s (`read_shared` / `write_exclusive` / `fault_exclusive`); `compatibleHolders` (an experiment's work items share its claims); `held(holder)`. |
+| `createBudgetLedger(deps)` | Budget leases: `open`, `reserve` (keyed, idempotent) → `settle` \| `release`, `charge`, `consume` (spent usage, never refused), `remaining`, `openReservations`, `releaseOpen`, `usage`. |
 | `AdapterRegistry` | `register` (validates capabilities, duplicate ⇒ `conflict`), `get` (unknown ⇒ `not_found`), `has`, `list`. |
-| helpers | `outcomeForOperation`, `operationEventType`, `UNSETTLED_OPERATION_STATUSES`, `BUDGET_DIMENSIONS`. |
+| helpers | `outcomeForOperation`, `operationEventType`, `operationExperimentId`, `UNSETTLED_OPERATION_STATUSES`, `BUDGET_DIMENSIONS`. |
 
 ## Gateway semantics (`run`)
 
@@ -99,6 +99,22 @@ exceeding amount. A `charge(…, { idempotencyKey })` is recorded once per key (
 key + unique `idempotency_key` column): a replay returns the recorded reservation id without charging again; the same
 key for other scopes/amounts ⇒ `conflict`; a refused charge records nothing (its retry is evaluated afresh).
 
+Budget dimensions (unit B2, conformance-5): `computeMs` (wall time of sandbox processes) and `artifactBytes` (bytes
+stored) are CONSUMED — recorded after the fact with `consume` (like `settle`: in full, even past a limit, never refused;
+the first exhausted scope/dimension among the recorded ones is reported) — and bounded BEFORE they are spent by the
+caller from `remaining(scopes)` (headroom = min over the chain of limit − used − reserved). `externalQps` is a RESERVABLE
+rate: a load job reserves its request rate (keyed `reserve`, so a replayed start never reserves twice) and releases it
+when the job ends; it is never `used`, so a rate refusal is transient and never exhausts a scope. `openReservations(scope)`
+lists the still-open reservations of a scope chain (with their keys) for sweeps.
+
+Experiment isolation (unit B2, conformance-6): `admit({ …, compatibleHolders })` treats the live claims of the named
+holders as compatible — a work item that runs for an experiment (holder = experimentId) shares the experiment's claims
+instead of being refused by them, while every other holder (another experiment, another run's item) still conflicts. The
+holder's own live claims are always extended, never conflicting. `held(holder)` lists a holder's live claims. Operations
+record the experiment they ran for (`PrepareOperationInput.experimentId`, `RunSideEffectRequest.experimentId` ⇒
+`ht_operations.experiment_id`, returned as `LedgerOperationRecord.experimentId`, in the `operation.*` event payloads, and
+filterable with `list({ experimentId })`); a deduplicated prepare keeps the first value.
+
 ## Invariants and where they are proven
 
 | Invariant | Tests |
@@ -122,6 +138,8 @@ key for other scopes/amounts ⇒ `conflict`; a refused charge records nothing (i
 | I4 renewal vs regrant race: no lost renewal | `test/postgres.int.test.ts` |
 | durability-3: a settled operation releases its lease (verified / not_applied / failed); another owner is served at once; observe extends the lease of a running job and releases it when it settles; never extends a dispatching operation's lease; a lease shared by two in-process drives is released only after both settle; a lease still guarding another unsettled operation is kept; a failed prepare releases its lease; a busy refusal records `not_applied` | `test/gateway.test.ts` › durability-3, › resource busy |
 | H5: a keyed charge is recorded once (sequential and 6 concurrent duplicates), the limit still applies, refused charges record nothing, a reused key for other amounts/scopes ⇒ conflict | `test/budget.test.ts` › H5 |
+| conformance-5: externalQps reserved across concurrent jobs (typed refusal, released rate fits again, never used); keyed reserve idempotent (6 concurrent duplicates hold the rate once, other amount ⇒ conflict); consume records past the limit and reports the exhaustion; remaining = chain headroom; openReservations | `test/isolation-budget.test.ts` |
+| conformance-6: compatibleHolders share an experiment's claims with its work items while any other holder is still refused; held(); operations carry the experimentId (record, events, list filter, replay keeps the first) | `test/isolation-budget.test.ts` |
 
 ## Contract changes (additive, backward compatible)
 
@@ -142,6 +160,14 @@ key for other scopes/amounts ⇒ `conflict`; a refused charge records nothing (i
   releases every still-open reservation whose scope chain contains `scope` — the control plane's `recover()` calls it
   for the `work:<id>` of every claim it takes from a dead worker, so a crash between reserve and settle never shrinks
   the run's headroom for good. A later settle of a released reservation is `precondition_failed`.
+- (unit B2, conformance-5) `BudgetDimension` gains `'externalQps'` (appended to `BUDGET_DIMENSIONS`, existing order unchanged);
+  `BudgetLedger.reserve(…, options?: { idempotencyKey? })` (optional 4th argument); optional members `consume?`, `remaining?`,
+  `openReservations?`; types `BudgetExhaustion` (the former inline exhaustion shape, unchanged), `ConsumeOutcome`,
+  `OpenReservation`. Migration `operation/007-open-reservations` (index).
+- (unit B2, conformance-6) `ResourceAdmission.admit` request `compatibleHolders?`; optional `ResourceAdmission.held?`;
+  `PrepareOperationInput.experimentId?`, `RunSideEffectRequest.experimentId?`, `OperationLedger.list` filter `experimentId?`;
+  type `LedgerOperationRecord` and helper `operationExperimentId(op)` (the domain `OperationRecord` has no such field yet).
+  Migration `operation/006-operation-experiment` adds `ht_operations.experiment_id`.
 - Documented (no signature change): `transition(→ dispatching)` clears `externalJobId`/`externalReceipt`
   unless the patch supplies them; `prepare` also treats a different `adapterId` as a `conflict`; the
   gateway emits `operation.late_receipt` audit events for receipts the ledger cannot store.

@@ -1,6 +1,7 @@
 import { HypertestError } from '@hypertest/core';
 import { eventFrom, EVENT_TYPES, type ContextSnapshot, type EventContext, type ReadSetEntry } from '@hypertest/domain';
-import type { ContextDeps, FreshnessGuard, FreshnessResult, ProposedAction, ResolverRegistry, SnapshotStore, StaleEntry } from './contracts.ts';
+import type { ContextDeps, FreshnessGuard, FreshnessResult, ObservationLog, ProposedAction, ResolverRegistry, SnapshotStore, StaleEntry } from './contracts.ts';
+import { ABSENT_VERSION } from './observations.ts';
 import { createResolverRegistry } from './resolvers.ts';
 import { environmentVersion, snapshotIdFor } from './snapshots.ts';
 
@@ -56,7 +57,16 @@ export interface FreshnessGuardDeps extends ContextDeps {
   snapshots: SnapshotStore;
   /** Defaults to an empty registry (every exact_version check then fails closed with `no_resolver`). */
   resolvers?: ResolverRegistry;
+  /**
+   * (additive) The agents' observations. The acting agent's (`ctx.agentId`) observations made under the validated
+   * snapshot — i.e. during the turn it fixes — refine the read set: each replaces the snapshot's entries of the same
+   * resource (its own write, or a fresh re-read, is its current knowledge) and a resource first observed in the turn
+   * joins it. A log that cannot be read fails the validation (the runtime reports stale_context).
+   */
+  observations?: ObservationLog;
 }
+
+const resourceKey = (e: Pick<ReadSetEntry, 'resourceType' | 'resourceId'>) => `${e.resourceType}\u0000${e.resourceId}`;
 
 /**
  * FreshnessGuard (I1: no mutating tool without a freshness validation).
@@ -68,6 +78,8 @@ export interface FreshnessGuardDeps extends ContextDeps {
  *    checked too, even without a matching read-set entry. A missing resolver, a throwing resolver and an unknown snapshot are all
  *    stale (fail closed). A snapshot object whose content no longer hashes to its id is not trusted: the stored
  *    snapshot is used instead (missing ⇒ stale). Stale results emit context.stale_rejected.
+ *  - (additive) With `observations`, the acting agent's observations made under the snapshot refine its read set
+ *    (see FreshnessGuardDeps.observations); an entry observed as ABSENT_VERSION is fresh while the resource is missing.
  */
 export function createFreshnessGuard(deps: FreshnessGuardDeps): FreshnessGuard {
   const resolvers = deps.resolvers ?? createResolverRegistry();
@@ -118,7 +130,17 @@ export function createFreshnessGuard(deps: FreshnessGuardDeps): FreshnessGuard {
       // set entry and pinned field are both checked, so at most one of them can pass).
       const versionKey = (e: ReadSetEntry) => `${e.resourceType}\u0000${e.resourceId}\u0000${e.observedVersion}`;
       const observedKeys = new Set(snapshot.readSet.map(versionKey));
-      const entries = [...snapshot.readSet, ...pinnedEntries(snapshot).filter((e) => !observedKeys.has(versionKey(e)))];
+      let entries = [...snapshot.readSet, ...pinnedEntries(snapshot).filter((e) => !observedKeys.has(versionKey(e)))];
+      // (additive) What the acting agent observed since this snapshot was fixed (during its turn) supersedes the snapshot's
+      // view of the same resources: its own writes and re-reads are its current knowledge — a change by anyone else after
+      // them is still caught — and resources it first observed in this turn are validated too.
+      if (deps.observations && typeof ctx?.agentId === 'string' && ctx.agentId.length > 0) {
+        const since = await deps.observations.latest({ runId: snapshot.runId, agentId: ctx.agentId, snapshotId: snapshot.snapshotId });
+        if (since.length > 0) {
+          const refined = new Map(since.map((o) => [resourceKey(o), { resourceType: o.resourceType, resourceId: o.resourceId, observedVersion: o.observedVersion, observedAt: o.observedAt, freshness: o.freshness } as ReadSetEntry]));
+          entries = [...entries.filter((e) => !refined.has(resourceKey(e))), ...refined.values()];
+        }
+      }
 
       for (const entry of entries) {
         if (entry.freshness.kind === 'immutable') continue;
@@ -149,8 +171,10 @@ export function createFreshnessGuard(deps: FreshnessGuardDeps): FreshnessGuard {
         pending.push(
           lookup.then((r) => {
             if (!r.ok) stale.push({ ...base, reason: 'resolver_error', error: r.error });
-            else if (r.version === undefined) stale.push({ ...base, reason: 'missing' });
-            else if (r.version !== entry.observedVersion) stale.push({ ...base, currentVersion: r.version, reason: 'version_changed' });
+            // an entry that recorded the resource as ABSENT stays fresh while it is still missing
+            else if (r.version === undefined) {
+              if (entry.observedVersion !== ABSENT_VERSION) stale.push({ ...base, reason: 'missing' });
+            } else if (r.version !== entry.observedVersion) stale.push({ ...base, currentVersion: r.version, reason: 'version_changed' });
           }),
         );
       }

@@ -57,6 +57,18 @@ export const EVENT_TYPES = {
    * the pass recovered something.
    */
   runRecovered: 'run.recovered',
+  /**
+   * (additive) The run was migrated to another runtime release (explicit migration, a new RuntimeEpoch): payload
+   * `{ runId, epochId, seq, fromManifestId, toManifestId, snapshotId, reconciliation, compatibility, statusBefore,
+   * statusAfter, by, reason }`.
+   */
+  runMigrated: 'run.migrated',
+  /**
+   * (additive) The runtime release the run is pinned to was rolled back; the run is paused (`pauseReason: quarantined`)
+   * until it is migrated or cancelled: payload `{ runId, manifestId, restoredManifestId?, transitionId, previousStatus,
+   * previousPauseReason?, by, reason }`.
+   */
+  runQuarantined: 'run.quarantined',
   runConverging: 'run.converging',
   runGating: 'run.gating',
   runUpdated: 'run.updated',

@@ -1,6 +1,7 @@
 import { isHypertestError } from '@hypertest/core';
 import { EVENT_TYPES, type EventContext, type ResourceLease, type TestRun, type WorkItem } from '@hypertest/domain';
 import type { ControlDeps, ResolvedControlConfig } from './deps.ts';
+import { releaseRunIsolation, runExperimentIds, settleExternalQps, syncExperimentClaims, type ExperimentSync } from './isolation.ts';
 import { event, runCtx } from './util.ts';
 
 export function workLeaseKey(workItemId: string): string {
@@ -41,6 +42,14 @@ export interface Scheduler {
   /** Frees the lease and resource claims held for a work item. */
   release(item: WorkItem): Promise<void>;
   /**
+   * (additive, conformance-5/6) Isolation upkeep of a live run, every tick before admission: the claims of its experiments
+   * are renewed while an owner (defining or declaring work item) is live and released otherwise; QPS reservations of load
+   * jobs that ended are given back. `progressed` when anything was released.
+   */
+  syncIsolation?(run: TestRun, items: WorkItem[]): Promise<ExperimentSync & { qpsReleased: string[] }>;
+  /** (additive, conformance-5/6) Releases everything a finished run still holds (experiment claims, open reservations). */
+  releaseRun?(runId: string): Promise<void>;
+  /**
    * Takes an orphaned claimed/running/waiting item away from its worker: back to `ready` (attempts + 1, claim dropped
    * ⇒ its fencing token is stale), or `failed` (`lease_lost`) once it lost its worker `maxWorkAttempts` times (a
    * poison item never livelocks the run). Returns the new state. Throws the Blackboard's conflict/stale_fence.
@@ -75,6 +84,8 @@ export function createScheduler(deps: ControlDeps, config: ResolvedControlConfig
   const workerId = config.workerId;
   /** Last refusal reported per item (admission.refused once per distinct conflict set, not every tick). */
   const refusals = new Map<string, string>();
+  /** Last lapse reported per experiment (admission.lapsed once per distinct conflict set). */
+  const experimentLapses = new Map<string, string>();
 
   async function requeue(w: WorkItem, ctx: EventContext, reason: string, expectedFencingToken?: number): Promise<'ready' | 'failed'> {
     const attempts = w.attempts + 1;
@@ -176,7 +187,8 @@ export function createScheduler(deps: ControlDeps, config: ResolvedControlConfig
         if (active >= run.budget.maxAgentConcurrency || dispatched.length >= cap) break;
         const hasClaims = w.resourceClaims.length > 0;
         if (hasClaims) {
-          const adm = await admission.admit({ holderId: w.workItemId, runId: run.runId, claims: w.resourceClaims, ttlMs: config.leaseTtlMs });
+          // (conformance-6) an item that runs for experiments shares their admitted claims (never refused by them)
+          const adm = await admission.admit({ holderId: w.workItemId, runId: run.runId, claims: w.resourceClaims, ttlMs: config.leaseTtlMs, compatibleHolders: await runExperimentIds(deps, w) });
           if (!adm.admitted) {
             const conflicts = adm.conflicts.map((c) => `${c.requested.resourceKey}@${c.heldBy}`).sort();
             logger.info('work item not admitted: resource conflict', { workItemId: w.workItemId, conflicts });
@@ -220,6 +232,17 @@ export function createScheduler(deps: ControlDeps, config: ResolvedControlConfig
     async release(item) {
       if (item.claim) await leases.release(item.claim.leaseId);
       if (item.resourceClaims.length > 0) await admission.release(item.workItemId);
+    },
+
+    async syncIsolation(run, items) {
+      const sync = await syncExperimentClaims(deps, config, run, items, experimentLapses);
+      const qpsReleased = await settleExternalQps(deps, run.runId);
+      return { ...sync, qpsReleased };
+    },
+
+    async releaseRun(runId) {
+      await releaseRunIsolation(deps, runId, runCtx(runId, workerId));
+      for (const e of await deps.specs.listExperiments(runId)) experimentLapses.delete(e.experimentId);
     },
   };
 }

@@ -2,6 +2,7 @@ import { HypertestError, fromJsonColumn, hashCanonical, toIso, type SqlExecutor 
 import { EVENT_TYPES, eventFrom, type EventContext } from '@hypertest/domain';
 import type { ActionPermit, ActionRequest, PolicyDecisionLog, PolicyDecisionRecord, PolicyDeps } from './contracts.ts';
 import { storable } from './storable.ts';
+import { requestPhase } from './phases.ts';
 
 interface DecisionRow {
   decision_id: string;
@@ -78,6 +79,8 @@ export function createPolicyDecisionLog(deps: PolicyDeps): PolicyDecisionLog {
                 requestId: request.requestId,
                 requestHash,
                 decision: permit.decision,
+                // the BUGate time point (additive): before_action | after_action | before_transition | before_acceptance
+                phase: requestPhase(request),
                 tool: request.tool,
                 effect: request.effect,
                 riskClass: request.riskClass,

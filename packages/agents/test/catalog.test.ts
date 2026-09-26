@@ -44,7 +44,7 @@ function rejects(fn: () => unknown, ...needles: string[]): HypertestError {
 
 test('get / require / list over the built-in catalog', () => {
   const catalog = new RoleCatalog(BUILTIN_ROLES);
-  assert.equal(catalog.list().length, 12);
+  assert.equal(catalog.list().length, 14);
   assert.deepEqual(catalog.list().map((r) => r.role), BUILTIN_ROLES.map((r) => r.role));
   assert.deepEqual(catalog.get('lead'), builtin('lead'));
   assert.equal(catalog.require('reviewer').role, 'reviewer');
@@ -181,7 +181,7 @@ test('effective roles are deep-frozen; mutation attempts throw and never change 
   }, TypeError);
   const listed = catalog.list();
   listed.pop();
-  assert.equal(catalog.list().length, 13, 'list() returns a copy');
+  assert.equal(catalog.list().length, 15, 'list() returns a copy');
   const subs = catalog.subscriptions();
   subs.length = 0;
   assert.equal(catalog.subscriptions().length, 6);

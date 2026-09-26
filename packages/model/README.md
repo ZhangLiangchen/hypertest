@@ -11,7 +11,8 @@ Provider-native shapes never leave this package.
 |---|---|
 | `ModelCatalog(profiles)` | Immutable, validated (`MODEL_CAPABILITY_PROFILE_SCHEMA`) set of `ModelCapabilityProfile`s. `revision = 'mc_' + sha256(canonicalJson(profiles))[0..16]`. `list()` (includes disabled), `get(routeId)`, `withScores(scores)` → new catalog/revision. Duplicate routeIds, unknown classes/capabilities, NaN → `invalid_argument`. |
 | `ProviderRegistry` | `register(provider, {replace?})` (duplicate ⇒ `conflict`), `get` (unknown ⇒ `not_found`), `has`, `list`, `adapters()` (for `RuntimeManifest.providerAdapters`). |
-| `createModelRouter(deps)` | `route()`, `invoke()`, `estimateCostUsd()` (see below). `deps.retry` sets same-route backoff. |
+| `createModelRouter(deps)` | `route()`, `invoke()`, `estimateCostUsd()`, `circuits()` (see below). `deps.retry` sets same-route backoff; `deps.circuitBreaker` configures (or, `false`, disables) the per-route circuit breaker and price guard. |
+| `CircuitBreakers`, `DEFAULT_CIRCUIT_BREAKER`, `AVAILABILITY_FAILURES`, `MODEL_CIRCUIT_EVENTS` | The breaker state machine used by the router (exported for tests/operators), its defaults, the error codes that count as availability failures, and the event names `model.circuit_opened` / `model.circuit_closed`. |
 | `ScriptedProvider` | Deterministic brains (`brain` or `brains[model]`), `callIndex` 0-based per instance, generated tool ids `call_<n>`, error replies ⇒ `HypertestError` with the same code, estimated usage, optional `latencyMs`. `requests`/`callCount` for assertions. |
 | `OpenAICompatibleProvider` | `POST {baseUrl}/chat/completions`, SSE (`stream_options.include_usage`) or plain JSON, tools/`tool_choice`/`response_format: json_schema (strict)`/`reasoning_effort`, `reasoning_content` → `reasoning.text`, cached/reasoning token usage. |
 | `AnthropicProvider` | `POST {baseUrl}/v1/messages`, SSE or JSON, tool_use/tool_result mapping, merged same-role turns, thinking ⇒ `reasoning.text` + `reasoning.opaque` (`anthropic:<model>`, replayed only to that class), `responseFormat` emulated via a forced `structured_output` tool. Extended thinking is configured via profile `extra.thinking`. |
@@ -29,7 +30,11 @@ Stages, first failure recorded as a `RouteRejection`:
    structured output; `contextWindow ≥ contextTokensEstimate + min(maxOutputTokens, 4096)`.
 3. **role** – an explicit `0` score for the role/taskType means "unsuitable"; **quality** –
    `score = quality[role] ?? quality[taskType] ?? quality.default ?? 0` must be `≥ minQuality`.
-4. **latency** – `typicalLatencyMs ≤ latencyBudgetMs`. 5. **cost** – `(ctx in, maxOutputTokens out) ≤ maxCostPerCallUsd`.
+4. **availability** – the route's circuit breaker is closed, or half-open with its single probe slot free; and, for a
+   cost-limited request (`policy.maxCostPerCallUsd` set, or every request with `priceGuard.appliesTo: 'all'`), the
+   catalog price is within the configured ceiling (a non-finite price never passes). It comes AFTER every eligibility
+   stage, so it only ever removes routes those stages accepted — it can never admit an ineligible one.
+5. **latency** – `typicalLatencyMs ≤ latencyBudgetMs`. 6. **cost** – `(ctx in, maxOutputTokens out) ≤ maxCostPerCallUsd`.
 
 Survivors are ranked: preferred routes (listed order) → score ↓ → (executor-like: role `executor` or
 taskType containing `execute`) tool reliability ↓ → latency ↑ → cost ↑ → routeId. `selectedByPolicy`
@@ -68,6 +73,37 @@ deltas; the returned response is authoritative. A response whose opaque reasonin
 continuation class than the route declares is logged as a catalog misconfiguration (it would never be
 replayed): Anthropic routes must declare `anthropic:<model>`, pi-ai routes `pi-ai:<api>:<piProvider>:<model>`.
 
+### Circuit breaker (technology-selection §关键风险: 模型价格/限流突然变化)
+
+Per route, in memory of the router instance (one per worker process; re-learned after a restart). Enabled by default
+(`DEFAULT_CIRCUIT_BREAKER`); `RouterDeps.circuitBreaker: false` disables it.
+
+- **closed → open** after `failureThreshold` (default 5) consecutive availability failures (`rate_limited`, `unavailable`,
+  `timeout`; each provider attempt counts) or a **rate-limit storm**: `rateLimitStorm.count` (default 8) `rate_limited`
+  failures within `windowMs` (default 60 s), successes in between notwithstanding. A bad request (`provider_error`), a
+  caller cancellation or an internal fault is no availability signal: it neither counts nor resets.
+- Same-route retries stop as soon as the breaker opens (never a retry into an open circuit).
+- **open → half-open** after `cooldownMs` (default 30 s): the route is selectable again, and the next invoke takes the
+  single **probe** slot (one attempt, no same-route retries). Concurrent calls are refused while the probe is out.
+  Probe success ⇒ **closed** (`model.circuit_closed`, reason `probe_succeeded`); an availability failure ⇒ **open** again
+  with the cooldown × `cooldownBackoff` (default 2, capped at `maxCooldownMs`, default 10 min); a probe without an
+  availability verdict (bad request, caller cancel) frees the slot and stays half-open. Only the probe closes an open
+  breaker: a call that started while closed and answers after the breaker opened proves nothing.
+- **Fail-closed interaction with fallbacks**: `invoke()` re-validates the decision including `availability`, so a
+  decision whose route opened since (or whose probe slot is taken) is refused **without a provider call**
+  (`precondition_failed`, `attempts: 0`, `details.stage: 'availability'`); under `fallback: 'fail_closed'` there is no
+  fallback, otherwise the full re-route (every stage, security first) excludes the route — an open route or an
+  ineligible (e.g. security-rejected) one is never a fallback.
+- **Price guard** (`priceGuard: { default?, routes?, appliesTo? }`, ceilings in USD per million input/output tokens): a
+  catalog price above the ceiling opens the breaker **for cost-limited policies**; recorded once as
+  `model.circuit_opened` (reason `price_ceiling`, price, ceiling, catalog revision) and as `model.circuit_closed`
+  (`price_ceiling_cleared`) when a later catalog revision brings it back under.
+- Events (aggregate `model`, aggregateId = routeId): `model.circuit_opened` `{ routeId, provider, model, reason
+  (consecutive_failures | rate_limit_storm | probe_failed | price_ceiling), code, consecutiveFailures, rateLimitsInWindow,
+  cooldownMs, halfOpenAt }` and `model.circuit_closed` — appended in ONE batch with the `model.invoked` of the call that
+  caused them (a sink failure around a failed call is a fault, as for `model.invoked`).
+- `router.circuits()` lists the state of every route that has a breaker (`closed | open | half_open`, counts, times).
+
 ### Conventions
 
 - Error taxonomy: 429 ⇒ `rate_limited`; 408/5xx/network ⇒ `unavailable`; deadline ⇒ `timeout` (all
@@ -97,6 +133,7 @@ replayed): Anthropic routes must declare `anthropic:<model>`, pi-ai routes `pi-a
 | I10 route/invoke/fallback events with full correlation; a sink failure is never masked as a model failure; after a paid call the append is retried and a persistent failure returns the response `auditPending` (never discarded, never re-called, no fallback) | `test/router.test.ts`, `test/router-invoke.test.ts`, `test/events.int.test.ts` (jsonb round-trip on PGlite and PostgreSQL 16) |
 | Provider error mapping, timeout vs cancel, SSE robustness (truncation), caller-callback faults, secret scrubbing | `test/openai.test.ts`, `test/anthropic.test.ts`, `test/pi-ai.test.ts`, `test/transport.test.ts`, `test/scripted.test.ts` |
 | Catalog immutability / validation | `test/catalog-registry.test.ts` |
+| Circuit breaker: open after N consecutive failures / rate-limit storm, no retry into an open circuit, single half-open probe (concurrent calls refused), backoff, stale successes never close it, fail-closed interaction with fallbacks (no provider call, no fallback under fail_closed, never an open or insecure fallback), property: availability only ever removes candidates, price guard for cost-limited policies, events batched with the call | `test/circuit-breaker.test.ts` |
 
 ## Contract changes (additive, 0.3)
 
@@ -107,6 +144,12 @@ replayed): Anthropic routes must declare `anthropic:<model>`, pi-ai routes `pi-a
 Review hardening (no type changes): `ModelRouter.invoke` doc now states the per-invoke re-validation,
 fallback tool compatibility and fault semantics; the provider error-mapping note covers truncated streams
 and `onDelta` exceptions.
+(unit B2, circuit breaker) `RouterDeps.circuitBreaker?: CircuitBreakerOptions | false` (default: enabled with
+`DEFAULT_CIRCUIT_BREAKER`); `RouteRejection.stage` gains `'availability'`; `ROUTING_STAGES` lists `availability` after
+`quality`; optional `ModelRouter.circuits?()`; new types `CircuitBreakerOptions`, `PriceCeiling`, `CircuitState`,
+`CircuitSnapshot`; exports `CircuitBreakers`, `DEFAULT_CIRCUIT_BREAKER`, `AVAILABILITY_FAILURES`, `MODEL_CIRCUIT_EVENTS`
+(`model.circuit_opened` / `model.circuit_closed` — not yet in the domain `EVENT_TYPES` catalog). Behaviour: an open
+route is rejected at routing and refused by `invoke()` before any provider call (`precondition_failed`).
 
 ## Testing
 

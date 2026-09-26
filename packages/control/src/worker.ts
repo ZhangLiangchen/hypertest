@@ -5,7 +5,9 @@ import {
   EVENT_TYPES, isTerminalWorkState, type ActionCapability, type AgentInstance, type ChatMessage, type EventContext, type ModelPolicy, type PermissionProfile, type TestRun,
   type WorkItem, type WorkResult,
 } from '@hypertest/domain';
-import { PERMISSION_PROFILES, attenuateCapability, createRootCapability, intersectPatterns, resourcePatternCovers, type PermissionProfileName } from '@hypertest/policy';
+import {
+  PERMISSION_PROFILES, attenuateCapability, createRootCapability, intersectPatterns, resourcePatternCovers, signCapability, type CapabilityConstraints, type PermissionProfileName,
+} from '@hypertest/policy';
 import { createModelInvoker, type EngineHost, type SpawnRequest } from '@hypertest/runtime';
 import type { RoleDefinition } from '@hypertest/agents';
 import type { WorkspaceHandle } from '@hypertest/tools';
@@ -13,9 +15,14 @@ import type { ExecuteTurnOptions, TurnOutcome } from './contracts.ts';
 import type { ControlDeps, ResolvedControlConfig } from './deps.ts';
 import { createContextProvider, type TurnState } from './context-provider.ts';
 import { createToolDispatcher, offeredRisk } from './dispatcher.ts';
-import { parseDelegationOperationId } from './domain-tools/work.ts';
+import { createPhaseGovernor } from './phases.ts';
+import { describeUnmet, unmetRequirements, workItemConstraint, type UnmetRequirement } from './capability-grant.ts';
+import {
+  delegationChatMessage, delegationSettled, inputWaitOperationId, isAwaitingInput, parseDelegationOperationId, unreadMessages,
+} from './delegation.ts';
 import { workLeaseKey, yieldWorkClaim } from './scheduler.ts';
-import { ControlStore, type AgentHostSpec, type WorkspaceRecipe } from './store.ts';
+import { runExperimentIds } from './isolation.ts';
+import { ControlStore, type AgentHostSpec, type Delegation, type WorkspaceRecipe } from './store.ts';
 import { runScope, workScope } from './work-factory.ts';
 import { KeyedMutex, assertRunPinned, clip, event, failureReason, itemCtx, jsonBlock, notFound, systemActor, tightenModelPolicy } from './util.ts';
 
@@ -61,6 +68,16 @@ function resolveProfile(name: string): PermissionProfile {
   return p;
 }
 
+/**
+ * A root capability narrowed by a further constraint (the work item's): attenuation semantics (never amplified), but the
+ * result keeps the root's identity and has no parent grant (a root agent has none), re-signed.
+ */
+function narrowRoot(root: ActionCapability, constraint: CapabilityConstraints, secret: string): ActionCapability {
+  const narrowed = attenuateCapability(root, [constraint], { subjectAgentId: root.subjectAgentId, workItemId: root.workItemId, capabilityId: root.capabilityId });
+  const { parentCapabilityId: _p, signature: _s, ...body } = narrowed;
+  return signCapability(body, secret);
+}
+
 /** (optional) Callbacks of the owning control plane. */
 export interface AgentWorkerHooks {
   /** A claim this worker took itself (observeWaiting re-takes the lease of a waiting item). */
@@ -77,6 +94,7 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
   /** One turn / observation of a work item at a time in this process (a duplicate durable delivery waits, then sees the outcome). */
   const itemMutex = new KeyedMutex();
   const workerActor = systemActor(config.workerId);
+  const phases = createPhaseGovernor(deps, config);
 
   // ------------------------------------------------------------------------------------------------ workspaces
 
@@ -146,8 +164,17 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
 
   // ------------------------------------------------------------------------------------------------ task context
 
-  async function taskMessage(item: WorkItem, run: TestRun): Promise<string> {
+  async function taskMessage(item: WorkItem, run: TestRun, unmet: readonly UnmetRequirement[] = [], delegation?: Delegation): Promise<string> {
     const lines: string[] = [`# Work item ${item.workItemId}: ${item.title}`, `Role: ${item.role}; kind: ${item.kind}; priority ${item.priority}.`, '', '## Objective', item.objective];
+    if (unmet.length > 0) {
+      // I2: the grant is parent ∩ role ∩ work-item requirements ∩ environment policy — the excess is reported, never granted
+      lines.push('', '## Capability requirements NOT granted');
+      lines.push('Your capability is your parent\'s (or your role\'s) ∩ your role policy ∩ this work item\'s requirements ∩ the environment policy. These requirements of your work item exceed it and were not granted: calls that need them are denied. Do not work around this — finish with what you may do, or fail_work naming the missing capability.');
+      for (const line of describeUnmet(unmet)) lines.push(`- ${line}`);
+    }
+    if (delegation?.continuable) {
+      lines.push('', '## Continuable delegation', 'You are a continuable subagent: after complete_work you wait for more input from your parent (its messages arrive as `[delegate.message …]`); answer each with complete_work again. Your parent releases you when done.');
+    }
     lines.push('', '## Expected output', item.expectedOutput ? jsonBlock(item.expectedOutput, 6000) : 'No structured output schema: complete_work with a precise summary and the ids you relied on.');
     if (item.evidenceRequirements.length > 0) {
       lines.push('', '## Evidence requirements (checked by complete_work)');
@@ -207,6 +234,11 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
       const environmentClasses = profile.environmentClasses.filter((c) => registeredClasses.has(c));
       const expiresAt = new Date(clock.nowMs() + item.budget.maxWallClockMs).toISOString();
       const ctx = itemCtx(item, workerActor);
+      // I2: … ∩ WORK ITEM requirements (baseline: its own workspace and the run's records) ∩ environment policy
+      const requirements = item.capabilityRequirements ?? [];
+      const workItemC = workItemConstraint(requirements, [`${ws.resourcePrefix}/**`, `run/${run.runId}/**`]);
+      const environmentC: CapabilityConstraints = { environmentClasses: [...registeredClasses].sort() };
+      const delegation = item.origin.kind === 'delegation' ? await store.delegation(item.workItemId) : undefined;
 
       let parent: AgentInstance | undefined;
       let parentCapability: ActionCapability | undefined;
@@ -225,23 +257,27 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
       let granted: ActionCapability | undefined;
       const capability = (agentId: string): ActionCapability => {
         if (parentCapability) {
-          // I2: a child is attenuated from its parent's recorded capability, never granted a root one.
-          granted = attenuateCapability(
-            parentCapability,
-            [{ tools: allow, resourceScopes: scopes, allowedEffects: profile.allowedEffects, environmentClasses, credentialScopes: profile.credentialScopes, maxRiskClass: profile.maxRiskClass, expiresAt }],
-            { subjectAgentId: agentId, workItemId: item.workItemId },
-            { secret: config.capabilitySecret },
-          );
+          // I2: a child is attenuated from its parent's recorded capability, never granted a root one:
+          // parent ∩ role ∩ work item ∩ environment policy
+          const roleC: CapabilityConstraints = {
+            tools: allow, resourceScopes: scopes, allowedEffects: profile.allowedEffects, environmentClasses: profile.environmentClasses, credentialScopes: profile.credentialScopes,
+            maxRiskClass: profile.maxRiskClass, expiresAt,
+          };
+          granted = attenuateCapability(parentCapability, [roleC, ...(workItemC ? [workItemC] : []), environmentC], { subjectAgentId: agentId, workItemId: item.workItemId }, { secret: config.capabilitySecret });
         } else {
-          granted = createRootCapability(
+          // root: role profile ∩ environment policy, then ∩ work item (narrowed in place: a root has no parent grant)
+          const root = createRootCapability(
             { runId: run.runId, subjectAgentId: agentId, workItemId: item.workItemId, profile: { ...profile, name: role.permissionProfile as PermissionProfileName, resourceScopes: scopes, environmentClasses }, tools: allow, expiresAt },
             config.capabilitySecret,
           );
+          granted = workItemC ? narrowRoot(root, workItemC, config.capabilitySecret) : root;
         }
         return granted;
       };
+      // what the work item asks for but the grant does not cover (the grant does not depend on the agent id)
+      const unmet = requirements.length > 0 ? unmetRequirements(capability('ag_preview'), requirements) : [];
       const snapshot = await snapshotBuilder.build({ runId: run.runId }, ctx);
-      const initialMessages: ChatMessage[] = [{ role: 'user', content: await taskMessage(item, run) }];
+      const initialMessages: ChatMessage[] = [{ role: 'user', content: await taskMessage(item, run, unmet, delegation) }];
       const request: SpawnRequest = {
         runId: run.runId,
         workItemId: item.workItemId,
@@ -253,15 +289,26 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
         toolPolicy: { allow, deny },
         contextSnapshotId: snapshot.snapshotId,
         initialMessages,
-        continuable: false,
-        background: false,
+        continuable: delegation?.continuable === true,
+        background: delegation?.background === true,
         budget: item.budget,
         engineKind: config.defaultEngineKind,
       };
       if (parent) request.parentAgentId = parent.agentId;
       if (item.expectedOutput) request.outputSchema = item.expectedOutput;
       const result = await db.transaction(async (tx) => {
+        // the parent's messages sent before this child existed start its session (locked: none is lost or doubled)
+        const d = delegation ? await store.delegation(item.workItemId, tx, true) : undefined;
+        const queued = d?.messages.filter((m) => !m.enqueued) ?? [];
+        request.initialMessages = [...initialMessages, ...queued.map(delegationChatMessage)];
         const agent = await subagents.spawn(request, ctx);
+        if (d && queued.length > 0) await store.setDelegationMessages(item.workItemId, d.messages.map((m) => (m.enqueued ? m : { ...m, enqueued: true })), tx);
+        if (unmet.length > 0) {
+          await events.append(
+            [event({ ...ctx, agentId: agent.agentId }, 'capability.requirements_unmet', 'work_item', item.workItemId, { workItemId: item.workItemId, agentId: agent.agentId, capabilityId: agent.capabilityId, unmet: describeUnmet(unmet) })],
+            tx,
+          );
+        }
         const spec: AgentHostSpec = {
           agentId: agent.agentId,
           runId: run.runId,
@@ -357,6 +404,79 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
   async function failItem(item: WorkItem, token: number, reason: NonNullable<WorkItem['failure']>['reason'], message: string, ctx: EventContext): Promise<void> {
     const done = await fenced(() => blackboard.transitionWorkItem(item.workItemId, 'failed', { failure: { reason, message } }, ctx, { expectedFencingToken: token }));
     await release(done);
+    if (item.origin.kind === 'delegation') {
+      const d = await store.delegation(item.workItemId);
+      if (d) await notifyParent(d, item, `failed (${reason}: ${clip(message, 500)})`);
+    }
+  }
+
+  /**
+   * A background delegation (or a continuable child answering a parent's message) reports to its parent's inbox when a
+   * task ends — summary and cited ids only, never the child's trace. A foreground child's first result reaches the parent
+   * through its pending delegate call instead. A parent that already ended is not told.
+   */
+  async function notifyParent(d: Delegation, child: WorkItem, what: string, result?: WorkResult): Promise<void> {
+    if (!d.background && d.messages.length === 0) return;
+    const parent = await agents.get(d.parentAgentId);
+    if (!parent || (parent.status !== 'active' && parent.status !== 'waiting')) return;
+    const refs = result && result.evidenceRefs.length > 0 ? `; evidence ${result.evidenceRefs.join(', ')}` : '';
+    const records = result && result.recordRefs.length > 0 ? `; records ${result.recordRefs.join(', ')}` : '';
+    const content = `[delegation ${child.workItemId} (${child.role}) ${what}]${result ? ` ${clip(result.summary, 2000)}${refs}${records}` : ''}`;
+    try {
+      await subagents.message(parent.agentId, { role: 'user', content });
+    } catch (e) {
+      if (!isHypertestError(e, 'precondition_failed')) throw e;
+    }
+  }
+
+  /**
+   * A task finished (complete_work). A continuable delegation that was not released waits for more input on
+   * `input:<id>` (its result recorded on the item and settled for delegate.collect); every other item completes. A released
+   * continuable child completes and its agent is disposed (it takes no more input).
+   */
+  async function finishTask(item: WorkItem, agent: AgentInstance, workResult: WorkResult, token: number, ctx: EventContext, from?: WorkItem['state'][]): Promise<TurnOutcome> {
+    // BUGate before_transition at the transition itself: complete_work was decided on the calls made before it, but a
+    // call of the same turn may run after it (the engine dispatches a turn's calls in order) and be flagged after
+    // action. A task whose calls are flagged is judged again here, on the current facts — flagged work never completes
+    // (nor settles a continuable task) unless the policy allows it.
+    const flagged = await phases.flaggedActions(item.runId, item.workItemId);
+    if (flagged > 0) {
+      const permit = await phases.beforeTransition({
+        runId: item.runId,
+        transition: {
+          subject: 'work_item', subjectId: item.workItemId, from: item.state, to: 'completed',
+          details: { role: item.role, kind: item.kind, citedEvidence: workResult.evidenceRefs.length, citedRecords: workResult.recordRefs.length, structuredOutput: workResult.output !== undefined, recheck: true },
+        },
+        workItemId: item.workItemId,
+        requestedBy: { agentId: agent.agentId, role: item.role },
+        ctx,
+      });
+      if (permit.decision !== 'allow') {
+        logger.warn('work item completion refused by policy at the transition (flagged calls)', { workItemId: item.workItemId, flagged, decisionId: permit.decisionId, decision: permit.decision });
+        await failItem(item, token, 'policy_denied', `completion refused by policy (before_transition work_item:completed, ${permit.decision}, decision ${permit.decisionId}): ${permit.reasons.join('; ') || 'no reason given'}`, ctx);
+        return { status: 'failed', workItemId: item.workItemId };
+      }
+    }
+    const d = item.origin.kind === 'delegation' ? await store.delegation(item.workItemId) : undefined;
+    const opts = { expectedFencingToken: token, ...(from ? { expectedFrom: from } : {}) };
+    if (d?.continuable && d.releasedAt === undefined) {
+      const op = inputWaitOperationId(item.workItemId);
+      await fenced(() =>
+        db.transaction(async () => {
+          await blackboard.transitionWorkItem(item.workItemId, 'waiting', { waitingOn: [op], result: workResult }, ctx, opts);
+          await notifyParent(d, item, 'finished a task and waits for more input', workResult);
+        }),
+      );
+      logger.info('continuable delegation finished a task; it waits for more input', { workItemId: item.workItemId, parentWorkItemId: d.parentWorkItemId });
+      return { status: 'waiting', workItemId: item.workItemId, operationIds: [op] };
+    }
+    const done = await fenced(() => blackboard.transitionWorkItem(item.workItemId, 'completed', { result: workResult }, ctx, opts));
+    await release(done);
+    if (d) {
+      await notifyParent(d, item, 'completed', workResult);
+      if (d.continuable) await subagents.dispose(agent.agentId, ctx).catch((e: unknown) => logger.warn('released child could not be disposed', { agentId: agent.agentId, error: (e as Error).message }));
+    }
+    return { status: 'completed', workItemId: item.workItemId };
   }
 
   /** Renews the lease (and the claim's expiry) while a turn runs; stops before the result is written. */
@@ -393,7 +513,8 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
    */
   async function renewResourceClaims(item: WorkItem, ctx: EventContext, phase: string): Promise<boolean> {
     if (item.resourceClaims.length === 0) return true;
-    const r = await admission.admit({ holderId: item.workItemId, runId: item.runId, claims: item.resourceClaims, ttlMs: config.leaseTtlMs });
+    // (conformance-6) an item that runs for experiments shares their admitted claims
+    const r = await admission.admit({ holderId: item.workItemId, runId: item.runId, claims: item.resourceClaims, ttlMs: config.leaseTtlMs, compatibleHolders: await runExperimentIds(deps, item) });
     if (r.admitted) return true;
     const conflicts = r.conflicts.map((c) => `${c.requested.resourceKey}@${c.heldBy}`).sort();
     logger.warn('resource claims of a held work item could not be renewed (taken by another holder); the item stops', { workItemId: item.workItemId, conflicts, phase });
@@ -505,9 +626,7 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
         if (agent.status === 'completed') {
           const workResult: WorkResult = { summary: settled.summary ?? '', evidenceRefs: settled.evidenceRefs, recordRefs: settled.recordRefs };
           if (settled.output !== undefined) workResult.output = settled.output;
-          const done = await fenced(() => blackboard.transitionWorkItem(workItemId, 'completed', { result: workResult }, agentCtx, { expectedFencingToken: fencingToken }));
-          await release(done);
-          return { status: 'completed', workItemId };
+          return await finishTask(item, agent, workResult, fencingToken, agentCtx);
         }
         const f = settled.failure ?? { reason: 'agent_failed', message: 'the agent failed' };
         await failItem(item, fencingToken, failureReason(f.reason), `${f.reason}: ${f.message}`, agentCtx);
@@ -570,9 +689,7 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
           if (!c) throw new HypertestError('internal', `agent ${agent.agentId} completed without a completion signal`);
           const workResult: WorkResult = { summary: c.summary, evidenceRefs: c.evidenceRefs, recordRefs: c.recordRefs };
           if (c.output !== undefined) workResult.output = c.output as JsonValue;
-          const done = await fenced(() => blackboard.transitionWorkItem(workItemId, 'completed', { result: workResult }, agentCtx, { expectedFencingToken: fencingToken, expectedFrom: ['running'] }));
-          await release(done);
-          return { status: 'completed', workItemId };
+          return await finishTask(item, agent, workResult, fencingToken, agentCtx, ['running']);
         }
         case 'failed': {
           const f = result.failure ?? { reason: 'agent_failed', message: 'the agent failed' };
@@ -703,6 +820,8 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
     // the external operation still occupies its resources: keep the item's resource claims alive with the lease (a lapse
     // is recorded; the in-flight operation is still observed to its outcome)
     await renewResourceClaims(item, ctx, 'waiting');
+    // a continuable delegation between tasks: more input from its parent resumes it; its release completes it
+    if (isAwaitingInput(item)) return awaitInput(item, agent, run, token, ctx, lastTurn);
 
     const lines: string[] = [];
     const evidenceIds: string[] = [];
@@ -716,7 +835,8 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
           lines.push(`- delegation ${op}: the child work item does not exist`);
           continue;
         }
-        if (!isTerminalWorkState(child.state)) {
+        // a continuable child's task result counts as settled while it waits for more input (it is not terminal)
+        if (!delegationSettled(child)) {
           settled = false;
           pending.push(op);
           continue;
@@ -729,7 +849,7 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
         const records = r?.recordRefs ?? child.result?.recordRefs ?? [];
         evidenceIds.push(...refs);
         lines.push(
-          `- delegation ${op} (${child.role}) ${child.state}: ${summary ? clip(summary, 2000) : failure ? `${failure.reason}: ${failure.message}` : 'no summary'}${refs.length ? `; evidence ${refs.join(', ')}` : ''}${records.length ? `; records ${records.join(', ')}` : ''}`,
+          `- delegation ${op} (${child.role}) ${isAwaitingInput(child) ? 'completed its task (continuable: it waits for delegate.message or delegate.release)' : child.state}: ${summary ? clip(summary, 2000) : failure ? `${failure.reason}: ${failure.message}` : 'no summary'}${refs.length ? `; evidence ${refs.join(', ')}` : ''}${records.length ? `; records ${records.join(', ')}` : ''}`,
         );
       } else {
         const outcome = await gateway.observe(op, ctx, signal ?? new AbortController().signal);
@@ -778,6 +898,64 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
       if (isHypertestError(e, 'stale_fence') || isHypertestError(e, 'conflict')) return { status: 'lease_lost', workItemId };
       throw e;
     }
+    return { status: 'continue', workItemId, turn: lastTurn };
+  }
+
+  /**
+   * observeWaiting of a continuable child between tasks: released (by its parent, its parent's end or its wall clock) ⇒ it
+   * completes with its last result and its agent is disposed; unread parent messages ⇒ the ones not yet handed over are
+   * queued (SubagentRuntime.message), the agent is resumed and the item runs its next turn; otherwise it keeps waiting.
+   */
+  async function awaitInput(item: WorkItem, agent: AgentInstance, run: TestRun, token: number, ctx: EventContext, lastTurn: number): Promise<TurnOutcome> {
+    const workItemId = item.workItemId;
+    const d = await store.delegation(workItemId);
+    const now = clock.nowMs();
+    const expired =
+      now - Date.parse(agent.createdAt) >= item.budget.maxWallClockMs ? `the work item's maxWallClockMs (${item.budget.maxWallClockMs} ms)` : now - Date.parse(run.createdAt) > run.budget.maxWallClockMs ? `the run's maxWallClockMs` : undefined;
+    let releasedBy = d === undefined ? 'no delegation on record' : d.releasedAt !== undefined ? (d.releaseReason ?? 'released') : undefined;
+    if (releasedBy === undefined && expired !== undefined) {
+      releasedBy = `waited for input past ${expired}`;
+      if (await store.releaseDelegation(workItemId, releasedBy, clock.isoNow())) {
+        await events.append([event(ctx, 'delegation.released', 'work_item', workItemId, { childWorkItemId: workItemId, parentWorkItemId: d!.parentWorkItemId, reason: releasedBy, auto: true })]);
+      }
+    }
+    if (releasedBy !== undefined) {
+      let result = item.result;
+      if (!result) {
+        const r = await subagents.collect(agent.agentId);
+        result = { summary: r.summary ?? '', evidenceRefs: r.evidenceRefs, recordRefs: r.recordRefs };
+        if (r.output !== undefined) result.output = r.output;
+      }
+      let done: WorkItem;
+      try {
+        done = await db.transaction(async () => {
+          await blackboard.transitionWorkItem(workItemId, 'running', { waitingOn: [] }, ctx, { expectedFencingToken: token, expectedFrom: ['waiting'] });
+          return blackboard.transitionWorkItem(workItemId, 'completed', { result: result! }, ctx, { expectedFencingToken: token, expectedFrom: ['running'] });
+        });
+      } catch (e) {
+        if (isHypertestError(e, 'stale_fence') || isHypertestError(e, 'conflict')) return { status: 'lease_lost', workItemId };
+        throw e;
+      }
+      await release(done);
+      await subagents.dispose(agent.agentId, ctx).catch((e: unknown) => logger.warn('released child could not be disposed', { agentId: agent.agentId, error: (e as Error).message }));
+      logger.info('continuable delegation released: completed with its last result', { workItemId, reason: releasedBy });
+      return { status: 'completed', workItemId };
+    }
+    if ((await unreadMessages(deps, d!, agent)).length === 0) return { status: 'waiting', workItemId, operationIds: item.waitingOn };
+    try {
+      await db.transaction(async (tx) => {
+        const locked = (await store.delegation(workItemId, tx, true))!;
+        const handOver = locked.messages.filter((m) => !m.enqueued);
+        for (const m of handOver) await subagents.message(agent.agentId, delegationChatMessage(m));
+        if (handOver.length > 0) await store.setDelegationMessages(workItemId, locked.messages.map((m) => (m.enqueued ? m : { ...m, enqueued: true })), tx);
+        await subagents.resume(agent.agentId);
+        await blackboard.transitionWorkItem(workItemId, 'running', { waitingOn: [] }, ctx, { expectedFencingToken: token, expectedFrom: ['waiting'] });
+      });
+    } catch (e) {
+      if (isHypertestError(e, 'stale_fence') || isHypertestError(e, 'conflict')) return { status: 'lease_lost', workItemId };
+      throw e;
+    }
+    logger.info('continuable delegation resumed with its parent\'s input', { workItemId });
     return { status: 'continue', workItemId, turn: lastTurn };
   }
 

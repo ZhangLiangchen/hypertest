@@ -3,7 +3,7 @@ import {
   DEFAULT_BUDGET, EVENT_TYPES, isTerminalWorkState, workItemFingerprint,
   type BudgetEnvelope, type EventContext, type GateSpec, type TestRun, type WorkItem,
 } from '@hypertest/domain';
-import { DEFAULT_GATE_SPEC } from '@hypertest/policy';
+import { DEFAULT_GATE_SPEC, gateOverrides } from '@hypertest/policy';
 import { environmentResolver, experimentResolver, leaseResolver, oracleResolver, recordResolver } from '@hypertest/context';
 import type { NewWorkItem } from '@hypertest/collab';
 import type { ControlPlane, ConvergenceState, ExecuteTurnOptions, RunReport, StartRunInput, TickOptions, TickResult, TurnOutcome } from './contracts.ts';
@@ -15,10 +15,12 @@ import { createDomainTools } from './domain-tools/index.ts';
 import { createReactorService, REACTOR_CONSUMER, REACTOR_SUBJECTS, type ReactorService } from './reactors.ts';
 import { createReportBuilder } from './report.ts';
 import { createScheduler, workLeaseKey, type Scheduler } from './scheduler.ts';
-import { ControlStore } from './store.ts';
+import { ControlStore, type GateAuthority } from './store.ts';
 import { createAgentWorker, type AgentWorker } from './worker.ts';
 import { WorkFactory, runScope, workScope } from './work-factory.ts';
-import { KeyedMutex, assertRunPinned, event, gateSpecProblems, isTerminalRunStatus, mergeDefined, notFound, runCtx, systemActor, workBudgetFor } from './util.ts';
+import {
+  GATE_AUTHORITY_KINDS, KeyedMutex, assertRunPinned, event, gateSpecProblems, gateWeakenings, isTerminalRunStatus, mergeDefined, notFound, runCtx, systemActor, workBudgetFor,
+} from './util.ts';
 
 const IDLE_BASE_MS = 100;
 const IDLE_MAX_MS = 5000;
@@ -54,6 +56,47 @@ function leadObjective(input: StartRunInput): string {
     `Target: ${target.length ? target.join('; ') : 'not specified'}${t.description ? ` — ${t.description}` : ''}`,
     'Analyse the goal and the target (cheap repository survey, oracles in force), derive testable objectives with acceptance criteria, and propose Plan v1 with plan.propose_revision: typed work items for the other roles, their dependencies, evidence requirements and budgets. Do not execute tests yourself. Finish with complete_work.',
   ].join('\n');
+}
+
+/**
+ * (conformance-9) The authority record of a run's gate. A weakening override (`weakened` non-empty) needs
+ * `gateOverrideBy` — a human or system actor, never an agent (nor a call made in an agent's name) — and a rationale.
+ * An authority given without a weakening is validated and recorded all the same.
+ */
+function overrideAuthority(input: StartRunInput, ctxIn: Partial<EventContext> | undefined, weakened: string[], baseGate: GateSpec): GateAuthority {
+  const by = input.gateOverrideBy;
+  const rationale = input.gateOverrideRationale;
+  const agentCall = ctxIn?.agentId !== undefined;
+  if (by !== undefined) {
+    if (!by || typeof by !== 'object' || typeof by.kind !== 'string' || typeof by.id !== 'string' || by.id.trim() === '') {
+      throw new HypertestError('invalid_argument', 'startRun: gateOverrideBy must be an actor { kind, id } with a non-empty id');
+    }
+    if (by.kind === 'agent' || agentCall) {
+      throw new HypertestError('permission_denied', `startRun: a gate override is never authorized by an agent (${by.kind === 'agent' ? `gateOverrideBy is agent ${by.id}` : `the call is made by agent ${ctxIn!.agentId}`}); a human or system authority must record it`, {
+        details: { weakened, gateOverrideBy: by.kind },
+      });
+    }
+    if (!GATE_AUTHORITY_KINDS.has(by.kind)) throw new HypertestError('invalid_argument', `startRun: gateOverrideBy.kind must be human or system (got ${JSON.stringify(by.kind)})`);
+    if (typeof rationale !== 'string' || rationale.trim() === '') throw new HypertestError('invalid_argument', 'startRun: gateOverrideRationale is required with gateOverrideBy');
+  } else if (rationale !== undefined) {
+    throw new HypertestError('invalid_argument', 'startRun: gateOverrideRationale without gateOverrideBy (name the human/system authority)');
+  }
+  if (weakened.length > 0 && by === undefined) {
+    throw new HypertestError(
+      'invalid_argument',
+      `startRun: the gate override weakens the run's gate and needs a recorded human/system authority (gateOverrideBy + gateOverrideRationale):\n  - ${weakened.join('\n  - ')}`,
+      { details: { weakened } },
+    );
+  }
+  if (weakened.length > 0 && agentCall) {
+    throw new HypertestError('permission_denied', `startRun: a gate override is never authorized by an agent (the call is made by agent ${ctxIn!.agentId})`, { details: { weakened } });
+  }
+  const out: GateAuthority = { baseGate, weakened };
+  if (by !== undefined) {
+    out.by = { ...by };
+    out.rationale = rationale!;
+  }
+  return out;
 }
 
 /**
@@ -146,6 +189,8 @@ export function createControlPlane(deps: ControlDeps): ControlPlaneInternals {
   async function finalResult(run: TestRun): Promise<TickResult> {
     // durability-11: an ended run keeps no per-process bookkeeping (long-lived serve/worker processes)
     idle.delete(run.runId);
+    // conformance-5/6: nor claims or reservations (idempotent; covers a crash between the gate and the release)
+    await scheduler.releaseRun?.(run.runId);
     if (issued.size > 0) for (const w of await blackboard.listWorkItems({ runId: run.runId })) forgetClaims(w.workItemId);
     const decision = run.decisionId ? await decisions.get(run.decisionId) : undefined;
     const partial: Partial<TickResult> & { convergence: ConvergenceState; idleMs: number } = { convergence: { state: 'drained', reason: 'ready_for_gate' }, final: true, idleMs: 0 };
@@ -216,6 +261,8 @@ export function createControlPlane(deps: ControlDeps): ControlPlaneInternals {
     const caught = await reactors.catchUp(runId);
     if (caught.created.length > 0) progressed = true;
     let items = await blackboard.listWorkItems({ runId });
+    // c2 continuable delegations whose parent work item ended are released (they complete with their last result)
+    if ((await releaseOrphanedChildren(runId, items)).length > 0) progressed = true;
     // d unblock
     const unblocked = await scheduler.unblock(runId, items);
     // e lease expiry
@@ -241,6 +288,9 @@ export function createControlPlane(deps: ControlDeps): ControlPlaneInternals {
         items = await blackboard.listWorkItems({ runId });
       }
     }
+    // f2 isolation upkeep (conformance-5/6): experiment claims follow their owners; ended load jobs free their QPS
+    const isolation = await scheduler.syncIsolation?.(run, items);
+    if (isolation && isolation.released.length + isolation.qpsReleased.length > 0) progressed = true;
     // g admission
     let dispatched: TickResult['dispatched'] = [];
     if (!exhausted) {
@@ -267,11 +317,41 @@ export function createControlPlane(deps: ControlDeps): ControlPlaneInternals {
       }
       const g = await convergence.gate(run);
       idle.delete(runId);
+      if (g.final) await scheduler.releaseRun?.(runId);
       return result(g.run, { convergence: state, decision: g.decision, final: g.final, idleMs: 0, replanScheduled: replan.scheduled });
     }
     if (state.state === 'exhausted' && !exhausted) state = { state: 'active', runnable: 0, running: 0, waiting: 0, pendingEvents };
     run = await mustRun(runId);
     return result(run, { dispatched, waiting, replanScheduled: replan.scheduled, convergence: state, idleMs: nextIdle(runId, progressed) });
+  }
+
+  /**
+   * Auto-release (subagent runtime): a continuable child waits for more input only while its parent works; once the
+   * parent's work item ended (completed, failed, cancelled — or is gone) the child is released and completes with its
+   * last task result at its next observation. Returns the released child ids.
+   */
+  async function releaseOrphanedChildren(runId: string, items: WorkItem[]): Promise<string[]> {
+    const byId = new Map(items.map((w) => [w.workItemId, w]));
+    const released: string[] = [];
+    for (const d of await store.delegations(runId)) {
+      if (!d.continuable || d.releasedAt !== undefined) continue;
+      const child = byId.get(d.childWorkItemId);
+      if (!child || isTerminalWorkState(child.state)) continue;
+      const parent = byId.get(d.parentWorkItemId);
+      if (parent && !isTerminalWorkState(parent.state)) continue;
+      const reason = parent ? `parent work item ${parent.workItemId} ${parent.state}` : `parent work item ${d.parentWorkItemId} is gone`;
+      const ctx = { ...runCtx(runId, config.workerId), workItemId: d.childWorkItemId, correlationId: d.childWorkItemId };
+      const changed = await db.transaction(async (tx) => {
+        const ok = await store.releaseDelegation(d.childWorkItemId, reason, clock.isoNow(), tx);
+        if (ok) await events.append([event(ctx, 'delegation.released', 'work_item', d.childWorkItemId, { childWorkItemId: d.childWorkItemId, parentWorkItemId: d.parentWorkItemId, reason, auto: true })], tx);
+        return ok;
+      });
+      if (changed) {
+        released.push(d.childWorkItemId);
+        logger.info('continuable delegation auto-released: its parent ended', { runId, childWorkItemId: d.childWorkItemId, parentWorkItemId: d.parentWorkItemId, reason });
+      }
+    }
+    return released;
   }
 
   async function cancelRunLocked(runId: string, reason: string): Promise<void> {
@@ -299,7 +379,11 @@ export function createControlPlane(deps: ControlDeps): ControlPlaneInternals {
     //   the cancel) is re-read and cancelled in its new state — never skipped on a conflict (durability-8).
     for (let pass = 0; pass < 10; pass++) {
       const open = (await blackboard.listWorkItems({ runId })).filter((w) => !isTerminalWorkState(w.state));
-      if (open.length === 0) return;
+      if (open.length === 0) {
+        // conformance-5/6: a cancelled run holds no experiment claims or budget reservations
+        await scheduler.releaseRun?.(runId);
+        return;
+      }
       for (const w of open) {
         try {
           await blackboard.transitionWorkItem(w.workItemId, 'cancelled', { failure: { reason: 'cancelled', message: reason } }, { ...ctx, workItemId: w.workItemId, correlationId: w.workItemId }, { expectedFrom: [w.state] });
@@ -342,10 +426,15 @@ export function createControlPlane(deps: ControlDeps): ControlPlaneInternals {
         const v = budgetEnvelope[k];
         if (v !== undefined && !(typeof v === 'number' && Number.isFinite(v) && v >= 0)) throw new HypertestError('invalid_argument', `startRun: budget.${k} must be a finite number ≥ 0 (got ${String(v)})`, { details: { field: k } });
       }
-      const gateSpec = mergeDefined<GateSpec>(DEFAULT_GATE_SPEC, config.defaultGate, input.gate);
+      const baseGate = mergeDefined<GateSpec>(DEFAULT_GATE_SPEC, config.defaultGate);
+      const gateSpec = mergeDefined<GateSpec>(baseGate, input.gate);
       // H3: never store a gate the QualityGate would misread as weaker (e.g. an unknown severity threshold disables C2)
       const gateProblems = gateSpecProblems(gateSpec);
       if (gateProblems.length > 0) throw new HypertestError('invalid_argument', `startRun: invalid gate:\n  - ${gateProblems.join('\n  - ')}`, { details: { errors: gateProblems } });
+      // conformance-9: a run-level override that weakens the gate needs a recorded human/system authority
+      // (an unusable configured base is never a reason to skip the check: the default gate is the reference then)
+      const reference = gateSpecProblems(baseGate).length === 0 ? baseGate : DEFAULT_GATE_SPEC;
+      const gateAuthority = overrideAuthority(input, ctxIn, gateWeakenings(reference, gateSpec), reference);
       const now = clock.isoNow();
       const ctx: EventContext = { runId, correlationId: ctxIn?.correlationId ?? runId, actorId: ctxIn?.actorId ?? actor };
       if (ctxIn?.causationId !== undefined) ctx.causationId = ctxIn.causationId;
@@ -393,22 +482,37 @@ export function createControlPlane(deps: ControlDeps): ControlPlaneInternals {
         state: 'ready',
       };
       if (lead.outputSchema !== undefined) leadItem.expectedOutput = lead.outputSchema;
-      const limits: { tokens: number; toolCalls: number; workItems: number; costUsd?: number } = {
+      const limits: { tokens: number; toolCalls: number; workItems: number; costUsd?: number; computeMs?: number; artifactBytes?: number; externalQps?: number } = {
         tokens: budgetEnvelope.maxModelTokens,
         toolCalls: budgetEnvelope.maxToolCalls,
         workItems: budgetEnvelope.maxWorkItems,
       };
       if (budgetEnvelope.maxModelCostUsd !== undefined) limits.costUsd = budgetEnvelope.maxModelCostUsd;
+      // conformance-5: sandbox compute, stored artifact bytes and concurrent external QPS are budget dimensions of the run
+      if (budgetEnvelope.maxComputeMinutes !== undefined) limits.computeMs = Math.round(budgetEnvelope.maxComputeMinutes * 60_000);
+      if (budgetEnvelope.maxArtifactBytes !== undefined) limits.artifactBytes = budgetEnvelope.maxArtifactBytes;
+      if (budgetEnvelope.maxExternalQps !== undefined) limits.externalQps = budgetEnvelope.maxExternalQps;
       const started = await db.transaction(async (tx) => {
         await factory.lock(runId, tx); // lock order: work creation lock before any event append of the run
         await store.putManifest(config.runtimeManifest, now, tx);
         await runs.create(run, ctx, tx);
-        await store.putGate(runId, gateSpec, tx);
+        await store.putGate(runId, gateSpec, tx, gateAuthority);
         await budget.open(runScope(runId), limits);
         await events.append([event(ctx, 'budget.reserved', 'budget', runScope(runId), { scope: runScope(runId), limits })], tx);
         const running = await runs.update(runId, { status: 'running' }, ctx, tx);
         const r = await factory.create(leadItem, ctx, tx);
         if (r.status === 'capped') throw new HypertestError('invalid_argument', 'startRun: maxWorkItems must allow at least the lead work item');
+        // conformance-9: the recorded authority of the run's gate override is on L0 with the run's creation
+        if (gateAuthority.by) {
+          await events.append(
+            [
+              event(ctx, 'gate.override_authorized', 'run', runId, {
+                gateId: gateSpec.gateId, weakened: gateAuthority.weakened, overrides: gateOverrides(gateSpec), by: gateAuthority.by, rationale: gateAuthority.rationale,
+              }),
+            ],
+            tx,
+          );
+        }
         return running;
       });
       logger.info('run started', { runId, goal: input.goal, manifest: run.runtimeManifestId });

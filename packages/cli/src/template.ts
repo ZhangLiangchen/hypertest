@@ -1,6 +1,6 @@
 /**
  * The commented `hypertest.config.yaml` written by `hypertest init`. It loads and validates as is
- * (`loadConfig`), names secrets only through `*Env` fields, and routes every built-in role once the two API keys
+ * (`loadConfig`), names secrets only through `*Env` fields, and routes every core role and the GUI role once the two API keys
  * it names are set (`hypertest doctor`).
  */
 
@@ -114,9 +114,12 @@ models:
     #   maxDataClassification: restricted   # data never leaves the machine
     #   quality: { default: 0.6 }
 
+    # The local_private role (restricted data: secrets, personal data) is routed ONLY to routes accepting restricted data
+    # like this one; without one its work fails closed (\`hypertest doctor\` warns). vision_gui needs a vision route.
+
 # Per-role model policies, deep-merged over the built-in role catalog. Roles: lead, code_change_analyst,
 # architecture_analyst, historical_bug_analyst, test_designer, executor, rca, fixer, reviewer, metrics_analyst,
-# environment, condenser. A policy may set preferredRoutes, requiredCapabilities, minQuality, allowedProviders,
+# environment, condenser, vision_gui (browser + screenshots), local_private (restricted data, local routes only). A policy may set preferredRoutes, requiredCapabilities, minQuality, allowedProviders,
 # prohibitedProviders, privacyClass, independentFromRoles, maxCostPerCallUsd, latencyBudgetMs, reasoningEffort,
 # temperature and fallback (revalidated | fail_closed).
 roles:
@@ -138,7 +141,7 @@ roles:
       preferredRoutes: [claude-sonnet, claude-opus]
       # every role that produces evidence, findings, tests or fixes (a list here REPLACES the built-in default: keep it
       # complete, or leave it out to inherit the catalog's list)
-      independentFromRoles: [executor, test_designer, rca, fixer, metrics_analyst, environment]
+      independentFromRoles: [executor, test_designer, rca, fixer, metrics_analyst, environment, vision_gui, local_private]
       fallback: fail_closed
   condenser:                         # context summaries; a local route keeps them on the machine
     defaultModelPolicy:

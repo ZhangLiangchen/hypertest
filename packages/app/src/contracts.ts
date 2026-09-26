@@ -1,5 +1,5 @@
 import type { Clock, EventBus, IdGenerator, Logger, SqlDatabase } from '@hypertest/core';
-import type { BudgetEnvelope, DomainEvent, GateSpec, ModelPolicy, OracleAssertion, OracleSpec, RuntimeManifest, TestRun } from '@hypertest/domain';
+import type { BudgetEnvelope, DomainEvent, GateSpec, ModelPolicy, OracleAssertion, OracleSpec, RuntimeEpoch, RuntimeManifest, TestRun } from '@hypertest/domain';
 import type { ModelCapabilityProfile, ModelCatalog, ModelRouter, ProviderRegistry, ScriptedBrain } from '@hypertest/model';
 import type { ApprovalRequest, ApprovalService, OracleGovernance, PolicyDecisionLog, PolicyEngine, PolicyRule, ResolvedProtocol } from '@hypertest/policy';
 import type { EnvironmentDescriptor, EnvironmentRegistry, SandboxProfile, ToolRegistryLike } from '@hypertest/tools';
@@ -8,8 +8,11 @@ import type { ControlPlane, RunReport, StartRunInput } from '@hypertest/control'
 import type { DurableRuntime, RunOutcome } from '@hypertest/durable';
 import type { Blackboard, DecisionRepository, EventStore, OutboxRelay, RunRepository, SpecRepository } from '@hypertest/collab';
 import type { ArtifactStore, EvidenceLedger, Signer } from '@hypertest/evidence';
-import type { DurableMemory } from '@hypertest/context';
-import type { OperationLedger } from '@hypertest/operation';
+import type { DurableMemory, ProvenanceService } from '@hypertest/context';
+import type { AdapterRegistry, OperationLedger } from '@hypertest/operation';
+import type {
+  CanarySelection, CompatibilitySuiteResult, PromotionResult, RecordSuiteInput, RollbackResult, RuntimeRelease, RuntimeReleaseRegistry, SchemaMigrationAllowance,
+} from '@hypertest/runtime';
 
 /**
  * @hypertest/app — configuration + composition root. The only place that knows every package.
@@ -75,6 +78,12 @@ export interface HypertestConfig {
    * `oracleIds` pin every configured oracle.
    */
   oracles?: OracleConfig[];
+  /**
+   * (additive, runtime release management) `requireActiveRelease`: refuse to create runs until a runtime release is
+   * active (default false: an installation that never activated a release runs unmanaged — any runtime but a rolled-back
+   * one creates runs; once a release is active, new runs are created only under it or a canary that selects them).
+   */
+  runtime?: { requireActiveRelease?: boolean };
 }
 
 /** (additive, conformance-1) A configured oracle: the OracleSpec content plus the human who establishes it. */
@@ -139,6 +148,8 @@ export interface Hypertest {
   listApprovals?(filter?: { runId?: string; status?: ApprovalRequest['status'][] }): Promise<ApprovalRequest[]>;
   /** (additive) Cancels a run (durable cancel signal; the control plane sweeps its work). */
   cancel?(runId: string, reason: string): Promise<void>;
+  /** (additive) Runtime release management: registry, promotions, rollback + quarantine, explicit run migration. */
+  readonly releases?: RuntimeReleaseService;
 }
 
 // ----------------------------------------------------------------------------- (additive) app types
@@ -191,6 +202,11 @@ export interface HypertestServices {
   catalog: ModelCatalog;
   router: ModelRouter;
   memory: DurableMemory;
+  /**
+   * (additive, optional) L5 provenance over the run's stores: evidence → tool invocation → operation → work item → agent
+   * → environment / commit, records → cited evidence, report claims (the service the report builder traces claims with).
+   */
+  provenance?: ProvenanceService;
   tools: ToolRegistryLike;
   environments: EnvironmentRegistry;
   roles: RoleCatalogLike;
@@ -198,6 +214,8 @@ export interface HypertestServices {
   logger: Logger;
   clock: Clock;
   ids: IdGenerator;
+  /** (additive, optional) The side-effect adapters whose capabilities the manifest's toolCatalogRevision pins. */
+  adapters?: AdapterRegistry;
 }
 
 /** (additive) What createHypertest returns: the Hypertest facade with every optional member present. */
@@ -208,6 +226,61 @@ export interface HypertestInstance extends Hypertest {
   events(runId: string, options?: { afterSeq?: number; limit?: number; types?: string[] }): Promise<DomainEvent<unknown>[]>;
   listApprovals(filter?: { runId?: string; status?: ApprovalRequest['status'][] }): Promise<ApprovalRequest[]>;
   cancel(runId: string, reason: string): Promise<void>;
+  readonly releases: RuntimeReleaseService;
+}
+
+/** (additive) A runtime release as `hypertest runtime list` shows it. */
+export interface RuntimeReleaseView extends RuntimeRelease {
+  /** The active pointer names it. */
+  active: boolean;
+  /** It is the manifest of this instance. */
+  current: boolean;
+  /** Runs pinned to it that are not finished. */
+  liveRuns: number;
+}
+
+/** (additive) Input of RuntimeReleaseService.migrate. */
+export interface MigrateRunInput {
+  /** The target release: a manifest id, a unique prefix, or `current` (this instance's manifest). */
+  to: string;
+  /** The actor, `<kind>:<id>` (e.g. `human:alice`). */
+  by: string;
+  reason: string;
+  /** How long in-flight turns may take to give their claims back at the checkpoint (default 90 000 ms). */
+  checkpointTimeoutMs?: number;
+  /** Start driving the migrated run here when this instance is the target runtime (default false). */
+  drive?: boolean;
+  signal?: AbortSignal;
+}
+
+/** (additive) Outcome of an explicit run migration. */
+export interface RunMigrationResult {
+  run: TestRun;
+  epoch: RuntimeEpoch;
+  /** This instance started driving the run (drive: true and this instance is the target). */
+  driven: boolean;
+}
+
+/**
+ * (additive) Runtime release management of a deployment (the registry is shared through the store): register manifests,
+ * record compatibility suite results, promote candidate → shadow → canary → active, roll back (the active pointer moves
+ * back; the rolled-back release's live runs are quarantined), and migrate a live run explicitly onto another release
+ * (checkpoint → snapshot → operation reconciliation → compatibility → RuntimeEpoch + re-pin → resume). Mutations take the
+ * acting human/system as `<kind>:<id>`.
+ */
+export interface RuntimeReleaseService {
+  readonly registry: RuntimeReleaseRegistry;
+  /** `current`, a registered manifest id or a unique prefix of one → the manifest id. */
+  resolve(ref: string): Promise<string>;
+  /** Every release (newest first) with the active flag and its live runs; retiring releases without live runs are retired. */
+  list(): Promise<RuntimeReleaseView[]>;
+  /** Registers `manifest` (default: this instance's) as a candidate; idempotent. */
+  register(input: { manifest?: RuntimeManifest; by: string; allowedMigrations?: SchemaMigrationAllowance[] }): Promise<{ release: RuntimeRelease; created: boolean }>;
+  recordSuite(input: RecordSuiteInput): Promise<CompatibilitySuiteResult>;
+  promote(manifestId: string, input: { by: string; reason: string; canary?: CanarySelection }): Promise<PromotionResult & { retired: string[] }>;
+  rollback(input: { by: string; reason: string; manifestId?: string }): Promise<RollbackResult & { quarantined: string[] }>;
+  migrate(runId: string, input: MigrateRunInput): Promise<RunMigrationResult>;
+  epochs(runId: string): Promise<RuntimeEpoch[]>;
 }
 
 /** (additive) Options of startApiServer. */

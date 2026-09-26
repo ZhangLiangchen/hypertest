@@ -56,7 +56,19 @@ export interface PrepareOperationInput {
   /** Defaults to the generated operationId. Supplying an existing key returns the existing record (idempotent). */
   idempotencyKey?: string;
   lease?: { leaseId: string; resourceKey: string; fencingToken: number };
+  /**
+   * (additive, conformance-6) The experiment the operation runs for (the work item declared it). Stored with the
+   * operation (`ht_operations.experiment_id`) and returned as `LedgerOperationRecord.experimentId`, so a gate can tell
+   * which external effects belong to which experiment. Recorded once: a deduplicated prepare keeps the first value.
+   */
+  experimentId?: string;
 }
+
+/**
+ * (additive, conformance-6) An OperationRecord as the ledger returns it: `experimentId` is set when the operation was
+ * prepared for an experiment. (The domain OperationRecord has no such field yet; see `operationExperimentId`.)
+ */
+export type LedgerOperationRecord = OperationRecord & { experimentId?: string };
 
 export interface OperationLedger {
   /**
@@ -81,7 +93,8 @@ export interface OperationLedger {
     ctx: EventContext,
     options?: { expectedFrom?: OperationStatus[]; expectedAttempt?: number; tx?: SqlExecutor },
   ): Promise<OperationRecord>;
-  list(filter: { runId: string; workItemId?: string; status?: OperationStatus[] }): Promise<OperationRecord[]>;
+  /** (additive) `experimentId`: only the operations prepared for that experiment. */
+  list(filter: { runId: string; workItemId?: string; status?: OperationStatus[]; experimentId?: string }): Promise<OperationRecord[]>;
   /** Operations that need reconciliation: dispatching, acknowledged, outcome_unknown, reconciling. */
   listUnsettled(runId?: string): Promise<OperationRecord[]>;
 }
@@ -206,6 +219,8 @@ export interface RunSideEffectRequest<I = unknown> {
    * its act already happened (or may have), but a new dispatch would be a new decision.
    */
   reconcileOnly?: boolean;
+  /** (additive, conformance-6) The experiment the call runs for; recorded on a NEW operation (PrepareOperationInput.experimentId). */
+  experimentId?: string;
 }
 
 /**
@@ -248,18 +263,57 @@ export type AdmissionResult =
   | { admitted: false; conflicts: Array<{ requested: ResourceClaim; heldBy: string; held: ResourceClaim }> };
 
 export interface ResourceAdmission {
-  /** Atomically admits all claims or none (conflicts via claimsConflict, ancestor/descendant aware). */
-  admit(request: { holderId: string; runId: string; claims: ResourceClaim[]; ttlMs: number }): Promise<AdmissionResult>;
+  /**
+   * Atomically admits all claims or none (conflicts via claimsConflict, ancestor/descendant aware). (additive,
+   * conformance-6) `compatibleHolders`: live claims of these holders never conflict with this request — a work item that
+   * runs FOR an experiment (holder = experimentId) shares that experiment's claims instead of being refused by them; any
+   * other holder still conflicts. The holder's own live claims never conflict (idempotent re-admission extends them).
+   */
+  admit(request: { holderId: string; runId: string; claims: ResourceClaim[]; ttlMs: number; compatibleHolders?: string[] }): Promise<AdmissionResult>;
   release(holderId: string): Promise<void>;
   active(runId?: string): Promise<Array<{ holderId: string; runId: string; claim: ResourceClaim; expiresAt: string }>>;
+  /** (additive, optional) The live claims of one holder (across runs); [] when it holds none. */
+  held?(holderId: string): Promise<Array<{ runId: string; claim: ResourceClaim; expiresAt: string }>>;
 }
 
-export type BudgetDimension = 'tokens' | 'costUsd' | 'toolCalls' | 'computeMs' | 'artifactBytes' | 'agents' | 'workItems' | 'wallClockMs';
+/**
+ * `externalQps` (additive, conformance-5) is a RESERVABLE rate dimension: a load job reserves its request rate while it
+ * runs and releases it when it ends (never `used`), so concurrent jobs of a run can never exceed `maxExternalQps`.
+ */
+export type BudgetDimension = 'tokens' | 'costUsd' | 'toolCalls' | 'computeMs' | 'artifactBytes' | 'agents' | 'workItems' | 'wallClockMs' | 'externalQps';
 export type BudgetAmounts = Partial<Record<BudgetDimension, number>>;
 
-export type ReserveOutcome =
-  | { ok: true; reservationId: string }
-  | { ok: false; exhausted: { scope: string; dimension: BudgetDimension; limit: number; used: number; reserved: number; requested: number } };
+/** (additive) Which scope/dimension refused (or, for `consume`, ran out): the typed exhaustion callers act on. */
+export interface BudgetExhaustion {
+  scope: string;
+  dimension: BudgetDimension;
+  limit: number;
+  used: number;
+  reserved: number;
+  requested: number;
+}
+
+export type ReserveOutcome = { ok: true; reservationId: string } | { ok: false; exhausted: BudgetExhaustion };
+
+/**
+ * (additive) Outcome of `BudgetLedger.consume`: the usage is ALWAYS recorded (it already happened); `exhausted` names the
+ * first scope/dimension (caller scope order, then BUDGET_DIMENSIONS order) whose used amount reached its limit.
+ */
+export interface ConsumeOutcome {
+  reservationId: string;
+  exhausted?: BudgetExhaustion;
+}
+
+/** (additive) An open (still `reserved`) reservation, as `BudgetLedger.openReservations` lists it. */
+export interface OpenReservation {
+  reservationId: string;
+  /** The listed scopes and all their ancestors (the chain the reservation holds amounts on). */
+  scopes: string[];
+  amounts: BudgetAmounts;
+  reason: string;
+  idempotencyKey?: string;
+  createdAt: string;
+}
 
 export interface BudgetUsage {
   scope: string;
@@ -275,7 +329,12 @@ export interface BudgetUsage {
  */
 export interface BudgetLedger {
   open(scope: string, limits: BudgetAmounts, parentScope?: string): Promise<void>;
-  reserve(scopes: string[], amounts: BudgetAmounts, reason: string): Promise<ReserveOutcome>;
+  /**
+   * (additive) `options.idempotencyKey`: a reservation already made under this key is returned as is (`ok: true`, its id —
+   * whatever its status now), so a replayed reserve (a durable retry of the call that holds it) never reserves twice.
+   * Reusing a key for other scopes or amounts is a `conflict`; a refused reserve records nothing.
+   */
+  reserve(scopes: string[], amounts: BudgetAmounts, reason: string, options?: { idempotencyKey?: string }): Promise<ReserveOutcome>;
   settle(reservationId: string, actual: BudgetAmounts): Promise<void>;
   release(reservationId: string): Promise<void>;
   /**
@@ -292,4 +351,18 @@ export interface BudgetLedger {
    * reservation ids. A later settle of a released reservation is refused (`precondition_failed`).
    */
   releaseOpen?(scope: string): Promise<string[]>;
+  /**
+   * (additive, optional; conformance-5) Records usage that ALREADY happened (sandbox wall time of a tool call, artifact
+   * bytes it stored) on the listed scopes and their ancestors — like `settle`, even above a limit, never refused (under-
+   * counting a spent resource would hide the exhaustion). Reports the first scope/dimension — among the dimensions named
+   * in `amounts` — that is now exhausted (used ≥ limit) so the caller applies its exhaustion policy.
+   */
+  consume?(scopes: string[], amounts: BudgetAmounts, reason: string): Promise<ConsumeOutcome>;
+  /**
+   * (additive, optional) Headroom per limited dimension over the listed scopes and their ancestors:
+   * min(limit − used − reserved), floored at 0. Dimensions without a limit anywhere in the chain are absent (unlimited).
+   */
+  remaining?(scopes: string[]): Promise<BudgetAmounts>;
+  /** (additive, optional) Open (`reserved`) reservations whose chain contains `scope`, oldest first. */
+  openReservations?(scope: string): Promise<OpenReservation[]>;
 }

@@ -7,11 +7,12 @@ import { openDatabase } from '@hypertest/store';
 import { ModelCatalog, PiAiProvider, ProviderRegistry, createModelRouter, piCompatibilityClass, type ModelCapabilityProfile, type ModelProvider } from '@hypertest/model';
 import { resolveProtocolBinding } from '@hypertest/policy';
 import { createOciSandbox, networkIsolation } from '@hypertest/tools';
-import { BUILTIN_ROLES, RoleCatalog } from '@hypertest/agents';
+import { BUILTIN_ROLES, RoleCatalog, SPECIALIST_ROLES, type RoleDefinition } from '@hypertest/agents';
+import { isLoopbackHost } from './api.ts';
 import { completeRoute, providerCompatibilityClass, resolveConfigPaths, roleOverrides, validateConfig, withDerivedPaths } from './config.ts';
 import { sandboxProfile } from './compose.ts';
 import { lockFileFor, lockHolder } from './lock.ts';
-import type { DiagnoseOptions, DiagnosticCheck, DiagnosticReport, HypertestConfig } from './contracts.ts';
+import type { DiagnoseOptions, DiagnosticCheck, DiagnosticReport, HypertestConfig, ProviderConfig } from './contracts.ts';
 
 /**
  * `hypertest doctor`: checks a configuration without starting Hypertest — validation, secrets named by `*Env` fields
@@ -178,22 +179,87 @@ async function checkRoutes(config: HypertestConfig, add: Add): Promise<void> {
     return;
   }
   const router = createModelRouter({ ids: new SequentialIdGenerator(), clock: new FixedClock(), logger: noopLogger, catalog, providers });
-  const unroutable: string[] = [];
-  for (const role of roles.list()) {
-    const decision = await router.route(
+  const route = (role: RoleDefinition) =>
+    router.route(
       {
         runId: 'doctor', agentId: 'doctor', role: role.role, taskType: role.taskType, policy: role.defaultModelPolicy, requiredCapabilities: [], actionRisk: 'low',
         dataClassification: role.dataClassification, contextTokensEstimate: 1, contextSnapshotId: 'doctor',
       },
       { runId: 'doctor', correlationId: 'doctor', actorId: 'system:doctor' },
     );
+  const unroutable: string[] = [];
+  // the core roles; the specialist roles (vision_gui, local_private) need special routes and are reported below
+  for (const role of roles.list().filter((r) => !SPECIALIST_ROLES.includes(r.role))) {
+    const decision = await route(role);
     if (decision.ok) continue;
     const why = decision.rejected.map((r) => `${r.routeId}: ${r.reason}`).join('; ');
     if (role.role === 'lead') add('models', 'error', `no route can serve the lead role (${why}): every run would fail at routing`);
     else unroutable.push(`${role.role} (${why})`);
   }
   if (unroutable.length > 0) add('models', 'warn', `roles without an eligible route (their work items fail at routing): ${unroutable.join('; ')}`);
-  else add('models', 'ok', `${config.models.routes.length} route(s); every built-in role can be routed`);
+  else add('models', 'ok', `${config.models.routes.length} route(s); every core role can be routed`);
+  await checkSpecialistRoutes(config, catalog.list(), roles, route, add);
+}
+
+/** Where a provider runs, for the restricted-data check: this host, a private network, or somewhere else. */
+export function providerLocality(p: Pick<ProviderConfig, 'kind' | 'baseUrl'>): { local: boolean; where: string } {
+  if (p.kind === 'scripted') return { local: true, where: 'in process (scripted)' };
+  if (p.kind === 'anthropic' && !p.baseUrl) return { local: false, where: 'the hosted Anthropic API' };
+  if (!p.baseUrl) return { local: false, where: `the provider's hosted default endpoint (${p.kind})` };
+  let host: string;
+  try {
+    host = new URL(p.baseUrl).hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  } catch {
+    return { local: false, where: `an unparsable endpoint ${JSON.stringify(p.baseUrl)}` };
+  }
+  if (isLoopbackHost(host) || host === 'localhost' || host === '::1') return { local: true, where: `this host (${host})` };
+  const privateV4 = /^(10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)$/.test(host);
+  const privateV6 = /^f[cd][0-9a-f]{2}:/.test(host);
+  if (privateV4 || privateV6 || host.endsWith('.internal') || host.endsWith('.local') || host.endsWith('.svc.cluster.local')) return { local: true, where: `a private network address (${host})` };
+  return { local: false, where: `${host}, which is neither this host nor a private network` };
+}
+
+/**
+ * Route coverage of the specialist roles: `vision_gui` needs a route with the vision capability (the computer-use
+ * capability is reported as the optional fallback), `local_private` a route accepting restricted data — and every route
+ * that accepts restricted data should be a local (or private-network) model, or restricted data leaves the deployment.
+ */
+async function checkSpecialistRoutes(
+  config: HypertestConfig,
+  profiles: readonly ModelCapabilityProfile[],
+  roles: RoleCatalog,
+  route: (role: RoleDefinition) => ReturnType<ReturnType<typeof createModelRouter>['route']>,
+  add: Add,
+): Promise<void> {
+  const enabled = profiles.filter((p) => p.enabled);
+  const gui = roles.get('vision_gui');
+  if (gui) {
+    const decision = await route(gui);
+    const cu = enabled.filter((p) => p.capabilities.includes('computer_use') && p.capabilities.includes('vision')).map((p) => p.routeId);
+    if (decision.ok) {
+      add('models', 'ok', `vision_gui: routed to ${decision.routeId} (vision); computer-use fallback ${cu.length > 0 ? `routes: ${cu.join(', ')}` : 'unavailable (no route with computer_use): DOM, API and screenshot checks only'}`);
+    } else {
+      const why = decision.rejected.map((r) => `${r.routeId}: ${r.reason}`).join('; ');
+      add('models', 'warn', `vision_gui: no route can serve GUI testing (${why}): GUI work items fail at routing — add a route with capabilities [tool_use, structured_output, vision]`);
+    }
+  }
+  const priv = roles.get('local_private');
+  if (priv) {
+    const decision = await route(priv);
+    const restricted = enabled.filter((p) => p.maxDataClassification === 'restricted');
+    if (!decision.ok) {
+      const why = decision.rejected.map((r) => `${r.routeId}: ${r.reason}`).join('; ');
+      add('models', 'warn', `local_private: no route can take restricted data (${why}): restricted work fails closed at routing and is never sent to another model — add a local route with maxDataClassification: restricted`);
+    } else {
+      add('models', 'ok', `local_private: restricted data is routed only to routes accepting it (${restricted.map((p) => p.routeId).join(', ')}); selected ${decision.routeId}`);
+    }
+    for (const p of restricted) {
+      const provider = config.models.providers.find((x) => x.id === p.provider);
+      if (!provider) continue;
+      const where = providerLocality(provider);
+      if (!where.local) add('models', 'warn', `route ${p.routeId} accepts restricted data but its provider ${provider.id} runs at ${where.where}: restricted data (local_private work) would leave this deployment — lower its maxDataClassification or point it at a local model`);
+    }
+  }
 }
 
 /** Read-only check: the directory (or, when it does not exist yet, its nearest existing ancestor) is writable. */

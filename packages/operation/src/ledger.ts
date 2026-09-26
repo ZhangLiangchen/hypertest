@@ -1,13 +1,13 @@
 import { HypertestError, fromJsonColumn, toIso, toNumber, type SqlExecutor, type SqlParam } from '@hypertest/core';
 import { canTransitionOperation, eventFrom, type EventContext, type OperationRecord, type OperationStatus, type ResourceRef } from '@hypertest/domain';
-import type { OperationDeps, OperationLedger, PrepareOperationInput } from './contracts.ts';
+import type { LedgerOperationRecord, OperationDeps, OperationLedger, PrepareOperationInput } from './contracts.ts';
 
 /** Statuses whose external outcome is not settled yet (reconciled before any new dispatch). */
 export const UNSETTLED_OPERATION_STATUSES: readonly OperationStatus[] = ['dispatching', 'acknowledged', 'outcome_unknown', 'reconciling'];
 
 const COLUMNS = `operation_id, run_id, work_item_id, agent_id, tool_invocation_id, operation_type, adapter_id, target,
   desired_state_hash, input_hash, idempotency_key, lease, status, external_job_id, external_receipt, attempt, result,
-  (result IS NOT NULL) AS has_result, last_error, evidence_refs, created_at, updated_at`;
+  (result IS NOT NULL) AS has_result, last_error, evidence_refs, created_at, updated_at, experiment_id`;
 
 interface OperationRow {
   operation_id: string;
@@ -32,10 +32,17 @@ interface OperationRow {
   evidence_refs: unknown;
   created_at: unknown;
   updated_at: unknown;
+  experiment_id: string | null;
+}
+
+/** (additive, conformance-6) The experiment an operation was prepared for (undefined: none recorded). */
+export function operationExperimentId(op: OperationRecord): string | undefined {
+  const id = (op as LedgerOperationRecord).experimentId;
+  return typeof id === 'string' && id.length > 0 ? id : undefined;
 }
 
 function rowToRecord(r: OperationRow): OperationRecord {
-  const rec: OperationRecord = {
+  const rec: LedgerOperationRecord = {
     operationId: r.operation_id,
     runId: r.run_id,
     workItemId: r.work_item_id,
@@ -60,6 +67,7 @@ function rowToRecord(r: OperationRow): OperationRecord {
   // jsonb 'null' is not SQL NULL: a recorded null result is preserved as null.
   if (r.has_result) rec.result = fromJsonColumn<unknown>(r.result);
   if (r.last_error !== null) rec.lastError = r.last_error;
+  if (r.experiment_id !== null && r.experiment_id !== undefined) rec.experimentId = r.experiment_id;
   return rec;
 }
 
@@ -108,6 +116,8 @@ export function createOperationLedger(deps: OperationDeps): OperationLedger {
     if (rec.externalJobId !== undefined) payload['externalJobId'] = rec.externalJobId;
     if (rec.externalReceipt !== undefined) payload['externalReceipt'] = rec.externalReceipt;
     if (rec.lease) payload['fencingToken'] = rec.lease.fencingToken;
+    const experimentId = operationExperimentId(rec);
+    if (experimentId !== undefined) payload['experimentId'] = experimentId;
     if (rec.lastError !== undefined && rec.status !== 'verified' && rec.status !== 'dispatching') payload['reason'] = rec.lastError;
     const event = eventFrom(ctx, operationEventType(from, rec.status), 'operation', rec.operationId, payload);
     // The operation's own run/work item win over the caller context so per-run streams stay correct.
@@ -135,6 +145,7 @@ export function createOperationLedger(deps: OperationDeps): OperationLedger {
         throw new HypertestError('invalid_argument', 'target.resourceKey must be a non-empty string');
       }
       if (input.toolInvocationId !== undefined) requireText(input.toolInvocationId, 'toolInvocationId');
+      if (input.experimentId !== undefined) requireText(input.experimentId, 'experimentId');
       const operationId = input.operationId ?? ids.next('op');
       const idempotencyKey = input.idempotencyKey ?? operationId;
       requireText(operationId, 'operationId');
@@ -143,8 +154,8 @@ export function createOperationLedger(deps: OperationDeps): OperationLedger {
       return inTx(tx, async (x) => {
         const inserted = await x.query<OperationRow>(
           `INSERT INTO ht_operations (operation_id, run_id, work_item_id, agent_id, tool_invocation_id, operation_type, adapter_id, target,
-             desired_state_hash, input_hash, idempotency_key, lease, status, attempt, evidence_refs, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12::jsonb, 'prepared', 0, '[]'::jsonb, $13, $13)
+             desired_state_hash, input_hash, idempotency_key, lease, status, attempt, evidence_refs, created_at, updated_at, experiment_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12::jsonb, 'prepared', 0, '[]'::jsonb, $13, $13, $14)
            ON CONFLICT DO NOTHING
            RETURNING ${COLUMNS}`,
           [
@@ -161,6 +172,7 @@ export function createOperationLedger(deps: OperationDeps): OperationLedger {
             idempotencyKey,
             jsonParam(input.lease),
             now,
+            input.experimentId ?? null,
           ],
         );
         if (inserted.rows[0]) {
@@ -280,6 +292,10 @@ export function createOperationLedger(deps: OperationDeps): OperationLedger {
       if (filter.status !== undefined) {
         params.push(filter.status);
         where.push(`status = ANY($${params.length}::text[])`);
+      }
+      if (filter.experimentId !== undefined) {
+        params.push(filter.experimentId);
+        where.push(`experiment_id = $${params.length}`);
       }
       const r = await db.query<OperationRow>(`SELECT ${COLUMNS} FROM ht_operations WHERE ${where.join(' AND ')} ORDER BY created_at, operation_id`, params);
       return r.rows.map(rowToRecord);

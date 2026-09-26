@@ -16,6 +16,7 @@ Depends only on `@hypertest/core`, `@hypertest/domain` and `yaml`. The binding A
 | Capabilities (I2) | `PERMISSION_PROFILES`, `createRootCapability(input, secret)`, `attenuateCapability(parent, constraints \| constraints[], child, { secret }?)`, `capabilityAllows(cap, req)`, `signCapability`, `verifyCapability`, `nonCanonicalResource`, `PRODUCT_FIX_SCOPE`, `holdsProductFix` |
 | Permits (I1) | `BuiltinPolicyEngine(rules, revision, options?)`, `DEFAULT_POLICY_RULES`, `POLICY_RULE_SCHEMA`, `OpaPolicyEngine({ url, path, timeoutMs, revision })`, `CompositePolicyEngine(engines)`, `intersectConstraints` |
 | Audit | `createPolicyDecisionLog(deps)` (`ht_policy_decisions`), `createApprovalService(deps)` (`ht_approvals`), `policyMigrations` |
+| BUGate phases | `POLICY_PHASES`, `requestPhase`, `flaggedActionsOf`, `IMPLICIT_EVIDENCE_TYPES`, `actionOutcomeFacts`, `acceptanceFacts`, `applyPhasePermit`, `withPolicyHold`, types `PolicyPhase`, `ActionOutcomeFacts`, `TransitionFacts`, `AcceptanceFacts`, `PolicyHold` |
 | Oracles (I8) | `createOracleGovernance(deps)`, `assertMayDecide`, `agentIndependenceViolation` |
 | Self-heal (I8) | `classifyTestChange(diff, options?)`, `categoryDecision`, `DEFAULT_TEST_PATH_PATTERNS`, `parseUnifiedDiff` |
 | Gate (I7) | `QualityGate#evaluate(input)`, `DEFAULT_GATE_SPEC`, `GATE_CRITERIA`, `currentRecords`, `evaluateOracleCheck` (the C3 check evaluator), `OracleCheckOutcome` |
@@ -48,7 +49,23 @@ Depends only on `@hypertest/core`, `@hypertest/domain` and `yaml`. The binding A
   local|sandbox allowed, on staging approval; destructive on local|sandbox allowed, ≥ high on
   sandbox|staging and anything on staging approval, critical approval; destructive and anything > read on
   production denied; `oracle.approve*`, `oracle.decide*`, `approval.decide*` denied.
-- **OPA.** `POST {url}/v1/data/{path}` with `{ input: request }` (capability signature stripped); expects
+- **Phases (BUGate four time points).** `ActionRequest.phase` is `before_action` (default; the ToolRuntime's permit),
+  `after_action` (+ `outcome`: the evidence types an executed call wrote vs the ones its tool declares), `before_transition`
+  (+ `transition`: `subject` work_item | plan | run, `from`, `to`, the subject's flagged calls, requester, details) or
+  `before_acceptance` (+ `acceptance`: `acceptanceFacts(gateInput, decision, …)`, a bounded digest of the gate input —
+  evidence counted by type, never its payloads — and the gate's verdict). A rule without `match.phases` applies to
+  `before_action` only, so every existing rule set keeps its meaning; the phase conditions `transitions`
+  (`<subject>:<to>` tool-style patterns), `undeclaredEvidence`, `flaggedActions` and `verdicts` never match a request
+  without the corresponding facts; a malformed phase or fact is `malformed_request` (deny), a malformed flagged count
+  counts as flagged. Defaults: `allow-after-action` + `flag-undeclared-evidence` (deny = flag),
+  `allow-transitions` + `deny-completion-with-flagged-actions`, `allow-acceptance` + `review-flagged-actions`
+  (approval_required). No matching rule in a phase ⇒ deny (fail closed). `applyPhasePermit(decision, permit, phase)`:
+  a non-allow before_transition / before_acceptance permit withholds a gate decision (`withPolicyHold`: pass /
+  conditional ⇒ inconclusive, fail stays fail, requiresHumanReview, the hold listed as an unknown criterion
+  `policy.<phase>`). The decision log's `policy.decided` event carries the phase; stored requests are replayable
+  (re-evaluation with the same rules and a clock at `decidedAt` gives the same permit).
+- **OPA.** `POST {url}/v1/data/{path}` with `{ input: request }` (capability signature stripped; `input.phase` always
+  present, the phase facts included); expects
   `{ allow, approval_required?, reasons?, constraints? }`. Transport error, timeout, non-2xx, undefined or
   malformed result ⇒ `deny` with first reason `opa_unavailable`. `path` must be package segments. The
   composite engine treats a throwing engine or a malformed permit as `deny`. Engines keep a deep-frozen
@@ -121,6 +138,7 @@ Depends only on `@hypertest/core`, `@hypertest/domain` and `yaml`. The binding A
 | I8 self-heal: JS/TS/Python/Go diffs, deletion/skip/swallow/assertion/threshold, evasion attempts (comments, wrappers, exits, modifiers, hooks, selection, malformed hunks) and false-positive guards, real git multi-file diff | `test/classifier.test.ts` |
 | I10 audit: decision log append-only (trigger), event in the same transaction (sink failure rolls back), approvals decided once (conditional UPDATE + trigger), agent deciders, NUL-safe storage, concurrent deciders on PostgreSQL | `test/persistence.test.ts`, `test/persistence.int.test.ts` |
 | BUGate binding + context rendering, byte bounds, schema identity with a checkout | `test/bugate.test.ts` |
+| BUGate four time points: phase-scoped rules (action rules never judge another phase), fail-closed phases and facts, defaults per phase, custom transition/verdict rules, the capability checked in every phase, decision log phase + replay, acceptance facts (no evidence payloads) and holds (never pass); OPA receives the phase and facts (mock and real server, composite deny wins) | `test/phases.test.ts`, `test/opa.test.ts`, `test/opa.int.test.ts` |
 
 ## Contract changes (additive)
 
@@ -152,6 +170,14 @@ weakened run-level override is visible in the decision and the report. conforman
 `gate_exception` (subject `{ criterionId, expiresAt? }`; migration `policy/003-gate-exception-approvals` widens the
 `ht_approvals.kind` check) — the governed waiver the gate's exception rules (never C1, never agent-approved, never
 expired) apply to.
+
+(B1 governance completion, phases) `PolicyPhase` (named; `ActionRequest.phase` has the same four values);
+`ActionRequest.outcome?` / `transition?` / `acceptance?` with `ActionOutcomeFacts`, `TransitionFacts`,
+`AcceptanceFacts`; `PolicyRule.match.phases?` / `transitions?` / `undeclaredEvidence?` / `flaggedActions?` /
+`verdicts?` (+ `POLICY_RULE_SCHEMA`); new exports of `src/phases.ts` (table above); `DEFAULT_POLICY_RULES` gains six
+phase rules (the action rules are unchanged, so `builtin:<digest>` revisions change); `policy.decided` gains `phase`;
+the OPA input always has `phase`. Behaviour: a request with an unknown phase or malformed phase facts is denied
+(`malformed_request`).
 
 ## Testing
 

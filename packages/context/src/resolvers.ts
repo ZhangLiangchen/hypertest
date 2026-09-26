@@ -113,3 +113,20 @@ export function fileResolver(root: string, options: { resourceType?: string } = 
     }
   });
 }
+
+/**
+ * (additive) `file` resources of the tool workspaces: resourceId = `workspace/<workspaceId>/<relative path>` — the
+ * resource keys the fs/git tools declare — and version = sha256 of the file content (fileResolver semantics inside the
+ * workspace root: `..`/absolute ⇒ invalid_argument, symlink escape ⇒ permission_denied, missing file ⇒ undefined).
+ * A workspace this process does not know is `not_found` (the guard reports resolver_error: fail closed); an id outside
+ * the `workspace/<id>/<path>` form is invalid_argument. Fits WorkspaceManager.get(workspaceId)?.root.
+ */
+export function workspaceFileResolver(getRoot: (workspaceId: string) => MaybePromise<string | undefined>, options: { resourceType?: string } = {}): ResourceVersionResolver {
+  return functionResolver(options.resourceType ?? 'file', async (resourceId) => {
+    const m = /^workspace\/([^/]+)\/(.+)$/.exec(resourceId);
+    if (!m) throw new HypertestError('invalid_argument', `file resource ids must be workspace/<workspaceId>/<path>: ${resourceId}`);
+    const root = await getRoot(m[1]!);
+    if (!root) throw new HypertestError('not_found', `workspace ${m[1]} is not open in this process`);
+    return fileResolver(root).currentVersion(m[2]!);
+  });
+}

@@ -113,3 +113,68 @@ test('OPA composed with the built-in rules: deny wins across engines', skip, asy
   assert.equal(exec.policyRevision, `builtin@1+opa@${suffix}`);
   assert.ok(exec.reasons.includes(`[opa@${suffix}] denied: execute on none`), exec.reasons.join(' | '));
 });
+
+test('BUGate phases against a real OPA: a phase-aware Rego package judges after_action, transitions and acceptance; deny wins in the composite', skip, async () => {
+  const pkg = `hypertest.phases_${suffix}`;
+  await putPolicy(
+    `hypertest-phases-${suffix}`,
+    `package ${pkg}
+
+default allow := false
+
+default approval_required := false
+
+allow if input.phase == "before_action"
+
+allow if {
+  input.phase == "after_action"
+  count(input.outcome.undeclaredEvidenceTypes) == 0
+}
+
+allow if {
+  input.phase == "before_transition"
+  not blocked_plan
+}
+
+blocked_plan if {
+  input.transition.subject == "plan"
+  input.transition.details.readyForGate == true
+  input.transition.details.openObjectives > 0
+}
+
+allow if {
+  input.phase == "before_acceptance"
+  input.acceptance.evidence.byType["api-response"] > 0
+}
+
+reasons contains sprintf("phase %s", [input.phase])
+
+reasons contains "ready for the gate with open objectives" if blocked_plan
+`,
+  );
+  const opa = new OpaPolicyEngine({ url: url!, path: pkg, revision: `opa-phases@${suffix}`, timeoutMs: 3000, clock: new FixedClock(NOW) });
+  const composite = new CompositePolicyEngine([new BuiltinPolicyEngine(DEFAULT_POLICY_RULES, 'builtin@1', { clock: new FixedClock(NOW) }), opa]);
+  const record = { tool: 'transition.plan', effect: 'record' as const, riskClass: 'low' as const, resources: ['run/run_1/plan'] };
+  // before_action: OPA sees the defaulted phase
+  assert.deepEqual((await opa.evaluate(request())).reasons, ['phase before_action']);
+  // after_action: evidence the tool does not declare is refused by OPA (and flagged by the built-in rules)
+  const outcome = { status: 'success', evidenceTypes: ['test-result'], evidenceIds: ['ev_1'], declaredEvidenceTypes: ['stdout', 'tool-output'], undeclaredEvidenceTypes: ['test-result'] };
+  const flagged = await composite.evaluate(request({ tool: 'shell.exec', effect: 'execute', riskClass: 'medium', resources: ['workspace/wt_1'], phase: 'after_action', outcome }));
+  assert.equal(flagged.decision, 'deny');
+  assert.ok(flagged.reasons.some((r) => r.startsWith('[builtin@1] rule:flag-undeclared-evidence')), flagged.reasons.join(' | '));
+  assert.equal((await opa.evaluate(request({ phase: 'after_action', outcome: { ...outcome, evidenceTypes: [], undeclaredEvidenceTypes: [] } }))).decision, 'allow');
+  // before_transition: an operator rule the built-in defaults do not have — OPA's deny wins in the composite
+  const transition = { subject: 'plan' as const, subjectId: 'plan_1', from: 'proposed', to: 'accepted', flaggedActions: 0, details: { readyForGate: true, openObjectives: 2 } };
+  const plan = await composite.evaluate(request({ ...record, phase: 'before_transition', transition }));
+  assert.equal(plan.decision, 'deny');
+  assert.ok(plan.reasons.includes(`[opa-phases@${suffix}] ready for the gate with open objectives`), plan.reasons.join(' | '));
+  assert.equal((await composite.evaluate(request({ ...record, phase: 'before_transition', transition: { ...transition, details: { readyForGate: true, openObjectives: 0 } } }))).decision, 'allow');
+  // before_acceptance: the gate input digest reaches OPA (a black-box release needs api-response evidence)
+  const acceptance = {
+    gateId: 'g', gateOverrides: [], verdict: 'pass' as const, requiresHumanReview: false, satisfiedCriteria: [], violatedCriteria: [], unknownCriteria: [], evidence: { count: 1, rootHash: 'r', byType: { 'test-result': 1 } },
+    findings: { total: 0, unresolved: [] }, risks: { total: 0, unresolved: [] }, reviews: [], oracleRevisions: {}, workItems: {}, claims: { total: 0, critical: 0 }, exceptions: [], flaggedActions: 0,
+  };
+  assert.equal((await composite.evaluate(request({ ...record, tool: 'gate.accept', phase: 'before_acceptance', acceptance }))).decision, 'deny');
+  const withApi = await composite.evaluate(request({ ...record, tool: 'gate.accept', phase: 'before_acceptance', acceptance: { ...acceptance, evidence: { count: 2, rootHash: 'r', byType: { 'api-response': 1, 'test-result': 1 } } } }));
+  assert.equal(withApi.decision, 'allow', withApi.reasons.join(' | '));
+});

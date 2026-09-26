@@ -55,7 +55,7 @@ describe('hypertest init', () => {
     assert.deepEqual(Object.keys(config.roles ?? {}).sort(), ['condenser', 'executor', 'lead', 'rca', 'reviewer', 'test_designer']);
     // H10: the generated reviewer override keeps EVERY evidence producer (an array replaces the catalog default)
     assert.deepEqual(config.roles!['reviewer']!.defaultModelPolicy, {
-      preferredRoutes: ['claude-sonnet', 'claude-opus'], independentFromRoles: ['executor', 'test_designer', 'rca', 'fixer', 'metrics_analyst', 'environment'], fallback: 'fail_closed',
+      preferredRoutes: ['claude-sonnet', 'claude-opus'], independentFromRoles: ['executor', 'test_designer', 'rca', 'fixer', 'metrics_analyst', 'environment', 'vision_gui', 'local_private'], fallback: 'fail_closed',
     });
     assert.deepEqual(config.roles!['lead']!.defaultModelPolicy, { preferredRoutes: ['claude-opus', 'deepseek-chat'], minQuality: 0.8 });
     // secrets hygiene: no inline credential field, no key-looking value
@@ -178,7 +178,11 @@ describe('hypertest doctor', () => {
     assert.match(lines[0]!, /^\[ok {3}\] node {7}Node\.js \d+\.\d+\.\d+$/);
     assert.ok(lines.includes('[ok   ] secrets    provider deepseek (apiKeyEnv): DEEPSEEK_API_KEY is set'), r.stdout);
     assert.ok(lines.includes('[ok   ] secrets    provider anthropic (apiKeyEnv): ANTHROPIC_API_KEY is set'), r.stdout);
-    assert.ok(lines.includes('[ok   ] models     3 route(s); every built-in role can be routed'), r.stdout);
+    assert.ok(lines.includes('[ok   ] models     3 route(s); every core role can be routed'), r.stdout);
+    // specialist roles: the Claude routes see images; no route of the template takes restricted data (the local route
+    // is commented out), so local_private work would fail closed — a warning, never a silent hosted fallback
+    assert.ok(lines.includes('[ok   ] models     vision_gui: routed to claude-opus (vision); computer-use fallback unavailable (no route with computer_use): DOM, API and screenshot checks only'), r.stdout);
+    assert.ok(lines.some((l) => /^\[WARN \] models {5}local_private: no route can take restricted data \(.*request carries restricted.*\): restricted work fails closed at routing/.test(l)), r.stdout);
     assert.ok(lines.some((l) => /^\[ok {3}\] protocol {3}BUGate \S+ \((embedded|checkout .+)\), digest [0-9a-f]{16}$/.test(l)), r.stdout);
     assert.ok(lines.some((l) => /^\[(ok {3}|WARN )\] git /.test(l)), r.stdout);
     assert.ok(lines.some((l) => /^\[info \] docker /.test(l)), r.stdout);
@@ -197,7 +201,7 @@ describe('hypertest doctor', () => {
       { name: 'secrets', status: 'error', detail: 'provider deepseek (apiKeyEnv): environment variable DEEPSEEK_API_KEY is not set' },
       { name: 'secrets', status: 'error', detail: 'provider anthropic (apiKeyEnv): environment variable ANTHROPIC_API_KEY is not set' },
     ]);
-    assert.deepEqual(report.checks.map((c) => c.name), ['node', 'config', 'secrets', 'secrets', 'models', 'protocol', 'engines', 'sandbox', 'store', 'artifacts', 'git', 'docker']);
+    assert.deepEqual(report.checks.map((c) => c.name), ['node', 'config', 'secrets', 'secrets', 'models', 'models', 'models', 'protocol', 'engines', 'sandbox', 'store', 'artifacts', 'git', 'docker']);
     const human = await cli(['doctor', '--no-connect'], { cwd: project, env: NO_KEYS });
     assert.equal(human.code, 1);
     assert.match(human.stdout, /\[ERROR\] secrets {4}provider deepseek \(apiKeyEnv\): environment variable DEEPSEEK_API_KEY is not set\n/);

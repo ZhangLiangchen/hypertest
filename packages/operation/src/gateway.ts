@@ -4,6 +4,7 @@ import type {
   CompensationResult,
   DispatchReceipt,
   GatewayDeps,
+  LedgerOperationRecord,
   ObservationResult,
   OperationContext,
   OperationLedger,
@@ -298,6 +299,7 @@ class SideEffectEngine {
         };
         if (req.agentId !== undefined) provisional.agentId = req.agentId;
         if (lease) provisional.lease = toLeaseRef(lease);
+        if (req.experimentId !== undefined) (provisional as LedgerOperationRecord).experimentId = req.experimentId;
         prepared = await this.#prepareWith(adapter, provisional, lease?.fencingToken, req.input, req.signal);
         op = await ledger.prepare(
           {
@@ -312,6 +314,7 @@ class SideEffectEngine {
             desiredStateHash: prepared.desiredStateHash,
             inputHash,
             ...(lease ? { lease: toLeaseRef(lease) } : {}),
+            ...(req.experimentId !== undefined ? { experimentId: req.experimentId } : {}),
           },
           req.ctx,
         );

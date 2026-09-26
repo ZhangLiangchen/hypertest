@@ -1,11 +1,12 @@
-import { estimateTokens, textOf, type ChatMessage, type ContextSnapshot, type EventContext, type ReadSetEntry, type TestRun, type WorkItem } from '@hypertest/domain';
-import { PromptAssembler, deterministicSummarizer, environmentVersion, type PromptSection, type Summarizer } from '@hypertest/context';
+import { estimateTokens, textOf, type ChatMessage, type ContextSnapshot, type EventContext, type OperationStatus, type ReadSetEntry, type TestRun, type WorkItem } from '@hypertest/domain';
+import { PromptAssembler, deterministicSummarizer, environmentVersion, softCondensationDue, type Compaction, type PromptSection, type Summarizer } from '@hypertest/context';
 import { prepareProtocolContext } from '@hypertest/policy';
 import { renderRolePrompt, type RoleDefinition } from '@hypertest/agents';
 import type { RouteRequest } from '@hypertest/model';
 import type { ContextProvider, ToolDispatcher } from '@hypertest/runtime';
 import type { WorkspaceHandle } from '@hypertest/tools';
 import type { ControlDeps, ResolvedControlConfig } from './deps.ts';
+import { claimLeaseOwner } from './dispatcher.ts';
 import { runScope } from './work-factory.ts';
 import { clip, event, jsonBlock } from './util.ts';
 
@@ -60,6 +61,17 @@ export function parseAgentHeader(text: string): { role: string; workItemId: stri
 }
 
 const DEFAULT_VIEW_TOKENS = 48_000;
+/** keepRecentTurns of a WorkingContextManager that does not expose its options (the context package default). */
+const DEFAULT_KEEP_RECENT_TURNS = 4;
+/** Deadline of a deferrable SOFT condensation (the turn goes on without it when the condenser is slower). */
+export const SOFT_CONDENSE_TIMEOUT_MS = 60_000;
+/**
+ * L0 record of a deferred SOFT condensation `{sessionId, turn, retryTurn, reason}` (aggregate `context`/sessionId): the
+ * audit of the deferral and the durable anchor of the soft back-off (the provider is rebuilt every turn).
+ */
+export const SOFT_CONDENSATION_DEFERRED = 'context.condensation_deferred';
+/** Operation states whose side-effect lease may still be held (not settled). */
+const IN_FLIGHT: OperationStatus[] = ['prepared', 'dispatching', 'acknowledged', 'outcome_unknown', 'reconciling', 'compensating'];
 const SECTION_TOKENS = 12_000;
 const CODE_ROLES_PHASES: ReadonlySet<string> = new Set(['analysis', 'design']);
 
@@ -76,9 +88,11 @@ export interface ContextProviderInput {
 
 /**
  * LLM condenser through the router (role `condenser`); any failure falls back to the deterministic extractive
- * summarizer, so condensation never blocks a turn.
+ * summarizer, so condensation never blocks a turn. With `{ fallback: false }` (additive; SOFT condensation) a failure —
+ * no eligible condenser route, a failed call, an empty answer — is thrown instead, so the caller can defer.
  */
-export function condenserSummarizer(deps: ControlDeps, input: { run: TestRun; item: WorkItem; agentId: string; snapshotId: string; eventContext: EventContext }): Summarizer {
+export function condenserSummarizer(deps: ControlDeps, input: { run: TestRun; item: WorkItem; agentId: string; snapshotId: string; eventContext: EventContext }, options: { fallback?: boolean } = {}): Summarizer {
+  const fallback = options.fallback !== false;
   const { router, roles, budget, logger } = deps;
   return {
     async summarize(req) {
@@ -112,6 +126,7 @@ export function condenserSummarizer(deps: ControlDeps, input: { run: TestRun; it
         await budget.charge([runScope(input.run.runId)], { tokens: used }, `condense:${input.item.workItemId}`).catch(() => undefined);
         return text;
       } catch (e) {
+        if (!fallback) throw e;
         logger.warn('LLM condenser unavailable; using the deterministic summarizer', { workItemId: input.item.workItemId, error: (e as Error).message });
         return deterministicSummarizer.summarize(req);
       }
@@ -205,8 +220,14 @@ export function createContextProvider(deps: ControlDeps, config: ResolvedControl
    * turn's ContextSnapshot so the FreshnessGuard re-validates it before every mutating action of the turn:
    *  - every registered environment's generation/build (an env.* action on ANY environment — not only the run target —
    *    is refused when that environment was restarted/redeployed since the turn started);
-   *  - the current head of every finding the item takes as input (a fix or test built on a finding that was rejected or
-   *    superseded meanwhile is refused).
+   *  - the current head of every record the item takes as input: findings as `finding` (always re-checked: a fix or
+   *    test built on a finding that was rejected or superseded meanwhile is refused), other records as `record`
+   *    (record resolver; checked for actions naming them);
+   *  - the side-effect leases held by THIS claim for the item's in-flight operations (`lease`, `<owner>:<fencingToken>`):
+   *    a mutating action is refused once another owner took one of them over.
+   * Beyond these, the snapshot builder joins everything the agent OBSERVED through its tool calls (`observer`: files it
+   * read or wrote, records it read or posted, metric windows, environment generations) when the composition gives it an
+   * ObservationLog; the FreshnessGuard also sees the observations of the current turn.
    * The item's own work claim is NOT pinned here: a turn replayed after a crash runs under a new claim against the
    * snapshot it was recorded with; the claim is fenced at dispatch and re-checked inside every record write (I4, H4).
    */
@@ -217,17 +238,60 @@ export function createContextProvider(deps: ControlDeps, config: ResolvedControl
     for (const ref of item.inputRefs) {
       if (ref.kind !== 'record') continue;
       const rec = await blackboard.getRecord(ref.id);
-      if (!rec || rec.runId !== run.runId || rec.recordType !== 'finding') continue;
+      if (!rec || rec.runId !== run.runId) continue;
       const head = (await blackboard.head(rec.lineageId)) ?? rec;
-      out.push({ resourceType: 'finding', resourceId: rec.lineageId, observedVersion: head.recordId, observedAt: at, freshness: exact });
+      out.push({ resourceType: rec.recordType === 'finding' ? 'finding' : 'record', resourceId: rec.lineageId, observedVersion: head.recordId, observedAt: at, freshness: exact });
+    }
+    out.push(...(await heldLeases(at)));
+    return out;
+  }
+
+  /** Live side-effect leases of the item's in-flight operations that the item's CURRENT claim owns. */
+  async function heldLeases(at: string): Promise<ReadSetEntry[]> {
+    const claim = (await blackboard.getWorkItem(item.workItemId))?.claim;
+    if (!claim) return [];
+    const owner = claimLeaseOwner(claim.ownerId, item.workItemId, claim.fencingToken);
+    const out: ReadSetEntry[] = [];
+    const seen = new Set<string>();
+    for (const op of await deps.ledger.list({ runId: run.runId, workItemId: item.workItemId, status: IN_FLIGHT })) {
+      if (!op.lease || seen.has(op.lease.resourceKey)) continue;
+      seen.add(op.lease.resourceKey);
+      const live = await deps.leases.current(op.lease.resourceKey);
+      if (!live || live.owner !== owner) continue;
+      out.push({ resourceType: 'lease', resourceId: live.resourceKey, observedVersion: `${live.owner}:${live.fencingToken}`, observedAt: at, freshness: { kind: 'exact_version' } });
     }
     return out;
+  }
+
+  /**
+   * SOFT back-off: after a deferral at turn t the next soft attempt of the session waits until turn t + keepRecentTurns
+   * + 2 (as many new turns as the due rule asks for), so a failing or hanging condenser never costs every turn its
+   * deadline (HARD pressure still condenses whenever it arises). Read from L0: the deferrals of this session.
+   */
+  async function softRetryTurn(sessionId: string): Promise<number> {
+    let retry = Number.NEGATIVE_INFINITY;
+    for (const e of await events.read(run.runId, { types: [SOFT_CONDENSATION_DEFERRED] })) {
+      const p = e.payload as { sessionId?: unknown; retryTurn?: unknown };
+      if (p.sessionId === sessionId && typeof p.retryTurn === 'number' && p.retryTurn > retry) retry = p.retryTurn;
+    }
+    return retry;
+  }
+
+  /** Persists a compaction and its L0 event (context.compacted, with its level). */
+  async function recordCompaction(sessionId: string, turn: number, compaction: Compaction): Promise<void> {
+    await sessions.addCompaction(sessionId, compaction);
+    await events.append([
+      event(eventContext, 'context.compacted', 'context', sessionId, {
+        sessionId, compactionId: compaction.compactionId, level: compaction.level, upToTurn: compaction.upToTurn, evidenceRefs: compaction.evidenceRefs, turn,
+      }),
+    ]);
   }
 
   return {
     async assemble({ sessionId, turn, transcript, compactions, signal }) {
       const epoch = await epochs.current(sessionId);
-      const buildInput: Parameters<typeof snapshotBuilder.build>[0] = { runId: run.runId };
+      // the observer: this agent's tool observations join the read set (when the builder has an ObservationLog)
+      const buildInput: Parameters<typeof snapshotBuilder.build>[0] = { runId: run.runId, observer: { agentId: input.agentId } };
       if (epoch) buildInput.modelEpochId = epoch.epochId;
       const target = await targetEnvironment(deps, run);
       if (target) buildInput.environment = target;
@@ -240,18 +304,40 @@ export function createContextProvider(deps: ControlDeps, config: ResolvedControl
       const window = epoch && catalog ? catalog.get(epoch.routeId)?.contextWindow : undefined;
       const viewBudget = config.maxInlineContextTokens ?? (window ? Math.floor(window * 0.6) : DEFAULT_VIEW_TOKENS);
       let view = workingContext.view({ transcript, compactions, budgetTokens: viewBudget });
+      const keepRecentTurns = workingContext.options?.keepRecentTurns ?? DEFAULT_KEEP_RECENT_TURNS;
+      const condenserInput = { run, item, agentId: input.agentId, snapshotId: snapshot.snapshotId, eventContext };
       if (view.pressure === 'hard') {
-        const summarizer = condenserSummarizer(deps, { run, item, agentId: input.agentId, snapshotId: snapshot.snapshotId, eventContext });
+        // HARD: mandatory — the LLM condenser, else the deterministic summarizer; the turn cannot go on without it
+        const summarizer = condenserSummarizer(deps, condenserInput);
         const condenseInput: Parameters<typeof workingContext.condense>[0] = { transcript, compactions, level: 'hard', summarizer, budgetTokens: viewBudget, ids, now: clock.isoNow() };
         if (signal) condenseInput.signal = signal;
         const compaction = await workingContext.condense(condenseInput);
-        await sessions.addCompaction(sessionId, compaction);
-        await events.append([
-          event(eventContext, 'context.compacted', 'context', sessionId, {
-            sessionId, compactionId: compaction.compactionId, level: compaction.level, upToTurn: compaction.upToTurn, evidenceRefs: compaction.evidenceRefs, turn,
-          }),
-        ]);
+        await recordCompaction(sessionId, turn, compaction);
         view = workingContext.view({ transcript, compactions: [...compactions, compaction], budgetTokens: viewBudget });
+      } else if (view.pressure === 'soft' && softCondensationDue({ transcript, compactions }, keepRecentTurns) && turn >= (await softRetryTurn(sessionId))) {
+        // SOFT: deferrable — only with an available condenser route and enough turns since the last cut; any failure
+        // (no route, failed or empty answer, nothing to condense, the soft deadline) defers it: the turn goes on as is,
+        // and the next soft attempt of the session backs off (SOFT_CONDENSATION_DEFERRED on L0)
+        let compaction: Compaction | undefined;
+        const softSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(SOFT_CONDENSE_TIMEOUT_MS)]) : AbortSignal.timeout(SOFT_CONDENSE_TIMEOUT_MS);
+        try {
+          compaction = await workingContext.condense({ transcript, compactions, level: 'soft', summarizer: condenserSummarizer(deps, condenserInput, { fallback: false }), budgetTokens: viewBudget, ids, now: clock.isoNow(), signal: softSignal });
+        } catch (e) {
+          if (signal?.aborted) throw e;
+          const retryTurn = turn + keepRecentTurns + 2;
+          const reason = clip((e as Error)?.message ?? String(e), 500);
+          logger.info('soft condensation deferred', { workItemId: item.workItemId, sessionId, turn, retryTurn, error: reason });
+          try {
+            await events.append([event(eventContext, SOFT_CONDENSATION_DEFERRED, 'context', sessionId, { sessionId, turn, retryTurn, reason })]);
+          } catch (inner) {
+            // the back-off is best effort: a deferral never fails the turn
+            logger.warn('soft condensation deferral could not be recorded', { sessionId, turn, error: (inner as Error).message });
+          }
+        }
+        if (compaction) {
+          await recordCompaction(sessionId, turn, compaction);
+          view = workingContext.view({ transcript, compactions: [...compactions, compaction], budgetTokens: viewBudget });
+        }
       }
       const protocolContext = prepareProtocolContext(protocol, { taskId: run.runId, role: item.role, phase: role.phase }).render.content;
       const rolePrompt = `${agentHeader(item)}\n${renderRolePrompt(role, { objective: item.objective, runGoal: run.goal, protocol: protocolContext })}`;

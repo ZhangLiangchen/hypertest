@@ -23,7 +23,7 @@ consumer tx: Inbox.tryConsume(consumer, eventId, tx) + side effect   ⇒ exactly
 
 | Export | Notes |
 |---|---|
-| `collabMigrations` | `collab/001-events`, `002-blackboard`, `003-specs`, `004-work-fencing` (all tables `ht_*`, PGlite + PostgreSQL 16). |
+| `collabMigrations` | `collab/001-events`, `002-blackboard`, `003-specs`, `004-work-fencing`, `005-append-only`, `006-outbox-immutable` (all tables `ht_*`, PGlite + PostgreSQL 16). |
 | `createEventStore(deps)` → `EventStore` | `append(events, tx?)`, `emit` (DomainEventSink), `read`, `get`, `lastSeq`, `causalChain`. |
 | `createInbox(deps)` → `Inbox` | `tryConsume(consumer, eventId, tx?)` (`INSERT … ON CONFLICT DO NOTHING`), `consumed`. |
 | `createOutboxRelay({...deps, bus, pollMs?, batchSize?})` → `OutboxRelay` | `flush`, `start`/`stop` (unref'd timer), `pending`. |
@@ -124,6 +124,7 @@ advisory lock (two-int4 key space, disjoint from other packages' locks). Malform
 | One head per lineage | supersede a non-head; 6 concurrent supersedes on PG | `test/blackboard-records.test.ts`, `test/postgres.int.test.ts` |
 | Append-only specs/decisions | stale explicit revision, rewritten proposal/decision, double decision, 5 concurrent writers of one oracle from 5 runs | `test/specs.test.ts`, `test/decisions.test.ts`, `test/postgres.int.test.ts` |
 | Append-only in the DATABASE (I6/I10, conformance-15): `ht_events`, `ht_system_models`, `ht_oracles`, `ht_experiments`, `ht_test_artifacts` reject UPDATE/DELETE/TRUNCATE; `ht_decisions` only takes the one-way reassessment flag (never cleared, reason never rewritten) | direct UPDATE/DELETE/TRUNCATE statements, a verdict change piggy-backing on the flag | `test/append-only.test.ts` |
+| L0 delivery records immutable (`ht_outbox`): only the one-way `sent_at` mark changes; rows are inserted unsent; unsent rows are never deleted; sent rows may be pruned; no TRUNCATE | envelope/subject/event id/created_at rewrites, a rewrite piggy-backing on the mark, a column added later, re-marking or clearing a mark, inserting a row pre-marked sent, deleting an unsent row, TRUNCATE | `test/append-only.test.ts` |
 | At-least-once relay, ordered | publish failure mid-batch, crash after publish, stop()+start() during an in-flight flush | `test/inbox-outbox.test.ts` |
 | Bus redelivery / dead letter / queue semantics | throwing and hanging handlers, poison messages, delayed ack, close/unsubscribe with running handlers, colliding durable names | `test/inprocess-bus.test.ts`, `test/i5-duplicate-delivery.test.ts`, `test/nats.int.test.ts` |
 
@@ -152,6 +153,15 @@ per run and deletes the stream afterwards.
 - (hardening, durability-11) `OutboxRelay.prune?()`, `OutboxRelayDeps.sentRetentionMs?` (default 1 h) and
   `.pruneIntervalMs?` (default 60 s): rows marked sent are delivery records only (`ht_events` keeps every event), so
   the poll loop deletes those sent longer ago than the retention; unsent rows are never touched.
+- (L0 immutability) migration `collab/006-outbox-immutable`: trigger function `ht_outbox_delivery_only()` on `ht_outbox`
+  (SQLSTATE 42501). The outbox row is the delivery half of an L0 event (same transaction as `ht_events`), so it is
+  immutable except for the relay's one-way delivery mark: `sent_at` may be set once (NULL → timestamp); every other
+  column — envelope, subject, event id, id, `created_at`, and any column a later migration adds (whole-row comparison
+  `to_jsonb(NEW) - 'sent_at'`) — can never change; a row is inserted unsent (one born marked sent would never be
+  relayed); a set mark can never be changed or cleared; only rows already marked sent may be deleted (the durability-11
+  prune); TRUNCATE is refused. No API change: the relay only ever did
+  `UPDATE … SET sent_at WHERE sent_at IS NULL` and pruned sent rows. Proven by `test/append-only.test.ts` (tamper test,
+  PGlite and PostgreSQL).
 
 Event types emitted that are not (yet) in `@hypertest/domain` `EVENT_TYPES`: `run.gating`, `run.updated`,
 `work.blocked`, `work.updated`.

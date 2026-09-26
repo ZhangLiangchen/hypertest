@@ -16,6 +16,11 @@ import type { Migration } from '@hypertest/core';
  *       history): UPDATE/DELETE/TRUNCATE of ht_events (L0) and of the revision tables ht_system_models, ht_oracles,
  *       ht_experiments, ht_test_artifacts are rejected by triggers; ht_decisions rows are immutable except for the
  *       one-way reassessment flag (needs_reassessment false → true with its reason), and cannot be deleted.
+ * 006 — L0 delivery records (ht_outbox) are immutable except for their one-way delivery mark: the relay may set
+ *       sent_at once (NULL → timestamp) and may prune rows already marked sent (durability-11); every other column
+ *       (envelope, subject, event id, id, created_at — and any column added later) can never change, a row is inserted
+ *       unsent, a delivery mark can never be changed or cleared, an unsent row (an event not yet propagated) can never
+ *       be deleted, and the table cannot be truncated.
  *
  * Domain objects are stored whole in a jsonb column (the value returned to callers); the scalar columns
  * beside them exist for filtering, uniqueness and ordering and are written in the same statement.
@@ -276,6 +281,42 @@ DROP TRIGGER IF EXISTS ht_decisions_no_delete ON ht_decisions;
 CREATE TRIGGER ht_decisions_no_delete BEFORE DELETE ON ht_decisions FOR EACH ROW EXECUTE FUNCTION ht_collab_append_only();
 DROP TRIGGER IF EXISTS ht_decisions_no_truncate ON ht_decisions;
 CREATE TRIGGER ht_decisions_no_truncate BEFORE TRUNCATE ON ht_decisions FOR EACH STATEMENT EXECUTE FUNCTION ht_collab_append_only();
+`,
+  },
+  {
+    // L0 immutability of the transactional outbox (the delivery half of an L0 event, written in the same transaction as
+    // ht_events): only the relay's one-way delivery mark may change, and only delivered rows may be pruned.
+    id: 'collab/006-outbox-immutable',
+    sql: `
+CREATE OR REPLACE FUNCTION ht_outbox_delivery_only() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    -- a row is born undelivered: one inserted already marked sent would never be relayed (and could then be pruned)
+    IF NEW.sent_at IS NOT NULL THEN
+      RAISE EXCEPTION 'append-only table ht_outbox: an event (%) is recorded undelivered; only its relay sets sent_at', NEW.event_id USING ERRCODE = '42501';
+    END IF;
+    RETURN NEW;
+  END IF;
+  IF TG_OP = 'DELETE' THEN
+    IF OLD.sent_at IS NULL THEN
+      RAISE EXCEPTION 'append-only table ht_outbox: an unsent event (%) cannot be deleted', OLD.event_id USING ERRCODE = '42501';
+    END IF;
+    RETURN OLD;
+  END IF;
+  -- every column but the delivery mark (whole-row comparison: a column added by a later migration is covered too)
+  IF (to_jsonb(NEW) - 'sent_at') IS DISTINCT FROM (to_jsonb(OLD) - 'sent_at') THEN
+    RAISE EXCEPTION 'append-only table ht_outbox: only the delivery mark sent_at may be updated' USING ERRCODE = '42501';
+  END IF;
+  IF OLD.sent_at IS NOT NULL AND NEW.sent_at IS DISTINCT FROM OLD.sent_at THEN
+    RAISE EXCEPTION 'append-only table ht_outbox: a delivery mark cannot be changed or cleared' USING ERRCODE = '42501';
+  END IF;
+  RETURN NEW;
+END
+$$;
+DROP TRIGGER IF EXISTS ht_outbox_delivery_guard ON ht_outbox;
+CREATE TRIGGER ht_outbox_delivery_guard BEFORE INSERT OR UPDATE OR DELETE ON ht_outbox FOR EACH ROW EXECUTE FUNCTION ht_outbox_delivery_only();
+DROP TRIGGER IF EXISTS ht_outbox_no_truncate ON ht_outbox;
+CREATE TRIGGER ht_outbox_no_truncate BEFORE TRUNCATE ON ht_outbox FOR EACH STATEMENT EXECUTE FUNCTION ht_collab_append_only();
 `,
   },
 ];

@@ -10,5 +10,6 @@ export { MIN_NODE_VERSION, nodeVersionCheck } from './commands/doctor.ts';
 export { availableArms, availableSuites, suiteFactoryName, suiteIdOf } from './commands/eval.ts';
 export { DEFAULT_API_PORT, DEFAULT_API_TOKEN_ENV, MIN_API_TOKEN_LENGTH } from './commands/serve.ts';
 export { SANDBOX_ENV } from './commands/decide.ts';
+export { parseAllowances, parseCanary, releaseActor, suiteFromEval } from './commands/runtime.ts';
 export { FOLLOW_POLL_MS, FOLLOW_QUIET_POLLS } from './commands/inspect.ts';
 export { WAIT_POLL_MS, resolveCommit } from './commands/run.ts';

@@ -25,7 +25,7 @@ describe('startRun', () => {
   after(async () => h.dispose());
 
   test('pins manifest, policy, protocol and oracle revisions; merges budgets and gates; creates the lead work item', async () => {
-    const run = await h.control.startRun({ goal: 'assess releasability', target: { repoPath: '/repo', commit: 'abc1234', description: 'cart service' }, oracleIds: ['oracle.pricing'], budget: { maxToolCalls: 50 }, gate: { requireIndependentReview: false }, labels: { team: 'qa' } });
+    const run = await h.control.startRun({ goal: 'assess releasability', target: { repoPath: '/repo', commit: 'abc1234', description: 'cart service' }, oracleIds: ['oracle.pricing'], budget: { maxToolCalls: 50 }, gate: { requireIndependentReview: false }, gateOverrideBy: { kind: 'human', id: 'qa-lead' }, gateOverrideRationale: 'no reviewer model in this deployment', labels: { team: 'qa' } });
     assert.equal(run.status, 'running');
     assert.equal(run.runtimeManifestId, h.deps.config.runtimeManifest.manifestId);
     assert.equal(run.policyRevision, 'policy-rev-1');

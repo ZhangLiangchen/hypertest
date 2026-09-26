@@ -4,7 +4,8 @@ import type { ProvenanceTrace } from '@hypertest/context';
 import type { ReportBuilder, RunReport } from './contracts.ts';
 import type { ControlDeps } from './deps.ts';
 import { ControlStore } from './store.ts';
-import { byString, clip, notFound } from './util.ts';
+import { DEFAULT_GATE_SPEC } from '@hypertest/policy';
+import { authorizedGateWeakenings, byString, clip, gateReference, notFound } from './util.ts';
 
 function cell(s: string): string {
   return s.replace(/\|/g, '\\|').replace(/\s+/g, ' ').trim();
@@ -104,6 +105,16 @@ export function createReportBuilder(deps: ControlDeps): ReportBuilder {
         if (decision.gateSpecDigest) {
           const overrides = decision.gateOverrides ?? [];
           md.push(`- **Gate:** ${decision.gateId} (spec ${decision.gateSpecDigest.slice(0, 16)}; ${overrides.length === 0 ? 'the default gate' : `overrides: ${overrides.join(', ')}`})`);
+        }
+        // conformance-9: who authorized a weakened gate, and why (judged like the gate path judges it)
+        const effective = await store.getGate(runId);
+        if (effective) {
+          const recorded = await store.gateAuthority(runId);
+          const judged = authorizedGateWeakenings(gateReference(recorded?.baseGate, deps.config.defaultGate, DEFAULT_GATE_SPEC), effective, recorded);
+          if (judged.authority) {
+            md.push(`- **Gate override authority:** ${judged.authority.by.kind}:${judged.authority.by.id} — ${judged.authority.rationale}${judged.authorized.length > 0 ? ` (weakened: ${judged.authorized.join('; ')})` : ''}`);
+          }
+          if (judged.unauthorized.length > 0) md.push(`- **Gate override authority:** NONE recorded for a weakened gate (${judged.unauthorized.join('; ')}) — the verdict is withheld`);
         }
         md.push('');
         md.push('## Decision reasons');

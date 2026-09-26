@@ -77,7 +77,11 @@ describe('conformance-1: no oracle in force ⇒ never pass; configured oracles a
   test('an explicit gate override (requireOracle: false) is the only way to a verdict without an oracle; malformed oracles are refused', async () => {
     const ht = await createHypertest(cfg('off', { oracles: [] }), { scriptedBrains: { sim: roleRouter(tinyRunBrains()) }, logger: new MemoryLogger() });
     try {
-      const outcome = await ht.run({ goal: GOAL, target: { repoPath: repo.path, commit: repo.head }, gate: { requireOracle: false } }, { timeoutMs: 90_000 });
+      // (conformance-9) disabling the oracle requirement weakens the gate: it needs a recorded human authority
+      const outcome = await ht.run(
+        { goal: GOAL, target: { repoPath: repo.path, commit: repo.head }, gate: { requireOracle: false }, gateOverrideBy: { kind: 'human', id: 'alice' }, gateOverrideRationale: 'exploratory run without an oracle' },
+        { timeoutMs: 90_000 },
+      );
       assert.equal(outcome.decision!.verdict, 'pass');
       assert.match(outcome.decision!.satisfiedCriteria.find((c) => c.criterionId === 'C0')!.detail ?? '', /requireOracle false/);
       await assert.rejects(ht.start({ goal: GOAL, target: {}, gate: { requireOracle: 'no' as never } }), (e: unknown) => e instanceof HypertestError && e.code === 'invalid_argument');

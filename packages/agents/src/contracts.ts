@@ -9,7 +9,7 @@ import type { AgentRole, DataClassification, FindingCategory, ModelPolicy, Sever
  * Implementations to export from src/index.ts:
  *   BUILTIN_ROLES: RoleDefinition[]   (lead, code_change_analyst, architecture_analyst, historical_bug_analyst,
  *                                      test_designer, executor, rca, fixer, reviewer, metrics_analyst,
- *                                      environment, condenser)
+ *                                      environment, condenser, + additive: vision_gui, local_private)
  *   class RoleCatalog implements RoleCatalogLike (constructor(roles, overrides?: RoleOverrides))
  *   renderTemplate(template: string, vars: Record<string, string>): string   ({{name}} substitution; unknown ⇒ left empty)
  *   TERMINAL_TOOLS = ['complete_work', 'fail_work'] as const
@@ -29,7 +29,8 @@ import type { AgentRole, DataClassification, FindingCategory, ModelPolicy, Sever
  *   RoleCatalog constructor third parameter `options?: RoleCatalogOptions` (roles may be `readonly RoleDefinition[]`),
  *   role output schemas: LEAD_OUTPUT_SCHEMA, ANALYSIS_OUTPUT_SCHEMA, TEST_DESIGN_OUTPUT_SCHEMA, EXECUTION_OUTPUT_SCHEMA,
  *   RCA_OUTPUT_SCHEMA, FIX_OUTPUT_SCHEMA, REVIEW_OUTPUT_SCHEMA, METRICS_OUTPUT_SCHEMA, ENVIRONMENT_OUTPUT_SCHEMA,
- *   CONDENSE_OUTPUT_SCHEMA.
+ *   CONDENSE_OUTPUT_SCHEMA, (runtime-roles unit) GUI_OUTPUT_SCHEMA, GUI_CHECK_METHODS, PRIVATE_OUTPUT_SCHEMA,
+ *   SPECIALIST_ROLES (vision_gui, local_private: roles only a special route can serve).
  * BUILTIN_ROLES and every RoleCatalog role are deep-frozen; invalid catalogs (and malformed options) throw
  * HypertestError('invalid_argument'). Role ids and subscription ruleIds may not be 'constructor' or 'prototype'.
  * Every built-in role holds both TERMINAL_TOOLS (the condenser holds only those).

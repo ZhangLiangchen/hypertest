@@ -1,6 +1,6 @@
 import type { BaseDeps, JsonValue } from '@hypertest/core';
 import type {
-  BudgetEnvelope, ContextSnapshot, EventContext, GateSpec, PlanRevision, QualityDecision, ReportClaim, TargetRef, TestRun, WorkItem,
+  ActorRef, BudgetEnvelope, ContextSnapshot, EventContext, GateSpec, PlanRevision, QualityDecision, ReportClaim, TargetRef, TestRun, WorkItem,
 } from '@hypertest/domain';
 import type { RoleCatalogLike } from '@hypertest/agents';
 
@@ -30,6 +30,17 @@ export interface StartRunInput {
   /** Oracles established by humans/authorities before the run (agents may only propose changes). */
   oracleIds?: string[];
   runId?: string;
+  /**
+   * (additive, conformance-9) The human or system authority of a `gate` override that WEAKENS the run's gate relative to
+   * DEFAULT_GATE_SPEC ⊕ configuration (a lowered failOnUnresolvedSeverity, a disabled requireIndependentReview /
+   * requireDeterministicForCritical / requireOracle, a lowered coverage threshold, removed required evidence — see
+   * gateWeakenings). Required for such an override (missing ⇒ invalid_argument); an agent — `kind: 'agent'`, or a call
+   * whose event context names an agent — is refused (permission_denied). Recorded with the run's gate, on L0
+   * (`gate.override_authorized`) and in every signed QualityDecision of the run.
+   */
+  gateOverrideBy?: ActorRef;
+  /** (additive, conformance-9) Why the gate is weakened; required with gateOverrideBy. */
+  gateOverrideRationale?: string;
 }
 
 export interface PlanValidationInput {

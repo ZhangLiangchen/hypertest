@@ -1,9 +1,12 @@
 import { HypertestError, newId, systemClock, validateJson, type Clock } from '@hypertest/core';
 import type { ActionPermit, ActionRequest, OpaPolicyEngineOptions, PermitConstraints, PolicyEngine } from './contracts.ts';
 import { PERMIT_CONSTRAINTS_SCHEMA, checkCapability } from './engine.ts';
+import { requestPhase } from './phases.ts';
 
 /**
- * OPA adapter (HTTP data API): POST `{url}/v1/data/{path}` with `{ input: request }` and expects
+ * OPA adapter (HTTP data API): POST `{url}/v1/data/{path}` with `{ input: request }` (the phase always explicit:
+ * `input.phase` is `before_action` for a request without one; the phase facts `outcome` / `transition` / `acceptance`
+ * ride along) and expects
  * `{ result: { allow: boolean, approval_required?: boolean, reasons?: string[], constraints?: {...} } }`.
  * Fail closed: transport errors, timeouts, non-2xx, an undefined result or a malformed document all
  * yield `deny` with first reason `opa_unavailable`. The capability is checked locally first.
@@ -48,7 +51,7 @@ export class OpaPolicyEngine implements PolicyEngine {
       const res = await this.#fetch(this.#endpoint, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ input: { ...request, capability } }),
+        body: JSON.stringify({ input: { ...request, phase: requestPhase(request), capability } }),
         signal: AbortSignal.timeout(this.#timeoutMs),
       });
       if (!res.ok) {

@@ -18,7 +18,8 @@ Depends on every runtime package (`scripts/check-boundaries.mjs` ALLOWED) and th
 | `validateRunOverrides({ budget?, gate? })` | Problems of a run's own overrides (same rules as the configuration's `budget`/`gate`). |
 | `createHypertest(config, overrides?)` | The composition root → `HypertestInstance` (the contract's `Hypertest` + `manifest`, `services`, `listRuns`, `events`, `listApprovals`, `cancel`). |
 | `startApiServer(ht, { port, host?, token?, eventPollMs?, maxBodyBytes? })` | node:http REST API (below) → `{ url, close() }`. |
-| `diagnose(config, { env?, connect?, timeoutMs? })` | `hypertest doctor`: config, secrets (presence only), route coverage per role, BUGate binding, sandbox, storage and infrastructure reachability. |
+| `diagnose(config, { env?, connect?, timeoutMs? })` | `hypertest doctor`: config, secrets (presence only), route coverage per role (core roles, then the specialist roles `vision_gui` — a vision route, computer-use fallback reported — and `local_private` — a route accepting restricted data, and a warning for every such route whose provider is not local: `providerLocality`), BUGate binding, sandbox, storage and infrastructure reachability. |
+| `HypertestInstance.releases` | Runtime release management (`RuntimeReleaseService`, below): `list`, `register`, `recordSuite`, `promote`, `rollback` (+ quarantine), `migrate`, `epochs`, `resolve`, `registry`. |
 | helpers | `mergeConfig`, `interpolateConfig`, `secretVariableNames`, `resolveConfigPaths`, `withDerivedPaths`, `completeRoute`, `providerCompatibilityClass`, `roleOverrides`, `buildCatalog`, `sandboxProfile`, `defaultWorkerId`, `loadSigningKeys`, `loadCapabilitySecret`, `recordedFailureFlipDetector`, `changedAssertions`, `testCaseMatches`, `isLoopbackHost`, `pinnedControlPlane`, `decisionProblems`, `persistentEnvironmentRegistry`, `resolveEnvironments`, `acquireDirectoryLock`, `lockFileFor`, `lockHolder`, `processAlive`; constants `ROUTE_DEFAULTS`, `PROVIDER_KINDS`, `ENGINE_KINDS`, `DEFAULT_ENV_ALLOWLIST`, `ALL_MIGRATIONS`, `HYPERTEST_VERSION`, `RELAY_POLL_MS` (200), `MAX_AGENTS_PER_RUN` (1000), `TOOL_SCHEMA_VERSION`, `RUN_ID_RE`, `ENVIRONMENT_STATE_FILE`. |
 
 ### Configuration
@@ -94,16 +95,51 @@ detector (every finding revision + the run's recorded test results); QualityGate
 (SQL or PowerContext), provenance, working context, per-root retrievers (symbol index + single-line exact search);
 workspace manager (`<dataDir>/workspaces`), local/OCI sandbox, tool registry (built-in tools with `stateDir`, then the
 control domain tools), tool runtime; sessions, agents, epochs, `EngineRegistry` (native + pi), subagents, runner;
-roles; the **RuntimeManifest**; control plane wrapped by `pinnedControlPlane` (I11, below); durable runtime (`LocalDurableRuntime` or `TemporalDurableRuntime`, with
+roles; the **RuntimeManifest**; control plane wrapped by `pinnedControlPlane` (I11, below) and
+`releaseGovernedControlPlane` (runtime release admission, below; its router has the condenser privacy floor); the
+runtime release service (`ht.releases`); durable runtime (`LocalDurableRuntime` or `TemporalDurableRuntime`, with
 `getRun` and a `resolveClaim` that only returns claims held by this worker). A failure closes whatever was opened.
 Runs are **not** resumed automatically — call `resumeIncomplete()` (`hypertest resume`).
 
-**RuntimeManifest**: `hypertest.version` (monorepo root package.json), `agentEngines` (`native` = @hypertest/runtime
-version, `pi` = pi-agent-core version), `providerAdapters` (every model provider + `engine:native`
-@hypertest/runtime, `engine:pi` @hypertest/runtime-pi and @earendil-works/pi-agent-core), `modelCatalogRevision`,
-`schemas` (last migration id of collab/context/operation/evidence; `tools/1`), `policyBundleRevision`
-(`<policy revision>+roles:<role catalog revision>`), `toolCatalogRevision` (built-in + domain tools), `protocol`.
-The id is content-addressed: the same runtime yields the same id across restarts.
+**RuntimeManifest** (the runtime BOM): `hypertest` = `version` (monorepo root package.json), `sourceDigest`, `gitSha`
+(`git rev-parse HEAD` of the installation when it is the top level of a git checkout — never a parent repository's
+commit; absent otherwise) and `imageDigest` (`HYPERTEST_IMAGE_DIGEST` of the composition environment, `sha256:<64 hex>`;
+a malformed value fails the composition before anything is created); `agentEngines` (`native` = @hypertest/runtime
+version, `pi` = pi-agent-core version, each with its `adapter` package/version — `@hypertest/runtime-pi` for pi);
+`defaultEngine`; `providerAdapters` (every model provider + `engine:native` @hypertest/runtime, `engine:pi`
+@hypertest/runtime-pi and @earendil-works/pi-agent-core); `modelCatalogRevision`; `schemas` (last migration id of
+collab/context/operation/evidence; `tools/1`); `policyBundleRevision` (`<policy revision>+roles:<role catalog
+revision>`); `roleCatalogRevision`; `toolCatalogRevision` (`toolCatalogRevision(tools, adapters)` of @hypertest/runtime:
+built-in + domain tools with their timeouts and side-effect bindings, and the side-effect adapters' capabilities);
+`protocol`. The id is content-addressed: the same runtime yields the same id across restarts.
+
+**Runtime releases** (`ht.releases`, `hypertest runtime …`; registry in @hypertest/runtime). New runs pass the
+release registry's admission in the control plane handed to the facade and the durable runtime
+(`releaseGovernedControlPlane`): once a release is active, a run is created only under the active release or under a
+canary whose selection (run-id percentage bucket or labels) picks it — every other runtime gets `precondition_failed`
+and creates nothing; an installation that never activated a release runs unmanaged (any runtime except a rolled-back
+one), unless `runtime.requireActiveRelease: true`. `promote` goes one step along candidate → shadow → canary → active,
+each over the latest passing `engine_contract` and `replay` suite results; activating retires the previous release
+once no live run is pinned to it (`list` and `promote` retire drained releases). `rollback` moves the active pointer
+back (or stops a canary/shadow/candidate), leaves old runs on their pinned manifest, and — in the same transaction —
+quarantines every live run of the rolled-back release: paused with `pauseReason: quarantined` (converging/gating runs
+through `running`, the only legal path) and `run.quarantined` on L0 with its previous status; `resumeRun` of a
+quarantined (or `migrating`) run is refused. `migrate(runId, { to, by, reason, checkpointTimeoutMs?, drive? })` is the
+only way a live run changes runtime: checkpoint (pause `migrating` a running run and wait until no work item holds a live
+claim), canonical ContextSnapshot, operation reconciliation (refused while any operation of the run is unsettled —
+prepared, dispatching, acknowledged, outcome_unknown, reconciling, compensating or manual_review — or a work item waits),
+compatibility (`runtimeCompatibility`: target active/canary, same schemas or an explicit allowed migration, the engines
+the run used, same protocol), then ONE transaction: the target manifest stored in `ht_manifests`, a RuntimeEpoch, the
+re-pin, `run.migrated`, and the resume (`running`, or the run's own earlier pause: an operator/budget/approval pause, or
+the pause a quarantine replaced, is kept). A failed migration releases the checkpoint it took. The report of a run
+carries its quarantine and migration notes (`## Runtime release`, `recovery`, `json.runtimeRelease`). Proven with the
+local durable runtime; with Temporal the source runtime's run workflow fails on its next tick (the I11 refusal of the
+re-pinned run) and `resume` on the target runtime starts the run's workflow on the target's task queue (not exercised
+against a live Temporal server).
+
+**Condenser privacy floor**: the router the control plane uses raises a `condenser` request to the classification of
+the agent whose context it condenses (its role's `dataClassification`, its role's and its work item's `privacyClass`),
+on `route` and on `invoke`: a `local_private` agent's context is never summarized on a hosted model.
 
 **I11 at restart and upgrade.** A run is driven only by a runtime with the manifest it is pinned to:
 `resumeIncomplete()` resumes only resumable runs pinned to this instance's manifest (the others are logged and left
@@ -174,6 +210,9 @@ use.
 | `close()` releases every handle (a child process that composed, ran and closed exits on its own) | `test/app.e2e.test.ts` + `test/fixtures/exit-probe.ts` |
 | API: validation, media type, body limit, Host guard, bearer token, JSON errors without internals, malformed paths, SSE ordering/resume/end (never before the final events) | `test/api.test.ts`, `test/app.e2e.test.ts` (REST API over a real instance) |
 | Production wiring: PostgreSQL + NATS JetStream (delivery proven by a probe consumer) + OPA composed with the built-in rules; Temporal durable runtime (through the pinned control boundary); doctor is read-only on PostgreSQL | `test/app.int.test.ts` |
+| I11 runtime releases: new runs only under the active release or a selecting canary (refused starts create nothing); promotion over recorded passing suites; rollback moves the pointer back, old runs continue on their pinned manifest, the rolled-back release's runs are quarantined (paused, `run.quarantined`, report note, resume refused); explicit migration (checkpoint, snapshot, reconciliation, compatibility, RuntimeEpoch + `run.migrated` + re-pin + resume) completes the run on the new runtime; migration refusals (checkpoint timeout, unknown ids, non-promoted target, unsettled operation) leave the run as it was; `runtime.requireActiveRelease`; drained releases retire; the image digest is part of the BOM | `test/releases.e2e.test.ts` |
+| Runtime BOM inputs (git commit of the installation only, image digest format), condenser privacy floor (restricted agents condensed on restricted routes only, replayed hosted decisions refused), admission wrapper, pin-cache eviction, report notes | `test/releases.test.ts` |
+| Doctor route coverage of the specialist roles (vision + computer-use fallback, restricted data only on local routes) | `test/diagnose.test.ts` |
 
 ## How to run
 
@@ -256,6 +295,18 @@ HYPERTEST_TEST_DB=postgres node scripts/run-tests.mjs --package app  # e2e runs 
   `tools.httpAllowlist`; loopback endpoints only); `diagnose()` reports the
   strategy, a warning when only the network is isolated or for `network: open`, and an error when the host cannot
   enforce the configured network.
+- (runtime release management) `HypertestConfig.runtime?: { requireActiveRelease?: boolean }`; env
+  `HYPERTEST_IMAGE_DIGEST`; `HypertestInstance.releases: RuntimeReleaseService` (`Hypertest.releases?`); new types
+  `RuntimeReleaseService`, `RuntimeReleaseView`, `MigrateRunInput`, `RunMigrationResult`; `HypertestServices.adapters?`;
+  `pinnedControlPlane` returns `ControlPlane & { forgetPin(runId) }`. New exports `providerLocality`, `hypertestGitSha`,
+  `imageDigestFrom`, `IMAGE_DIGEST_ENV`, `condenserPrivacyFloor`, `agentClassification`, `releaseGovernedControlPlane`,
+  `createReleaseService`, `runtimeReleaseNotes`, `withRuntimeReleaseNotes`, `DEFAULT_CHECKPOINT_TIMEOUT_MS`,
+  `ReleaseServiceDeps`. (behaviour) the manifest's `toolCatalogRevision` is the runtime's `toolCatalogRevision` (tools
+  with timeouts/bindings + adapter capabilities) instead of the tool registry's revision, and the manifest carries
+  `gitSha`/`imageDigest`/engine adapters/`defaultEngine`/`roleCatalogRevision`: manifest ids change once with this
+  version (runs pinned to an older runtime are driven by that runtime, or migrated); `diagnose` reports the specialist
+  roles separately (`every core role can be routed`); the facade's `report` appends runtime-release notes; the control
+  plane's `startRun`/`resumeRun` are release-governed.
 - (hardening) conformance-8: `RuntimeManifest.hypertest.sourceDigest` (domain, additive) = `hypertestSourceDigest()`
   (new export): sha256 over every file under the packages' `src/` — changed code at the same version is another
   runtime (I11). conformance-12: an OPA policy engine's revision is `opa:<path>@<digest>` of the policy modules of the

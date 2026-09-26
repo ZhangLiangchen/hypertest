@@ -1,6 +1,7 @@
 import { isValidSchema } from '@hypertest/core';
 import { toolPatternCovers } from '@hypertest/policy';
 import type { PlanValidationInput, PlanValidationResult } from './contracts.ts';
+import { requirementProblems } from './capability-grant.ts';
 
 /**
  * Validates a proposed PlanRevision (typed Plan IR — never code) against the run and the role catalog. Pure and
@@ -13,6 +14,8 @@ import type { PlanValidationInput, PlanValidationResult } from './contracts.ts';
  *  - tool allow patterns ⊆ the role allowlist (and not role-denied);
  *  - per-item budgets within the run envelope; total work items after acceptance ≤ maxWorkItems;
  *  - expectedOutput is a valid JSON schema;
+ *  - capabilityRequirements are well formed (known effects, canonical resource patterns) — requirements beyond the role
+ *    are not an issue: the grant intersects them away and reports the excess to the agent (I2);
  *  - cancelWorkItems exist, are not lead planning work (the proposer's own item included) and are not waiting on
  *    side effects.
  */
@@ -82,6 +85,7 @@ export function validatePlan(input: PlanValidationInput): PlanValidationResult {
     }
 
     if (w.expectedOutput !== undefined && !isValidSchema(w.expectedOutput)) issues.push(`${at}: expectedOutput is not a valid JSON schema`);
+    if (w.capabilityRequirements !== undefined) for (const p of requirementProblems(w.capabilityRequirements)) issues.push(`${at}: ${p}`);
   }
 
   // acyclic dependency graph over this revision's localIds

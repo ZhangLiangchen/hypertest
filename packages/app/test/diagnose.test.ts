@@ -7,8 +7,11 @@ import { after, before, describe, test } from 'node:test';
 import { tempDir } from '@hypertest/testkit';
 import { MemoryLogger } from '@hypertest/core';
 import { networkIsolation } from '@hypertest/tools';
-import { acquireDirectoryLock, defaultConfig, diagnose, lockFileFor, type DiagnosticReport, type HypertestConfig } from '../src/index.ts';
+import { acquireDirectoryLock, defaultConfig, diagnose, lockFileFor, providerLocality, type DiagnosticReport, type HypertestConfig } from '../src/index.ts';
 import { FULL_ROUTE } from './helpers.ts';
+
+/** A local model route every role can use, the specialists included: vision, and restricted data (it runs on this host). */
+const LOCAL_ROUTE = { ...FULL_ROUTE, capabilities: [...FULL_ROUTE.capabilities, 'vision'], quality: { ...FULL_ROUTE.quality }, maxDataClassification: 'restricted' } as const;
 
 async function closedPort(): Promise<number> {
   const server = createServer();
@@ -30,7 +33,7 @@ describe('diagnose (hypertest doctor)', () => {
         project: { name: 'doc', dataDir: join(dir.path, 'data') },
         models: {
           providers: [{ id: 'local', kind: 'openai-compatible', baseUrl: 'http://127.0.0.1:1/v1', apiKeyEnv: 'HT_DOCTOR_KEY' }],
-          routes: [{ routeId: 'local-big', provider: 'local', model: 'm', ...FULL_ROUTE, capabilities: [...FULL_ROUTE.capabilities], quality: { ...FULL_ROUTE.quality } }],
+          routes: [{ routeId: 'local-big', provider: 'local', model: 'm', ...LOCAL_ROUTE, capabilities: [...LOCAL_ROUTE.capabilities] }],
         },
         ...extra,
       } as never);
@@ -51,7 +54,11 @@ describe('diagnose (hypertest doctor)', () => {
     assert.deepEqual(r.checks.filter((c) => c.status !== 'ok'), []);
     assert.match(of(r, 'sandbox')[0]!.detail, /^local sandbox, network loopback \(enforced: userns_jail, private loopback; keys, store and other workspaces hidden\), env allowlist /);
     assert.deepEqual(of(r, 'secrets'), [{ name: 'secrets', status: 'ok', detail: 'provider local (apiKeyEnv): HT_DOCTOR_KEY is set' }]);
-    assert.deepEqual(of(r, 'models'), [{ name: 'models', status: 'ok', detail: '1 route(s); every built-in role can be routed' }]);
+    assert.deepEqual(of(r, 'models'), [
+      { name: 'models', status: 'ok', detail: '1 route(s); every core role can be routed' },
+      { name: 'models', status: 'ok', detail: 'vision_gui: routed to local-big (vision); computer-use fallback unavailable (no route with computer_use): DOM, API and screenshot checks only' },
+      { name: 'models', status: 'ok', detail: 'local_private: restricted data is routed only to routes accepting it (local-big); selected local-big' },
+    ]);
     assert.equal(of(r, 'store')[0]!.detail, `PGlite data directory ${join(dir.path, 'data', 'db')} can be created (${dir.path} is writable)`);
     assert.equal(existsSync(join(dir.path, 'data')), false, 'doctor is read-only');
     assert.match(of(r, 'protocol')[0]!.detail, /^BUGate .* \(embedded\), digest [0-9a-f]{16}$/);
@@ -80,12 +87,53 @@ describe('diagnose (hypertest doctor)', () => {
     const r = await diagnose(cfg, { env: {}, connect: false });
     assert.equal(r.ok, false);
     const models = of(r, 'models');
-    assert.equal(models.length, 2);
+    assert.equal(models.length, 4);
     assert.equal(models[0]!.status, 'error');
     assert.match(models[0]!.detail, /^no route can serve the lead role \(plain: .+\): every run would fail at routing$/);
     assert.equal(models[1]!.status, 'warn');
     assert.match(models[1]!.detail, /code_change_analyst \(plain: /);
     assert.doesNotMatch(models[1]!.detail, /executor \(/, 'the executor needs tool_use + structured_output only: the default route serves it');
+    assert.doesNotMatch(models[1]!.detail, /vision_gui|local_private/, 'the specialist roles are reported on their own');
+    assert.deepEqual(models.slice(2).map((m) => m.status), ['warn', 'warn']);
+    assert.match(models[2]!.detail, /^vision_gui: no route can serve GUI testing \(plain: .*vision.*\): GUI work items fail at routing — add a route with capabilities \[tool_use, structured_output, vision\]$/);
+    assert.match(models[3]!.detail, /^local_private: no route can take restricted data \(plain: route accepts data up to confidential; request carries restricted\): restricted work fails closed at routing and is never sent to another model/);
+  });
+
+  test('specialist route coverage: vision (+ computer-use fallback) and restricted data only on local routes', async () => {
+    const providers: HypertestConfig['models']['providers'] = [
+      { id: 'claude', kind: 'anthropic', apiKeyEnv: 'HT_DOCTOR_KEY' },
+      { id: 'local', kind: 'openai-compatible', baseUrl: 'http://127.0.0.1:11434/v1' },
+    ];
+    const hosted = { routeId: 'claude-big', provider: 'claude', model: 'c', ...FULL_ROUTE, capabilities: [...FULL_ROUTE.capabilities, 'vision', 'computer_use'], quality: { default: 0.95 } };
+    const local = { routeId: 'local-qwen', provider: 'local', model: 'q', capabilities: ['tool_use', 'structured_output'], quality: { default: 0.6 }, maxDataClassification: 'restricted' };
+    // hosted vision route + a local restricted route: both specialists are served, restricted data stays local
+    let r = await diagnose(base({ models: { providers, routes: [hosted, local] } }), { env: { HT_DOCTOR_KEY: 'k' }, connect: false });
+    assert.deepEqual(of(r, 'models').slice(1), [
+      { name: 'models', status: 'ok', detail: 'vision_gui: routed to claude-big (vision); computer-use fallback routes: claude-big' },
+      { name: 'models', status: 'ok', detail: 'local_private: restricted data is routed only to routes accepting it (local-qwen); selected local-qwen' },
+    ]);
+    assert.equal(r.ok, true, JSON.stringify(r.checks));
+    // a hosted route declared to accept restricted data: local_private would be sent to it (warning naming the provider)
+    r = await diagnose(base({ models: { providers, routes: [{ ...hosted, maxDataClassification: 'restricted' }, local] } }), { env: { HT_DOCTOR_KEY: 'k' }, connect: false });
+    assert.deepEqual(of(r, 'models').filter((c) => c.status === 'warn').map((c) => c.detail), [
+      'route claude-big accepts restricted data but its provider claude runs at the hosted Anthropic API: restricted data (local_private work) would leave this deployment — lower its maxDataClassification or point it at a local model',
+    ]);
+    // no route for restricted data at all: the role fails closed (never routed elsewhere)
+    r = await diagnose(base({ models: { providers, routes: [hosted] } }), { env: { HT_DOCTOR_KEY: 'k' }, connect: false });
+    const priv = of(r, 'models').find((c) => c.detail.startsWith('local_private'))!;
+    assert.equal(priv.status, 'warn');
+    assert.match(priv.detail, /claude-big: route accepts data up to confidential; request carries restricted/);
+  });
+
+  test('providerLocality: loopback, private networks and in-process providers are local; hosted APIs are not', () => {
+    const local = (baseUrl: string) => providerLocality({ kind: 'openai-compatible', baseUrl }).local;
+    for (const u of ['http://127.0.0.1:11434/v1', 'http://localhost:8000/v1', 'http://[::1]:8000/v1', 'http://10.1.2.3/v1', 'http://192.168.0.7:1234/v1', 'http://172.20.0.2/v1', 'http://llm.internal/v1', 'http://vllm.ml.svc.cluster.local/v1']) {
+      assert.equal(local(u), true, u);
+    }
+    for (const u of ['https://api.deepseek.com/v1', 'http://172.32.0.1/v1', 'http://8.8.8.8/v1', 'http://127.0.0.1.nip.io/v1']) assert.equal(local(u), false, u);
+    assert.equal(providerLocality({ kind: 'scripted' }).local, true);
+    assert.equal(providerLocality({ kind: 'anthropic' }).local, false);
+    assert.equal(providerLocality({ kind: 'pi-ai' }).local, false, 'no endpoint: the provider default (hosted)');
   });
 
   test('invalid configurations stop at validation with every problem', async () => {
@@ -129,7 +177,7 @@ describe('diagnose (hypertest doctor)', () => {
       environments: [{ environmentId: 'shop', environmentClass: 'local', generation: 0, control: { kind: 'process', target: 'http://127.0.0.1:9100/__hypertest', tokenEnv: 'HT_DOCTOR_SUPERVISOR' } }],
       models: {
         providers: [{ id: 'local', kind: 'openai-compatible', baseUrl: 'http://127.0.0.1:1/v1', apiKeyEnv: 'HT_DOCTOR_KEY', maxRetries: 3 }],
-        routes: [{ routeId: 'local-big', provider: 'local', model: 'm', ...FULL_ROUTE, capabilities: [...FULL_ROUTE.capabilities], quality: { ...FULL_ROUTE.quality } }],
+        routes: [{ routeId: 'local-big', provider: 'local', model: 'm', ...LOCAL_ROUTE, capabilities: [...LOCAL_ROUTE.capabilities] }],
       },
     });
     let r = await diagnose(cfg, { env: { HT_DOCTOR_KEY: 'k' }, connect: false });

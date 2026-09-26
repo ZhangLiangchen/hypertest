@@ -47,6 +47,14 @@ import type { ArtifactRef, ChatMessage, ContextSnapshot, DomainEventSink, EventC
  *   sameActor(a, b), creatorActing(createdBy, reviewer, ctx) — the reviewer ≠ creator rule (trimmed, case-insensitive;
  *                                                      the acting ctx.actorId/agentId counts as well)
  *   resolveLimit(limit, fallback)                    — result limits: non-finite ⇒ invalid_argument
+ *   (context engine completion)
+ *   createObservationLog(deps): ObservationLog         — what agents observed (ht_context_observations, append-only)
+ *   observationsOf(call, result, ports?)              — tool results → read-set entries (files, records, metric windows, environments)
+ *   observeToolRuntime(runtime, options)              — ToolRuntime wrapper: every execution feeds the ObservationLog
+ *   workspaceFileResolver(getRoot)                    — `file` resources `workspace/<id>/<path>` (sha256)
+ *   softCondensationDue(input, keepRecentTurns)       — SOFT condensation is due (≥ keepRecentTurns + 2 turns beyond the cut)
+ *   WorkspaceVectorRetriever, chunkText, gitHeadCommit — lazily populated vector corpus per workspace + commit
+ *   SymbolIndex.writers/callers/imports/importers, classifyUsage, extractImports, resolveImport — the symbol graph
  *
  * Behavioural clarifications (v0.3 review):
  *   FreshnessGuard.validate: a malformed action (mutating not a boolean, resources not string[]) is invalid_argument,
@@ -81,6 +89,13 @@ export interface SnapshotBuilderDeps extends ContextDeps {
   snapshots: SnapshotStore;
   sources: SnapshotSources;
   resolvers: ResolverRegistry;
+  /**
+   * Additive: what agents OBSERVED through their tool calls. When a build names an `observer`, that agent's latest
+   * observation of every resource (at most `maxObservedEntries`, most recent first) joins the read set.
+   */
+  observations?: ObservationLog;
+  /** Additive: cap of observed entries per snapshot (default 256, most recent kept). */
+  maxObservedEntries?: number;
 }
 
 export interface BuildSnapshotInput {
@@ -89,6 +104,8 @@ export interface BuildSnapshotInput {
   environment?: { environmentId: string; generation: number; buildDigest?: string };
   /** Extra read-set entries observed by the caller (files read, findings consulted, metric windows). */
   readSet?: ReadSetEntry[];
+  /** Additive: the agent whose recorded observations (ObservationLog) join the read set. */
+  observer?: { agentId: string };
 }
 
 export interface SnapshotBuilder {
@@ -128,12 +145,58 @@ export interface StaleEntry {
 
 export type FreshnessResult = { fresh: true; checked: number } | { fresh: false; checked: number; stale: StaleEntry[] };
 
+// ----------------------------------------------------------------------------- observations (additive)
+
+/**
+ * Additive: one resource version an agent observed through a tool call (`read`: fs.read, blackboard.read, a metric
+ * query, …) or established itself (`write`: fs.write, fs.apply_patch, blackboard.post_*, env.*). A write is an
+ * observation too: the agent knows the version it produced. `observedVersion` = ABSENT_VERSION records that the
+ * resource did not exist (e.g. a file the agent's own patch deleted).
+ */
+export interface ObservedEntry extends ReadSetEntry {
+  kind: 'read' | 'write';
+}
+
+/** Additive: where an observation came from. */
+export interface ObservationSource {
+  runId: string;
+  agentId: string;
+  workItemId?: string;
+  /** The turn snapshot the observing tool call ran against. */
+  snapshotId?: string;
+  toolId: string;
+  invocationId: string;
+}
+
+/** Additive: one recorded observation (append-only, ordered by `seq`). */
+export interface Observation extends ObservedEntry, ObservationSource {
+  seq: number;
+}
+
+/**
+ * Additive: the per-agent observation collector, fed by every tool execution (tool results → read-set entries) and
+ * read by the SnapshotBuilder (the NEXT turn's snapshot includes what the agent observed) and by the FreshnessGuard
+ * (observations made under the validated snapshot — during the current turn — refine its read set, so the agent's own
+ * writes and fresh re-reads are never mistaken for concurrent changes, while another agent's change still is).
+ */
+export interface ObservationLog {
+  /** Appends observations (validated; an empty list is a no-op). */
+  record(source: ObservationSource, entries: ObservedEntry[]): Promise<void>;
+  /**
+   * The latest observation per (resourceType, resourceId) of one agent in one run, newest first, at most `limit`
+   * (default: all). With `snapshotId` only observations made under that snapshot count.
+   */
+  latest(scope: { runId: string; agentId: string; snapshotId?: string; limit?: number }): Promise<Observation[]>;
+}
+
 export interface FreshnessGuard {
   readonly resolvers: ResolverRegistry;
   /**
    * For mutating actions validates every non-immutable read-set entry whose type is environment, build,
    * oracle, experiment or lease, plus entries whose resourceId appears in action.resources. max_age
    * entries expire by time. Read-only actions always pass. Emits context.stale_rejected when stale.
+   * (additive) With an ObservationLog, the acting agent's (`ctx.agentId`) observations made under this snapshot
+   * replace the snapshot's entries of the same resource and add the resources it observed since.
    */
   validate(snapshot: ContextSnapshot | string, action: ProposedAction, ctx: EventContext): Promise<FreshnessResult>;
 }
@@ -217,6 +280,8 @@ export interface WorkingContextOptions {
 }
 
 export interface WorkingContextManager {
+  /** (additive, optional) The resolved options (callers use keepRecentTurns to decide when SOFT condensation is due). */
+  readonly options?: Readonly<Required<WorkingContextOptions>>;
   view(input: { transcript: TranscriptEntry[]; compactions: Compaction[]; budgetTokens: number }): WorkingView;
   condense(input: {
     transcript: TranscriptEntry[];
@@ -292,12 +357,28 @@ export interface SymbolDefinition {
   signature: string;
 }
 
+/** Additive: how a reference uses the name (regex classification of its line, no parser). */
+export type SymbolUsage = 'import' | 'write' | 'call' | 'read';
+
 /** Additive: one word-boundary occurrence of a name that is not its definition. */
 export interface SymbolReference {
   name: string;
   path: string;
   line: number;
   snippet: string;
+  /** (additive) import statement, assignment/increment (write), call, or any other use (read). */
+  usage?: SymbolUsage;
+  /** (additive) The nearest enclosing definition (`Container.name` or `name`), when one precedes the reference. */
+  enclosing?: string;
+}
+
+/** Additive: one import edge of the symbol graph (`to` = the resolved repository file, when it is one). */
+export interface ImportEdge {
+  from: string;
+  specifier: string;
+  to?: string;
+  line: number;
+  language: SymbolLanguage;
 }
 
 export interface Embedder {

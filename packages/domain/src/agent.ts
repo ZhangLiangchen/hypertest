@@ -16,7 +16,11 @@ export type BuiltinRole =
   | 'reviewer'
   | 'metrics_analyst'
   | 'environment'
-  | 'condenser';
+  | 'condenser'
+  // (additive) GUI testing through the browser tools with screenshot evidence (vision routes)
+  | 'vision_gui'
+  // (additive) work over restricted data, routed only to routes accepting restricted data (local models)
+  | 'local_private';
 export type AgentRole = BuiltinRole | (string & {});
 
 export type ModelCapability = 'tool_use' | 'parallel_tool_calls' | 'structured_output' | 'reasoning' | 'vision' | 'long_context' | 'computer_use';
