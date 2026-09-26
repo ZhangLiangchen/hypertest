@@ -219,6 +219,7 @@ export function killPointProblems(point: unknown, label = 'kill point'): string[
   if (p.operationType !== undefined && (typeof p.operationType !== 'string' || p.operationType === '')) out.push(`${label}.operationType must be a non-empty string`);
   if (p.nth !== undefined && !(Number.isSafeInteger(p.nth) && p.nth >= 1)) out.push(`${label}.nth must be a positive integer, got ${String(p.nth)}`);
   if (p.delayMs !== undefined && !(Number.isSafeInteger(p.delayMs) && p.delayMs >= 0)) out.push(`${label}.delayMs must be a non-negative integer, got ${String(p.delayMs)}`);
+  if (p.downtimeMs !== undefined && !(Number.isSafeInteger(p.downtimeMs) && p.downtimeMs >= 0)) out.push(`${label}.downtimeMs must be a non-negative integer, got ${String(p.downtimeMs)}`);
   return out;
 }
 
@@ -239,7 +240,7 @@ export function killPointCount(progress: readonly TrialProgressEvent[], point: K
 
 /** A human-readable label of a kill point (error messages, reports). */
 export function describeKillPoint(point: KillPoint): string {
-  return `after ${point.after} of ${point.operationType ?? 'any operation'}${(point.nth ?? 1) > 1 ? ` #${point.nth}` : ''}${point.delayMs ? ` + ${point.delayMs} ms` : ''}`;
+  return `after ${point.after} of ${point.operationType ?? 'any operation'}${(point.nth ?? 1) > 1 ? ` #${point.nth}` : ''}${point.delayMs ? ` + ${point.delayMs} ms` : ''}${point.downtimeMs ? `, down ${point.downtimeMs} ms` : ''}`;
 }
 
 /**
@@ -299,9 +300,9 @@ export async function runChildTrial(job: TrialChildJob, options: RunChildTrialOp
 
   // every kill point, in order: the first one reached SIGKILLs the running child and a resume child takes over; a point
   // that is never reached (the run finished, or the deadline passed) ends the chaos plan there
-  const points: Array<{ reached: (progress: readonly TrialProgressEvent[]) => boolean; killPoint: boolean; delayMs: number }> = [];
-  if (killAfterOperationDispatch !== undefined) points.push({ reached: (p) => dispatchCount(p) >= killAfterOperationDispatch, killPoint: false, delayMs: 0 });
-  for (const k of killPoints) points.push({ reached: (p) => killPointCount(p, k) >= (k.nth ?? 1), killPoint: true, delayMs: k.delayMs ?? 0 });
+  const points: Array<{ reached: (progress: readonly TrialProgressEvent[]) => boolean; killPoint: boolean; delayMs: number; downtimeMs: number }> = [];
+  if (killAfterOperationDispatch !== undefined) points.push({ reached: (p) => dispatchCount(p) >= killAfterOperationDispatch, killPoint: false, delayMs: 0, downtimeMs: 0 });
+  for (const k of killPoints) points.push({ reached: (p) => killPointCount(p, k) >= (k.nth ?? 1), killPoint: true, delayMs: k.delayMs ?? 0, downtimeMs: k.downtimeMs ?? 0 });
   let attempt = 1;
   let proc = await start(attempt, job.mode);
   let exercised = 0;
@@ -315,6 +316,8 @@ export async function runChildTrial(job: TrialChildJob, options: RunChildTrialOp
     kills++;
     exercised++;
     if (point.killPoint) killPointsHit++;
+    // Hypertest stays down for a while: the external world moves on without it
+    if (point.downtimeMs > 0) await sleep(Math.min(point.downtimeMs, Math.max(0, deadline - Date.now())));
     proc = await start(++attempt, 'resume');
   }
   if (exercised === points.length) chaosExercised = true;

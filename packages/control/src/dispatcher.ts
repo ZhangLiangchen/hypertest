@@ -2,6 +2,7 @@ import { readFile, realpath } from 'node:fs/promises';
 import { basename, dirname, join, relative, sep } from 'node:path';
 import { sha256Hex, type JsonValue } from '@hypertest/core';
 import {
+  type ActorRef,
   EFFECT_ORDER, RISK_ORDER, isTerminalWorkState,
   type ActionCapability, type ContextSnapshot, type EventContext, type RiskClass, type TestArtifact, type ToolCall, type ToolEffect, type ToolResultMessage,
 } from '@hypertest/domain';
@@ -197,6 +198,17 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
   let quarantine: WorkspaceQuarantine | undefined = input.quarantine;
   let pendingGuard = input.guard;
 
+  /**
+   * The requesting agent as an approval subject: role and the model provider of its current epoch — what an independent
+   * agent approver must differ from (I8; without the provider, independence can never be established: fail closed).
+   */
+  async function requester(): Promise<ActorRef> {
+    const actor: ActorRef = { kind: 'agent', id: input.agentId, role: input.role };
+    const epoch = await deps.epochs.current(input.sessionId);
+    if (epoch?.provider) actor.modelProvider = epoch.provider;
+    return actor;
+  }
+
   async function snapshotFor(turn: number): Promise<ContextSnapshot | undefined> {
     if (input.turnState.turn === turn && input.turnState.snapshot) return input.turnState.snapshot;
     // replayed turn (no context assembly): the snapshot the turn was recorded against
@@ -274,7 +286,7 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
             runId: input.runId,
             kind: 'test_change',
             subject: { toolId, invocationId, workItemId: input.workItemId, diffSha256, paths, categories: classification.categories, findings: findings.slice(0, 20), diff: clip(diff, 20_000) } as JsonValue,
-            requestedBy: { kind: 'agent', id: input.agentId, role: input.role },
+            requestedBy: await requester(),
             rationale: `test change classified ${classification.decision} (${categories}) by the self-heal policy`,
           },
           input.eventContext,

@@ -49,6 +49,14 @@ export const EVENT_TYPES = {
   runStarted: 'run.started',
   runPaused: 'run.paused',
   runResumed: 'run.resumed',
+  /**
+   * (additive) A process recovered the run after a restart (control recover()): payload `{ workerId, operations:
+   * {examined, verified, notApplied, manualReview, stillPending, compensated}, requeued: [{workItemId, role, from,
+   * attempts}], reattached: [{workItemId, role, waitingOn, fencingToken, claim: 'kept' | 'retaken'}] }` — what was
+   * reconciled, what re-runs and what keeps waiting on its (re-attached, never re-created) operations. Emitted only when
+   * the pass recovered something.
+   */
+  runRecovered: 'run.recovered',
   runConverging: 'run.converging',
   runGating: 'run.gating',
   runUpdated: 'run.updated',

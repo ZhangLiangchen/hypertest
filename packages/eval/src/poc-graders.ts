@@ -316,7 +316,8 @@ export const loadJobReattachedGrader: Grader = (ctx) => {
 
 /**
  * Recovery is auditable: when the trial killed the Hypertest process, the report's recovery log names what was
- * reconciled or requeued, and every operation of the run ended settled.
+ * reconciled, re-run (requeued) or re-attached (a waiting item kept waiting on its operation) by the resumed process
+ * (run.recovered), and every operation of the run ended settled.
  */
 export const recoveryAuditGrader: Grader = (ctx) => {
   const missing = noRun('recoveryAudit', ctx.data);

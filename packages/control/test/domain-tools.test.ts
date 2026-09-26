@@ -91,6 +91,8 @@ describe('domain tools on the real pipeline: specs, oracles, experiments, approv
     const approval = (await h.deps.approvals.get(approvalId))!;
     assert.equal(approval.kind, 'manual_review');
     assert.equal(approval.requestedBy.role, 'lead');
+    // the requester's model provider is recorded: an agent approver must be independent of it (I8)
+    assert.equal(approval.requestedBy.modelProvider, 'alpha');
     const proposed = parsed(prop1!.content);
     assert.equal(proposed['created'], true);
     assert.equal(parsed(prop2!.content)['created'], false, 'identical proposals are deduplicated');

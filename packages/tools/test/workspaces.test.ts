@@ -152,6 +152,31 @@ test('concurrent creators for the same worktree serialize: one worktree, identic
   assert.equal(listed.length, 1);
 });
 
+test('parallel work items on ONE repository: every worktree is created (git worktree administration is serialized per repository)', async () => {
+  // Parallel agents (two test designers, three analysts, a fixer beside a test designer…) each get their own worktree of
+  // the same repository at the same moment. `git worktree prune` of one creator used to delete the half-created
+  // administrative directory of another (`fatal: could not open '.git/worktrees/<id>/gitdir' for writing`): that agent's
+  // spawn was refused and its work item failed. Disposal (remove + prune) races the same way.
+  for (let round = 0; round < 6; round++) {
+    const runId = `run_par${round}`;
+    const settled = await Promise.allSettled(Array.from({ length: 8 }, (_, i) => wm.isolatedWorktree({ runId, workItemId: `wi_${i}`, repoPath: repo.path })));
+    const refused = settled.filter((s) => s.status === 'rejected').map((s) => String((s as PromiseRejectedResult).reason?.message ?? s));
+    assert.deepEqual(refused, [], `round ${round}`);
+    const handles = settled.map((s) => (s as PromiseFulfilledResult<Awaited<ReturnType<WorkspaceManager['isolatedWorktree']>>>).value);
+    const listed = git(repo.path, 'worktree', 'list', '--porcelain');
+    for (const h of handles) {
+      assert.ok(listed.includes(`worktree ${h.root}`), `${h.root} is a registered worktree`);
+      assert.equal(await readFile(join(h.root, 'src/a.txt'), 'utf8'), 'v2\n');
+    }
+    // half of them are disposed while the next ones are created
+    const more = Promise.allSettled(Array.from({ length: 4 }, (_, i) => wm.isolatedWorktree({ runId, workItemId: `wi_more_${i}`, repoPath: repo.path })));
+    await Promise.all(handles.slice(0, 4).map((h) => wm.dispose(h.workspaceId)));
+    const late = await more;
+    assert.deepEqual(late.filter((s) => s.status === 'rejected').map((s) => String((s as PromiseRejectedResult).reason?.message)), [], `round ${round} (with disposals)`);
+    for (const h of handles.slice(4)) assert.ok(existsSync(join(h.root, 'src/a.txt')), 'a disposal never takes another worktree with it');
+  }
+});
+
 // ----------------------------------------------------------------------------- review regressions
 
 test('dispose then re-create re-attaches the kept work branch (the agent commits are never reset away)', async () => {

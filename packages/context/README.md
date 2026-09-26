@@ -172,7 +172,11 @@ returned over budget and the caller must condense. Returns `droppedSections`, `t
   work item, work item without events, no agent, neither environment nor commit, lineage deeper than `maxDepth`, and
   every inconsistent link: `toolInvocationId` ≠ `provenance.toolInvocationId`, tool events of another tool than
   `provenance.toolId`, an operation of another tool invocation or work item, tool events of another work item or
-  agent, `agentId` ≠ `producer.agentId`.
+  agent, `agentId` ≠ `producer.agentId`. An **observation** is lineage, not an inconsistency: when another invocation
+  started the operation and the evidence's own invocation OBSERVED it — its own L0 tool events name the operation
+  (e.g. `load.observe` recording a load job's results in the metrics analyst's work item) — the trace is evidence
+  `-produced_by->` observing invocation `-observed->` operation `-started_by->` starting invocation (whose tool events
+  must exist). An invocation whose events never touched the operation cannot claim it: still a gap.
 - `traceRecord(id)`: record `-cites->` each cited evidence (traced), record `-caused_by->` its creation event
   (`aggregateType 'record'`, `payload.recordId`) and the `causationId` chain (`-caused_by->`); no evidence cited,
   no creation event, and cited evidence of **another run** (outside the run's hash chain / Merkle root) are gaps.
@@ -208,6 +212,7 @@ returned over budget and the caller must condense. Returns `droppedSections`, `t
 | L4 row + event atomic | event sink throws during propose / review ⇒ no row / status unchanged | `test/experience.test.ts` |
 | L4 over HTTP keeps the same invariants | server leaks candidates/quarantined items or other projects' items; ignores list filters; accepts a self-review (also via the acting actor); answers another status / id; rewrites `createdBy`; 503; hang; stalls after headers; bad JSON | `test/powercontext.test.ts` |
 | L5 gaps are explicit | missing tool events, operation events, work item, agent, env/commit; inconsistent invocation id, tool id, agent, operation/tool work item; record citing evidence of another run; unknown evidence/record; record citing nothing | `test/provenance.test.ts` |
+| L5 observation lineage (eval PoC C: SLO numbers of a load job observed in another work item trace completely); a forged operation link is still a gap | `test/provenance.test.ts` › an observation is lineage |
 
 ## Testing
 
@@ -231,6 +236,7 @@ The ripgrep-vs-JS test skips with a reason when `rg` is not on `PATH`.
   `SymbolIndex.build()/findDefinitions()/findReferences()`.
 - `ExperienceDecision` (named union, adds `'review'` ⇒ status `reviewed`); `PowerContextOptions`.
 - `ProvenanceRefKind`/`ProvenanceRef` (supertype of `Ref`) for `ProvenanceNode.ref` and `ProvenanceTrace.root`.
+- (eval integration) `ProvenanceTrace.edges[].relation` adds `'observed'` and `'started_by'` (observation lineage).
 - `createFreshnessGuard` accepts `resolvers?`; `createPgVectorIndex(db, embedder)` is async (the header comment said
   `(db, dims)`; the embedder is needed to embed and to tag rows with its `modelId`).
 - Extra exports: resolver factories, `snapshotIdFor`, `offloadToolResult`, id extractors, helper constants,

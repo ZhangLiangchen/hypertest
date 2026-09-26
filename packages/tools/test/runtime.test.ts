@@ -59,6 +59,13 @@ function specs(): ToolSpec[] {
       const ev = await ctx.recordEvidence({ evidenceType: 'log', data: 'some log line\n', mimeType: 'text/plain', summary: 'a log', provenance: { command: ['echo', 'x'], toolId: 'spoofed.tool' } });
       return { status: 'success', structured: { evidenceId: ev.evidenceId } };
     }),
+    read('t.envev', async (input: { environmentId?: string; explicit?: boolean }, ctx) => {
+      const ev = await ctx.recordEvidence({
+        evidenceType: 'metric', data: '{}', mimeType: 'application/json', summary: 'env evidence',
+        ...(input.explicit ? { environment: { environmentId: 'env_other', environmentClass: 'sandbox', generation: 7, buildDigest: 'sha-x' } } : {}),
+      });
+      return { status: 'success', structured: { evidenceId: ev.evidenceId } };
+    }, { inputSchema: obj({ environmentId: { type: 'string' }, explicit: { type: 'boolean' } }, []) }),
     read('t.secret', async () => {
       bump('t.secret');
       return { status: 'success', text: 'ok' };
@@ -406,6 +413,23 @@ test('evidence: ctx.recordEvidence fills producer, provenance (not spoofable) an
   assert.deepEqual((completed.payload as { evidenceRefs: string[] }).evidenceRefs, [id]);
 });
 
+test('evidence records the environment the tool addressed (input.environmentId, current generation); an explicit environment wins; an unknown one records none', async () => {
+  // black-box evidence without an environment (and without a commit) has no provenance anchor: L5 reports a gap for
+  // every HTTP exchange, scrape or load result — "all key numbers have provenance" (PoC C) could never hold
+  const rt = runtimeFor(env, specs(), { policy });
+  const envOf = async (input: Record<string, unknown>) => {
+    const r = await rt.execute(request('t.envev', input, ws));
+    assert.equal(r.status, 'success', r.modelText);
+    return (await env.evidence.get((r.structured as { evidenceId: string }).evidenceId))!.environment;
+  };
+  assert.deepEqual(await envOf({ environmentId: 'env_local' }), { environmentId: 'env_local', environmentClass: 'local', generation: 1 });
+  env.environments.bumpGeneration('env_local', 'sha-2');
+  assert.deepEqual(await envOf({ environmentId: 'env_local' }), { environmentId: 'env_local', environmentClass: 'local', generation: 2, buildDigest: 'sha-2' }, 'the generation current at execution');
+  assert.deepEqual(await envOf({ environmentId: 'env_local', explicit: true }), { environmentId: 'env_other', environmentClass: 'sandbox', generation: 7, buildDigest: 'sha-x' });
+  assert.equal(await envOf({ environmentId: 'env_unknown' }), undefined);
+  assert.equal(await envOf({}), undefined);
+});
+
 test('I4 side effects run only through the SideEffectGateway; the same invocation id twice ⇒ one external effect', async () => {
   const adapter = new FakeLoadAdapter();
   const gateway = gatewayFor(env, [adapter]);
@@ -436,6 +460,66 @@ test('I4 side effects run only through the SideEffectGateway; the same invocatio
   assert.equal(noGateway.status, 'failed');
   assert.equal(noGateway.error?.code, 'precondition_failed');
   assert.equal(adapter.external.applied, 2);
+});
+
+test('I4 + I1: the REPLAY of a dispatched side-effect call settles its operation even on a snapshot that is stale by now; a new call, or a re-dispatch, is still validated', async () => {
+  // A durable retry replays a committed turn with the snapshot it was decided on. When the act was already dispatched
+  // (here: the load job runs, verification pending) and the world moved on meanwhile (after a crash the recovery's own
+  // reconciliation may have verified a restart and bumped the environment), refusing the replay as stale would hide the
+  // recorded outcome and invite the model to re-issue the act: a second operation, a duplicate side effect.
+  let stale = false;
+  const validated: string[] = [];
+  const freshness: FreshnessPort = {
+    async validate(_snap, action) {
+      validated.push(action.tool);
+      return stale ? { fresh: false, checked: 1, stale: [{ resourceType: 'environment', resourceId: 'env_local', reason: 'version_changed' }] } : { fresh: true, checked: 1 };
+    },
+  };
+  const adapter = new FakeLoadAdapter();
+  const rt = runtimeFor(env, specs(), { policy, freshness, sideEffects: gatewayFor(env, [adapter]) });
+  adapter.verifyPending = true;
+  const req = request('t.load', { name: 'replayed' }, ws, { invocationId: 'sess_r:2:call_load', snapshot: snapshot() });
+  const first = await rt.execute(req);
+  assert.equal(first.status, 'pending', first.modelText);
+  assert.deepEqual([adapter.calls.dispatch, validated.length], [1, 1]);
+
+  stale = true;
+  adapter.verifyPending = false;
+  const replay = await rt.execute({ ...req, signal: new AbortController().signal });
+  assert.equal(replay.status, 'success', replay.modelText);
+  assert.equal(replay.operationId, first.operationId);
+  assert.deepEqual([adapter.calls.dispatch, adapter.external.applied], [1, 1], 'settled, never dispatched again');
+  assert.equal(validated.length, 2, 'the replay was validated (stale) and then only settled its operation');
+  const called = eventsFor(req.invocationId).filter((e) => e.eventType === 'tool.called').map((e) => (e.payload as { replayOfOperation?: string }).replayOfOperation);
+  assert.deepEqual(called, [undefined, first.operationId], 'the audit names the replayed operation');
+
+  // a NEW call on the stale snapshot is still refused (it would be a new decision)
+  const fresh = await rt.execute(request('t.load', { name: 'replayed' }, ws, { invocationId: 'sess_r:3:call_load', snapshot: snapshot() }));
+  assert.equal(fresh.status, 'stale_context');
+  assert.equal(adapter.calls.dispatch, 1);
+
+  // a replay whose earlier dispatch was lost (the effect is absent) is settled as not_applied — never re-dispatched on
+  // the stale view (on a FRESH one the retry gets its single safe re-dispatch, see the next test); a call that never got
+  // past `not_applied` is validated like a new one
+  stale = false;
+  adapter.hangDispatch = true;
+  const lost = request('t.load', { name: 'lost-replay' }, ws, { invocationId: 'sess_r:4:call_load', snapshot: snapshot(), timeoutMs: 150 });
+  const hung = await rt.execute(lost);
+  assert.equal(hung.status, 'pending', hung.modelText);
+  assert.equal(adapter.calls.dispatch, 2);
+  adapter.hangDispatch = false;
+  stale = true;
+  const settled = await rt.execute({ ...lost, timeoutMs: 5000, signal: new AbortController().signal });
+  assert.equal(settled.status, 'failed', settled.modelText);
+  assert.equal(settled.error?.code, 'not_applied');
+  assert.equal(adapter.calls.dispatch, 2, 'the replay never re-dispatches');
+  const again = await rt.execute({ ...lost, timeoutMs: 5000, signal: new AbortController().signal });
+  assert.equal(again.status, 'stale_context', 'a not_applied operation needs a new (validated) decision');
+  assert.deepEqual([adapter.calls.dispatch, adapter.external.applied], [2, 1]);
+  stale = false;
+  const redo = await rt.execute({ ...lost, timeoutMs: 5000, signal: new AbortController().signal });
+  assert.equal(redo.status, 'success', redo.modelText);
+  assert.deepEqual([adapter.calls.dispatch, adapter.external.applied], [3, 2]);
 });
 
 test('non-side-effect tools only get an observe-only gateway view', async () => {

@@ -388,7 +388,8 @@ export interface ProvenanceNode {
 export interface ProvenanceTrace {
   root: ProvenanceRef;
   nodes: ProvenanceNode[];
-  edges: Array<{ from: string; to: string; relation: 'produced_by' | 'derived_from' | 'executed_in' | 'caused_by' | 'cites' | 'operation' | 'commit' }>;
+  /** (additive) `observed` / `started_by`: evidence of an invocation that observed an operation another invocation started. */
+  edges: Array<{ from: string; to: string; relation: 'produced_by' | 'derived_from' | 'executed_in' | 'caused_by' | 'cites' | 'operation' | 'commit' | 'observed' | 'started_by' }>;
   complete: boolean;
   gaps: string[];
 }

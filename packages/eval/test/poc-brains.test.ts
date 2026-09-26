@@ -12,22 +12,26 @@ import type { ModelCallRequest, ScriptedReply } from '@hypertest/model';
 import { FIXTURES_DIR, LEAD_TRACE_MARKER, MULTI_PROVIDERS, SINGLE_PROVIDERS, pocBrains, pocChildBrains, providerBrain, providersOf, readObservations, viewOf } from '../src/index.ts';
 import {
   PAGINATION_FINDING, ROBUST_TEST_PATH, WEAKENING_PATCH, assertBrainArgs, caseFailed, evIds, inputRecord, jsonOf, observationOf, opIds, pocAExecutor, pocCExecutor, recIds,
-  recordObservation, replanOrdinal, replanReason, requestBytes, reviewerOfFinding, robustnessExecutor, str, targetCommits,
+  recordObservation, replanOrdinal, replanReason, requestBytes, reviewerOfFinding, robustnessExecutor, str, targetCommits, MAX_DUMP_ATTEMPTS, pocCTag, staleRefusal,
 } from '../src/brains/index.ts';
 
 const INFO = { callIndex: 0, routeModel: 'm' };
 const dir = mkdtempSync(join(tmpdir(), 'ht-poc-brains-'));
 after(() => rmSync(dir, { recursive: true, force: true }));
 
+/** A tool result of a conversation: its text, or the text with the tool's wire name and error flag. */
+type Result = string | { content: string; name?: string; isError?: boolean };
+
 /** A request of `role`: system header, the task message, then one assistant tool call + its tool result per entry. */
-function conv(role: string, user: string, results: string[] = [], system = ''): ModelCallRequest {
+function conv(role: string, user: string, results: Result[] = [], system = ''): ModelCallRequest {
   const messages: ModelCallRequest['messages'] = [
     { role: 'system', content: `[hypertest role=${role} work_item=wi_1 kind=task run=run_1]\nYou are the ${role}.${system}` },
     { role: 'user', content: user },
   ];
-  results.forEach((content, i) => {
-    messages.push({ role: 'assistant', content: '', toolCalls: [{ id: `c${i}`, name: 't', arguments: {} }] } as never);
-    messages.push({ role: 'tool', toolCallId: `c${i}`, toolName: 't', content, isError: false } as never);
+  results.forEach((r, i) => {
+    const { content, name = 't', isError = false } = typeof r === 'string' ? { content: r } : r;
+    messages.push({ role: 'assistant', content: '', toolCalls: [{ id: `c${i}`, name, arguments: {} }] } as never);
+    messages.push({ role: 'tool', toolCallId: `c${i}`, toolName: name, content, isError } as never);
   });
   return { model: 'm', messages };
 }
@@ -80,8 +84,11 @@ describe('observations and providers', () => {
     const o = observationOf('fast-b', viewOf(leaked), 'after_large_output');
     assert.deepEqual(
       { ...o, requestBytes: o.requestBytes === requestBytes(leaked) },
-      { provider: 'fast-b', role: 'executor', workItemId: 'wi_1', kind: 'task', step: 1, requestBytes: true, maxMessageBytes: 5000, assistantMessages: 1, toolMessages: 1, sawLeadTrace: true, tag: 'after_large_output' },
+      { provider: 'fast-b', role: 'executor', workItemId: 'wi_1', kind: 'task', step: 1, requestBytes: true, maxMessageBytes: 5000, assistantMessages: 1, toolMessages: 1, sawLeadTrace: true, tag: 'after_large_output', offeredTools: [] },
     );
+    // the tools offered on the call (wire names, deduplicated, sorted): what the agent could do at all
+    const withTools = { ...conv('executor', 'go'), tools: [{ name: 'test__run', description: '', parameters: {} }, { name: 'complete_work', description: '', parameters: {} }, { name: 'test__run', description: '', parameters: {} }] };
+    assert.deepEqual(observationOf('fast-b', viewOf(withTools as never)).offeredTools, ['complete_work', 'test__run']);
     const own = observationOf('reason-a', viewOf(conv('lead', `${LEAD_TRACE_MARKER}: mine`)));
     assert.deepEqual([own.sawLeadTrace, Object.hasOwn(own, 'tag')], [false, false]);
     assert.equal(requestBytes(leaked), Buffer.byteLength(JSON.stringify(leaked.messages)) + 2);
@@ -172,12 +179,39 @@ describe('role policies', () => {
   });
 
   test('PoC C executor: fails its item when the request after the dump is unbounded (I9 self-check), completes on a bounded digest', () => {
+    const dump = (content: string, isError = false) => ({ content, name: 'shell__exec', isError });
     assert.equal(call(pocCExecutor(viewOf(conv('executor', 'dump')))).name, 'shell__exec');
-    const unbounded = call(pocCExecutor(viewOf(conv('executor', 'dump', ['x'.repeat(300 * 1024)]))));
+    const unbounded = call(pocCExecutor(viewOf(conv('executor', 'dump', [dump('x'.repeat(300 * 1024))]))));
     assert.equal(unbounded.name, 'fail_work');
     assert.match(String(unbounded.args['message']), /^context overflow: the request after the dump is \d+ bytes$/);
-    const bounded = call(pocCExecutor(viewOf(conv('executor', 'dump', ['head … [output truncated: 2170000 bytes] … tail\n[evidence: ev_d, ev_o]']))));
+    const bounded = call(pocCExecutor(viewOf(conv('executor', 'dump', [dump('head … [output truncated: 2170000 bytes] … tail\n[evidence: ev_d, ev_o]')]))));
     assert.deepEqual([bounded.name, bounded.args['evidenceRefs']], ['complete_work', ['ev_d', 'ev_o']]);
+    // only a call after a SUCCESSFUL dump is tagged as following the large output
+    assert.equal(pocCTag(viewOf(conv('executor', 'dump', [dump('head … tail\n[evidence: ev_d]')]))), 'after_large_output');
+    assert.equal(pocCTag(viewOf(conv('executor', 'dump'))), undefined);
+  });
+
+  test('PoC C executor: a dump refused on a stale snapshot (re-validated after a crash) is retried, at most 3 attempts; other failures fail the item', () => {
+    const stale = { content: '[stale_context] stale_context: stale context (snapshot cs_1): environment/kv: version_changed', name: 'shell__exec', isError: true };
+    assert.equal(staleRefusal(stale), true);
+    assert.equal(staleRefusal({ ...stale, isError: false }), false);
+    assert.equal(staleRefusal({ content: '[denied] capability_denied: nope', isError: true }), false);
+    assert.equal(MAX_DUMP_ATTEMPTS, 3);
+    // retried on a fresh turn, then completes on the successful attempt
+    assert.equal(call(pocCExecutor(viewOf(conv('executor', 'dump', [stale])))).name, 'shell__exec');
+    assert.equal(call(pocCExecutor(viewOf(conv('executor', 'dump', [stale, stale])))).name, 'shell__exec');
+    const done = call(pocCExecutor(viewOf(conv('executor', 'dump', [stale, { content: 'head … tail\n[evidence: ev_d]', name: 'shell__exec' }]))));
+    assert.deepEqual([done.name, done.args['evidenceRefs']], ['complete_work', ['ev_d']]);
+    // bounded: the third stale refusal fails the item (never an endless retry)
+    const exhausted = call(pocCExecutor(viewOf(conv('executor', 'dump', [stale, stale, stale]))));
+    assert.equal(exhausted.name, 'fail_work');
+    assert.match(String(exhausted.args['message']), /^the diagnostics dump could not be collected \(3 attempt\(s\)\): \[stale_context\]/);
+    // any other refusal is not retried; the item never completes without the dump
+    const denied = call(pocCExecutor(viewOf(conv('executor', 'dump', [{ content: '[denied] capability_denied: nope', name: 'shell__exec', isError: true }]))));
+    assert.deepEqual([denied.name, denied.args['message']], ['fail_work', 'the diagnostics dump could not be collected (1 attempt(s)): [denied] capability_denied: nope']);
+    // a refused completion is never repeated in a loop
+    const refused = call(pocCExecutor(viewOf(conv('executor', 'dump', [{ content: 'ok\n[evidence: ev_d]', name: 'shell__exec' }, { content: '[failed] completion_refused: x', name: 'complete_work', isError: true }]))));
+    assert.deepEqual([refused.name, refused.args['message']], ['fail_work', 'completion after the dump was refused: [failed] completion_refused: x']);
   });
 
   test('oracle-robustness: the cheating executor tries to weaken the real failing assertion (the patch matches the fixture) and then claims a pass', () => {

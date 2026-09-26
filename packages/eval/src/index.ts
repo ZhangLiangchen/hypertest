@@ -26,7 +26,7 @@ export { renderSuiteReport, runSuite, summarizeSuite, trialSeed } from './suite.
 // (additive) PoC suites, arms, brains, fixtures and acceptance graders
 export {
   BANK_ORACLE, KV_ORACLE, LEDGER_ORACLE, OBSERVATIONS_PROBE, ORACLE_ROBUSTNESS_TASK_ID, POC_A_TASK_ID, POC_B_TASK_ID, POC_C_INSUFFICIENT_TASK_ID, POC_C_TASK_ID,
-  POC_SUITE_REVISION, RECOVERY_CHAOS_TASK_ID, kvFixture, observationsFile, observationsProbe, oracleRobustnessSuite, oracleRobustnessTask, pocATask, pocAWhiteboxSuite,
+  POC_SUITE_REVISION, RECOVERY_CHAOS_TASK_ID, kvFixture, observationsFile, observationsProbe, oracleRobustnessSuite, oracleRobustnessTask, pocAllSuite, pocATask, pocAWhiteboxSuite,
   pocBEventDrivenSuite, pocBTask, pocCDurableLoadSuite, pocCInsufficientTask, pocCTask, recoveryChaosSuite, recoveryChaosTask,
 } from './suites/index.ts';
 export {
@@ -36,8 +36,8 @@ export {
   LEAD_TRACE_MARKER, MULTI_PROVIDERS, SINGLE_PROVIDERS, armBrains, pocBrains, pocChildBrains, providerBrain, providersOf, type ArmKind, type PocBrainArgs,
 } from './brains/index.ts';
 export {
-  BANK_API_SERVER, FIXTURES_DIR, KV_SERVICE_SERVER, createLedgerRepo, gitShowFile, killLoadWorkers, loadJobs, readObservations, startBankApi, startKvService,
-  type BankApi, type BrainObservation, type KvServiceOptions, type LedgerRepo,
+  BANK_API_SERVER, FIXTURES_DIR, KV_SERVICE_SERVER, createLedgerRepo, gitShowFile, isLoadWorker, killLoadWorkers, loadJobs, readObservations, startBankApi, startKvService,
+  type BankApi, type BrainObservation, type KvService, type KvServiceOptions, type LedgerRepo,
 } from './fixtures.ts';
 export {
   MAX_BOUNDED_MESSAGE_BYTES, MAX_BOUNDED_REQUEST_BYTES, POC_GRADERS, causalChainGrader, contextIsolationGrader, independentReviewGrader, insufficientDataNotPassedGrader,

@@ -193,6 +193,9 @@ describe('recover(): reconcile, then take over orphaned work with new fencing to
       const recovery = (await worker2.report(run.runId)).recovery.map((r) => r.detail);
       assert.ok(recovery.some((d) => d.startsWith(`work item ${lead1.workItemId} requeued (attempt 1`)));
       assert.ok(recovery.some((d) => d === `operation ${prepared.operationId} reconciled: acknowledged`));
+      // the recovery pass explains what re-runs and why (the first, refused attempt recorded nothing)
+      assert.ok(recovery.includes(`recovery by worker-2: re-runs ${lead1.workItemId} (lead, was claimed, attempt 1) — orphaned by the previous process`), recovery.join('\n'));
+      assert.equal(recovery.filter((d) => d.startsWith('recovery by')).length, 1);
     } finally {
       await h.dispose();
     }
@@ -212,6 +215,44 @@ describe('recover(): reconcile, then take over orphaned work with new fencing to
       assert.ok(d2!.fencingToken > d1!.fencingToken);
       assert.deepEqual(await h.control.executeTurn(d1!.workItemId, d1!.fencingToken), { status: 'lease_lost', workItemId: d1!.workItemId });
       assert.equal(await runItem(restarted, d2!.workItemId, d2!.fencingToken), 'completed');
+    } finally {
+      await h.dispose();
+    }
+  });
+
+  test('recovery is auditable: a waiting item re-attached by a restarted process is named in the report (what was recovered, by whom, waiting on what)', async () => {
+    // PoC C "recovery audit": the load item was WAITING on its running load job when Hypertest was killed; the resumed
+    // process (same worker id) keeps it waiting on the same operation — re-attached, never re-created. The report must
+    // explain that, not only requeues and reconciliations. A pass that recovered nothing records nothing.
+    const done = { summary: 'done', output: { summary: 'done', planProposed: false, readyForGate: false, objectives: [] } };
+    const lead: RoleBrain = (v) => (v.step === 0 ? call('delegate', { role: 'code_change_analyst', objective: 'Summarise the risky functions', title: 'summary' }) : call('complete_work', done));
+    const h = await createHarness({ brains: { lead, code_change_analyst: () => call('complete_work', { summary: 'S', output: { summary: 'S', risks: [], testIdeas: [] } }) } });
+    const recovered = async (runId: string) => (await h.deps.events.read(runId, { types: ['run.recovered'] })).map((e) => e.payload as Record<string, unknown>);
+    try {
+      const run = await h.control.startRun({ goal: 'recovery audit', target: {} });
+      const [d1] = (await h.control.tick(run.runId)).dispatched;
+      assert.deepEqual(await h.control.recover(run.runId), { reconciled: 0, requeued: [] });
+      assert.deepEqual(await recovered(run.runId), [], 'the issuing instance recovered nothing: no audit record');
+      const waited = await h.control.executeTurn(d1!.workItemId, d1!.fencingToken);
+      assert.equal(waited.status, 'waiting');
+      const before = (await h.deps.blackboard.getWorkItem(d1!.workItemId)) as WorkItem;
+      assert.equal(before.state, 'waiting');
+
+      const restarted = createControlPlane({ ...h.deps }); // same worker id, fresh process
+      assert.deepEqual(await restarted.recover(run.runId), { reconciled: 0, requeued: [] }, 'a waiting item is not re-run');
+      const after = (await h.deps.blackboard.getWorkItem(d1!.workItemId)) as WorkItem;
+      assert.deepEqual([after.state, after.claim?.fencingToken, after.waitingOn], ['waiting', before.claim!.fencingToken, before.waitingOn]);
+      assert.deepEqual(await recovered(run.runId), [{
+        workerId: 'worker-1',
+        operations: { examined: 0, verified: [], notApplied: [], manualReview: [], stillPending: [], compensated: 0 },
+        requeued: [],
+        reattached: [{ workItemId: d1!.workItemId, role: 'lead', waitingOn: before.waitingOn, fencingToken: before.claim!.fencingToken, claim: 'kept' }],
+      }]);
+      const recovery = (await restarted.report(run.runId)).recovery.map((r) => r.detail);
+      assert.deepEqual(recovery, [`recovery by worker-1: re-attached ${d1!.workItemId} (lead) to ${before.waitingOn!.join(', ')} — still waiting, nothing re-created`]);
+      // idempotent: a second pass of the same process has nothing new to recover
+      await restarted.recover(run.runId);
+      assert.equal((await recovered(run.runId)).length, 1);
     } finally {
       await h.dispose();
     }

@@ -240,9 +240,11 @@ describe('kill points: SIGKILL after an operation reaches a state (type-filtered
     assert.equal(killPointCount(lines, { after: 'verified' }), 0);
     assert.deepEqual(KILL_POINT_STATES, { dispatched: 'dispatching', acknowledged: 'acknowledged', verified: 'verified' });
     assert.deepEqual(killPointProblems({ after: 'dispatched', operationType: 'load.start', nth: 2, delayMs: 0 }), []);
-    assert.deepEqual(killPointProblems({ after: 'sometime', operationType: '', nth: 0, delayMs: -1 }, 'k'), [
+    assert.deepEqual(killPointProblems({ after: 'sometime', operationType: '', nth: 0, delayMs: -1, downtimeMs: 1.5 }, 'k'), [
       'k.after must be one of dispatched, acknowledged, verified, got sometime', 'k.operationType must be a non-empty string', 'k.nth must be a positive integer, got 0', 'k.delayMs must be a non-negative integer, got -1',
+      'k.downtimeMs must be a non-negative integer, got 1.5',
     ]);
+    assert.equal(describeKillPoint({ after: 'dispatched', operationType: 'env.restart', delayMs: 400, downtimeMs: 1500 }), 'after dispatched of env.restart + 400 ms, down 1500 ms');
     assert.deepEqual(killPointProblems(null, 'k'), ['k must be an object']);
     assert.equal(describeKillPoint({ after: 'acknowledged', operationType: 'load.start', nth: 2, delayMs: 300 }), 'after acknowledged of load.start #2 + 300 ms');
     assert.equal(describeKillPoint({ after: 'dispatched' }), 'after dispatched of any operation');
@@ -286,6 +288,20 @@ describe('kill points: SIGKILL after an operation reaches a state (type-filtered
       const resumed = r.progress.filter((e) => e.type === 'started')[1]!;
       assert.ok(Date.parse(resumed.at) - Date.parse(hit.at) >= 350, `resumed ${Date.parse(resumed.at) - Date.parse(hit.at)} ms after the dispatch`);
       assert.ok(Date.now() - started < 15_000);
+    } finally {
+      await w.cleanup();
+    }
+  });
+
+  test('downtimeMs: the resumed child starts only that long after the kill (Hypertest stays down; the world moves on)', async () => {
+    const w = await tempDir('ht-eval-kp-dt-');
+    try {
+      const j = job(w.path, { intervalMs: 20, ops: [{ operationId: 'op_1', operationType: 'env.restart', to: 'dispatching' }], exitCode: 0 });
+      const r = await runChildTrial(j, { workDir: w.path, timeoutMs: 20_000, entry: FAKE, kills: [{ after: 'dispatched', downtimeMs: 600 }] });
+      assert.deepEqual([r.kills, r.killPointsHit, r.chaosExercised, r.exit.code], [1, 1, true, 0]);
+      const hit = r.progress.find((e) => e.type === 'operation')!;
+      const resumed = r.progress.filter((e) => e.type === 'started')[1]!;
+      assert.ok(Date.parse(resumed.at) - Date.parse(hit.at) >= 550, `resumed ${Date.parse(resumed.at) - Date.parse(hit.at)} ms after the kill point`);
     } finally {
       await w.cleanup();
     }

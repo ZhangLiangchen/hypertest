@@ -46,6 +46,8 @@ test('PoC B: finding.created wakes RCA and the test designer without the lead; d
         return e.evidenceType === 'api-response' && s?.request?.method === 'POST' && s.request.path === '/transfers' && s.response?.status === 201 && /"amount":\s*-30\b/.test(s.request.body ?? '');
       }).length,
       open: d.workItems.filter((w) => !['completed', 'failed', 'cancelled'].includes(w.state)).length,
+      // the environment (and its generation) each HTTP exchange cited by the findings was captured in (provenance anchor)
+      findingHttpEnvironments: [...new Set(d.findings.flatMap((f) => f.evidenceRefs.map((id) => evidence.get(id)).filter((e) => e?.evidenceType === 'api-response').map((e) => (e!.environment ? `${e!.environment.environmentId}@${e!.environment.generation}` : 'none'))))],
       health: d.probes['bankHealth'],
     };
   });
@@ -79,6 +81,8 @@ test('PoC B: finding.created wakes RCA and the test designer without the lead; d
   assert.equal(a.acceptedNegative, 1);
   assert.ok(a.violated?.includes('C3'), `violated ${a.violated?.join(', ')}`);
   assert.ok(a.reportFindingEvidence.includes('api-response'), a.reportFindingEvidence.join(', '));
-  // ground truth: money is conserved (the defect is invisible to the total — only the contract test catches it)
-  assert.deepEqual(a.health, { status: 'ok', accounts: 2, total: 150, deposited: 150, balanceConserved: true });
+  assert.deepEqual(a.findingHttpEnvironments, ['bank@1']);
+  // ground truth: money is conserved (the defect is invisible to the total — only the contract test catches it). The
+  // executor opened alice (100) and bob (50); the regression test run opened two more accounts (10 each)
+  assert.deepEqual(a.health, { status: 'ok', accounts: 4, total: 170, deposited: 170, balanceConserved: true });
 });

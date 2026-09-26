@@ -66,13 +66,15 @@ export function createReportBuilder(deps: ControlDeps): ReportBuilder {
         }
       }
 
-      const recoveryEvents = await events.read(runId, { types: ['work.requeued', 'operation.reconciled'] });
+      const recoveryEvents = await events.read(runId, { types: ['work.requeued', 'operation.reconciled', 'run.recovered'] });
       const recovery = recoveryEvents.map((e) => {
         const p = (e.payload ?? {}) as Record<string, unknown>;
         const detail =
           e.eventType === 'work.requeued'
             ? `work item ${e.aggregateId} requeued (attempt ${String(p['attempts'] ?? '?')}, from ${String(p['from'] ?? '?')})`
-            : `operation ${e.aggregateId} reconciled: ${String(p['to'] ?? p['status'] ?? '')}`;
+            : e.eventType === 'run.recovered'
+              ? recoveredDetail(p)
+              : `operation ${e.aggregateId} reconciled: ${String(p['to'] ?? p['status'] ?? '')}`;
         return { at: e.occurredAt, detail };
       });
 
@@ -164,4 +166,32 @@ export function createReportBuilder(deps: ControlDeps): ReportBuilder {
       return { ...report, markdown: md.join('\n') + '\n', json };
     },
   };
+}
+
+/**
+ * One recovery pass (run.recovered) in words: what the restarted process reconciled, what it re-runs and why, and which
+ * waiting items it re-attached to their operations (never re-created).
+ */
+function recoveredDetail(p: Record<string, unknown>): string {
+  const arr = (v: unknown): Array<Record<string, unknown>> => (Array.isArray(v) ? v.filter((x): x is Record<string, unknown> => x !== null && typeof x === 'object') : []);
+  const ids = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
+  const ops = (p['operations'] ?? {}) as Record<string, unknown>;
+  const parts: string[] = [];
+  const examined = typeof ops['examined'] === 'number' ? ops['examined'] : 0;
+  if (examined > 0) {
+    const settled = ([['verified', 'verified'], ['notApplied', 'not applied'], ['manualReview', 'manual review'], ['stillPending', 'still pending']] as const)
+      .filter(([k]) => ids(ops[k]).length > 0)
+      .map(([k, label]) => `${label} ${ids(ops[k]).join(', ')}`);
+    parts.push(`reconciled ${examined} unsettled operation(s)${settled.length > 0 ? ` (${settled.join('; ')})` : ''} before any re-dispatch`);
+  }
+  if (typeof ops['compensated'] === 'number' && ops['compensated'] > 0) parts.push(`resumed ${ops['compensated']} interrupted compensation(s)`);
+  const requeued = arr(p['requeued']);
+  if (requeued.length > 0) {
+    parts.push(`re-runs ${requeued.map((r) => `${String(r['workItemId'])} (${String(r['role'] ?? '?')}, was ${String(r['from'] ?? '?')}, attempt ${String(r['attempts'] ?? '?')}${r['to'] === 'failed' ? ', failed: too many lost workers' : ''})`).join(', ')} — orphaned by the previous process`);
+  }
+  const reattached = arr(p['reattached']);
+  if (reattached.length > 0) {
+    parts.push(`re-attached ${reattached.map((r) => `${String(r['workItemId'])} (${String(r['role'] ?? '?')}) to ${ids(r['waitingOn']).join(', ') || 'its operations'}`).join(', ')} — still waiting, nothing re-created`);
+  }
+  return `recovery by ${String(p['workerId'] ?? 'unknown worker')}: ${parts.join('; ') || 'nothing to recover'}`;
 }

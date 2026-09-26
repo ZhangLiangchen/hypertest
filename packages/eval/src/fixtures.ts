@@ -6,17 +6,18 @@
  * - `startBankApi`      — PoC B: `fixtures/bank-api/server.js` as a child process on a free loopback port (hidden
  *   defect: negative transfer amounts are accepted and move money backwards).
  * - `startKvService`    — PoC C / recovery-chaos: `fixtures/kv-service/server.js` under the Hypertest process
- *   supervisor (restart through `env.restart`, operation records persisted in a state file).
+ *   supervisor running as its own process (restart through `env.restart`, operation records persisted in a state
+ *   file; the service's latency never depends on the harness's event loop).
  * - `readObservations`  — the scripted brains' observation log (what the "model" saw), JSON lines.
  */
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readdirSync, readFileSync } from 'node:fs';
 import { cp, mkdir, mkdtemp } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { HypertestError, sleep, type JsonValue } from '@hypertest/core';
-import { startProcessSupervisor, type ProcessSupervisor } from '@hypertest/tools';
+import { PROCESS_SUPERVISOR_CLI_PATH, type SupervisorOperation } from '@hypertest/tools';
 
 const exec = promisify(execFile);
 
@@ -151,20 +152,112 @@ export interface KvServiceOptions {
   warmupMs?: number;
   /** Upper bound of the random per-request latency (default 6 ms). */
   maxLatencyMs?: number;
+  /** How long to wait for the supervisor to report the service ready (default 20 000 ms). */
+  readyTimeoutMs?: number;
 }
 
-/** Starts kv-service under the process supervisor (operation records persisted: a restart is reconcilable by id). */
-export async function startKvService(options: KvServiceOptions): Promise<ProcessSupervisor> {
+/** kv-service under its own process supervisor (see startKvService). */
+export interface KvService {
+  /** Public URL (the supervisor's proxy): EnvironmentDescriptor.baseUrl. */
+  readonly url: string;
+  /** Control target WITH the control token (EnvironmentDescriptor.control.target, kind `process`). A secret. */
+  readonly controlUrl: string;
+  /** Control API base URL without the token (status and operation lookups). */
+  readonly controlBaseUrl: string;
+  /** Pid of the supervisor process. */
+  readonly pid: number;
+  /** The supervisor's current generation (1 = first start; +1 per restart): GET /__hypertest/status. */
+  generation(): Promise<number>;
+  /** The operation records the supervisor persisted (restarts per operation id): ground truth for side effects. */
+  operations(): SupervisorOperation[];
+  /** Stops the supervisor and the service (SIGTERM, SIGKILL after a grace period). Idempotent. */
+  close(): Promise<void>;
+}
+
+/**
+ * Starts kv-service under the Hypertest process supervisor running as ITS OWN PROCESS (`PROCESS_SUPERVISOR_CLI_PATH`):
+ * the supervisor proxies every request to the service, so hosting it in the harness process would make the service's
+ * latency depend on the event loop of the system under evaluation (an in-process trial runs Hypertest there). Its
+ * operation records are persisted in `<stateDir>/supervisor-state.json` (a restart is reconcilable by operation id).
+ */
+export async function startKvService(options: KvServiceOptions): Promise<KvService> {
   await mkdir(options.stateDir, { recursive: true });
-  return startProcessSupervisor({
-    command: [process.execPath, KV_SERVICE_SERVER],
-    cwd: options.stateDir,
-    inheritEnv: false,
-    env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin', KV_WARMUP_MS: String(options.warmupMs ?? 0), KV_MAX_LATENCY_MS: String(options.maxLatencyMs ?? 6) },
-    stateFile: join(options.stateDir, 'supervisor-state.json'),
-    logFile: join(options.stateDir, 'kv-service.log'),
-    readyTimeoutMs: 20_000,
-  });
+  const stateFile = join(options.stateDir, 'supervisor-state.json');
+  const args = [
+    '--no-warnings', PROCESS_SUPERVISOR_CLI_PATH, '--port', '0', '--cwd', options.stateDir, '--state-file', stateFile, '--log-file', join(options.stateDir, 'kv-service.log'),
+    '--env', `KV_WARMUP_MS=${options.warmupMs ?? 0}`, '--env', `KV_MAX_LATENCY_MS=${options.maxLatencyMs ?? 6}`, '--', process.execPath, KV_SERVICE_SERVER,
+  ];
+  const errFd = openSync(join(options.stateDir, 'supervisor.err'), 'a');
+  let child: ChildProcess;
+  try {
+    // a scrubbed environment: the service inherits nothing of the harness but PATH
+    child = spawn(process.execPath, args, { stdio: ['ignore', 'pipe', errFd], env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin' } });
+  } finally {
+    closeSync(errFd);
+  }
+  let info: { url: string; controlUrl: string; controlBaseUrl: string; childPid: number | null };
+  try {
+    info = await new Promise((resolve, reject) => {
+      let buf = '';
+      const timer = setTimeout(() => reject(new HypertestError('timeout', 'kv-service supervisor did not report ready in time')), options.readyTimeoutMs ?? 20_000);
+      child.stdout!.on('data', (d: Buffer) => {
+        buf += d.toString('utf8');
+        const nl = buf.indexOf('\n');
+        if (nl < 0) return;
+        clearTimeout(timer);
+        try {
+          resolve(JSON.parse(buf.slice(0, nl)) as typeof info);
+        } catch (e) {
+          reject(e as Error);
+        }
+      });
+      child.once('exit', (code) => {
+        clearTimeout(timer);
+        reject(new HypertestError('unavailable', `kv-service supervisor exited before it was ready (code ${String(code)}; see ${join(options.stateDir, 'supervisor.err')})`));
+      });
+    });
+  } catch (e) {
+    await stopChild(child, 5000);
+    throw e;
+  }
+  child.stdout!.resume();
+  const status = async (): Promise<{ generation: number; childPid: number | null }> => {
+    const res = await fetch(`${info.controlBaseUrl}/status`, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) throw new HypertestError('unavailable', `kv-service supervisor status answered ${res.status}`);
+    return (await res.json()) as { generation: number; childPid: number | null };
+  };
+  let closing: Promise<void> | undefined;
+  return {
+    url: info.url,
+    controlUrl: info.controlUrl,
+    controlBaseUrl: info.controlBaseUrl,
+    pid: child.pid!,
+    generation: async () => (await status()).generation,
+    operations() {
+      try {
+        return (JSON.parse(readFileSync(stateFile, 'utf8')) as { operations?: SupervisorOperation[] }).operations ?? [];
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === 'ENOENT') return [];
+        throw e;
+      }
+    },
+    close() {
+      closing ??= (async () => {
+        // the CURRENT service pid (a restart replaces it), for the case the supervisor cannot stop it itself
+        const servicePid = child.exitCode === null && child.signalCode === null ? await status().then((s) => s.childPid, () => info.childPid) : null;
+        // SIGTERM: the supervisor stops the service (its own grace period) and exits
+        await stopChild(child, 8000);
+        if (child.signalCode === 'SIGKILL' && servicePid !== null) {
+          try {
+            process.kill(-servicePid, 'SIGKILL'); // the service leads its own process group (detached)
+          } catch {
+            // already gone
+          }
+        }
+      })();
+      return closing;
+    },
+  };
 }
 
 /** Load job directories created under a Hypertest state dir (`<stateDir>/loadjobs/<operationId>`), with their worker pid. */
@@ -191,10 +284,37 @@ export function loadJobs(stateDir: string): Array<{ operationId: string; pid?: n
     });
 }
 
-/** Kills load workers still running under a state dir (fixture cleanup: nothing outlives a trial). */
+/**
+ * Whether `pid` is (still) the worker of the load job `operationId`: a live process whose argv carries the job
+ * directory (`…/loadjobs/<operationId>`, as the load adapter launches it). A recorded pid outlives its worker — the
+ * worker exits by itself when the job finishes — and the kernel reuses pids (pid_max is often 32768), so a bare
+ * `kill(pid)` could hit an unrelated process. Without /proc (non-Linux) the pid is trusted only while the job has not
+ * reported a terminal state.
+ */
+export function isLoadWorker(pid: number, job: { operationId: string; state?: string }): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'EPERM') return false;
+  }
+  let cmdline: string;
+  try {
+    cmdline = readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+  } catch {
+    return job.state === undefined || job.state === 'starting' || job.state === 'running';
+  }
+  const marker = `${sep}${join('loadjobs', job.operationId)}`;
+  return cmdline.split('\0').some((arg) => arg.endsWith(marker));
+}
+
+/**
+ * Kills the load workers still running under a state dir (fixture cleanup: nothing outlives a trial). Only a pid that
+ * still belongs to its job's worker is signalled (see isLoadWorker): never a process that reused a recorded pid.
+ */
 export async function killLoadWorkers(stateDir: string): Promise<void> {
   for (const job of loadJobs(stateDir)) {
-    if (job.pid === undefined) continue;
+    if (job.pid === undefined || !isLoadWorker(job.pid, job)) continue;
     try {
       process.kill(job.pid, 'SIGKILL');
     } catch {
@@ -223,6 +343,8 @@ export interface BrainObservation {
   sawLeadTrace: boolean;
   /** Free-form tag set by the brain (e.g. `after_large_output`). */
   tag?: string;
+  /** (additive) Tool names offered to the model on this call (wire names, sorted): what the agent could do at all. */
+  offeredTools?: string[];
 }
 
 /** Reads the brains' observation log (JSON lines; a missing file is an empty log). */

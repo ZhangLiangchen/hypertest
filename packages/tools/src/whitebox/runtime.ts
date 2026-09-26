@@ -1,5 +1,5 @@
 import { HypertestError, abortReason, compileSchema, throwIfAborted, withTimeout, type JsonValue } from '@hypertest/core';
-import { EFFECT_ORDER, EVENT_TYPES, RISK_ORDER, eventFrom, type ArtifactRef, type EventContext, type EvidenceRecord, type Provenance, type ResourceRef, type RiskClass, type ToolEffect } from '@hypertest/domain';
+import { EFFECT_ORDER, EVENT_TYPES, RISK_ORDER, eventFrom, type ArtifactRef, type EnvironmentRef, type EventContext, type EvidenceRecord, type Provenance, type ResourceRef, type RiskClass, type ToolEffect } from '@hypertest/domain';
 import { recordEvidence, type RecordEvidenceInput } from '@hypertest/evidence';
 import type { SideEffectGateway, SideEffectOutcome } from '@hypertest/operation';
 import { capabilityAllows, matchesResourcePattern, verifyCapability, type ActionPermit, type ActionRequest } from '@hypertest/policy';
@@ -316,27 +316,48 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
         if (outside.length > 0) return deny('denied', 'permission_denied', `permit_constraint_violated: resources outside allowedPaths: ${outside.join(', ')}`, permit);
       }
 
-      // 6 freshness for mutating effects — fail closed: a configured guard with no snapshot cannot vouch for the action
-      if (!EFFECTS_WITHOUT_FRESHNESS.has(effect) && deps.freshness && !request.snapshot) {
-        return deny('stale_context', 'stale_context', 'no context snapshot supplied for a mutating action; freshness cannot be validated', permit, 'The runtime must execute mutating tools against the current turn snapshot.');
-      }
-      if (!EFFECTS_WITHOUT_FRESHNESS.has(effect) && deps.freshness && request.snapshot) {
-        let fresh: Awaited<ReturnType<NonNullable<ToolRuntimeDeps['freshness']>['validate']>>;
-        try {
-          fresh = await deps.freshness.validate(request.snapshot, { tool: spec.id, resources, mutating: true }, evCtx);
-        } catch (e) {
-          logger.error('freshness validation failed; not executing', { error: (e as Error).message });
-          return deny('stale_context', 'stale_context', `freshness could not be validated: ${(e as Error).message}`, permit);
+      // 6 freshness for mutating effects — fail closed: a configured guard with no snapshot cannot vouch for the action.
+      //   Exception: the REPLAY of a side-effect call that was already dispatched (the same invocation: a durable retry of
+      //   a committed turn, e.g. after a crash) on a snapshot that is stale by now. Its act happened (or may have) under
+      //   the snapshot validated when it was dispatched — the recovery's own reconciliation may even have moved the
+      //   environment on since. Refusing it would hide the recorded outcome and invite the model to re-issue the act (a
+      //   second operation, a duplicate side effect: §4.4, I4). It only SETTLES that operation: reconcile-only, never
+      //   dispatched again (a re-dispatch would be a new decision on a stale view).
+      let replayOf: string | undefined;
+      if (!EFFECTS_WITHOUT_FRESHNESS.has(effect) && deps.freshness) {
+        let staleText: string | undefined;
+        if (!request.snapshot) staleText = 'no context snapshot supplied for a mutating action; freshness cannot be validated';
+        else {
+          let fresh: Awaited<ReturnType<NonNullable<ToolRuntimeDeps['freshness']>['validate']>>;
+          try {
+            fresh = await deps.freshness.validate(request.snapshot, { tool: spec.id, resources, mutating: true }, evCtx);
+          } catch (e) {
+            logger.error('freshness validation failed; not executing', { error: (e as Error).message });
+            return deny('stale_context', 'stale_context', `freshness could not be validated: ${(e as Error).message}`, permit);
+          }
+          if (!fresh.fresh) staleText = `stale context (snapshot ${request.snapshot.snapshotId}): ${fresh.stale.map((s) => `${s.resourceType}/${s.resourceId}: ${s.reason}`).join('; ')}`;
         }
-        if (!fresh.fresh) {
-          const list = fresh.stale.map((s) => `${s.resourceType}/${s.resourceId}: ${s.reason}`).join('; ');
-          return deny('stale_context', 'stale_context', `stale context (snapshot ${request.snapshot.snapshotId}): ${list}`, permit, 'Refresh your view of these resources (new context snapshot) before retrying the mutating action.');
+        if (staleText !== undefined && spec.sideEffect && deps.sideEffects?.find) {
+          try {
+            const prior = await deps.sideEffects.find(request.invocationId, spec.sideEffect.operationType, request.runId);
+            if (prior && prior.status !== 'prepared' && prior.status !== 'not_applied') replayOf = prior.operationId;
+          } catch (e) {
+            logger.warn('operation lookup failed; the stale call is refused', { invocationId: request.invocationId, error: (e as Error).message });
+          }
+        }
+        if (staleText !== undefined && replayOf === undefined) {
+          return request.snapshot
+            ? deny('stale_context', 'stale_context', staleText, permit, 'Refresh your view of these resources (new context snapshot) before retrying the mutating action.')
+            : deny('stale_context', 'stale_context', staleText, permit, 'The runtime must execute mutating tools against the current turn snapshot.');
         }
       }
 
       // 7 tool.called (audit before any effect)
       try {
-        await emit(EVENT_TYPES.toolCalled, { toolId: spec.id, invocationId: request.invocationId, effect, riskClass, resources, permitDecisionId: permit.decisionId });
+        const called: Record<string, JsonValue> = { toolId: spec.id, invocationId: request.invocationId, effect, riskClass, resources, permitDecisionId: permit.decisionId };
+        // (audit) a stale replay: this call only settles the operation it dispatched before (reconcile-only)
+        if (replayOf !== undefined) called['replayOfOperation'] = replayOf;
+        await emit(EVENT_TYPES.toolCalled, called);
       } catch (e) {
         logger.error('tool.called could not be emitted; not executing', { error: (e as Error).message });
         return finish({ status: 'failed', error: { code: 'unavailable', message: `audit event could not be written: ${(e as Error).message}` }, artifactRefs: [], evidenceRefs: [] }, '[failed] unavailable: audit event could not be written; the tool was not executed', permit);
@@ -362,6 +383,8 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
           provenance,
         };
         if (inp.structured !== undefined) evInput.structured = inp.structured;
+        const environment = inp.environment ?? addressedEnvironment(input, deps.environments);
+        if (environment !== undefined) evInput.environment = environment;
         if (inp.operationId !== undefined) evInput.operationId = inp.operationId;
         if (inp.parentEvidenceIds !== undefined) evInput.parentEvidenceIds = inp.parentEvidenceIds;
         const eventContext: Partial<Omit<EventContext, 'runId'>> = { correlationId: evCtx.correlationId, actorId: evCtx.actorId, workItemId: request.workItemId, agentId: request.agentId };
@@ -401,6 +424,8 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
                 lease: { resourceKey: target.resourceKey, ttlMs: binding.leaseTtlMs ?? Math.max(spec.timeoutMs, 60_000), owner: request.agentId },
                 ctx: evCtx,
                 signal,
+                // a replay settles its operation; a (re-)dispatch would be a new decision on a snapshot nobody validated
+                ...(replayOf !== undefined ? { reconcileOnly: true } : {}),
               }),
             timeoutMs,
             request.signal,
@@ -536,4 +561,18 @@ function applySideEffectOutcome(stage: Stage, outcome: SideEffectOutcome): void 
       stage.error = { code: outcome.status, message: outcome.reason };
       stage.structured = { operationId: outcome.operation.operationId, operationStatus: outcome.operation.status };
   }
+}
+
+/**
+ * The environment a tool input addresses (`environmentId` of a registered environment) as an evidence EnvironmentRef,
+ * at its generation now (the generation the tool executed against).
+ */
+function addressedEnvironment(input: unknown, environments: ToolRuntimeDeps['environments']): EnvironmentRef | undefined {
+  const id = input !== null && typeof input === 'object' ? (input as { environmentId?: unknown }).environmentId : undefined;
+  if (typeof id !== 'string' || !environments) return undefined;
+  const env = environments.get(id);
+  if (!env) return undefined;
+  const ref: EnvironmentRef = { environmentId: env.environmentId, environmentClass: env.environmentClass, generation: env.generation };
+  if (env.buildDigest !== undefined) ref.buildDigest = env.buildDigest;
+  return ref;
 }

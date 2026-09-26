@@ -10,7 +10,7 @@ import type { OperationRecord } from '@hypertest/domain';
 import type { OperationContext } from '@hypertest/operation';
 import {
   CONTROL_TOKEN_HEADER, EnvControlAdapter, ProcessEnvAdapter, blackboxTools, builtinSideEffectAdapters, createEnvironmentRegistry, envDeployTool, envRestartTool, httpRequestTool, loadStartTool,
-  startProcessSupervisor, type EnvInput, type ProcessSupervisor, type ToolSpec,
+  PROCESS_SUPERVISOR_CLI_PATH, startProcessSupervisor, type EnvInput, type ProcessSupervisor, type SupervisorOperation, type ToolSpec,
 } from '../src/index.ts';
 import { CrashAfterDispatch, fakeContext, newGateway, newRuntime, nextInvocationId, openBlackboxEnv, sideEffectRequest, structuredOf, tempDir, toolRequest, waitFor, type BlackboxEnv } from './blackbox-helpers.ts';
 
@@ -154,6 +154,32 @@ test('CRASH/RECONCILE env.process: a restart whose receipt was lost is found by 
   assert.equal(env.environments.get('env_proc')!.generation, envGen + 1, 'generation bumped once');
 });
 
+test('CRASH between the generation bump and the ledger\'s verified: the resumed process re-verifies with a FRESH adapter and gets the recorded bump — one restart, one generation', async () => {
+  // verify() bumps (and a persistent registry writes the bump) BEFORE the gateway records `verified`: a process killed in
+  // between leaves the operation unsettled, and the reconciliation re-verifies it in a new process (new adapter, no
+  // in-process memory of the bump). The registry remembers the bump by operation id, so it is not counted twice.
+  const g = newGateway(env, [new EnvControlAdapter({ environments: env.environments, backends: { process: new ProcessEnvAdapter({ environments: env.environments }) } })]);
+  const envGen = env.environments.get('env_proc')!.generation;
+  const out = await g.gateway.run(sideEffectRequest(envRestartTool() as ToolSpec, { environmentId: 'env_proc', reason: 'bump once' }, env.environments, nextInvocationId()));
+  assert.equal(out.status, 'verified');
+  assert.equal(env.environments.get('env_proc')!.generation, envGen + 1);
+  const record = (await getJson(`${sup.controlBaseUrl}/operations/${out.operation.operationId}`)).body as SupervisorOperation;
+  const ctx: OperationContext = { operation: out.operation, signal: new AbortController().signal };
+  const resumed = new ProcessEnvAdapter({ environments: env.environments });
+  const again = await resumed.verify(record, out.operation.desiredStateHash, ctx);
+  assert.equal(again.status, 'verified');
+  assert.equal((again as { result: { generation: number } }).result.generation, envGen + 1, 'the recorded bump is returned');
+  assert.equal(env.environments.get('env_proc')!.generation, envGen + 1, 'the same restart is never counted twice');
+  // the registry refuses to attribute one operation's bump to another environment
+  env.environments.register({ environmentId: 'env_other_bump', environmentClass: 'local', generation: 1 });
+  assert.throws(() => env.environments.bumpGeneration('env_other_bump', undefined, out.operation.operationId), (e: unknown) => isHypertestError(e, 'conflict'));
+  assert.equal(env.environments.get('env_other_bump')!.generation, 1);
+  // another operation (and an anonymous bump) still moves the generation forward
+  assert.equal(env.environments.bumpGeneration('env_proc', undefined, 'op_other_restart').generation, envGen + 2);
+  assert.equal(env.environments.bumpGeneration('env_proc').generation, envGen + 3);
+  assert.equal(env.environments.bumpGeneration('env_proc').generation, envGen + 4);
+});
+
 test('env.deploy: critical risk needs approval through the runtime; the verified deploy sets BUILD_REF and bumps buildDigest', async () => {
   const d = await tempDir('ht-bb-sup-deploy-');
   try {
@@ -228,6 +254,7 @@ test('env.inject_fault: error_rate and latency are injected by the supervisor pr
 
 test('process-supervisor-cli runs the supervisor as its own process (outlives its launcher) and stops the child on SIGTERM', async () => {
   const cli = fileURLToPath(new URL('../src/blackbox/process-supervisor-cli.ts', import.meta.url));
+  assert.equal(PROCESS_SUPERVISOR_CLI_PATH, cli, 'the exported CLI path is the CLI module');
   const proc = spawn(process.execPath, ['--no-warnings', cli, '--port', '0', '--allow-env', 'BUILD_REF', '--control-token', 'cli-fixed-token-0123456789', '--', process.execPath, childScript], { stdio: ['ignore', 'pipe', 'pipe'] });
   const exited = once(proc, 'exit');
   const line = await new Promise<string>((resolve, reject) => {

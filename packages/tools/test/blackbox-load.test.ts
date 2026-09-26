@@ -5,6 +5,7 @@ import { once } from 'node:events';
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { join, relative } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { isHypertestError } from '@hypertest/core';
 import type { OperationRecord } from '@hypertest/domain';
 import type { OperationContext } from '@hypertest/operation';
@@ -81,6 +82,37 @@ test('load results report the error rate over completed requests (non-2xx respon
   assert.equal(s['results']['errors'], 5);
   assert.equal(s['results']['errorRate'], 1);
   assert.deepEqual(s['results']['statusCodes'], { '500': 5 });
+});
+
+test('the results evidence records the environment the job MEASURED (its generation at launch), even when load.observe runs after a restart', async () => {
+  // load.observe addresses an operation, not an environment: without the job's environment the SLO numbers would have
+  // no provenance anchor (L5 gap: "records neither an environment nor a commit")
+  const dir = await stateDir();
+  const { gateway } = newGateway(env, builtinSideEffectAdapters({ stateDir: dir, environments: env.environments }));
+  const runtime = newRuntime(env, blackboxTools({ stateDir: dir }), gateway);
+  const launchGeneration = env.environments.get('env_load')!.generation;
+  const start = await runtime.execute(toolRequest('load.start', baseInput('/hit-env', { ratePerSecond: 10, durationMs: 300 })));
+  assert.equal(start.status, 'pending', start.modelText);
+  await trackPid(dir, start.operationId!);
+  const spec = JSON.parse(await readFile(join(loadJobDir(dir, start.operationId!), 'spec.json'), 'utf8')) as Record<string, unknown>;
+  assert.deepEqual([spec['environmentId'], spec['environmentClass'], spec['environmentGeneration']], ['env_load', 'local', launchGeneration]);
+  env.environments.bumpGeneration('env_load'); // e.g. an env.restart after the job ran
+  const done = await waitFor(async () => {
+    const r = await runtime.execute(toolRequest('load.observe', { operationId: start.operationId! }));
+    return r.status === 'success' ? r : undefined;
+  }, 15_000, 100, 'load job verification');
+  const ev = (await env.evidence.get(structuredOf(done)['evidenceId']))!;
+  assert.equal(ev.evidenceType, 'metric');
+  assert.deepEqual(ev.environment, { environmentId: 'env_load', environmentClass: 'local', generation: launchGeneration });
+  // a job against a bare URL names no registered environment: no environment is invented
+  const bare = await runtime.execute(toolRequest('load.start', { targetUrl: `${target.url}/hit-bare`, method: 'GET', ratePerSecond: 10, durationMs: 200, concurrency: 2 }));
+  assert.equal(bare.status, 'pending', bare.modelText);
+  await trackPid(dir, bare.operationId!);
+  const bareDone = await waitFor(async () => {
+    const r = await runtime.execute(toolRequest('load.observe', { operationId: bare.operationId! }));
+    return r.status === 'success' ? r : undefined;
+  }, 15_000, 100, 'bare load job verification');
+  assert.equal((await env.evidence.get(structuredOf(bareDone)['evidenceId']))!.environment, undefined);
 });
 
 test('load.start → pending → load.observe → verified results (20 rps × 1 s) through the ToolRuntime, with metric evidence recorded once', async () => {
@@ -442,6 +474,33 @@ test('a stop requested before the worker started wins: the worker exits as stopp
   assert.equal(results.sent, 0);
   assert.equal((results as { errorRate?: unknown }).errorRate, null, 'no completed request: the error rate is unknown, never 0');
   assert.equal(hitsFor('op_prestop1'), 0);
+});
+
+test("the worker's own HTTP client start-up is never charged to the target: the schedule starts once the client is warm, and the warm-up sends nothing", async () => {
+  // Node's fetch initializes its client lazily on the first call (tens of ms, far more on a loaded host). Latency is
+  // measured from each request's scheduled time, so a schedule that started before the client was usable charged that
+  // start-up to the target: the first requests' latency — the p99 of a short job — was the generator's, not the SUT's.
+  // The preload makes the first fetch call of the process (whatever its URL) take 400 ms.
+  const dir = await stateDir();
+  const preload = join(dir, 'slow-first-fetch.mjs');
+  await writeFile(preload, [
+    'const real = globalThis.fetch;',
+    'let first = true;',
+    'globalThis.fetch = async (...args) => {',
+    '  if (first) { first = false; await new Promise((r) => setTimeout(r, 400)); }',
+    '  return real(...args);',
+    '};',
+  ].join('\n'));
+  const jobDir = loadJobDir(dir, 'op_warmup1');
+  await mkdir(jobDir, { recursive: true });
+  await writeFile(join(jobDir, 'spec.json'), JSON.stringify({ operationId: 'op_warmup1', targetUrl: `${target.url}/hit-warmup`, method: 'GET', ratePerSecond: 10, durationMs: 300, concurrency: 4, timeoutMs: 5000 }));
+  const worker = spawn(process.execPath, ['--no-warnings', '--import', pathToFileURL(preload).href, LOADGEN_WORKER_PATH, jobDir], { cwd: jobDir, stdio: 'ignore' });
+  const [code] = await once(worker, 'exit');
+  assert.equal(code, 0);
+  const results = JSON.parse(await readFile(join(jobDir, 'results.json'), 'utf8')) as { state: string; sent: number; ok: number; latencyMs: { max: number } };
+  assert.deepEqual([results.state, results.sent, results.ok], ['completed', 3, 3]);
+  assert.ok(results.latencyMs.max < 400, `the client start-up (400 ms) was charged to the target: max latency ${results.latencyMs.max} ms`);
+  assert.equal(hitsFor('op_warmup1'), 3, 'the warm-up never reaches the target');
 });
 
 test('CRASH during load.stop after the stop marker, before the signal: the worker honours the marker; reconciliation attaches (no re-dispatch)', async () => {

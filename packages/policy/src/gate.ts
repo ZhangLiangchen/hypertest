@@ -144,12 +144,26 @@ function buildKey(e: EvidenceRecord): string {
   return e.environment?.buildDigest ?? e.provenance.commit ?? '';
 }
 
-/** Restricts evidence to the build of the most recent record (by ledger seq). */
+/**
+ * Restricts evidence to the build of the most recent record (by ledger seq). A record without a build identity (no
+ * build digest, no commit: e.g. a request to a URL that names no registered environment) cannot say which build it is
+ * about: it belongs to the build that was current when it was recorded (that of the latest identified record before
+ * it). So it never becomes "the latest build" on its own and hides the failures recorded on the current build — it is
+ * judged with them; evidence recorded before any identified build belongs to none (''). Without identified evidence,
+ * everything is judged.
+ */
 function latestBuild(evs: readonly EvidenceRecord[]): EvidenceRecord[] {
   if (evs.length === 0) return [];
+  const attributed = new Map<EvidenceRecord, string>();
+  let current = '';
+  for (const e of [...evs].sort((a, b) => a.seq - b.seq)) {
+    const own = buildKey(e);
+    if (own !== '') current = own;
+    attributed.set(e, own !== '' ? own : current);
+  }
   const newest = evs.reduce((m, e) => (e.seq > m.seq ? e : m));
-  const key = buildKey(newest);
-  return evs.filter((e) => buildKey(e) === key);
+  const key = attributed.get(newest)!;
+  return evs.filter((e) => attributed.get(e) === key);
 }
 
 function metricValue(structured: JsonValue | undefined, metric: string, aggregation: string | undefined): JsonValue | undefined {

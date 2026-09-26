@@ -75,6 +75,15 @@ export function createWorkspaceManager(deps: WorkspaceDeps): WorkspaceManager {
     });
     return next;
   }
+  /**
+   * `git worktree` administration (prune / add / remove) of ONE repository is serialized in-process: parallel work
+   * items create their worktrees of the same repository at the same moment, and one creator's `worktree prune` would
+   * delete another's half-created administrative directory (`.git/worktrees/<id>` before its `gitdir` exists), failing
+   * that `worktree add` — and the agent's spawn. Disposal (remove + prune) races the same way.
+   */
+  function gitAdmin<T>(repo: string, fn: () => Promise<T>): Promise<T> {
+    return serialized(`git-admin:${repo}`, fn);
+  }
 
   async function makeHandle(input: Omit<WorkspaceHandle, 'workspaceId' | 'resourcePrefix' | 'sandbox' | 'tempDir'>, slotKey: string, runId: string): Promise<WorkspaceHandle> {
     const workspaceId = workspaceIdFor(slotKey);
@@ -162,13 +171,15 @@ export function createWorkspaceManager(deps: WorkspaceDeps): WorkspaceManager {
     const slot = join(runDir(runId), 'shared', sha.slice(0, 12));
     const existing = await validWorktreeAt(slot, repo);
     if (existing !== sha) {
-      if (await isDir(slot)) {
-        await gitRun(repo, ['worktree', 'remove', '--force', slot], { check: false });
-        await rm(slot, { recursive: true, force: true });
-      }
-      await gitRun(repo, ['worktree', 'prune']);
-      await mkdir(join(runDir(runId), 'shared'), { recursive: true });
-      await gitRun(repo, ['worktree', 'add', '--detach', slot, sha]);
+      await gitAdmin(repo, async () => {
+        if (await isDir(slot)) {
+          await gitRun(repo, ['worktree', 'remove', '--force', slot], { check: false });
+          await rm(slot, { recursive: true, force: true });
+        }
+        await gitRun(repo, ['worktree', 'prune']);
+        await mkdir(join(runDir(runId), 'shared'), { recursive: true });
+        await gitRun(repo, ['worktree', 'add', '--detach', slot, sha]);
+      });
     }
     const root = await realpath(slot);
     const handle = await makeHandle({ kind: 'shared_readonly', root, readOnly: true, baseCommit: sha }, slot, runId);
@@ -202,17 +213,22 @@ export function createWorkspaceManager(deps: WorkspaceDeps): WorkspaceManager {
       await mkdir(join(runDir(runId), 'meta'), { recursive: true });
       // written BEFORE `worktree add`: its presence means the branch is ours (reattach never resets it)
       await writeFile(metaPath, JSON.stringify(meta));
-      await gitRun(repo, ['worktree', 'prune']);
-      if (await isDir(slot)) await rm(slot, { recursive: true, force: true });
-      await mkdir(join(runDir(runId), 'wt'), { recursive: true });
-      await gitRun(repo, ['worktree', 'add', '-B', branch, slot, sha]);
+      await gitAdmin(repo, async () => {
+        await gitRun(repo, ['worktree', 'prune']);
+        if (await isDir(slot)) await rm(slot, { recursive: true, force: true });
+        await mkdir(join(runDir(runId), 'wt'), { recursive: true });
+        await gitRun(repo, ['worktree', 'add', '-B', branch, slot, sha]);
+      });
     } else if ((await validWorktreeAt(slot, repo)) === undefined) {
-      await gitRun(repo, ['worktree', 'prune']);
-      if (await isDir(slot)) await rm(slot, { recursive: true, force: true });
-      await mkdir(join(runDir(runId), 'wt'), { recursive: true });
-      const hasBranch = await gitRun(repo, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], { check: false });
-      if (hasBranch.code === 0) await gitRun(repo, ['worktree', 'add', slot, branch]);
-      else await gitRun(repo, ['worktree', 'add', '-B', branch, slot, meta.baseCommit]);
+      const recorded = meta;
+      await gitAdmin(repo, async () => {
+        await gitRun(repo, ['worktree', 'prune']);
+        if (await isDir(slot)) await rm(slot, { recursive: true, force: true });
+        await mkdir(join(runDir(runId), 'wt'), { recursive: true });
+        const hasBranch = await gitRun(repo, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], { check: false });
+        if (hasBranch.code === 0) await gitRun(repo, ['worktree', 'add', slot, branch]);
+        else await gitRun(repo, ['worktree', 'add', '-B', branch, slot, recorded.baseCommit]);
+      });
       logger.info('workspace worktree re-created', { slot, branch });
     }
     const root = await realpath(slot);
@@ -267,9 +283,12 @@ export function createWorkspaceManager(deps: WorkspaceDeps): WorkspaceManager {
       if (!e) return;
       entries.delete(workspaceId);
       if (e.ownsWorktree && e.repoPath) {
-        await gitRun(e.repoPath, ['worktree', 'remove', '--force', e.slot], { check: false });
-        await rm(e.slot, { recursive: true, force: true });
-        await gitRun(e.repoPath, ['worktree', 'prune'], { check: false });
+        const repo = e.repoPath;
+        await gitAdmin(repo, async () => {
+          await gitRun(repo, ['worktree', 'remove', '--force', e.slot], { check: false });
+          await rm(e.slot, { recursive: true, force: true });
+          await gitRun(repo, ['worktree', 'prune'], { check: false });
+        });
       } else if (e.handle.kind === 'scratch') {
         await rm(e.slot, { recursive: true, force: true });
       }

@@ -1,5 +1,5 @@
 import { canonicalJson, isValidSchema, validateJson, type JsonSchema, type JsonValue } from '@hypertest/core';
-import { WORK_COMPLETION_SCHEMA, workItemFingerprint, type Ref } from '@hypertest/domain';
+import { WORK_COMPLETION_SCHEMA, workItemFingerprint, type ActorRef, type Ref } from '@hypertest/domain';
 import type { NewWorkItem } from '@hypertest/collab';
 import type { ToolSpec } from '@hypertest/tools';
 import type { ApprovalRequest } from '@hypertest/policy';
@@ -137,10 +137,11 @@ export function workTools(deps: ControlDeps): ToolSpec[] {
             a.kind === input.kind && a.requestedBy.id === ctx.agentId && a.rationale === input.rationale && canonicalJson(a.subject as JsonValue) === canonicalJson(input.subject),
         );
         if (pending) return success({ approvalId: pending.approvalId, status: pending.status, deduplicated: true });
-        const approval = await approvals.request(
-          { runId: ctx.runId, kind: input.kind, subject: input.subject, requestedBy: { kind: 'agent', id: ctx.agentId, role: ctx.role }, rationale: input.rationale },
-          ctx.eventContext,
-        );
+        // the requester with its current model provider: an agent approver must be independent of it (I8)
+        const epoch = await new Caller(deps, ctx).epoch();
+        const requestedBy: ActorRef = { kind: 'agent', id: ctx.agentId, role: ctx.role };
+        if (epoch.provider !== undefined) requestedBy.modelProvider = epoch.provider;
+        const approval = await approvals.request({ runId: ctx.runId, kind: input.kind, subject: input.subject, requestedBy, rationale: input.rationale }, ctx.eventContext);
         return success({ approvalId: approval.approvalId, status: approval.status });
       },
     }),

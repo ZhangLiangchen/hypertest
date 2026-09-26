@@ -151,6 +151,7 @@ function validateRequest(req: RunSideEffectRequest<unknown>): void {
   if (req.dispatchTimeoutMs !== undefined && (!Number.isFinite(req.dispatchTimeoutMs) || req.dispatchTimeoutMs <= 0)) {
     throw new HypertestError('invalid_argument', 'dispatchTimeoutMs must be positive');
   }
+  if (req.reconcileOnly !== undefined && typeof req.reconcileOnly !== 'boolean') throw new HypertestError('invalid_argument', 'reconcileOnly must be a boolean');
 }
 
 function validatePrepared(prepared: PreparedOperation, adapterId: string): void {
@@ -226,7 +227,8 @@ class SideEffectEngine {
     }
     // Single-flight (process-wide per ledger): concurrent duplicate deliveries of one tool invocation
     // share one drive. A request that differs in run/adapter/input is not joined; #run rejects it.
-    const key = [req.toolInvocationId, req.operationType, req.runId, req.adapterId, inputHash].join('\u0000');
+    // a reconcile-only call never joins (nor lends its no-dispatch outcome to) a drive that may dispatch
+    const key = [req.toolInvocationId, req.operationType, req.runId, req.adapterId, inputHash, req.reconcileOnly === true ? 'reconcile-only' : 'run'].join('\u0000');
     const existing = this.#flights.get(key);
     if (existing) return existing;
     const flight = this.#run(req as RunSideEffectRequest<unknown>, adapter, inputHash).finally(() => this.#flights.delete(key));
@@ -241,6 +243,11 @@ class SideEffectEngine {
       this.#assertSameRequest(op, req, inputHash);
       // verified ⇒ recorded result; failed/manual_review/compensation states ⇒ recorded outcome. Never re-dispatch.
       if (!WORK_STATUSES.has(op.status)) return outcomeForOperation(op);
+    }
+    if (req.reconcileOnly) {
+      // settle what exists; a dispatch would be a new decision (see RunSideEffectRequest.reconcileOnly)
+      if (!op) throw new HypertestError('not_found', `no operation is recorded for tool invocation ${req.toolInvocationId} (${req.operationType}): nothing to reconcile, and a reconcile-only call never dispatches`);
+      if (op.status === 'prepared' || op.status === 'not_applied') return { status: 'not_applied', operation: op, reason: `dispatch_refused: operation ${op.operationId} is ${op.status}; a (re-)dispatch needs a fresh decision` };
     }
 
     let lease: ResourceLease | undefined;
@@ -309,7 +316,8 @@ class SideEffectEngine {
       signal: req.signal,
       input: { value: req.input },
       verifyWithinMs: req.verifyWithinMs ?? 0,
-      redispatchesLeft: 1,
+      // reconcile-only: an operation found absent ends not_applied (never re-dispatched)
+      redispatchesLeft: req.reconcileOnly ? 0 : 1,
     };
     const fence = lease ? toLeaseRef(lease) : op.lease;
     if (fence) flow.fence = fence;
@@ -801,6 +809,11 @@ export function createSideEffectGateway(deps: GatewayDeps): SideEffectGateway {
     run: (request) => engine.run(request),
     observe: (operationId, ctx, signal) => engine.observe(operationId, ctx, signal),
     compensate: (operationId, ctx, signal) => engine.compensate(operationId, ctx, signal),
+    async find(toolInvocationId, operationType, runId) {
+      const op = await deps.ledger.findByToolInvocation(toolInvocationId, operationType);
+      // run-scoped like every other gateway call
+      return op && op.runId === runId ? op : undefined;
+    },
   };
 }
 

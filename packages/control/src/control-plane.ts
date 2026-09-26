@@ -1,6 +1,6 @@
 import { HypertestError, isHypertestError, type BaseDeps, type Subscription } from '@hypertest/core';
 import {
-  DEFAULT_BUDGET, isTerminalWorkState, workItemFingerprint,
+  DEFAULT_BUDGET, EVENT_TYPES, isTerminalWorkState, workItemFingerprint,
   type BudgetEnvelope, type EventContext, type GateSpec, type TestRun, type WorkItem,
 } from '@hypertest/domain';
 import { DEFAULT_GATE_SPEC } from '@hypertest/policy';
@@ -364,10 +364,23 @@ export function createControlPlane(deps: ControlDeps): ControlPlaneInternals {
       // 3 orphaned work: requeue claimed/running items not leased by this worker (or leased by a previous process of
       //   this worker: nobody holds their fencing token any more); waiting items keep waiting under a fresh claim
       const requeued: string[] = [];
+      // (audit) what this pass recovered: re-run items and waiting items re-attached to their operations (run.recovered)
+      const requeuedAudit: Array<Record<string, unknown>> = [];
+      const reattached: Array<Record<string, unknown>> = [];
       for (const w of await blackboard.listWorkItems({ runId, states: ['claimed', 'running', 'waiting'] })) {
         const live = await leases.current(workLeaseKey(w.workItemId));
         const leasedHere = !!w.claim && !!live && live.owner === config.workerId && live.fencingToken === w.claim.fencingToken && w.claim.ownerId === config.workerId;
-        if (leasedHere && (w.state === 'waiting' || issued.has(claimKey(w.workItemId, w.claim!.fencingToken)))) continue;
+        if (leasedHere && w.state === 'waiting') {
+          // a waiting item this worker id still leases: this process continues it under the same claim — re-attached when
+          // the claim was issued by an earlier process (a restart of the same worker)
+          const key = claimKey(w.workItemId, w.claim!.fencingToken);
+          if (!issued.has(key)) {
+            issued.add(key);
+            reattached.push({ workItemId: w.workItemId, role: w.role, waitingOn: w.waitingOn ?? [], fencingToken: w.claim!.fencingToken, claim: 'kept' });
+          }
+          continue;
+        }
+        if (leasedHere && issued.has(claimKey(w.workItemId, w.claim!.fencingToken))) continue;
         const wctx = { ...ctx, workItemId: w.workItemId, correlationId: w.workItemId };
         try {
           if (w.state === 'waiting') {
@@ -376,17 +389,25 @@ export function createControlPlane(deps: ControlDeps): ControlPlaneInternals {
             if (l) {
               await blackboard.transitionWorkItem(w.workItemId, 'waiting', { claim: { ownerId: config.workerId, leaseId: l.leaseId, fencingToken: l.fencingToken, expiresAt: l.expiresAt } }, wctx, { expectedFrom: ['waiting'] });
               issued.add(claimKey(w.workItemId, l.fencingToken));
+              reattached.push({ workItemId: w.workItemId, role: w.role, waitingOn: w.waitingOn ?? [], fencingToken: l.fencingToken, claim: 'retaken' });
             }
             continue;
           }
           const to = await scheduler.requeue(w, ctx, `orphaned by ${w.claim?.ownerId ?? 'an unknown worker'} (recovered by ${config.workerId})`);
           if (live && live.owner === config.workerId) await leases.release(live.leaseId);
           if (to === 'ready') requeued.push(w.workItemId);
+          requeuedAudit.push({ workItemId: w.workItemId, role: w.role, from: w.state, attempts: w.attempts + 1, to });
         } catch (e) {
           if (!isHypertestError(e, 'conflict') && !isHypertestError(e, 'stale_fence')) throw e;
         }
       }
-      logger.info('run recovered', { runId, examined: report.examined, verified: report.verified.length, notApplied: report.notApplied.length, manualReview: report.manualReview.length, compensated, requeued: requeued.length });
+      if (report.examined + compensated > 0 || requeuedAudit.length > 0 || reattached.length > 0) {
+        const operations = {
+          examined: report.examined, verified: report.verified, notApplied: report.notApplied, manualReview: report.manualReview, stillPending: report.stillPending, compensated,
+        };
+        await events.append([event(ctx, EVENT_TYPES.runRecovered, 'run', runId, { workerId: config.workerId, operations, requeued: requeuedAudit, reattached })]);
+      }
+      logger.info('run recovered', { runId, examined: report.examined, verified: report.verified.length, notApplied: report.notApplied.length, manualReview: report.manualReview.length, compensated, requeued: requeued.length, reattached: reattached.length });
       return { reconciled: report.examined + compensated, requeued };
     },
 

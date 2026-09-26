@@ -311,6 +311,47 @@ test('C3: the latest build decides; a failure on the same build as a pass is a v
   assert.equal(gate.evaluate(flaky).verdict, 'fail');
 });
 
+test('C3: evidence without a build identity belongs to the build current when it was recorded — it can never hide the latest build\'s failure', () => {
+  // black-box evidence carries the environment it was captured in (and its build digest); a request that names no
+  // registered environment (a raw URL, another host) has no build identity. Recorded AFTER the failing exchange on build
+  // b-2, it must not become "the latest build" on its own and take the failure out of the gate's view.
+  const B1: OracleAssertion = { assertionId: 'a_neg', description: 'negative transfers are rejected', kind: 'requirement', severity: 'P1', check: { type: 'http_expectation', method: 'POST', path: '/transfers', expectStatus: 400 } };
+  const deployed = { environmentId: 'bank', environmentClass: 'sandbox', generation: 2, buildDigest: 'b-2' };
+  const escape = baseline();
+  escape.oracles = [oracle([P1_TEST, B1])];
+  escape.evidence.push(
+    ev('ev_on_build', 10, 'api-response', { method: 'POST', path: '/transfers', status: 201 }, { environment: deployed }),
+    ev('ev_no_build', 11, 'api-response', { method: 'POST', path: '/transfers', status: 400 }),
+  );
+  escape.evidenceRoot.count = escape.evidence.length;
+  let d = gate.evaluate(escape);
+  assert.equal(d.verdict, 'fail');
+  assert.ok(d.reasons.includes('C3 or_cart@2/a_neg (P1) violated: POST /transfers expectation violated'), d.reasons.join('\n'));
+  // the latest build still wins over an OLDER build: before the deploy of b-3 the endpoint failed (unidentified and on
+  // b-2); after it, it passes — the fix is judged on b-3 and on what was recorded while b-3 was current
+  const fixed = baseline();
+  fixed.oracles = [oracle([P1_TEST, B1])];
+  fixed.evidence.push(
+    ev('ev_before', 10, 'api-response', { method: 'POST', path: '/transfers', status: 201 }),
+    ev('ev_old_build', 11, 'api-response', { method: 'POST', path: '/transfers', status: 201 }, { environment: deployed }),
+    ev('ev_new_build', 12, 'api-response', { method: 'POST', path: '/transfers', status: 400 }, { environment: { ...deployed, generation: 3, buildDigest: 'b-3' } }),
+    ev('ev_after', 13, 'api-response', { method: 'POST', path: '/transfers', status: 400 }),
+  );
+  fixed.evidenceRoot.count = fixed.evidence.length;
+  d = gate.evaluate(fixed);
+  assert.equal(d.verdict, 'pass', d.reasons.join('\n'));
+  // …but a failure recorded while b-3 is current (no build identity of its own) is a failure of b-3
+  fixed.evidence.push(ev('ev_after_fail', 14, 'api-response', { method: 'POST', path: '/transfers', status: 201 }));
+  fixed.evidenceRoot.count = fixed.evidence.length;
+  assert.equal(gate.evaluate(fixed).verdict, 'fail');
+  // with no build identity anywhere, everything is judged (as before)
+  const plain = baseline();
+  plain.oracles = [oracle([P1_TEST, B1])];
+  plain.evidence.push(ev('ev_p1', 10, 'api-response', { method: 'POST', path: '/transfers', status: 201 }), ev('ev_p2', 11, 'api-response', { method: 'POST', path: '/transfers', status: 400 }));
+  plain.evidenceRoot.count = plain.evidence.length;
+  assert.equal(gate.evaluate(plain).verdict, 'fail');
+});
+
 test('C3: PASS/FAIL/XFAIL/SKIP stay distinct (xfail violates; skip and harness errors are unproven)', () => {
   for (const [status, verdict] of [['xfail', 'fail'], ['skipped', 'inconclusive'], ['error', 'inconclusive'], ['xpass', 'inconclusive']] as const) {
     const input = baseline();

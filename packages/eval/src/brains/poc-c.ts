@@ -142,9 +142,43 @@ export const pocCEnvironment: RoleBrain = (v) => (/load\.start/.test(v.userText)
 
 // ------------------------------------------------------------------------------------------------ executor (large output)
 
+/** Attempts of the dump before the executor gives up on a refused one. */
+export const MAX_DUMP_ATTEMPTS = 3;
+
+/** The tool id of a tool result (`shell__exec` on the wire ⇒ `shell.exec`). */
+function toolIdOf(name: string): string {
+  return name.split('__').join('.');
+}
+
+/** The diagnostics dump attempts so far (shell.exec results, in transcript order). */
+function dumpResults(v: BrainView): BrainView['toolResults'] {
+  return v.toolResults.filter((r) => toolIdOf(r.name) === 'shell.exec');
+}
+
+/**
+ * A refusal because the call was decided on a stale context snapshot (e.g. the environment was restarted meanwhile —
+ * after a crash, the committed turn's call is re-validated against its original snapshot): a real agent retries in a
+ * new turn, on a fresh snapshot.
+ */
+export function staleRefusal(r: { content: string; isError: boolean } | undefined): boolean {
+  return r !== undefined && r.isError && /^\[stale_context\]/.test(r.content);
+}
+
+/**
+ * The executor collects the ~2 MiB diagnostics dump (shell.exec: safe to repeat) and checks that only a bounded digest
+ * reached its next request (I9). A dump refused on a stale snapshot is retried (at most MAX_DUMP_ATTEMPTS attempts);
+ * any other failure fails the item — it never completes without the dump.
+ */
 export const pocCExecutor: RoleBrain = (v) => {
-  if (v.step === 0) return toolCall('shell.exec', { command: ['node', '-e', `process.stdout.write(${JSON.stringify(DIAGNOSTIC_LINE)}.repeat(${DIAGNOSTIC_REPEAT}))`] });
-  const text = resultText(v, 0);
+  const dumps = dumpResults(v);
+  const last = dumps.at(-1);
+  if (!last || (staleRefusal(last) && dumps.length < MAX_DUMP_ATTEMPTS)) {
+    return toolCall('shell.exec', { command: ['node', '-e', `process.stdout.write(${JSON.stringify(DIAGNOSTIC_LINE)}.repeat(${DIAGNOSTIC_REPEAT}))`] });
+  }
+  if (last.isError) return toolCall('fail_work', { reason: 'agent_failed', message: `the diagnostics dump could not be collected (${dumps.length} attempt(s)): ${last.content.slice(0, 300)}` });
+  const after = v.toolResults.at(-1);
+  if (after !== last) return toolCall('fail_work', { reason: 'agent_failed', message: `completion after the dump was refused: ${(after?.content ?? '').slice(0, 300)}` });
+  const text = last.content;
   const bytes = requestBytes(v.request);
   // I9: the dump itself never enters the model's messages — only a bounded digest with the artifact reference
   if (bytes > MAX_REQUEST_BYTES_AFTER_OFFLOAD) return toolCall('fail_work', { reason: 'agent_failed', message: `context overflow: the request after the dump is ${bytes} bytes` });
@@ -153,9 +187,9 @@ export const pocCExecutor: RoleBrain = (v) => {
   return toolCall('complete_work', { summary, evidenceRefs: ev, output: { summary, executed: [{ selector: 'diagnostics dump', passed: true, outcome: 'passed', evidenceIds: ev }], findings: [] } });
 };
 
-/** Tag of a model call made after the large output (the probe/grader reads these observations). */
+/** Tag of a model call made after the large output (a successful dump is in the transcript; read by offloadBounded). */
 export function pocCTag(v: BrainView): string | undefined {
-  return v.role === 'executor' && v.step >= 1 ? 'after_large_output' : undefined;
+  return v.role === 'executor' && dumpResults(v).some((r) => !r.isError) ? 'after_large_output' : undefined;
 }
 
 // ------------------------------------------------------------------------------------------------ metrics analyst

@@ -193,10 +193,23 @@ export interface RunSideEffectRequest<I = unknown> {
    * Defaults to GatewayDeps.dispatchTimeoutMs.
    */
   dispatchTimeoutMs?: number;
+  /**
+   * (additive) true: only settle this invocation's EXISTING operation — return its recorded outcome, attach to or
+   * reconcile its dispatch — and never dispatch: an operation that is (or reconciles to) `prepared`/`not_applied`
+   * returns `not_applied` (reason `dispatch_refused: …`) without an adapter dispatch. No operation at all is a
+   * `not_found` error (nothing is recorded). Used for the replay of a call decided on a snapshot that is stale by now:
+   * its act already happened (or may have), but a new dispatch would be a new decision.
+   */
+  reconcileOnly?: boolean;
 }
 
 export interface SideEffectGateway {
   run<I>(request: RunSideEffectRequest<I>): Promise<SideEffectOutcome>;
+  /**
+   * (additive, optional) The operation recorded for a tool invocation of this run (undefined when none): lets a caller
+   * tell the replay of an already dispatched call from a new call before it decides anything.
+   */
+  find?(toolInvocationId: string, operationType: string, runId: string): Promise<OperationRecord | undefined>;
   /** Poll a pending/unsettled operation (observe → verify); used by durable waits. */
   observe(operationId: string, ctx: EventContext, signal: AbortSignal): Promise<SideEffectOutcome>;
   compensate(operationId: string, ctx: EventContext, signal: AbortSignal): Promise<SideEffectOutcome>;

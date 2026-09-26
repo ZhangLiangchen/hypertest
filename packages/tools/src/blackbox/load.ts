@@ -4,7 +4,7 @@ import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HypertestError, hashCanonical, isHypertestError, sleep, type JsonSchema, type JsonValue, type Logger } from '@hypertest/core';
-import type { EvidenceRecord } from '@hypertest/domain';
+import type { EnvironmentRef, EvidenceRecord } from '@hypertest/domain';
 import type { CompensationResult, DispatchReceipt, ObservationResult, OperationContext, PreparedOperation, SideEffectAdapter, SideEffectCapabilities, SideEffectOutcome, VerificationResult } from '@hypertest/operation';
 import type { EnvironmentRegistry, ToolContext, ToolOutcome, ToolSpec } from '../contracts.ts';
 import {
@@ -49,6 +49,12 @@ export interface LoadJobSpec {
   timeoutMs: number;
   environmentId?: string;
   environmentClass?: string;
+  /**
+   * (additive) Generation (and build digest) of the environment when the job was launched — what the job measured.
+   * Written to spec.json at dispatch, beside (not part of) the hashed desired state.
+   */
+  environmentGeneration?: number;
+  buildDigest?: string;
 }
 
 export type LoadJobState = 'starting' | 'running' | 'completed' | 'failed' | 'stopped';
@@ -368,7 +374,11 @@ export class HttpLoadAdapter implements SideEffectAdapter<LoadStartInput, LoadJo
     let logFd: number | undefined;
     let pid: number;
     try {
-      await writeJsonAtomic(join(dir, 'spec.json'), { ...spec, desiredStateHash: prepared.desiredStateHash, runId: op.operation.runId, createdAt: new Date().toISOString() });
+      // bookkeeping beside the (hashed) desired state: the run, and the environment generation the job measures (a
+      // re-prepare after a restart must not change the desired state of the SAME operation)
+      const env = spec.environmentId !== undefined ? this.#o.environments?.get(spec.environmentId) : undefined;
+      const measured = env ? { environmentGeneration: env.generation, ...(env.buildDigest !== undefined ? { buildDigest: env.buildDigest } : {}) } : {};
+      await writeJsonAtomic(join(dir, 'spec.json'), { ...spec, ...measured, desiredStateHash: prepared.desiredStateHash, runId: op.operation.runId, createdAt: new Date().toISOString() });
       logFd = openSync(join(dir, 'worker.log'), 'a');
       const child = spawn(this.#o.nodePath ?? process.execPath, ['--no-warnings', this.#o.workerPath ?? LOADGEN_WORKER_PATH, dir], {
         cwd: dir,
@@ -622,6 +632,7 @@ async function loadResultsEvidence(ctx: ToolContext, stateDir: string | undefine
         if (marker.kind === 'ok' && marker.value.runId === ctx.runId && typeof marker.value.evidenceId === 'string') return { evidenceId: marker.value.evidenceId };
       }
       const r = (result.results ?? {}) as { sent?: number; ok?: number; errors?: number; achievedRps?: number; latencyMs?: { p95?: number | null } };
+      const environment = jobEnvironment(stateDir, operationId);
       const rec = await ctx.recordEvidence({
         evidenceType: 'metric',
         data: JSON.stringify({ operationId, ...result.results }, null, 2),
@@ -629,6 +640,7 @@ async function loadResultsEvidence(ctx: ToolContext, stateDir: string | undefine
         summary: `load job ${operationId}: sent ${r.sent ?? 0}, ok ${r.ok ?? 0}, errors ${r.errors ?? 0}, p95 ${r.latencyMs?.p95 ?? 'n/a'} ms, achieved ${r.achievedRps ?? 'n/a'} rps`,
         structured: { source: 'loadgen', operationId, ...(result.results ?? {}) } as JsonValue,
         operationId,
+        ...(environment ? { environment } : {}),
       });
       if (markerPath) {
         try {
@@ -644,6 +656,19 @@ async function loadResultsEvidence(ctx: ToolContext, stateDir: string | undefine
     pending.catch(() => evidenceByJob.delete(key));
   }
   return (await pending).evidenceId;
+}
+
+/**
+ * The environment a load job measured (spec.json: id, class and generation at launch), as an evidence EnvironmentRef;
+ * undefined when the job named no registered environment (a bare URL) — a generation is never guessed.
+ */
+function jobEnvironment(stateDir: string | undefined, operationId: string): EnvironmentRef | undefined {
+  if (!stateDir) return undefined;
+  const spec = readJsonFileSync<LoadJobSpec>(join(loadJobDir(stateDir, operationId), 'spec.json'));
+  if (!spec || typeof spec.environmentId !== 'string' || typeof spec.environmentClass !== 'string' || !Number.isSafeInteger(spec.environmentGeneration)) return undefined;
+  const ref: EnvironmentRef = { environmentId: spec.environmentId, environmentClass: spec.environmentClass, generation: spec.environmentGeneration! };
+  if (typeof spec.buildDigest === 'string') ref.buildDigest = spec.buildDigest;
+  return ref;
 }
 
 function jobStatusSnapshot(stateDir: string | undefined, operationId: string): LoadJobStatus | undefined {

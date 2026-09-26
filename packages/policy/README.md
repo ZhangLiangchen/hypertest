@@ -84,7 +84,10 @@ Depends only on `@hypertest/core`, `@hypertest/domain` and `yaml`. The binding A
   spec: C1 is also `unknown` with zero evidence, zero *eligible* evidence (only ineligible generated
   tests) or foreign-run evidence (a pass without evidence is impossible and C1 is never waivable); C2 treats unresolved P0/P1 test/infra/environment findings as
   `unknown`; C3 evaluates the latest *build* (by `environment.buildDigest`/`provenance.commit`) so a fix
-  followed by a green regression passes while a fail+pass on the same build stays a violation; `xfail`
+  followed by a green regression passes while a fail+pass on the same build stays a violation; evidence
+  without a build identity (e.g. a request to a URL that names no registered environment) belongs to the
+  build current when it was recorded, so it can never become "the latest build" on its own and hide the
+  current build's failures; `xfail`
   violates, `skipped`/`error`/`xpass` are unproven; C5 also counts unfinished work; C6 counts rejects
   from any reviewer; exceptions approved by agents or expired are ignored. Coverage thresholds > 1 are
   read as percentages.
@@ -111,7 +114,7 @@ Depends only on `@hypertest/core`, `@hypertest/domain` and `yaml`. The binding A
 |---|---|
 | I1 permit before tool: capability checked first, signature/run/subject/work-item binding, malformed input denied, fail-closed defaults, OPA fail-closed, immutable rules | `test/engine.test.ts`, `test/opa.test.ts`, `test/opa.int.test.ts` |
 | I2 no amplification: attenuation per field, greedy child, tampered parent refused, non-canonical keys, seeded randomized property (400 capabilities × 50 actions) | `test/capabilities.test.ts`, `test/patterns.test.ts` |
-| I7 gate: one test per criterion (satisfied/violated/unknown), precedence, exceptions, determinism, zero (eligible) evidence, LLM-only critical, ineligible generated tests | `test/gate.test.ts` |
+| I7 gate: one test per criterion (satisfied/violated/unknown), precedence, exceptions, determinism, zero (eligible) evidence, LLM-only critical, ineligible generated tests, latest build (unidentified evidence never hides the current build's failure) | `test/gate.test.ts` |
 | I8 oracles: self-approval, same/unknown provider or role, approver kinds, flip needs human (re-checked at decision time), stale proposal, create-only establish, concurrent approvals (in-process and across instances), resumable approval, new revision + reassessment | `test/oracle-governance.test.ts` |
 | I8 self-heal: JS/TS/Python/Go diffs, deletion/skip/swallow/assertion/threshold, evasion attempts (comments, wrappers, exits, modifiers, hooks, selection, malformed hunks) and false-positive guards, real git multi-file diff | `test/classifier.test.ts` |
 | I10 audit: decision log append-only (trigger), event in the same transaction (sink failure rolls back), approvals decided once (conditional UPDATE + trigger), agent deciders, NUL-safe storage, concurrent deciders on PostgreSQL | `test/persistence.test.ts`, `test/persistence.int.test.ts` |

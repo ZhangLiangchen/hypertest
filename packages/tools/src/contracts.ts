@@ -49,8 +49,13 @@ export interface ToolContext {
   invocationId: string;
   workspace: WorkspaceHandle;
   artifacts: ArtifactStore;
-  /** Records evidence with producer/provenance pre-filled by the runtime. */
-  recordEvidence(input: { evidenceType: EvidenceType; data: string | Uint8Array; mimeType: string; summary: string; structured?: JsonValue; operationId?: string; parentEvidenceIds?: string[]; provenance?: EvidenceInput['provenance'] }): Promise<EvidenceRecord>;
+  /**
+   * Records evidence with producer/provenance pre-filled by the runtime. (additive) `environment`: the environment the
+   * evidence was captured in; when omitted, the runtime records the environment the tool's input addresses
+   * (`input.environmentId` of a registered environment, at its generation at execution) — black-box evidence then has
+   * a provenance anchor (L5: evidence → environment/generation) instead of a gap.
+   */
+  recordEvidence(input: { evidenceType: EvidenceType; data: string | Uint8Array; mimeType: string; summary: string; structured?: JsonValue; operationId?: string; parentEvidenceIds?: string[]; provenance?: EvidenceInput['provenance']; environment?: EvidenceInput['environment'] }): Promise<EvidenceRecord>;
   /** Only for tools with a sideEffect binding. */
   sideEffects?: SideEffectGateway;
   eventContext: EventContext;
@@ -266,8 +271,13 @@ export interface EnvironmentRegistry {
   get(environmentId: string): EnvironmentDescriptor | undefined;
   list(): EnvironmentDescriptor[];
   register(env: EnvironmentDescriptor): void;
-  /** Bumps generation (after deploy/restart) — invalidates snapshots that observed the old one. */
-  bumpGeneration(environmentId: string, buildDigest?: string): EnvironmentDescriptor;
+  /**
+   * Bumps generation (after deploy/restart) — invalidates snapshots that observed the old one. (additive)
+   * `operationId`: the verified operation the bump belongs to. A bump already recorded for it is returned as recorded
+   * instead of bumping again — a re-verification (a duplicate observe, or a reconciliation after a crash between the
+   * bump and the ledger's `verified`) never counts one restart twice.
+   */
+  bumpGeneration(environmentId: string, buildDigest?: string, operationId?: string): EnvironmentDescriptor;
 }
 
 // ----------------------------------------------------------------------------- test runners + coverage

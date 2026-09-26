@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { after, before, describe, test } from 'node:test';
-import { sha256Hex } from '@hypertest/core';
+import { isHypertestError, sha256Hex } from '@hypertest/core';
 import type { TestArtifact, WorkItem } from '@hypertest/domain';
 import { ControlStore, unifiedDiff } from '../src/index.ts';
 import { call, createHarness, items, parsed, runItem, type Harness, type RoleBrain } from './harness.ts';
@@ -117,6 +117,19 @@ describe('I8 test-change governance in the dispatcher (before any write executes
     for (const id of refused) assert.ok(!called.includes(id), `refused ${id} must not execute`);
     const deniedEvents = (await h.deps.events.read(run.runId, { types: ['tool.denied'] })).map((e) => e.payload as { invocationId: string; errorCode: string });
     assert.deepEqual(deniedEvents.map((p) => [p.invocationId, p.errorCode]), [[refused[0], 'approval_required'], [refused[1], 'test_change_forbidden']]);
+
+    // the requester is recorded WITH its model provider (the heterogeneity check of an agent approval, as for oracle
+    // proposals): an agent on the requester's provider is refused, an independent one (other provider, other role) may
+    // approve. Without the provider every agent approval failed closed (provider_unknown): independent approval impossible.
+    const pending = approvals[0]!;
+    assert.deepEqual(pending.requestedBy, { kind: 'agent', id: agent.agentId, role: 'test_designer', modelProvider: 'alpha' });
+    const ctx = { runId: run.runId, correlationId: run.runId, actorId: 'agent:reviewer' };
+    await assert.rejects(
+      h.deps.approvals.decide(pending.approvalId, true, { kind: 'agent', id: 'ag_same_provider', role: 'reviewer', modelProvider: 'alpha' }, 'looks fine', ctx),
+      (e: unknown) => isHypertestError(e, 'permission_denied') && /shares model provider alpha/.test((e as Error).message),
+    );
+    const approved = await h.deps.approvals.decide(pending.approvalId, true, { kind: 'agent', id: 'ag_independent', role: 'reviewer', modelProvider: 'gamma' }, 'independent review of the test change', ctx);
+    assert.equal(approved.status, 'approved');
   });
 });
 

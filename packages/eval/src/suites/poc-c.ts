@@ -2,8 +2,9 @@
  * PoC C — Durable load + fault recovery (BLUEPRINT §6; acceptance table "首批 PoC：长时压测与故障恢复闭环"), and the
  * recovery-chaos suite on the same fixture.
  *
- * Fixture: `fixtures/kv-service/server.js` under the Hypertest process supervisor (environment `kv`, class local,
- * restartable through `env.restart`, operation records persisted). Oracle `kv-slo`: C1 P1 statistical "p99 latency <
+ * Fixture: `fixtures/kv-service/server.js` under the Hypertest process supervisor, which runs as its own process (the
+ * SLO measurement never depends on the harness's event loop; environment `kv`, class local, restartable through
+ * `env.restart`, operation records persisted). Oracle `kv-slo`: C1 P1 statistical "p99 latency <
  * 250 ms at 30 rps" and C2 P1 statistical "error rate < 1%" (evidence predicates over the load job's metric evidence).
  *
  * - `pocCTask()`: chaos = kill the Hypertest process right after the load.start operation is acknowledged (the load
@@ -65,13 +66,13 @@ export async function kvFixture(ctx: TrialContext, options: { warmupMs?: number 
         for (const op of sup.operations()) if (op.kind === 'restart') out[op.operationId] = (out[op.operationId] ?? 0) + 1;
         const jobs = loadJobs(stateDir);
         for (const job of jobs) out[job.operationId] = (out[job.operationId] ?? 0) + 1;
-        out[`${KV_ENV_ID}:restarts`] = sup.generation - 1;
+        out[`${KV_ENV_ID}:restarts`] = (await sup.generation()) - 1;
         out['loadgen:jobs'] = jobs.length;
         out['loadgen:workers'] = new Set(jobs.map((j) => j.pid).filter((p) => p !== undefined)).size;
         return out;
       },
       loadJobs: async (): Promise<JsonValue> => asJson(loadJobs(stateDir)),
-      'metric.serviceGeneration': async () => sup.generation,
+      'metric.serviceGeneration': () => sup.generation(),
       'metric.loadJobs': async () => loadJobs(stateDir).length,
     },
     cleanup: async () => {
@@ -82,8 +83,8 @@ export async function kvFixture(ctx: TrialContext, options: { warmupMs?: number 
 }
 
 const POC_C_GRADERS = [
-  'verdict', 'pocCWorkflow', 'planDynamics', 'loadJobReattached', 'noDuplicateSideEffects', 'noOrphanOperations', 'offloadBounded', 'modelFallback', 'independentReview', 'reportTracesToEvidence',
-  'evidenceCompleteness', 'evidenceIntegrity', 'policyViolation', 'auditReconstruction',
+  'verdict', 'pocCWorkflow', 'planDynamics', 'loadJobReattached', 'noDuplicateSideEffects', 'noOrphanOperations', 'recoveryAudit', 'offloadBounded', 'modelFallback', 'independentReview',
+  'reportTracesToEvidence', 'evidenceCompleteness', 'evidenceIntegrity', 'policyViolation', 'auditReconstruction',
 ];
 
 export function pocCTask(overrides: Partial<EvalTask> = {}): EvalTask {

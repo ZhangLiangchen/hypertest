@@ -104,7 +104,7 @@ export {
   type HttpLoadAdapterOptions, type LoadStartInput, type LoadJobSpec, type LoadJobState, type LoadJobStatus, type LoadJobObservation, type LoadStopObservation, type LoadToolOptions,
 } from './load.ts';
 export {
-  startProcessSupervisor, normalizeFault, SUPERVISOR_CONTROL_PREFIX, OPERATION_HEADER, CONTROL_TOKEN_HEADER,
+  startProcessSupervisor, normalizeFault, SUPERVISOR_CONTROL_PREFIX, OPERATION_HEADER, CONTROL_TOKEN_HEADER, PROCESS_SUPERVISOR_CLI_PATH,
   type ProcessSupervisor, type ProcessSupervisorOptions, type SupervisorOperation, type SupervisorFault, type SupervisorFaultKind,
 } from './process-supervisor.ts';
 export {

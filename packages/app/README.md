@@ -165,7 +165,7 @@ use.
 | I8 an oracle change flipping a recorded failure needs a human (independent agents refused) — including when the proposer cites nothing (the run's failed test cases matching a changed `test_outcome` selector) and when the citing finding was later superseded as rejected; additions flip nothing; unknown base fails closed | `test/governance.test.ts`, `test/app.e2e.test.ts` (facade operations) |
 | I1/I8 human decisions over the API need the token (403 without one, never reaching the facade) | `test/api.test.ts` |
 | One process per PGlite data directory (a second instance/process is refused; stale locks of dead processes are taken over; close() and a failed composition release it) | `test/lock.test.ts`, `test/compose.test.ts` |
-| Freshness: environment generation bumps (deploy/restart) survive restarts; a corrupt state file fails closed | `test/environments.test.ts`, `test/compose.test.ts` |
+| Freshness: environment generation bumps (deploy/restart) survive restarts; a re-verified operation (crash between bump and `verified`) is bumped once; a corrupt state file fails closed | `test/environments.test.ts`, `test/compose.test.ts` |
 | Secrets never interpolated or inlined (also credential-named headers, `?password=`, NATS userinfo, inline supervisor tokens → `control.tokenEnv`); missing key variables reported by name only | `test/config.test.ts`, `test/compose.test.ts`, `test/environments.test.ts`, `test/diagnose.test.ts` |
 | I7 a gate spec (config or a run's override) cannot silently disable a gate rule (unknown severity, malformed required evidence) | `test/config.test.ts`, `test/app.e2e.test.ts` (facade robustness) |
 | Keys persist with 0600 (dir 0700), are reloaded, tightened when loose; configured-but-missing keys are faults; rotated keys stay trusted; capability secret stable / from env (≥ 16) | `test/keys.test.ts` |
@@ -206,7 +206,10 @@ HYPERTEST_TEST_DB=postgres node scripts/run-tests.mjs --package app  # e2e runs 
 - Workers sharing a PostgreSQL store must share `policy.capabilitySecretEnv` (and the signing key via
   `signing.keyFile`): capabilities and seals are verified by other workers (`diagnose` warns).
 - Environment generations are durable per data directory (`<dataDir>/state/environments.json`, written synchronously
-  on every bump, merged by max): a restart never forgets a deploy, so a snapshot from before it stays stale. Workers
+  on every bump, merged by max): a restart never forgets a deploy, so a snapshot from before it stays stale. The file
+  also records which operation made each bump (`operations`, the latest 1024): the adapter bumps while verifying,
+  before the ledger records `verified`, so a process killed in between re-verifies the operation after the restart and
+  gets the recorded bump back — one restart is never counted twice. Workers
   sharing a PostgreSQL store each keep their own registry (a bump in one worker is not seen by the others).
 - `tools.enableBrowser` browsers and lazily started MCP servers are process-wide; `close()` releases them.
 - In the integration test the NATS stream `HT_APP_INT_<suffix>` stays on the dev server (only @hypertest/collab may use
@@ -231,3 +234,6 @@ HYPERTEST_TEST_DB=postgres node scripts/run-tests.mjs --package app  # e2e runs 
 - (review, behaviour) human decisions over the API require the token; `cancel()` of a completed/failed run is a
   `conflict`; `verifyEvidence()` of an unknown run is `not_found` and also verifies the decision; `resumeIncomplete()`
   resumes only runs pinned to this manifest.
+- (eval review, behaviour) `persistentEnvironmentRegistry().bumpGeneration(id, digest?, operationId?)` records the bump
+  of an operation in the state file (`operations`, additive) and returns it when the same operation is re-verified in a
+  later process: no double bump after a crash between the adapter's bump and the ledger's `verified`.

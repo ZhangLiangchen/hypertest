@@ -71,7 +71,9 @@ class TraceBuilder {
  * L5 provenance: answers "where does this conclusion come from?" from canonical stores only (evidence ledger,
  * L0 events, blackboard). Evidence traces follow evidence → tool invocation (tool.* events matched by
  * payload.invocationId) → operation (+ operation.* events) → work item (+ work.* events) → agent →
- * environment → commit, and parent evidence (derived_from). Every missing or inconsistent link is a gap and
+ * environment → commit, and parent evidence (derived_from). An invocation that OBSERVED an operation another invocation
+ * started (its own tool events name the operation, e.g. load.observe) links evidence → observing invocation -observed→
+ * operation -started_by→ starting invocation. Every missing or inconsistent link is a gap and
  * makes the trace incomplete; required links: tool events for the invocation, a work item, a producing agent,
  * an environment or commit, and operation events whenever an operation is referenced. Inconsistent links are
  * gaps as well: conflicting invocation ids, tool ids, agents or work items between the evidence, its tool events
@@ -146,15 +148,28 @@ export function createProvenanceService(deps: ProvenanceDeps & { maxDepth?: numb
         const status = last ? str(payloadOf(last)['to']) : undefined;
         if (status) detail['status'] = status;
         const opKey = b.node({ kind: 'operation', id: opId }, `operation ${opId}`, detail);
-        b.edge(toolKey ?? evKey, opKey, 'operation');
         if (opEvents.length === 0) b.gap(`operation ${opId} has no operation.* events in run ${ev.runId}`);
         const opInvocation = opEvents.map((e) => str(payloadOf(e)['toolInvocationId'])).find(Boolean);
-        if (invocationId && opInvocation && opInvocation !== invocationId) {
-          b.gap(`operation ${opId} belongs to tool invocation ${opInvocation}, but evidence ${evidenceId} names ${invocationId}`);
+        // an OBSERVATION: another invocation started the operation, and the evidence's own invocation observed it — its
+        // own L0 tool events name the operation (e.g. load.observe recording a load job's results). Lineage: evidence →
+        // observing invocation → operation → starting invocation. Without such events the link is inconsistent.
+        const observation = invocationId !== undefined && opInvocation !== undefined && opInvocation !== invocationId && toolEvents.some((e) => str(payloadOf(e)['operationId']) === opId);
+        if (observation) {
+          b.edge(toolKey ?? evKey, opKey, 'observed');
+          const starterEvents = (await runEvents(ev.runId, TOOL_EVENT_TYPES)).filter((e) => payloadOf(e)['invocationId'] === opInvocation);
+          const starterTool = starterEvents.map((e) => str(payloadOf(e)['toolId'])).find(Boolean);
+          const starterKey = b.node({ kind: 'tool_invocation', id: opInvocation }, `tool ${starterTool ?? '?'} (${opInvocation})`, { events: starterEvents.map(eventSummary), ...(starterTool ? { toolId: starterTool } : {}) });
+          b.edge(opKey, starterKey, 'started_by');
+          if (starterEvents.length === 0) b.gap(`tool invocation ${opInvocation} (which started operation ${opId}) has no tool.called/tool.completed events in run ${ev.runId}`);
+        } else {
+          b.edge(toolKey ?? evKey, opKey, 'operation');
+          if (invocationId && opInvocation && opInvocation !== invocationId) {
+            b.gap(`operation ${opId} belongs to tool invocation ${opInvocation}, but evidence ${evidenceId} names ${invocationId}`);
+          }
+          const evWorkItem = ev.workItemId ?? toolEvents.map((e) => e.workItemId).find(Boolean);
+          const opWorkItem = opEvents.map((e) => e.workItemId).find(Boolean);
+          if (evWorkItem && opWorkItem && opWorkItem !== evWorkItem) b.gap(`operation ${opId} ran in work item ${opWorkItem}, but evidence ${evidenceId} names ${evWorkItem}`);
         }
-        const evWorkItem = ev.workItemId ?? toolEvents.map((e) => e.workItemId).find(Boolean);
-        const opWorkItem = opEvents.map((e) => e.workItemId).find(Boolean);
-        if (evWorkItem && opWorkItem && opWorkItem !== evWorkItem) b.gap(`operation ${opId} ran in work item ${opWorkItem}, but evidence ${evidenceId} names ${evWorkItem}`);
       }
 
       // work item → work.* events

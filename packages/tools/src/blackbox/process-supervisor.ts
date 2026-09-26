@@ -3,6 +3,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { closeSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
+import { fileURLToPath } from 'node:url';
 import { HypertestError, noopLogger, sleep, type Logger } from '@hypertest/core';
 import { CONTROL_PATH_PREFIX, CONTROL_TOKEN_HEADER, errorMessage } from './common.ts';
 
@@ -31,6 +32,12 @@ import { CONTROL_PATH_PREFIX, CONTROL_TOKEN_HEADER, errorMessage } from './commo
  */
 
 export const SUPERVISOR_CONTROL_PREFIX = CONTROL_PATH_PREFIX;
+/**
+ * Absolute path of `process-supervisor-cli.ts`: runs the supervisor as its own process (`node <path> [options] -- <cmd…>`),
+ * so the environment neither dies with nor shares an event loop with the process that launched it (e.g. an eval harness
+ * running Hypertest in-process: the SUT's latency must not depend on the load of the system under evaluation).
+ */
+export const PROCESS_SUPERVISOR_CLI_PATH: string = fileURLToPath(new URL('./process-supervisor-cli.ts', import.meta.url));
 export const OPERATION_HEADER = 'x-hypertest-operation';
 export { CONTROL_TOKEN_HEADER };
 const CONTROL_TOKEN_RE = /^[A-Za-z0-9_-]{16,256}$/;

@@ -56,7 +56,12 @@ the reason. In order:
    `allowedCommands` (shell.exec / test.run command). A throwing engine, a malformed permit or an
    unrecordable decision ⇒ fail closed (never executed).
 6. **Freshness** — effects beyond `read`/`record` with `deps.freshness` and `request.snapshot` ⇒
-   `freshness.validate`; stale (or a throwing guard) ⇒ `stale_context` listing the stale entries.
+   `freshness.validate`; stale (or a throwing guard) ⇒ `stale_context` listing the stale entries. Exception: the
+   REPLAY of a side-effect call whose operation was already dispatched (same invocation id, operation found through
+   `gateway.find`, status beyond `prepared`/`not_applied`) on a snapshot that is stale by now — e.g. after a crash,
+   when the recovery (or a parallel item) moved the environment on. Its act already happened (or may have), so a
+   refusal would hide the recorded outcome and invite a duplicate act: the call only settles that operation
+   (`reconcileOnly`: never dispatched again) and `tool.called` names it (`replayOfOperation`).
 7. **`tool.called`** `{toolId, invocationId, effect, riskClass, resources, permitDecisionId}` — if it cannot
    be written the tool is not executed (`failed` / `unavailable`).
 8. **Execution** — side-effect tools (`spec.sideEffect`) run **only** through
@@ -103,7 +108,9 @@ tool iff an allow pattern matches, no deny pattern matches and `capability.tools
 
 Deterministic layout (a restarted process re-attaches by calling the creators again; `get()` only knows
 workspaces created or re-attached by this instance; concurrent creators for the same slot are serialized
-in-process):
+in-process, and so is all `git worktree` administration — prune / add / remove — of one repository: a creator's
+`prune` would otherwise delete another creator's half-created `.git/worktrees/<id>` and fail its `add`. Processes
+sharing one repository checkout are not serialized with each other):
 
 | Kind | Root | Notes |
 |---|---|---|
@@ -219,12 +226,13 @@ restores. score = killed / (killed + survived), 0 when nothing was decidable. Th
 | Invariant | Tests |
 |---|---|
 | I1 no execution without capability + permit (+ freshness for mutating effects); every denial path returns a result and a `tool.denied` event: unknown tool, schema, forged/unsigned/foreign-secret capability, run/agent/work-item mismatch, tool/effect/resource scope miss, policy deny, approval_required, permit `allowedPaths`, stale context, throwing policy engine / freshness guard, unrecordable decision, unwritable audit event | `test/runtime.test.ts` (fault injection: each check removed ⇒ its test fails) |
+| I4 + I1 the stale REPLAY of a dispatched side-effect call settles its operation (never refused, never re-dispatched); a new call or a not_applied operation on the stale snapshot is still refused | `test/runtime.test.ts` › the REPLAY of a dispatched side-effect call |
 | I1 secrets redacted before policy evaluation and decision logs | `test/runtime.test.ts` › redaction |
 | I4 side effects only via the SideEffectGateway; same invocation id twice ⇒ one external effect; pending never re-dispatched; not_applied mapped; read tools cannot dispatch; a target outside the authorized resources is refused | `test/runtime.test.ts` (real `createSideEffectGateway` over PGlite/PostgreSQL) |
 | I9 offload: > 16 KiB ⇒ artifact + `tool-output` evidence + bounded head/marker/tail text | `test/runtime.test.ts` › offload |
 | I10 `tool.called`/`tool.completed`/`tool.denied` with run/work item/agent/correlation/causation; evidence producer/provenance | `test/runtime.test.ts` |
 | Path confinement: absolute, `..`, symlink escapes (existing and not-yet-existing targets) | `test/workspaces.test.ts`, `test/whitebox-tools.test.ts` (fs.read/fs.write/fs.apply_patch) |
-| Worktree isolation, idempotent re-attach across restarts (branch never reset), concurrent creators, diff incl. untracked, dispose keeps the repo | `test/workspaces.test.ts` |
+| Worktree isolation, idempotent re-attach across restarts (branch never reset), concurrent creators, parallel work items on one repository (with concurrent disposals), diff incl. untracked, dispose keeps the repo | `test/workspaces.test.ts` |
 | Sandbox: env scrubbing (parent secret invisible), process-group kill incl. grandchildren, SIGKILL escalation, orphan reaping, abort, truncation, stdin, cwd confinement, no shell | `test/sandbox.test.ts` (fault injection verified) |
 | Fake-green: zero tests, empty-file pseudo-cases, load errors, collection errors, build failures, command runner | `test/runners.test.ts`, `test/coverage.test.ts`, `test/whitebox-tools.test.ts` |
 | Unknown branch coverage never reads as 0 | `test/coverage.test.ts` |
@@ -246,6 +254,11 @@ restores. score = killed / (killed + survived), 0 when nothing was decidable. Th
 - New types: `MutationOperator`, `MutationLanguage`, `Mutant`, `MutantStatus`, `MutationAnalysisResult`,
   `LocalSandboxOptions`, `OciSandboxOptions`, `TestRunnerOptions`.
 - `BuiltinToolOptions.stateDir?` — passed through `builtinTools()` to the black-box tools (load job state).
+- (eval integration) `ToolContext.recordEvidence(input)` accepts `environment?: EnvironmentRef`. When omitted, the runtime
+  records the environment the tool's input addresses (`input.environmentId` of a registered environment, at its
+  generation at execution time; unknown ids record none). Black-box evidence (HTTP exchanges, scrapes, load results)
+  therefore has a provenance anchor: without it, L5 reported "records neither an environment nor a commit" for every
+  black-box number. Test: `test/runtime.test.ts` › evidence records the environment the tool addressed.
 
 ### How to test
 
@@ -279,7 +292,7 @@ world beyond a single probe (load jobs, restarts, deploys, faults) is a `SideEff
 | `createEnvironmentRegistry(initial?)` | Re-export of the part-1 in-memory registry (`bumpGeneration` increments generation, optional new buildDigest). |
 | `HttpLoadAdapter`, `HttpLoadStopAdapter`, `observeLoadJob`, `stopLoadJob`, `loadJobDir`, `LOADGEN_WORKER_PATH`, `loadStartTool({ httpAllowlist? })` | Built-in load generator as an external job. |
 | `ProcessEnvAdapter`, `DockerEnvAdapter`, `KubectlEnvAdapter`, `EnvControlAdapter` | Environment control adapters. |
-| `startProcessSupervisor(options)` (+ `process-supervisor-cli.ts`), `CONTROL_TOKEN_HEADER` | Tiny reusable supervisor for local SUT processes (restart, kill, proxy-level fault injection) with a token-protected control API. |
+| `startProcessSupervisor(options)` (+ `process-supervisor-cli.ts` at `PROCESS_SUPERVISOR_CLI_PATH`), `CONTROL_TOKEN_HEADER` | Tiny reusable supervisor for local SUT processes (restart, kill, proxy-level fault injection) with a token-protected control API. Run it through the CLI when the SUT's latency must not depend on the launcher's event loop (the eval kv-service fixture). |
 | `BrowserSessionManager`, `browserTools()`, `chromiumExecutablePath()`, `BrowserEgressGuard`, `BlockedRequest` | Playwright (playwright-core) browser fallback with a context-wide egress guard. |
 | `McpToolBridge`, `mcpToolId`, `normalizeMcpSchema` | MCP stdio bridge. |
 | `parsePrometheusText`, `histogramQuantile`, `summarizeMetrics`, `parsePrometheusApiResponse` | Pure metric parsers. |
@@ -323,15 +336,19 @@ context that never navigated sends nothing (fail closed).
   (`state running|completed|failed|stopped, startedAt, updatedAt, sent, ok, errors, latencyMs{p50,p95,p99,max,mean}, achievedRps, statusCodes, …`)
   and `results.json` on completion (+ cumulative latency histogram buckets). Files are written atomically.
   Scheduling is open-loop (request *i* at `t0 + i/rate`), at most `concurrency` in flight, latency measured
-  from the scheduled time (coordinated-omission corrected). Every request carries `X-Hypertest-Operation`.
+  from the scheduled time (coordinated-omission corrected). The schedule clock starts only once the worker's
+  own HTTP client is usable: `fetch` initializes lazily on its first call (60–90 ms on an idle host, far more on a
+  busy one), so a local `data:` warm-up request (never the target) runs first — the generator's start-up is never
+  charged to the target (it was the p99 of every short job). Every request carries `X-Hypertest-Operation`.
   A `stop-*.json` marker in the job directory is a **durable stop request**: honoured at startup (before any
   request — a stop is never overtaken by a slow launch) and on every status tick (a stop whose signal was
   lost still takes effect within ~500 ms).
 - `HttpLoadAdapter` (`load.http`; native idempotency, lookup by operation id, compensation, deterministic,
   risk high): the job directory `<abs stateDir>/loadjobs/<operationId>/` **is** the external effect (always
   absolute: the worker runs with it as cwd). `dispatch` claims it with an exclusive `mkdir` (an existing
-  directory ⇒ receipt for the existing job, never a second worker), writes `spec.json` (+ desiredStateHash
-  and the launching `runId`), spawns the worker detached (`unref`, stdio → `worker.log`, scrubbed env) and
+  directory ⇒ receipt for the existing job, never a second worker), writes `spec.json` (+ desiredStateHash,
+  the launching `runId` and — beside the hashed desired state — the environment's `environmentGeneration` /
+  `buildDigest` at launch: what the job measured), spawns the worker detached (`unref`, stdio → `worker.log`, scrubbed env) and
   records `launch.json`; any failure before a successful spawn removes the claim ⇒ `not_applied`. `observe`:
   no directory ⇒ `absent`; corrupt `status.json`, `completed` without results, or a directory without a
   worker after `launchGraceMs` ⇒ `uncertain`; `running` with a dead pid (pid reuse checked via
@@ -372,7 +389,10 @@ context that never navigated sends nothing (fail closed).
   annotation match; verify = rollout-status semantics (observedGeneration, updated/available replicas,
   `ProgressDeadlineExceeded` ⇒ failed).
 - After a **verified** restart/deploy the adapter calls `environments.bumpGeneration` (deploy with
-  buildDigest = buildRef) once per operation, so snapshots that observed the old generation become stale.
+  buildDigest = buildRef) once per operation, so snapshots that observed the old generation become stale. The
+  bump names its operation (`bumpGeneration(id, digest, operationId)`): a registry returns the recorded bump when the
+  same operation is verified again — by another adapter instance, e.g. the reconciliation in a process resumed after a
+  crash between the bump and the ledger's `verified` — so one restart is never counted twice.
 - `EnvControlAdapter` (`env.control`) is what the env tools bind to (a ToolSpec binding names one adapter),
   routing by `control.kind`. It declares lookup-by-operation-id so process/kubectl operations reconcile
   after a crash, and reports `uncertain` for a backend without that capability (docker) whenever no receipt
@@ -412,13 +432,15 @@ context that never navigated sends nothing (fail closed).
 | I4 native idempotency: second dispatch for an operation never spawns; spawn failure ⇒ not_applied with the claim removed; relative state dir still launches a working job | `test/blackbox-load.test.ts` › dispatch idempotent, › a RELATIVE state dir |
 | I4 env.process lost receipt ⇒ found by operation id, never restarted twice; duplicate restart requests restart once; supervisor state persisted in order | `test/blackbox-supervisor.test.ts` |
 | I4 docker without receipt / failed command ⇒ manual_review (standalone and via env.control), no second restart; kubectl lost receipt ⇒ annotation lookup, no second patch; kubectl deploy never overwrites sidecars (refusal ⇒ not_applied, 0 patches) | `test/blackbox-envcli.test.ts` (fake CLIs) |
-| Generation bump after verified restart/deploy (not after faults) | `test/blackbox-supervisor.test.ts`, `test/blackbox-envcli.test.ts` |
+| Generation bump after verified restart/deploy (not after faults); once per operation, also when a fresh adapter re-verifies it (crash between bump and `verified`) | `test/blackbox-supervisor.test.ts` (› CRASH between the generation bump and the ledger's verified), `test/blackbox-envcli.test.ts` |
 | I1 through the runtime: POST to a production env denied, deploy needs approval, MCP/load.stop without an environment class denied | `test/blackbox-http.test.ts`, `test/blackbox-supervisor.test.ts`, `test/blackbox-mcp.test.ts`, `test/blackbox-load.test.ts` |
 | I1 control plane: unauthenticated supervisor mutations ⇒ 401 (child untouched); http.request / load.start can never address `/__hypertest` or a registered control target (even with the token, raw URL or dot segments); env.process without the token ⇒ not_applied; the token never reaches the ledger | `test/blackbox-supervisor.test.ts` › I1 control plane, › env.process without the control token, › env.restart through the ToolRuntime |
 | Egress guard: allowlist, loopback-only-for-local, permit `allowedHosts` (http AND load.start, before any operation exists), base-path confinement, no redirects followed (http), redirect / link click / subresource off-allowlist blocked in the browser, no-navigate context fail-closed | `test/blackbox-http.test.ts`, `test/blackbox-load.test.ts` › egress, `test/blackbox-browser.test.ts` |
 | Run isolation: load.observe / load.stop of another run's job refused; the job keeps running | `test/blackbox-load.test.ts` › run isolation |
 | I6/I9 evidence: full body in the artifact, bounded structured/preview, redacted credentials (headers, query, JSON body fields), NUL-safe, partial bodies flagged; metric evidence once per load operation | `test/blackbox-http.test.ts`, `test/blackbox-load.test.ts` |
 | Non-2xx is a successful tool call; timeouts/connection failures still produce evidence | `test/blackbox-http.test.ts` |
+| Measurement: the load generator's own client start-up is never charged to the target (a preload makes the first fetch take 400 ms; the warm-up sends nothing to the target) | `test/blackbox-load.test.ts` › the worker's own HTTP client start-up |
+| Provenance: load results evidence records the environment the job MEASURED (generation at launch, even when observed after a restart); a bare-URL job records none | `test/blackbox-load.test.ts` › the results evidence records the environment |
 | MCP: per-server availability, reconnect after server exit, one caller's abort does not fail the others | `test/blackbox-mcp.test.ts` |
 
 ### Contract changes
@@ -429,6 +451,15 @@ consumer outside this package): `ProcessSupervisor.controlUrl` now carries the c
 `resolveLoadTarget` also returns `trustedOrigins`; `BrowserSessionManager.page()` takes an optional egress
 guard (new `drainBlocked()`); `readBodyLimited` returns partial bytes + `error` instead of throwing;
 `HttpRequestResult.bodyError` (additive).
+
+Eval integration (additive): `PROCESS_SUPERVISOR_CLI_PATH`; `LoadJobSpec.environmentGeneration?` /
+`buildDigest?` (written at dispatch, outside the desired-state hash); load results evidence carries the job's
+environment; api-response evidence records `request.path` (the path an oracle's `http_expectation` names); load
+results carry `errorRate` (errors / completed requests, null before any completed); the worker warms its client up
+before the schedule starts; `EnvironmentRegistry.bumpGeneration(environmentId, buildDigest?, operationId?)` (the
+optional operation id makes the bump idempotent per operation; the in-memory registry remembers the last 4096);
+`tool.called` of a stale replay carries `replayOfOperation` (behaviour: such a replay settles its operation
+reconcile-only instead of being refused as `stale_context`).
 
 ### How to test
 

@@ -49,7 +49,41 @@ describe('environment generations survive restarts (freshness)', () => {
     assert.deepEqual([persisted.environments['shop']!.generation, persisted.environments['other']!.generation], [3, 2]);
   });
 
+  test('a bump names its operation: a NEW process re-verifying that operation (crash between the bump and the ledger\'s verified) gets the recorded bump, never a second one', async () => {
+    const file = join(dir.path, 'ops.json');
+    const first = persistentEnvironmentRegistry(createEnvironmentRegistry([env(1)]), file, new MemoryLogger());
+    assert.equal(first.bumpGeneration('shop', 'b2', 'op_restart_1').generation, 2);
+    assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), {
+      version: 1, environments: { shop: { generation: 2, buildDigest: 'b2' } }, operations: { op_restart_1: { environmentId: 'shop', generation: 2, buildDigest: 'b2' } },
+    });
+    // the killed process is gone; the resumed one composes a fresh registry over the same state file and re-verifies
+    const resumed = persistentEnvironmentRegistry(createEnvironmentRegistry([env(1)]), file, new MemoryLogger());
+    const again = resumed.bumpGeneration('shop', 'b2', 'op_restart_1');
+    assert.deepEqual([again.generation, again.buildDigest, again.baseUrl], [2, 'b2', 'http://127.0.0.1:8080']);
+    assert.equal(resumed.get('shop')!.generation, 2, 'one restart, one generation');
+    assert.equal(JSON.parse(await readFile(file, 'utf8')).environments.shop.generation, 2);
+    // the recorded bump belongs to its environment; another operation (and an anonymous bump) still moves forward
+    assert.throws(() => resumed.bumpGeneration('other', undefined, 'op_restart_1'), (e: unknown) => e instanceof HypertestError && e.code === 'conflict');
+    assert.equal(resumed.bumpGeneration('shop', undefined, 'op_restart_2').generation, 3);
+    assert.equal(resumed.bumpGeneration('shop').generation, 4);
+    const state = JSON.parse(await readFile(file, 'utf8')) as { environments: Record<string, unknown>; operations: Record<string, unknown> };
+    assert.deepEqual([state.environments['shop'], Object.keys(state.operations)], [{ generation: 4, buildDigest: 'b2' }, ['op_restart_1', 'op_restart_2']]);
+    // a later bump of the same environment does not change what an earlier operation recorded
+    assert.equal(persistentEnvironmentRegistry(createEnvironmentRegistry([env(1)]), file, new MemoryLogger()).bumpGeneration('shop', 'b2', 'op_restart_1').generation, 2);
+  });
+
+  test('the bump record is bounded (the most recent 1024 operations are kept)', async () => {
+    const file = join(dir.path, 'bounded.json');
+    const r = persistentEnvironmentRegistry(createEnvironmentRegistry([env(1)]), file, new MemoryLogger());
+    for (let i = 0; i < 1030; i++) r.bumpGeneration('shop', undefined, `op_b${i}`);
+    const ops = Object.keys((JSON.parse(await readFile(file, 'utf8')) as { operations: Record<string, unknown> }).operations);
+    assert.deepEqual([ops.length, ops[0], ops.at(-1)], [1024, 'op_b6', 'op_b1029']);
+  });
+
   test('a corrupt state file fails closed (integrity_violation), never silently resets generations', async () => {
+    const corrupt = join(dir.path, 'd-ops.json');
+    await writeFile(corrupt, '{"version":1,"environments":{"shop":{"generation":2}},"operations":{"op_x":{"environmentId":"shop","generation":"2"}}}');
+    assert.throws(() => persistentEnvironmentRegistry(createEnvironmentRegistry([env(1)]), corrupt, new MemoryLogger()), (e: unknown) => e instanceof HypertestError && e.code === 'integrity_violation');
     const file = join(dir.path, 'd.json');
     await writeFile(file, '{"version":1,"environments":{"shop":{"generation":"two"}}}');
     assert.throws(() => persistentEnvironmentRegistry(createEnvironmentRegistry([env(1)]), file, new MemoryLogger()), (e: unknown) => e instanceof HypertestError && e.code === 'integrity_violation');

@@ -361,7 +361,11 @@ describe('resolveGrader', () => {
       assert.equal(r.id, 'verdict');
       assert.equal((await r.grader(ctx(data({ decision: decision('fail') })))).graderId, 'verdict');
     }
-    assert.deepEqual(Object.keys(GRADERS).sort(), ['auditReconstruction', 'defectDetected', 'evidenceCompleteness', 'evidenceIntegrity', 'noDuplicateSideEffects', 'planDynamics', 'policyViolation', 'verdict']);
+    assert.deepEqual(Object.keys(GRADERS).sort(), [
+      'auditReconstruction', 'causalChain', 'contextIsolation', 'defectDetected', 'evidenceCompleteness', 'evidenceIntegrity', 'independentReview', 'insufficientDataNotPassed',
+      'loadJobReattached', 'modelFallback', 'noDuplicateSideEffects', 'noOrphanOperations', 'offloadBounded', 'planDynamics', 'pocAWorkflow', 'pocBWorkflow', 'pocCWorkflow',
+      'policyViolation', 'recoveryAudit', 'reportTracesToEvidence', 'singleLeaseOwner', 'testChangeGoverned', 'verdict',
+    ]);
   });
 
   test('extra graders are resolvable and override built-ins; their results carry the registered id', async () => {
@@ -372,7 +376,7 @@ describe('resolveGrader', () => {
   });
 
   test('unknown ids, empty specs and parameters on a parameterless grader are refused', () => {
-    assert.throws(() => resolveGrader('llmJudge'), (e: unknown) => invalid(e) && /unknown grader 'llmJudge' \(known: auditReconstruction, defectDetected/.test((e as Error).message));
+    assert.throws(() => resolveGrader('llmJudge'), (e: unknown) => invalid(e) && /unknown grader 'llmJudge' \(known: auditReconstruction, causalChain, contextIsolation, defectDetected/.test((e as Error).message));
     assert.throws(() => resolveGrader(''), invalid);
     assert.throws(() => resolveGrader('verdict?x=1'), (e: unknown) => invalid(e) && /takes no parameters/.test((e as Error).message));
   });

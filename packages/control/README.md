@@ -151,7 +151,9 @@ CANONICAL form — `..`/`.` segments and symlinks resolved, so `test/../src/x.js
 is classified as the product code it writes), `fs.apply_patch` (the patch; `check: true` exempt) and `git.commit`
 (`workspaces.diff`): `classifyTestChange(diff, {productFixAuthorized: holdsProductFix})` ⇒
 forbidden: not executed + `policy.decided {decision: deny, reason: test_change_forbidden}`; approval_required: not
-executed + one `test_change` approval per diff digest (an approved digest executes); conditional: executed + registered
+executed + one `test_change` approval per diff digest (an approved digest executes; the requester is recorded with the
+model provider of its current epoch, as `request_approval` and oracle proposals do — an agent approver must be
+independent of it, which is impossible to establish without the provider); conditional: executed + registered
 artifacts at those paths reset to `draft`; auto_allowed: executed. Then `toolRuntime.execute` with the turn's
 snapshot (replayed turns use the snapshot recorded with the turn) and the work item event context (correlation =
 work item, actor = agent, causation = the item's causation event). Terminal tools return `{terminal}`; pending
@@ -183,8 +185,14 @@ is queued for the agent and the item goes `waiting → running` ⇒ `continue`; 
 recovery of the run's work),
 then take the run lease (a live foreign owner ⇒ `unavailable`, retryable), then requeue claimed/running items not
 leased by this worker — or leased by a previous process of this worker (claims this instance never issued) — and
-re-take the claims of waiting items (new fencing tokens). Requeues count attempts (`maxWorkAttempts`). `work.requeued`
-/ `operation.*` events form the recovery log of the report.
+re-take the claims of waiting items (new fencing tokens). Requeues count attempts (`maxWorkAttempts`). A pass that
+recovered anything appends ONE audit event `run.recovered` (actor `system:control:<worker>`): `{workerId, operations:
+{examined, verified, notApplied, manualReview, stillPending, compensated}, requeued: [{workItemId, role, from,
+attempts, to}], reattached: [{workItemId, role, waitingOn, fencingToken, claim: kept|retaken}]}` — a waiting item still
+leased by this worker id but whose claim an EARLIER process issued (a restart of the same worker) is re-attached with
+its claim kept; a pass with nothing to recover records nothing. `work.requeued`, `operation.reconciled` and
+`run.recovered` form the recovery log of the report ("recovery by <worker>: reconciled …; re-runs … — orphaned by the
+previous process; re-attached <item> (<role>) to <operations> — still waiting, nothing re-created").
 
 **cancelRun** — the run is set `cancelled` FIRST (ticks, reactions and executeTurn stop acting on it), then every
 active/waiting agent is interrupted (children of already settled parents included), then open work is cancelled and its
@@ -244,6 +252,8 @@ routes per role from the epochs (turns), evidence count/root/seal (verified), re
 | I2 delegation children are attenuated from the parent's recorded capability | `test/worker.test.ts` (delegation) |
 | I4 fencing: stale token ⇒ `lease_lost` with no writes; a reassigned worker's tool calls are refused; the new owner continues; settled results adopted after a crash | `test/scheduler.test.ts` |
 | I4 waiting on external operations: observed, never re-dispatched; recover reconciles first, takes over orphaned claims with new tokens (other worker, restarted process) | `test/operations.test.ts` |
+| Recovery audit: a recovery pass is recorded (run.recovered) and explained in the report — re-runs and waiting items re-attached by a restarted process of the same worker; nothing recorded when nothing was recovered; idempotent per process | `test/operations.test.ts` › recovery is auditable |
+| I8 independent approval is possible: test-change and `request_approval` requesters carry their model provider; a same-provider agent is refused, an independent agent (other provider and role) may approve | `test/test-governance.test.ts` › weakening an assertion needs approval, `test/domain-tools.test.ts` |
 | I5 duplicate delivery ⇒ one reaction (bus handler twice, bus + catch-up, in-process bus duplicate injection, two workers on PostgreSQL) | `test/reactors.test.ts`, `test/postgres.int.test.ts` |
 | I7 gate: signed decision bound to the sealed root; evidence gaps ⇒ inconclusive; feedback loop bounded to 2 evaluations | `test/control.e2e.test.ts`, `test/lifecycle.test.ts` |
 | I10 audit: every model route, tool call and gate decision reconstructible from L0 alone; causal chain finding → reaction | `test/control.e2e.test.ts` (audit) |
@@ -284,6 +294,9 @@ observeWaiting). `test/fixture.ts` is a git repo with a seeded pricing regressio
   `AgentHostSpec.guard?`, `ControlStore.setQuarantine` / `setGuard`; `Scheduler.requeue`; `WorkFactory.lock`; `createAgentWorker(deps, config, hooks?)`;
   new exports `classifyDrift`, `quarantineLifted`, `QUARANTINE_BLOCKED_TOOL_IDS`, `diffSections`, `invertSection`,
   `sectionPaths`, `tightenModelPolicy`, `RESOLVING_FINDING_STATUSES`. No change to `src/contracts.ts`.
+- (eval integration, behaviour) `recover()` appends `run.recovered` (domain `EVENT_TYPES.runRecovered`) and the
+  report's recovery log renders it; test-change / `request_approval` requesters record `modelProvider`. No change to
+  `src/contracts.ts`.
 
 ## Notes for integrators
 

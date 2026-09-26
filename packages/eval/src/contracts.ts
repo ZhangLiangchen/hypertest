@@ -30,11 +30,12 @@ import type { OracleGovernance, PolicyDecisionRecord } from '@hypertest/policy';
  *   (additive, review) the trial result rules decideTrialResult / unexercisedChaos / chaosProblems / childExitProblem,
  *   hintProblems, RELEASE_VERDICTS.
  *   (additive, PoC suites) the PoC task factories (pocATask, pocBTask, pocCTask, pocCInsufficientTask, oracleRobustnessTask,
- *   recoveryChaosTask), the arms (scriptedMultiLlmArm, scriptedSingleArm, liveArm, liveArmAvailable, POC_ARMS), the
- *   scripted PoC brains (pocBrains: child-process brains export), the fixtures (createLedgerRepo, startBankApi,
- *   startKvService), the PoC graders (reactionsWithoutLead, causalChain, singleLeaseOwner, noOrphanOperations,
- *   loadJobReattached, offloadBounded, modelFallback, contextIsolation, independentReview, testChangeGoverned,
- *   reportTracesToEvidence, roleCoverage) and establishOracles / killPointProblems / KILL_POINT_STATES.
+ *   recoveryChaosTask) and pocAllSuite(), the arms (scriptedMultiLlmArm, scriptedSingleArm, liveArm, liveArmAvailable,
+ *   POC_ARMS, builtinArms), the scripted PoC brains (pocBrains; pocChildBrains: child-process brains export), the fixtures
+ *   (createLedgerRepo, startBankApi, startKvService: supervisor in its own process; killLoadWorkers/isLoadWorker), the PoC graders (pocAWorkflow,
+ *   pocBWorkflow, pocCWorkflow, causalChain, singleLeaseOwner, noOrphanOperations, loadJobReattached, recoveryAudit,
+ *   offloadBounded, modelFallback, contextIsolation, independentReview, reportTracesToEvidence, testChangeGoverned,
+ *   insufficientDataNotPassed) and establishOracles / killPointProblems / KILL_POINT_STATES.
  */
 export interface HiddenFault {
   faultId: string;
@@ -77,6 +78,12 @@ export interface KillPoint {
    * external call lands the kill while the request is in flight at the external system (an unknown outcome).
    */
   delayMs?: number;
+  /**
+   * (additive) How long Hypertest stays down after this kill before the resumed process starts (default 0). The external
+   * world moves on meanwhile: e.g. an in-flight restart completes, so the recovery finds it done (and moves the
+   * environment's generation on) before the interrupted turn is replayed.
+   */
+  downtimeMs?: number;
 }
 
 export interface TrialContext {

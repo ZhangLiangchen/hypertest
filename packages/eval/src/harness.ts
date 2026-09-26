@@ -285,11 +285,11 @@ async function waitForPoint(
 }
 
 /** The kill points of a chaos plan as predicates over operation lines (killAfterOperationDispatch first). */
-function killPredicates(chaos: ChaosPlan): Array<{ reached: (lines: readonly TrialProgressEvent[]) => boolean; delayMs: number }> {
-  const out: Array<{ reached: (lines: readonly TrialProgressEvent[]) => boolean; delayMs: number }> = [];
+function killPredicates(chaos: ChaosPlan): Array<{ reached: (lines: readonly TrialProgressEvent[]) => boolean; delayMs: number; downtimeMs: number }> {
+  const out: Array<{ reached: (lines: readonly TrialProgressEvent[]) => boolean; delayMs: number; downtimeMs: number }> = [];
   const n = chaos.killAfterOperationDispatch;
-  if (n !== undefined) out.push({ reached: (lines) => dispatchCount(lines) >= n, delayMs: 0 });
-  for (const k of chaos.kills ?? []) out.push({ reached: (lines) => killPointCount(lines, k) >= (k.nth ?? 1), delayMs: k.delayMs ?? 0 });
+  if (n !== undefined) out.push({ reached: (lines) => dispatchCount(lines) >= n, delayMs: 0, downtimeMs: 0 });
+  for (const k of chaos.kills ?? []) out.push({ reached: (lines) => killPointCount(lines, k) >= (k.nth ?? 1), delayMs: k.delayMs ?? 0, downtimeMs: k.downtimeMs ?? 0 });
   return out;
 }
 
@@ -364,6 +364,8 @@ async function executeInProcess(x: ExecutionInput): Promise<Execution> {
     // "kill": the instance goes away mid-run (in-flight turns aborted); a new one resumes from the stores
     await ht.close();
     restarts++;
+    // Hypertest stays down for a while: the external world moves on without it
+    if (point.downtimeMs > 0) await sleep(Math.min(point.downtimeMs, Math.max(0, deadline - Date.now())));
     ht = await compose();
     await ht.resumeIncomplete();
   }

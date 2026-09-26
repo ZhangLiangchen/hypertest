@@ -182,6 +182,7 @@ export function observationOf(provider: string, v: BrainView, tag?: string): Bra
     toolMessages: messages.filter((m) => m.role === 'tool').length,
     // the lead's own transcript legitimately contains its reasoning
     sawLeadTrace: v.role !== 'lead' && sawLeadTrace,
+    offeredTools: [...new Set((v.request.tools ?? []).map((t) => t.name))].sort(),
   };
   if (tag !== undefined) o.tag = tag;
   return o;

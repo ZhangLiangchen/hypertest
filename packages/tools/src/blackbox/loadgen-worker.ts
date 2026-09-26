@@ -8,7 +8,10 @@
  * Scheduling is OPEN-LOOP: request i is due at start + i/ratePerSecond regardless of how fast the target
  * answers. At most `concurrency` requests are in flight; due requests beyond that wait in a FIFO queue.
  * Latency is measured from the request's scheduled time (coordinated-omission corrected), so a slow
- * target shows up as latency instead of silently lowering the offered rate.
+ * target shows up as latency instead of silently lowering the offered rate. The schedule starts only once the
+ * worker's own HTTP client is usable: `fetch` initializes lazily on its first call (tens of ms, far more on a busy
+ * host), so a local no-network warm-up request (`data:` URL, never the target) runs first — the generator's start-up
+ * is never charged to the target as latency.
  *
  * SIGTERM/SIGINT ⇒ stop scheduling, abort in-flight requests, final state `stopped`. A `stop-*.json`
  * marker (written by load.stop BEFORE it signals) is itself a durable stop request: it is honoured at
@@ -164,7 +167,8 @@ function main(): void {
   let inFlight = 0;
   let finishedAt: string | undefined;
   let lastError: string | undefined;
-  const t0 = performance.now();
+  // the schedule clock starts after the client warm-up (see main's tail)
+  let t0 = performance.now();
   let sendWindowEnd: number | undefined;
   const headers: Record<string, string> = { 'user-agent': 'hypertest-loadgen/0.3' };
   for (const [k, v] of Object.entries(spec.headers ?? {})) headers[k.toLowerCase()] = String(v);
@@ -309,7 +313,25 @@ function main(): void {
   if (stopRequested || stopMarkerPresent()) onStop();
   else {
     writeStatus();
-    tick();
+    void warmUpClient().then(() => {
+      // a stop that arrived during the warm-up already finished the job (no request was sent)
+      if (state !== 'running') return;
+      t0 = performance.now();
+      tick();
+    });
+  }
+}
+
+/**
+ * Initializes the HTTP client without touching the target (a `data:` URL is answered locally): the lazy start-up of
+ * `fetch` then happens before the open-loop schedule starts. A failed warm-up is harmless (the first real request
+ * pays the start-up, as before).
+ */
+async function warmUpClient(): Promise<void> {
+  try {
+    await (await fetch('data:text/plain,hypertest-loadgen-warmup')).arrayBuffer();
+  } catch {
+    // best effort
   }
 }
 

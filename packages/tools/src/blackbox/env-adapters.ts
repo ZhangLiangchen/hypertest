@@ -74,7 +74,10 @@ function controlEndpoint(base: URL, suffix: string): URL {
 
 /**
  * Bumps the environment generation once per verified operation (a re-verification — e.g. a duplicate
- * observe in this process — reuses the recorded bump instead of bumping twice).
+ * observe in this process — reuses the recorded bump instead of bumping twice). The operation id is handed to the
+ * registry as well: a registry that remembers bumps by operation (the in-memory one per process; the app's persistent
+ * one across processes) returns the recorded bump when ANOTHER adapter instance re-verifies the same operation — a
+ * reconciliation after a crash between the bump and the ledger's `verified` never counts one restart twice.
  */
 class GenerationBumper {
   readonly #done = new Map<string, EnvironmentDescriptor>();
@@ -85,7 +88,7 @@ class GenerationBumper {
   bump(operationId: string, environmentId: string, buildDigest?: string): EnvironmentDescriptor {
     const prior = this.#done.get(operationId);
     if (prior) return prior;
-    const next = this.#envs.bumpGeneration(environmentId, buildDigest);
+    const next = this.#envs.bumpGeneration(environmentId, buildDigest, operationId);
     this.#done.set(operationId, next);
     return next;
   }

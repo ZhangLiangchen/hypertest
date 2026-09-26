@@ -40,7 +40,12 @@ Depends on `@hypertest/core` and `@hypertest/domain` only. The ABI is `src/contr
 7. `acknowledged` ⇒ attach (observe + verify). Because the target acknowledged the job, `absent` is treated as
    *not yet observable* (`pending`), never as "not applied" — re-dispatching an acknowledged job could duplicate
    it; `uncertain` ⇒ `manual_review`. (The domain state machine has no `acknowledged → reconciling` edge.)
-8. Outcome mapping for states without their own outcome: `compensated` ⇒ `not_applied`/`compensated`,
+8. `reconcileOnly: true` (additive; the replay of a call decided on a snapshot that is stale by now): only the
+   invocation's EXISTING operation is settled — recorded outcome, attach, reconcile — and nothing is ever dispatched:
+   `prepared`/`not_applied` ⇒ `not_applied` (`dispatch_refused: …`), reconciled `absent` ⇒ `not_applied` (no safe
+   re-dispatch), no operation ⇒ `not_found` (nothing recorded). A reconcile-only call never joins a normal drive.
+   `find(toolInvocationId, operationType, runId)` returns the invocation's operation (run-scoped).
+9. Outcome mapping for states without their own outcome: `compensated` ⇒ `not_applied`/`compensated`,
    `compensating` ⇒ `pending`, `prepared` (observe only) ⇒ `not_applied`/`not_dispatched`. The
    authoritative status is always `outcome.operation.status`.
 
@@ -89,6 +94,7 @@ exceeding amount.
 | I4 absent ⇒ single safe retry; uncertain ⇒ manual_review; non-reconcilable high-risk ⇒ manual_review | `test/gateway.test.ts` |
 | I4 duplicate delivery ⇒ one operation, one side effect | `test/gateway.test.ts`, `test/ledger.test.ts` (10 concurrent prepares), `test/postgres.int.test.ts` |
 | I4 reconciliation never dispatches | `test/reconciler.test.ts` |
+| I4 a reconcile-only replay settles (recorded result, attach, reconcile) and never dispatches (absent / not_applied / no operation) | `test/gateway.test.ts` › reconcileOnly |
 | I4 monotonic fencing tokens (5 acquire/expire cycles), never reused | `test/leases.test.ts`, `test/postgres.int.test.ts` |
 | I10 every transition emits an `operation.*` event atomically with the state change | `test/ledger.test.ts`, `test/reconciler.test.ts` |
 | I12 admission conflicts (ancestor/descendant, read_shared compatibility), all-or-nothing | `test/admission.test.ts`, `test/postgres.int.test.ts` |
@@ -106,6 +112,8 @@ exceeding amount.
 - `OperationLedger.transition(..., { expectedAttempt? })` — rules out ABA across a re-dispatch cycle.
 - `GatewayDeps.pollIntervalMs?`, `GatewayDeps.dispatchTimeoutMs?`, `RunSideEffectRequest.dispatchTimeoutMs?`.
 - `ReconcileReport.failed?` — operations whose verification definitively failed during reconciliation.
+- (eval review) `RunSideEffectRequest.reconcileOnly?` and `SideEffectGateway.find?(toolInvocationId, operationType,
+  runId)` (optional member; `createSideEffectGateway` implements it) — see Gateway semantics 8.
 - Documented outcome mapping for `compensated`/`compensating`/`prepared` (no new outcome statuses).
 - Documented (no signature change): `transition(→ dispatching)` clears `externalJobId`/`externalReceipt`
   unless the patch supplies them; `prepare` also treats a different `adapterId` as a `conflict`; the

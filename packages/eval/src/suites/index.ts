@@ -31,6 +31,18 @@ export function recoveryChaosSuite(): EvalSuite {
   return { suiteId: 'recovery-chaos', revision: POC_SUITE_REVISION, tasks: [recoveryChaosTask()] };
 }
 
+/**
+ * (additive) Every PoC task in one suite — the arm comparison (`hypertest eval run poc-all --arms scripted-multi-llm,
+ * scripted-single`): paired trials per task, McNemar over the discordant pairs.
+ */
+export function pocAllSuite(): EvalSuite {
+  return {
+    suiteId: 'poc-all',
+    revision: POC_SUITE_REVISION,
+    tasks: [pocATask(), pocBTask(), pocCTask(), pocCInsufficientTask(), oracleRobustnessTask(), recoveryChaosTask()],
+  };
+}
+
 export { OBSERVATIONS_PROBE, POC_SUITE_REVISION, observationsFile, observationsProbe } from './common.ts';
 export { LEDGER_ORACLE, POC_A_TASK_ID, pocATask } from './poc-a.ts';
 export { BANK_ORACLE, POC_B_TASK_ID, pocBTask } from './poc-b.ts';

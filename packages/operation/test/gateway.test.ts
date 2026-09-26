@@ -269,6 +269,56 @@ test('I4: absent on reconcile ⇒ not_applied ⇒ exactly one safe re-dispatch p
   assert.deepEqual(types.slice(-3), ['operation.dispatched', 'operation.acknowledged', 'operation.verified']);
 });
 
+test('reconcileOnly: the replay of a call settles its EXISTING operation (recorded result, reconcile, attach) and never dispatches', async () => {
+  // no operation ⇒ not_found; nothing is recorded, nothing dispatched
+  const fresh = new FakeAdapter();
+  const g = gatewayFor(env, [fresh]).gateway;
+  const none = request('run-ro-none');
+  await assert.rejects(g.run({ ...none, reconcileOnly: true }), (e: unknown) => isHypertestError(e, 'not_found') && /nothing to reconcile/.test((e as Error).message));
+  assert.equal(await env.ledger.findByToolInvocation(none.toolInvocationId, none.operationType), undefined);
+  await assert.rejects(g.run({ ...none, reconcileOnly: 'yes' as never }), (e: unknown) => isHypertestError(e, 'invalid_argument'));
+  assert.equal(fresh.calls.dispatch, 0);
+
+  // verified ⇒ the recorded result
+  const done = request('run-ro-done');
+  const first = await g.run(done);
+  assertStatus(first, 'verified');
+  const replay = await g.run({ ...done, reconcileOnly: true });
+  assertStatus(replay, 'verified');
+  assert.deepEqual([replay.operation.operationId, replay.result], [first.operation.operationId, first.result]);
+  assert.equal(fresh.calls.dispatch, 1);
+  // find(): the operation of an invocation, run-scoped
+  assert.equal((await g.find!(done.toolInvocationId, done.operationType, done.runId))?.operationId, first.operation.operationId);
+  assert.equal(await g.find!(done.toolInvocationId, done.operationType, 'run-other'), undefined);
+  assert.equal(await g.find!('sess-unknown:turn-1:call-1', done.operationType, done.runId), undefined);
+
+  // lost response, effect present ⇒ reconciled to verified (attached), no second dispatch
+  const lost = new FakeAdapter();
+  lost.dispatchFaults = ['apply_then_throw'];
+  const lostReq = request('run-ro-lost');
+  assertStatus(await gatewayFor(env, [lost]).gateway.run(lostReq), 'pending');
+  const settled = await gatewayFor(env, [lost]).gateway.run({ ...lostReq, reconcileOnly: true });
+  assertStatus(settled, 'verified');
+  assert.deepEqual([lost.calls.dispatch, lost.target.created], [1, 1]);
+
+  // lost dispatch, effect ABSENT ⇒ not_applied — never the "single safe re-dispatch" of a normal run
+  const absent = new FakeAdapter();
+  absent.dispatchFaults = ['throw_before_apply'];
+  const absentReq = request('run-ro-absent');
+  assertStatus(await gatewayFor(env, [absent]).gateway.run(absentReq), 'pending');
+  const refused = await gatewayFor(env, [absent]).gateway.run({ ...absentReq, reconcileOnly: true });
+  assertStatus(refused, 'not_applied');
+  assert.deepEqual([absent.calls.dispatch, absent.target.created, refused.operation.status], [1, 0, 'not_applied']);
+  // …and a not_applied operation is not re-dispatched by a reconcile-only call either
+  const again = await gatewayFor(env, [absent]).gateway.run({ ...absentReq, reconcileOnly: true });
+  assertStatus(again, 'not_applied');
+  assert.match(again.reason, /^dispatch_refused: operation op_\w+ is not_applied/);
+  assert.equal(absent.calls.dispatch, 1);
+  // a normal run (a new decision) may still dispatch it
+  assertStatus(await gatewayFor(env, [absent]).gateway.run(absentReq), 'verified');
+  assert.deepEqual([absent.calls.dispatch, absent.target.created], [2, 1]);
+});
+
 test('I4: an uncertain reconciliation ⇒ manual_review, and nothing is retried afterwards', async () => {
   const adapter = new FakeAdapter();
   adapter.dispatchFaults = ['apply_then_throw'];

@@ -36,10 +36,10 @@ async function workItem(runId: string, ctx: EventContext, objective: string): Pr
   return workItem.workItemId;
 }
 
-async function toolRun(runId: string, ctx: EventContext, invocationId: string, workItemId: string, operationId?: string): Promise<DomainEvent<unknown>[]> {
+async function toolRun(runId: string, ctx: EventContext, invocationId: string, workItemId: string, operationId?: string, toolId = 'env.restart'): Promise<DomainEvent<unknown>[]> {
   const base = { aggregateType: 'tool' as const, aggregateId: invocationId, runId, correlationId: ctx.correlationId, actorId: 'agent-exec', agentId: 'agent-exec', workItemId };
-  const [called] = await events.append([{ ...base, eventType: 'tool.called', payload: { invocationId, toolId: 'env.restart' } }]);
-  const [completed] = await events.append([{ ...base, eventType: 'tool.completed', causationId: called!.eventId, payload: { invocationId, toolId: 'env.restart', status: 'success', ...(operationId ? { operationId } : {}) } }]);
+  const [called] = await events.append([{ ...base, eventType: 'tool.called', payload: { invocationId, toolId } }]);
+  const [completed] = await events.append([{ ...base, eventType: 'tool.completed', causationId: called!.eventId, payload: { invocationId, toolId, status: 'success', ...(operationId ? { operationId } : {}) } }]);
   return [called!, completed!];
 }
 
@@ -247,4 +247,36 @@ test('inconsistent links are gaps: invocation ids, tool ids, agents, operation w
   const t = await prov.traceRecord(rec.recordId);
   assert.equal(t.complete, false);
   assert.deepEqual(t.gaps, [`record ${rec.recordId} (run ${otherRun}) cites evidence ${good.evidenceId} of run ${runId}`]);
+});
+
+test('an observation is lineage, not an inconsistency: evidence recorded by the invocation that OBSERVED an operation another invocation started', async () => {
+  // load.observe (metrics analyst) records the results of a load job that load.start (environment operator) started in
+  // another work item: evidence → observing invocation → operation → starting invocation. Only the observing
+  // invocation's OWN L0 events can make that link (they name the operation); a record merely naming it stays a gap.
+  const runId = 'run_prov_observation';
+  const ctx = eventCtx(runId);
+  const starter = await workItem(runId, ctx, 'start the load job');
+  const observer = await workItem(runId, ctx, 'analyse the load job');
+  const envRef = { environmentId: 'kv', environmentClass: 'local', generation: 2 };
+  await toolRun(runId, ctx, 'inv_start', starter, 'op_load', 'load.start');
+  await operation(runId, ctx, 'op_load', 'inv_start', starter);
+  await toolRun(runId, ctx, 'inv_observe', observer, 'op_load', 'load.observe');
+  const observed = await evidence(runId, { workItemId: observer, toolInvocationId: 'inv_observe', operationId: 'op_load', environment: envRef, provenance: { toolId: 'load.observe' } });
+  const t = await prov.traceEvidence(observed.evidenceId);
+  assert.deepEqual(t.gaps, []);
+  assert.equal(t.complete, true);
+  const e = edges(t);
+  assert.ok(e.includes(`evidence:${observed.evidenceId} -produced_by-> tool_invocation:inv_observe`), e.join('\n'));
+  assert.ok(e.includes('tool_invocation:inv_observe -observed-> operation:op_load'), e.join('\n'));
+  assert.ok(e.includes('operation:op_load -started_by-> tool_invocation:inv_start'), e.join('\n'));
+  assert.ok(!e.includes('tool_invocation:inv_observe -operation-> operation:op_load'), 'the observer did not run the operation');
+  assert.ok(e.includes(`evidence:${observed.evidenceId} -executed_in-> work_item:${observer}`));
+
+  // forged: an invocation whose own events never touched the operation cannot claim it — still inconsistent
+  await toolRun(runId, ctx, 'inv_unrelated', observer, undefined, 'load.observe');
+  const forged = await evidence(runId, { workItemId: observer, toolInvocationId: 'inv_unrelated', operationId: 'op_load', environment: envRef, provenance: { toolId: 'load.observe' } });
+  assert.deepEqual((await prov.traceEvidence(forged.evidenceId)).gaps, [
+    `operation op_load belongs to tool invocation inv_start, but evidence ${forged.evidenceId} names inv_unrelated`,
+    `operation op_load ran in work item ${starter}, but evidence ${forged.evidenceId} names ${observer}`,
+  ]);
 });
