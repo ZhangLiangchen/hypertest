@@ -14,6 +14,10 @@ test('state machines allow only declared transitions', () => {
   assert.ok(canTransitionOperation('dispatching', 'outcome_unknown'));
   assert.ok(!canTransitionOperation('outcome_unknown', 'dispatching'), 'unknown outcomes must reconcile before re-dispatch');
   assert.ok(!canTransitionOperation('verified', 'dispatching'));
+  // never dispatched (e.g. refused as resource_busy) ⇒ recorded not_applied, re-dispatchable; but never back to prepared
+  assert.ok(canTransitionOperation('prepared', 'not_applied'));
+  assert.ok(canTransitionOperation('not_applied', 'dispatching'));
+  assert.ok(!canTransitionOperation('not_applied', 'prepared'));
   assert.ok(canTransitionRun('gating', 'completed'));
   assert.ok(!canTransitionRun('completed', 'running'));
 });

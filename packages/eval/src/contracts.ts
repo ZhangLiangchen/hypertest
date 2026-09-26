@@ -181,6 +181,11 @@ export interface TrialOptions extends HarnessOptions {
   seed: string;
   baseConfig?: HypertestConfig;
   timeoutMs?: number;
+  /**
+   * (additive, H11) Cancels the trial cooperatively: the run is cancelled (in-process) or the trial child SIGKILLed
+   * (child-process), the trial ends as `infra_error` ("cancelled") and its environment is torn down as usual.
+   */
+  signal?: AbortSignal;
 }
 
 export interface SuiteOptions extends HarnessOptions {
@@ -191,6 +196,11 @@ export interface SuiteOptions extends HarnessOptions {
   timeoutMs?: number;
   /** (additive) Called after every trial (e.g. CLI progress output). */
   onTrial?: (trial: EvalTrial) => void;
+  /**
+   * (additive, H11) Cancels the suite: the running trial is cancelled (TrialOptions.signal) and no further trial starts;
+   * runSuite then rejects with `cancelled` (details: the trials completed so far — also reported through onTrial).
+   */
+  signal?: AbortSignal;
 }
 
 export interface SuiteResult {
@@ -378,6 +388,8 @@ export interface ChildTrialResult {
   chaosExercised: boolean;
   timedOut: boolean;
   progress: TrialProgressEvent[];
+  /** (additive, H11) The trial's signal aborted: the child was killed (no verdict to take from it). */
+  cancelled?: boolean;
 }
 
 /** (additive) The outcome of a run (`Hypertest.run`), as the durable runtime reports it. */

@@ -115,6 +115,8 @@ begun, nothing produced). A `model_responded` turn (response with unsettled call
    `excludeRoutes` = routes that already failed in this epoch sequence. ok ⇒ settle actual tokens/cost. Failure ⇒
    release; caller abort ⇒ `cancelled`; router fallback ⇒ stored for the next boundary ⇒ `retry_next_turn`; none ⇒
    `model_unavailable`. A settle/release failure is logged and the reservation kept (over-counted, never under).
+   A response the router returns `auditPending` (its `model.invoked` append failed after the provider answered) is
+   kept and its usage SETTLED — never released: the call is paid (durability-10); the audit gap is logged as an error.
 
 ## Subagents and the runner
 
@@ -174,6 +176,7 @@ additive: `src` may not depend on `@hypertest/store`.)
 | Durable step: an unsettled terminal agent is recovered from the recorded outcome, a committed wait is honoured (no turn re-run, budgets never override it) | `test/runner.test.ts` ("crash between the terminal turn and the settle", "run() settles the recorded failure", "crash after a committed waiting turn") |
 | Repetition not hidden by model-boundary turns | `test/native-engine.test.ts` |
 | I3 safe boundary refusal; fallback only at the next turn in a new epoch; fail-closed; exclusions across the epoch sequence; opaque reasoning projection; budget boundary; route extras can only tighten security | `test/epochs-invoker.test.ts` |
+| I12/I10 a paid call whose `model.invoked` append fails keeps its response and settles its usage (never released, never re-called) | `test/epochs-invoker.test.ts` › durability-10 |
 | I1 (integration) out-of-capability call denied by the real ToolRuntime, never executed; permit logged | `test/runner.test.ts` (full stack) |
 | I2 capability bound to the new agent, derived from **and covered by** the parent's recorded capability (8 amplification variants); unrecorded parent refused; signatures verified with `capabilitySecret` | `test/subagents.test.ts` |
 | I10 correlated route/epoch/turn/tool events; interrupt status + event atomic | `test/runner.test.ts`, `test/native-engine.test.ts`, `test/subagents.test.ts` |

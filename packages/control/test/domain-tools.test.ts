@@ -282,3 +282,66 @@ describe('test_artifact.validate binds sensitivity proofs to the artifact\'s own
     }
   });
 });
+
+describe('conformance-10: sensitivity validation is bound to the artifact content and to distinct code', () => {
+  test('a known-bad run of a modified test file proves nothing; known-good and known-bad on the same code prove nothing; distinct code does', async () => {
+    const repo = await pricingRepo();
+    const design: Result[] = [];
+    const ev: Record<string, string> = {};
+    let h!: Harness;
+    const seed = async (runId: string, key: string, structured: Record<string, unknown>) => {
+      const run = (await h.deps.runs.get(runId))!;
+      const artifact = await h.deps.artifacts.put(Buffer.from(key), { mimeType: 'text/plain' });
+      ev[key] = (await h.deps.evidence.append({ runId, evidenceType: 'test-result', artifact, summary: key, structured: structured as never, producer: { workerId: 'seed', runtimeManifestId: run.runtimeManifestId }, provenance: {} })).evidenceId;
+    };
+    const cases = (status: string) => [{ id: 'test/a.test.js::t', name: 't', file: 'test/a.test.js', status }];
+    const delta = (sha256: string, tree: string) => ({ status: 'computed', readOnly: false, baseCommit: repo.head, treeDigest: tree.repeat(64), changedFiles: 1, testFiles: [{ path: 'test/a.test.js', change: 'added', sha256 }] });
+    h = await createHarness({
+      brains: {
+        lead: (v) => {
+          if (v.step === 0) return call('plan.propose_revision', { rationale: 'design', objectives: [{ objectiveId: 'o', description: 'd', priority: 'P1' }], workItems: [{ localId: 'd', title: 'design', objective: 'design', role: 'test_designer', dependsOn: [], objectiveIds: ['o'] }] });
+          return call('complete_work', { summary: 'planned', output: { summary: 'planned', planProposed: true, readyForGate: false, objectives: [] } });
+        },
+        test_designer: recorder(design, async (step, v) => {
+          const artifactId = design[1] ? (parsed(design[1].content)['artifactId'] as string) : '';
+          switch (step) {
+            case 0:
+              return call('fs.write', { path: 'test/a.test.js', content: "import { test } from 'node:test';\ntest('t', () => { throw new Error('x'); });\n" });
+            case 1:
+              return call('test_artifact.register', { path: 'test/a.test.js', sourceType: 'generated', runner: { framework: 'node_test', selector: 'test/a.test.js' }, oracleRefs: [] });
+            case 2: {
+              const digest = (await h.deps.specs.getTestArtifact(artifactId))!.artifactDigest;
+              await seed(v.runId, 'tampered', { passed: false, totals: { failed: 1 }, cases: cases('failed'), workspaceDelta: delta('0'.repeat(64), 'b') });
+              await seed(v.runId, 'goodSame', { passed: true, totals: { passed: 1 }, cases: cases('passed'), workspaceDelta: delta(digest, 'c') });
+              await seed(v.runId, 'badSame', { passed: false, totals: { failed: 1 }, cases: cases('failed'), workspaceDelta: delta(digest, 'c') });
+              await seed(v.runId, 'badOther', { passed: false, totals: { failed: 1 }, cases: cases('failed'), workspaceDelta: delta(digest, 'd') });
+              return call('test_artifact.validate', { artifactId, knownBadEvidenceId: ev['tampered']! });
+            }
+            case 3:
+              return call('test_artifact.validate', { artifactId, knownGoodEvidenceId: ev['goodSame']!, knownBadEvidenceId: ev['badSame']! });
+            case 4:
+              return call('test_artifact.validate', { artifactId, knownBadEvidenceId: ev['badOther']! });
+            default:
+              return call('complete_work', { summary: 'validated', output: { summary: 'validated', testArtifacts: [] } });
+          }
+        }),
+      },
+    });
+    try {
+      const run = await h.control.startRun({ goal: 'bound sensitivity', target: { repoPath: repo.path, commit: repo.head } });
+      for (let i = 0; i < 2; i++) for (const d of (await h.control.tick(run.runId)).dispatched) await runItem(h.control, d.workItemId, d.fencingToken);
+      const [, registered, tampered, same, other] = design;
+      assert.equal(registered!.isError, false, registered!.content);
+      assert.equal(parsed(tampered!.content)['approvalState'], 'draft');
+      assert.match(tampered!.content, /known-bad: test-result ev_\w+ executed test\/a\.test\.js with content 000000000000…, not the registered artifact content/);
+      assert.equal(parsed(same!.content)['approvalState'], 'draft');
+      assert.match(same!.content, /known-bad: known-good and known-bad ran on the same code \(tree cccccccccccc…\)/);
+      assert.equal(parsed(other!.content)['approvalState'], 'validated', other!.content);
+      const v = parsed(other!.content)['validations'] as { knownGood: { codeDigest: string }; knownBad: { codeDigest: string } };
+      assert.deepEqual([v.knownGood.codeDigest, v.knownBad.codeDigest], ['c'.repeat(64), 'd'.repeat(64)]);
+    } finally {
+      await h.dispose();
+      await repo.cleanup();
+    }
+  });
+});

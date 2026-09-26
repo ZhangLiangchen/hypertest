@@ -4,6 +4,7 @@
  * is governed; a quarantine lifts only when the governed sections are back to their pre-command text.
  */
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { after, before, describe, test } from 'node:test';
@@ -58,6 +59,34 @@ describe('classifyDrift / quarantine on real worktree diffs', () => {
     // the restoring command itself is not a new violation (its inverse would read as "assertion changed" otherwise)
     assert.equal(classifyDrift(afterDiff, restoredDiff, false, q.expected).decision, 'auto_allowed');
     assert.equal(classifyDrift(afterDiff, restoredDiff, false).decision, 'approval_required', 'without the quarantine context the undo is classified');
+  });
+
+  test('security-1 (audit PoC): `git update-index --skip-worktree` or `git replace` before gutting an assertion no longer drives the drift to auto_allowed', async () => {
+    const git = (root: string, ...args: string[]) => execFileSync('git', args, { cwd: root, stdio: 'pipe' }).toString();
+    // skip-worktree, then sed the assertion — one shell.exec in the PoC
+    ws = await freshWorktree();
+    const before1 = await workspaces.diff(ws);
+    git(ws.root, 'update-index', '--skip-worktree', 'test/pricing.test.js');
+    await writeFile(join(ws.root, 'test/pricing.test.js'), WEAKENED);
+    assert.equal(git(ws.root, 'diff', repo.head), '', 'plain `git diff` sees nothing');
+    const after1 = await workspaces.diff(ws);
+    assert.notEqual(after1, before1);
+    const v1 = classifyDrift(before1, after1, false);
+    assert.equal(v1.decision, 'approval_required');
+    assert.deepEqual(v1.categories, ['assertion']);
+    assert.deepEqual(v1.paths, ['test/pricing.test.js']);
+    // commit, then replace the base commit with the agent's commit
+    ws = await freshWorktree();
+    const before2 = await workspaces.diff(ws);
+    await writeFile(join(ws.root, 'test/pricing.test.js'), WEAKENED);
+    git(ws.root, '-c', 'user.email=a@b', '-c', 'user.name=a', 'commit', '-qam', 'weaken');
+    git(ws.root, 'replace', repo.head, git(ws.root, 'rev-parse', 'HEAD').trim());
+    try {
+      assert.equal(git(ws.root, 'diff', repo.head), '', 'plain `git diff` sees nothing');
+      assert.equal(classifyDrift(before2, await workspaces.diff(ws), false).decision, 'approval_required');
+    } finally {
+      git(ws.root, 'replace', '-d', repo.head);
+    }
   });
 
   test('a command that deletes a test the run had added ⇒ the inverse section is classified: test_deleted, forbidden', async () => {

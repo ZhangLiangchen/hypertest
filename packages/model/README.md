@@ -57,8 +57,11 @@ compatibility** the failed call used (tools ⇒ `tool_use`, `responseFormat` ⇒
 `vision`), as far as the failed route declared those capabilities. `provider_error`, `cancelled` (any caller
 abort, whatever its reason) and internal errors (including an exception thrown by the caller's `onDelta`)
 never produce a fallback. Emits `model.invoked` (usage incl. `costUsd`, attempts, latency) and
-`model.fallback` (`from`, `to|null`, `reason`, `policy`). A failure to emit the audit events after a
-successful call is thrown as a fault — it is never reported as a model failure with a fallback.
+`model.fallback` (`from`, `to|null`, `reason`, `policy`). A failure to append `model.invoked` after a
+successful (paid) call is never reported as a model failure with a fallback, and never discards the response: the
+append is retried (`AUDIT_APPEND_ATTEMPTS` = 3, short backoff); if the store stays unavailable the response is returned
+with `auditPending: { code, message }` (logged as an error) so the caller settles its usage instead of releasing the
+reservation and re-paying the call (durability-10). Audit failures around a FAILED call are still thrown as faults.
 
 Streaming deltas are a preview: a same-route retry streams again after the failed attempt's partial
 deltas; the returned response is authoritative. A response whose opaque reasoning carries a different
@@ -91,7 +94,7 @@ replayed): Anthropic routes must declare `anthropic:<model>`, pi-ai routes `pi-a
 | I3 fail-closed fallback (re-validation, tool compatibility, `fail_closed`, no mid-invoke switch, no masking of bad requests, cancellation) | `test/router-invoke.test.ts` |
 | I3 decision re-validated at every invoke (escalated classification/risk, avoided provider, excluded route, context fit, forged decision) | `test/router-invoke.test.ts` |
 | I3 opaque continuation replayed only to the same class | `test/router-invoke.test.ts`, `test/anthropic.test.ts`, `test/pi-ai.test.ts` |
-| I10 route/invoke/fallback events with full correlation; sink failure fails the call (never masked as a model failure) | `test/router.test.ts`, `test/router-invoke.test.ts`, `test/events.int.test.ts` (jsonb round-trip on PGlite and PostgreSQL 16) |
+| I10 route/invoke/fallback events with full correlation; a sink failure is never masked as a model failure; after a paid call the append is retried and a persistent failure returns the response `auditPending` (never discarded, never re-called, no fallback) | `test/router.test.ts`, `test/router-invoke.test.ts`, `test/events.int.test.ts` (jsonb round-trip on PGlite and PostgreSQL 16) |
 | Provider error mapping, timeout vs cancel, SSE robustness (truncation), caller-callback faults, secret scrubbing | `test/openai.test.ts`, `test/anthropic.test.ts`, `test/pi-ai.test.ts`, `test/transport.test.ts`, `test/scripted.test.ts` |
 | Catalog immutability / validation | `test/catalog-registry.test.ts` |
 
@@ -100,6 +103,7 @@ replayed): Anthropic routes must declare `anthropic:<model>`, pi-ai routes `pi-a
 `RouterDeps.retry?`, `InvokeRequest.onDelta?`, provider option interfaces (`ScriptedProviderOptions`,
 `OpenAICompatibleProviderOptions`, `AnthropicProviderOptions`, `PiAiProviderOptions`,
 `PiAiModelDefinition`), and the documented exports `estimateCostUsd` / `MODEL_CAPABILITY_PROFILE_SCHEMA`.
+(hardening) `InvokeOutcome` ok variant `auditPending?: { code, message }`; export `AUDIT_APPEND_ATTEMPTS`.
 Review hardening (no type changes): `ModelRouter.invoke` doc now states the per-invoke re-validation,
 fallback tool compatibility and fault semantics; the provider error-mapping note covers truncated streams
 and `onDelta` exceptions.

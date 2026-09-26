@@ -2,7 +2,7 @@ import { HypertestError, type SqlExecutor } from '@hypertest/core';
 import type { EventContext, WorkItem } from '@hypertest/domain';
 import type { NewWorkItem } from '@hypertest/collab';
 import type { ControlDeps } from './deps.ts';
-import { event } from './util.ts';
+import { event, isTerminalRunStatus } from './util.ts';
 
 export type CreateWorkOutcome =
   | { status: 'created'; workItem: WorkItem }
@@ -53,6 +53,12 @@ export class WorkFactory {
     return db.transaction(async (q) => {
       const t = tx ?? q;
       await this.lock(input.runId, t);
+      // durability-8: no work for an ended run (cancelRun changes the status under this lock, so a creation either
+      // committed before it — and is swept — or sees the ended run here)
+      const run = await this.#deps.runs.get(input.runId);
+      if (run && isTerminalRunStatus(run.status)) {
+        throw new HypertestError('conflict', `run ${input.runId} is ${run.status}: no work is created for it`, { details: { runId: input.runId, status: run.status } });
+      }
       const existing = (await blackboard.listWorkItems({ runId: input.runId })).find((w) => w.fingerprint === input.fingerprint);
       if (existing) return { status: 'duplicate', workItem: existing };
       if ((await this.remainingWorkItems(input.runId)) < 1) {

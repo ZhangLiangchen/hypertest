@@ -188,7 +188,7 @@ describe('composition failures fail fast and leave nothing open', () => {
     await assert.rejects(createHypertest(bad, { scriptedBrains: {} }), (e: unknown) => {
       assert.ok(e instanceof HypertestError && e.code === 'invalid_argument');
       assert.deepEqual((e.details as { errors: string[] }).errors, [
-        "unknown configuration key 'bogus' (expected one of version, project, store, bus, durable, artifacts, models, roles, budget, gate, policy, bugate, engines, sandbox, environments, tools, signing, memory, observability)",
+        "unknown configuration key 'bogus' (expected one of version, project, store, bus, durable, artifacts, models, roles, budget, gate, policy, bugate, engines, sandbox, environments, tools, signing, memory, observability, oracles)",
         'engines.default: "dsh" is not a registered engine (native, pi)',
       ]);
       return true;
@@ -367,7 +367,7 @@ describe('facade robustness: run ids, a durable start that fails, best-effort wa
     }
     await assert.rejects(ht.start({ goal: GOAL, target: {}, gate: { failOnUnresolvedSeverity: 'P9' as never } }), (e: unknown) => {
       assert.ok(e instanceof HypertestError && e.code === 'invalid_argument');
-      assert.deepEqual((e.details as { errors: string[] }).errors, ['gate.failOnUnresolvedSeverity must be one of P0, P1, P2, P3, P4, got "P9"']);
+      assert.deepEqual((e.details as { errors: string[] }).errors, ['gate.failOnUnresolvedSeverity must be one of P0, P1, P2, P3, got "P9"']);
       return true;
     });
     assert.deepEqual(await ht.listRuns(), []);

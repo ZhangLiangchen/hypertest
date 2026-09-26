@@ -6,7 +6,7 @@ import { FixedClock, HypertestError, SequentialIdGenerator, noopLogger } from '@
 import { openDatabase } from '@hypertest/store';
 import { ModelCatalog, PiAiProvider, ProviderRegistry, createModelRouter, piCompatibilityClass, type ModelCapabilityProfile, type ModelProvider } from '@hypertest/model';
 import { resolveProtocolBinding } from '@hypertest/policy';
-import { createOciSandbox } from '@hypertest/tools';
+import { createOciSandbox, networkIsolation } from '@hypertest/tools';
 import { BUILTIN_ROLES, RoleCatalog } from '@hypertest/agents';
 import { completeRoute, providerCompatibilityClass, resolveConfigPaths, roleOverrides, validateConfig, withDerivedPaths } from './config.ts';
 import { sandboxProfile } from './compose.ts';
@@ -81,7 +81,17 @@ export async function diagnose(input: HypertestConfig, options: DiagnoseOptions 
     const ok = options.connect === false ? undefined : await createOciSandbox({ image: profile.image! }).available!().catch(() => false);
     if (ok === false) add('sandbox', 'error', `OCI sandbox (${profile.image}): the docker daemon is not reachable`);
     else add('sandbox', ok ? 'ok' : 'warn', `OCI sandbox (${profile.image})${ok ? '' : ': not probed'}`);
-  } else add('sandbox', 'ok', `local sandbox, network ${profile.network}, env allowlist ${profile.envAllowlist.join(', ') || '(none)'}`);
+  } else {
+    const allow = `env allowlist ${profile.envAllowlist.join(', ') || '(none)'}`;
+    if (profile.network === 'open') add('sandbox', 'warn', `local sandbox, network open (commands agents run reach any host: no egress governance), ${allow}`);
+    else {
+      // security-2: every other profile runs commands in a network namespace; without one the sandbox refuses them
+      const iso = await networkIsolation();
+      if (iso.available && iso.jail) add('sandbox', 'ok', `local sandbox, network ${profile.network} (enforced: ${iso.strategy}, private loopback; keys, store and other workspaces hidden), ${allow}`);
+      else if (iso.available) add('sandbox', 'warn', `local sandbox, network ${profile.network} (enforced: ${iso.strategy}${iso.loopback ? ', private loopback' : ', no loopback'}); keys, store and other workspaces are NOT hidden from commands agents run (needs python3 and PID/mount namespaces), ${allow}`);
+      else add('sandbox', 'error', `local sandbox, network ${profile.network} cannot be enforced on this host (${iso.reason}): every command agents run would be refused — use the OCI sandbox, or set sandbox.network: open to accept an unrestricted network`);
+    }
+  }
 
   // ---- storage and infrastructure
   if (config.store.kind === 'pglite') {

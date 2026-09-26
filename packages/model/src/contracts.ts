@@ -158,7 +158,18 @@ export interface InvokeRequest {
 }
 
 export type InvokeOutcome =
-  | { ok: true; response: ModelCallResponse; routeId: string; attempts: number }
+  | {
+      ok: true;
+      response: ModelCallResponse;
+      routeId: string;
+      attempts: number;
+      /**
+       * (additive) Set when the `model.invoked` audit event could not be appended after the provider answered (retried
+       * first): the paid response and its usage are still returned — never discarded over an audit write, which would
+       * lose the usage from the budget (under-count) and re-pay the call on retry. Callers must settle the usage and log.
+       */
+      auditPending?: { code: string; message: string };
+    }
   | {
       ok: false;
       error: { code: string; message: string; retryable: boolean };

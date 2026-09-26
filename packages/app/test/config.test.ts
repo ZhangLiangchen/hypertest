@@ -299,8 +299,8 @@ describe('validateConfig', () => {
       }),
       [
         'budget.maxToolCalls must be an integer ≥ 1',
-        "gate: unknown key 'sneaky' (expected one of gateId, description, failOnUnresolvedSeverity, conditionalOnRiskLevel, requiredEvidence, requireDeterministicForCritical, requireIndependentReview, minCoverage)",
-        'gate.failOnUnresolvedSeverity must be one of P0, P1, P2, P3, P4, got "p1"',
+        "gate: unknown key 'sneaky' (expected one of gateId, description, failOnUnresolvedSeverity, conditionalOnRiskLevel, requiredEvidence, requireDeterministicForCritical, requireIndependentReview, minCoverage, requireOracle)",
+        'gate.failOnUnresolvedSeverity must be one of P0, P1, P2, P3, got "p1"',
         'gate.requiredEvidence[0].minCount must be an integer ≥ 1, got 0',
         'gate.requiredEvidence[1].evidenceType is required',
         'gate.requiredEvidence[2] must be a mapping',
@@ -310,7 +310,9 @@ describe('validateConfig', () => {
     assert.deepEqual(validateRunOverrides({ gate: { failOnUnresolvedSeverity: 'P2', requiredEvidence: [{ evidenceType: 'metric', minCount: 2, critical: true }], minCoverage: { lines: 0.8 } }, budget: { maxAgentDepth: 0 } }), []);
     assert.deepEqual(validateRunOverrides({}), []);
     // the configuration's gate follows the same rules
-    assert.deepEqual(validateConfig({ ...defaultConfig(), gate: { failOnUnresolvedSeverity: 'P9' } } as unknown as HypertestConfig), ['gate.failOnUnresolvedSeverity must be one of P0, P1, P2, P3, P4, got "P9"']);
+    assert.deepEqual(validateConfig({ ...defaultConfig(), gate: { failOnUnresolvedSeverity: 'P9' } } as unknown as HypertestConfig), ['gate.failOnUnresolvedSeverity must be one of P0, P1, P2, P3, got "P9"']);
+    // H3: 'P4' is not a domain Severity — the QualityGate would compare it as "nothing blocks" (C2 silently disabled)
+    assert.deepEqual(validateRunOverrides({ gate: { failOnUnresolvedSeverity: 'P4' } }), ['gate.failOnUnresolvedSeverity must be one of P0, P1, P2, P3, got "P4"']);
   });
 
   test('validation never reads the environment (missing API key variables are not load errors)', () => {

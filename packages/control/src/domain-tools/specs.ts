@@ -106,6 +106,23 @@ function caseAboutArtifact(c: JsonValue, a: TestArtifact): boolean {
 }
 
 /**
+ * conformance-10: what a validating test-result executed, from its tool-derived `workspaceDelta` (never a caller claim):
+ * a changed copy of the artifact's file must be exactly the registered content (a known-bad run obtained with a
+ * temporarily broken assertion proves nothing), and the run's tree digest identifies the code it ran on. Evidence
+ * without a computed delta (legacy, unavailable) is judged as before.
+ */
+function executedAs(e: EvidenceRecord, a: TestArtifact): { ok: true; codeDigest?: string } | { ok: false; detail: string } {
+  const delta = field(e.structured, 'workspaceDelta');
+  if (!delta || typeof delta !== 'object' || Array.isArray(delta) || delta['status'] !== 'computed') return { ok: true };
+  const files = Array.isArray(delta['testFiles']) ? (delta['testFiles'] as JsonValue[]) : [];
+  const mine = files.find((f) => !!f && typeof f === 'object' && !Array.isArray(f) && f['path'] === a.path) as Record<string, JsonValue> | undefined;
+  if (mine && mine['change'] !== 'deleted' && mine['sha256'] !== a.artifactDigest) {
+    return { ok: false, detail: `test-result ${e.evidenceId} executed ${a.path} with content ${String(mine['sha256']).slice(0, 12)}…, not the registered artifact content ${a.artifactDigest.slice(0, 12)}…` };
+  }
+  return typeof delta['treeDigest'] === 'string' ? { ok: true, codeDigest: delta['treeDigest'] } : { ok: true };
+}
+
+/**
  * How a test-result record bears on an artifact: its cases of that artifact (by exact file), or — when the record
  * was produced for the artifact (`testArtifactId(s)`) and names no file per case — the whole run.
  */
@@ -407,9 +424,13 @@ export function specTools(deps: ControlDeps): ToolSpec[] {
           const e = byId.get(input.knownGoodEvidenceId)!;
           let v: TestValidation;
           const o = e.evidenceType === 'test-result' ? artifactOutcome(e, artifact) : undefined;
+          const ran = executedAs(e, artifact);
           if (e.evidenceType !== 'test-result') v = { status: 'failed', evidenceRefs: [e.evidenceId], detail: `known-good evidence must be a test-result (got ${e.evidenceType})` };
           else if (!o?.about) v = { status: 'failed', evidenceRefs: [e.evidenceId], detail: `test-result ${e.evidenceId} does not run artifact ${artifact.artifactId} (${artifact.path})` };
-          else if (o.passed) v = { status: 'passed', evidenceRefs: [e.evidenceId], detail: 'passed on known-good code' };
+          else if (!ran.ok) v = { status: 'failed', evidenceRefs: [e.evidenceId], detail: ran.detail };
+          else if (ran.codeDigest !== undefined && validations.knownBad?.status === 'passed' && validations.knownBad.codeDigest === ran.codeDigest) {
+            v = { status: 'failed', evidenceRefs: [e.evidenceId], detail: `known-good and known-bad ran on the same code (tree ${ran.codeDigest.slice(0, 12)}…): sensitivity needs the defect in the code under test, not a different run of the same code` };
+          } else if (o.passed) v = { status: 'passed', evidenceRefs: [e.evidenceId], detail: 'passed on known-good code', ...(ran.codeDigest ? { codeDigest: ran.codeDigest } : {}) };
           else v = { status: 'failed', evidenceRefs: [e.evidenceId], detail: 'the test did not pass on the known-good code' };
           if (v.status !== 'passed') reasons.push(`known-good: ${v.detail}`);
           validations.knownGood = v;
@@ -418,9 +439,14 @@ export function specTools(deps: ControlDeps): ToolSpec[] {
           const e = byId.get(input.knownBadEvidenceId)!;
           let v: TestValidation;
           const o = e.evidenceType === 'test-result' ? artifactOutcome(e, artifact) : undefined;
+          const ran = executedAs(e, artifact);
+          const goodCode = validations.knownGood?.status === 'passed' ? validations.knownGood.codeDigest : undefined;
           if (e.evidenceType !== 'test-result') v = { status: 'failed', evidenceRefs: [e.evidenceId], detail: `known-bad evidence must be a test-result (got ${e.evidenceType})` };
           else if (!o?.about) v = { status: 'failed', evidenceRefs: [e.evidenceId], detail: `test-result ${e.evidenceId} does not run artifact ${artifact.artifactId} (${artifact.path})` };
-          else if (!o.passed && o.failed >= 1) v = { status: 'passed', evidenceRefs: [e.evidenceId], detail: `failed on known-bad code (${o.failed} failed cases of this artifact)` };
+          else if (!ran.ok) v = { status: 'failed', evidenceRefs: [e.evidenceId], detail: ran.detail };
+          else if (goodCode !== undefined && ran.codeDigest === goodCode) {
+            v = { status: 'failed', evidenceRefs: [e.evidenceId], detail: `known-good and known-bad ran on the same code (tree ${goodCode.slice(0, 12)}…): sensitivity needs the defect in the code under test, not a different run of the same code` };
+          } else if (!o.passed && o.failed >= 1) v = { status: 'passed', evidenceRefs: [e.evidenceId], detail: `failed on known-bad code (${o.failed} failed cases of this artifact)`, ...(ran.codeDigest ? { codeDigest: ran.codeDigest } : {}) };
           else v = { status: 'failed', evidenceRefs: [e.evidenceId], detail: 'the test did not fail with an assertion failure on the known-bad code (insensitive or harness error)' };
           if (v.status !== 'passed') reasons.push(`known-bad: ${v.detail}`);
           validations.knownBad = v;

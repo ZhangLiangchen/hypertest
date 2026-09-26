@@ -1,4 +1,4 @@
-import { deepFreeze, type JsonValue } from '@hypertest/core';
+import { canonicalJson, deepFreeze, sha256Hex, type JsonValue } from '@hypertest/core';
 import {
   RISK_ORDER, SEVERITY_ORDER, atLeastAsSevere, isEligibleTestArtifact, isUnresolvedFinding,
   type ApprovedException, type BlackboardRecord, type Comparator, type CriterionResult, type EvidenceRecord, type Finding, type GateSpec,
@@ -12,9 +12,15 @@ import type { GateInput } from './contracts.ts';
  * randomness, stable ordering), so the same input always yields the same QualityDecision.
  *
  * Criteria, evaluated in order (each satisfied | violated | unknown):
+ *   C0 oracle_in_force      – (conformance-1) unless gate.requireOracle is false: at least one approved oracle pinned by
+ *                             the run with at least one deterministic P0/P1 assertion (a machine check other than an LLM
+ *                             rubric); otherwise unknown — a run judged against no correctness criterion is never `pass`.
  *   C1 evidence_integrity   – ledger root count equals the evidence handed in, no foreign-run evidence, and
  *                             at least one ELIGIBLE evidence record (a pass with zero evidence, or with only
  *                             evidence from ineligible generated tests, is impossible). Not waivable.
+ *                             Eligibility: a declared testArtifactId must name an eligible artifact, and evidence
+ *                             carrying a `workspaceDelta` (test.run) counts only when every test file added/modified
+ *                             since the base commit is covered by a validated artifact with that exact digest.
  *   C2 unresolved_findings  – unresolved product/security/performance/unknown findings at or above
  *                             gate.failOnUnresolvedSeverity ⇒ violated (fail); unresolved test/infra/environment
  *                             findings at that severity ⇒ unknown (the evidence itself is in doubt).
@@ -32,6 +38,7 @@ import type { GateInput } from './contracts.ts';
  */
 
 export const GATE_CRITERIA = [
+  { id: 'C0', name: 'oracle_in_force', violation: 'fail' },
   { id: 'C1', name: 'evidence_integrity', violation: 'fail' },
   { id: 'C2', name: 'unresolved_findings', violation: 'fail' },
   { id: 'C3', name: 'critical_oracles', violation: 'fail' },
@@ -53,6 +60,7 @@ export const DEFAULT_GATE_SPEC: GateSpec = deepFreeze<GateSpec>({
   requiredEvidence: [{ evidenceType: 'test-result', minCount: 1, critical: true }],
   requireDeterministicForCritical: true,
   requireIndependentReview: true,
+  requireOracle: true,
 });
 
 const PRODUCT_CATEGORIES: ReadonlySet<Finding['category']> = new Set(['product_defect', 'security', 'performance', 'unknown']);
@@ -182,7 +190,21 @@ function metricValue(structured: JsonValue | undefined, metric: string, aggregat
   return undefined;
 }
 
-type CheckOutcome = { status: 'satisfied' | 'violated' | 'unknown'; refs: string[]; detail: string };
+/** Outcome of one machine-checkable oracle check against evidence (see evaluateOracleCheck). */
+export type OracleCheckOutcome = { status: 'satisfied' | 'violated' | 'unknown'; refs: string[]; detail: string };
+type CheckOutcome = OracleCheckOutcome;
+
+/**
+ * (exported) The QualityGate's own evaluator of one oracle check (C3), so other deterministic consumers — e.g. the
+ * oracle-change flip detector asking "does the recorded evidence violate the BASE assertion and satisfy the proposed
+ * one?" — judge with exactly the gate's semantics instead of a re-implementation that drifts: `test_outcome` (case
+ * selector; failed/xfail ⇒ violated, error ⇒ unknown), `evidence_predicate`, `metric_threshold` (metric/aggregation
+ * lookup), `http_expectation`, each on the evidence of the latest build; `llm_rubric` ⇒ always unknown. Pure; the
+ * caller decides which evidence is eligible (the gate passes only gate-eligible evidence).
+ */
+export function evaluateOracleCheck(check: OracleCheck, evidence: readonly EvidenceRecord[]): OracleCheckOutcome {
+  return evaluateCheck(check, evidence);
+}
 
 function evaluateCheck(check: OracleCheck, evidence: readonly EvidenceRecord[]): CheckOutcome {
   switch (check.type) {
@@ -275,6 +297,43 @@ function latestArtifacts(artifacts: readonly TestArtifact[]): Map<string, TestAr
   return m;
 }
 
+/**
+ * A test file that is new or changed since the base commit is, whatever its artifact claims, not an existing test: it
+ * must have demonstrated sensitivity (known-bad or mutation) and not be draft/quarantined/retired.
+ */
+function provesSensitivity(a: TestArtifact): boolean {
+  return isEligibleTestArtifact(a.sourceType === 'existing' ? { ...a, sourceType: 'generated' } : a);
+}
+
+/**
+ * conformance-2: eligibility of evidence from its recorded `workspaceDelta` (written by test.run from the workspace
+ * itself — a derived linkage, never a caller claim). Every test file added or modified since the base commit must be
+ * covered by the LATEST revision of a TestArtifact with exactly that content digest that proved its sensitivity; an
+ * unavailable delta counts only for a read-only workspace (agents cannot have written tests there). Evidence without
+ * a delta (other producers) is not judged here.
+ */
+function deltaIneligibility(e: EvidenceRecord, byDigest: ReadonlyMap<string, TestArtifact[]>): string | undefined {
+  const delta = getField(e.structured, 'workspaceDelta');
+  if (delta === undefined) return undefined;
+  if (delta === null || typeof delta !== 'object' || Array.isArray(delta)) return 'malformed workspace delta';
+  const d = delta as Record<string, JsonValue>;
+  if (d['status'] !== 'computed') {
+    return d['readOnly'] === true ? undefined : `workspace delta unavailable (${String(d['reason'] ?? 'unknown')}): the tests that ran cannot be tied to the base commit or to validated artifacts`;
+  }
+  if (d['testFilesTruncated'] === true) return 'too many changed test files to verify';
+  const files = d['testFiles'];
+  if (!Array.isArray(files)) return 'malformed workspace delta (no testFiles)';
+  for (const f of files) {
+    if (f === null || typeof f !== 'object' || Array.isArray(f)) return 'malformed workspace delta entry';
+    const { path, change, sha256 } = f as Record<string, JsonValue>;
+    if (change === 'deleted') continue;
+    if (typeof sha256 !== 'string' || sha256 === '') return `test file ${String(path)} (${String(change)}) has no content digest`;
+    const covering = (byDigest.get(sha256) ?? []).filter(provesSensitivity);
+    if (covering.length === 0) return `test file ${String(path)} is ${String(change)} since the base commit and no validated test artifact has its content (sha256 ${sha256.slice(0, 12)})`;
+  }
+  return undefined;
+}
+
 export class QualityGate {
   evaluate(input: GateInput): QualityDecision {
     const { run, gate } = input;
@@ -283,10 +342,17 @@ export class QualityGate {
     const evidenceIds = new Set(runEvidence.map((e) => e.evidenceId));
 
     // Evidence from generated tests that never demonstrated sensitivity does not count (nor does evidence
-    // pointing at an unknown artifact).
+    // pointing at an unknown artifact, nor evidence of a run over new/changed test files no validated artifact covers).
     const artifacts = latestArtifacts(input.testArtifacts);
+    const byDigest = new Map<string, TestArtifact[]>();
+    for (const a of artifacts.values()) byDigest.set(a.artifactDigest, [...(byDigest.get(a.artifactDigest) ?? []), a]);
     const ignored: string[] = [];
     const eligible = runEvidence.filter((e) => {
+      const unproven = deltaIneligibility(e, byDigest);
+      if (unproven !== undefined) {
+        ignored.push(`${e.evidenceId} (${unproven})`);
+        return false;
+      }
       const id = getField(e.structured, 'testArtifactId');
       if (id === undefined) return true;
       const a = typeof id === 'string' ? artifacts.get(id) : undefined;
@@ -300,6 +366,43 @@ export class QualityGate {
     const reviews = currentRecords(input.reviews).filter((r) => r.runId === run.runId);
 
     const outcomes = new Map<CriterionId, Outcome>();
+
+    // C0 oracle_in_force (conformance-1): the run is judged against a governed, deterministic correctness criterion
+    {
+      const superseded = Object.entries(run.oracleRevisions ?? {}).filter(([id, rev]) => {
+        const current = input.currentOracleRevisions?.[id];
+        return current !== undefined && current > rev;
+      });
+      if (superseded.length > 0) {
+        // conformance-4: an oracle approved in a new revision during the run replaces the criterion this run pinned
+        outcomes.set('C0', {
+          status: 'unknown',
+          evidenceRefs: [],
+          detail: `${superseded.map(([id, rev]) => `oracle ${id} revision ${rev} is superseded by approved revision ${input.currentOracleRevisions![id]}`).join('; ')}: the verdict would rest on a replaced criterion — judge the candidate against the new revision in a new run`,
+          reasons: ['a pinned oracle was superseded during the run'],
+        });
+      } else if (gate.requireOracle === false) {
+        outcomes.set('C0', { status: 'satisfied', evidenceRefs: [], detail: 'no oracle required by the gate (gate.requireOracle false: a recorded override)', reasons: ['gate.requireOracle is false: the verdict rests on no oracle'] });
+      } else {
+        const pinned = currentOracles(input.oracles).filter((o) => run.oracleRevisions?.[o.oracleId] === o.revision);
+        const critical = pinned.flatMap((o) =>
+          o.assertions
+            .filter((a) => SEVERITY_ORDER[a.severity] <= SEVERITY_ORDER.P1 && a.check !== undefined && a.check.type !== 'llm_rubric' && a.kind !== 'llm_semantic')
+            .map((a) => `${o.oracleId}/${a.assertionId}`),
+        );
+        outcomes.set(
+          'C0',
+          critical.length > 0
+            ? { status: 'satisfied', evidenceRefs: [], detail: `${critical.length} deterministic P0/P1 assertion(s) in force: ${critical.slice(0, 10).join(', ')}`, reasons: [] }
+            : {
+                status: 'unknown',
+                evidenceRefs: [],
+                detail: pinned.length === 0 ? 'no approved oracle is pinned by the run' : `the pinned oracles (${pinned.map((o) => o.oracleId).join(', ')}) have no deterministic P0/P1 assertion`,
+                reasons: ['no oracle in force: establish one (human authority) and pin it to the run — correctness is never decided by the agents'],
+              },
+        );
+      }
+    }
 
     // C1 evidence_integrity
     {
@@ -328,7 +431,11 @@ export class QualityGate {
     const unresolvedFindings: string[] = [];
     {
       const reasons: string[] = [];
-      const blocking = findings.filter((r) => isUnresolvedFinding(r.payload) && atLeastAsSevere(r.payload.severity, gate.failOnUnresolvedSeverity));
+      // (H3) fail closed on a threshold the gate cannot interpret: every unresolved finding blocks, and C2 is at best unknown
+      const thresholdKnown = typeof gate.failOnUnresolvedSeverity === 'string' && Object.hasOwn(SEVERITY_ORDER, gate.failOnUnresolvedSeverity);
+      const threshold = thresholdKnown ? gate.failOnUnresolvedSeverity : 'P3';
+      if (!thresholdKnown) reasons.push(`gate.failOnUnresolvedSeverity ${JSON.stringify(gate.failOnUnresolvedSeverity)} is not a severity (${Object.keys(SEVERITY_ORDER).join(', ')}): every unresolved finding blocks`);
+      const blocking = findings.filter((r) => isUnresolvedFinding(r.payload) && atLeastAsSevere(r.payload.severity, threshold));
       const product = blocking.filter((r) => PRODUCT_CATEGORIES.has(r.payload.category));
       const infra = blocking.filter((r) => !PRODUCT_CATEGORIES.has(r.payload.category));
       for (const r of product) {
@@ -337,11 +444,16 @@ export class QualityGate {
         if (r.evidenceRefs.length === 0) reasons.push(`unevidenced finding ${r.recordId} (still blocking)`);
       }
       for (const r of infra) reasons.push(`unresolved ${r.payload.severity} ${r.payload.category} finding ${r.recordId} casts doubt on the evidence: ${r.payload.title}`);
-      const status: Outcome['status'] = product.length ? 'violated' : infra.length ? 'unknown' : 'satisfied';
+      const status: Outcome['status'] = product.length ? 'violated' : infra.length || !thresholdKnown ? 'unknown' : 'satisfied';
       outcomes.set('C2', {
         status,
         evidenceRefs: uniqSorted([...product, ...infra].flatMap((r) => r.evidenceRefs)),
-        detail: status === 'satisfied' ? `no unresolved findings at or above ${gate.failOnUnresolvedSeverity}` : `${product.length} product and ${infra.length} test/infrastructure findings unresolved`,
+        detail:
+          status === 'satisfied'
+            ? `no unresolved findings at or above ${threshold}`
+            : !thresholdKnown && product.length + infra.length === 0
+              ? `unknown severity threshold ${JSON.stringify(gate.failOnUnresolvedSeverity)}`
+              : `${product.length} product and ${infra.length} test/infrastructure findings unresolved`,
         reasons,
       });
     }
@@ -459,12 +571,21 @@ export class QualityGate {
     const unresolvedRisks: string[] = [];
     {
       const reasons: string[] = [];
-      const open = risks.filter((r) => r.payload.status === 'open' && RISK_ORDER[r.payload.level] >= RISK_ORDER[gate.conditionalOnRiskLevel]);
+      // (H3) an uninterpretable risk level fails closed: every open risk counts, and C7 is at best unknown
+      const levelKnown = typeof gate.conditionalOnRiskLevel === 'string' && Object.hasOwn(RISK_ORDER, gate.conditionalOnRiskLevel);
+      const level = levelKnown ? gate.conditionalOnRiskLevel : 'low';
+      if (!levelKnown) reasons.push(`gate.conditionalOnRiskLevel ${JSON.stringify(gate.conditionalOnRiskLevel)} is not a risk level (${Object.keys(RISK_ORDER).join(', ')}): every open risk counts`);
+      const open = risks.filter((r) => r.payload.status === 'open' && RISK_ORDER[r.payload.level] >= RISK_ORDER[level]);
       for (const r of open) {
         unresolvedRisks.push(r.recordId);
         reasons.push(`open ${r.payload.level} risk ${r.recordId}: ${r.payload.title}`);
       }
-      outcomes.set('C7', { status: open.length ? 'violated' : 'satisfied', evidenceRefs: uniqSorted(open.flatMap((r) => r.evidenceRefs)), detail: open.length ? `${open.length} open risks at or above ${gate.conditionalOnRiskLevel}` : `no open risks at or above ${gate.conditionalOnRiskLevel}`, reasons });
+      outcomes.set('C7', {
+        status: open.length ? 'violated' : levelKnown ? 'satisfied' : 'unknown',
+        evidenceRefs: uniqSorted(open.flatMap((r) => r.evidenceRefs)),
+        detail: open.length ? `${open.length} open risks at or above ${level}` : levelKnown ? `no open risks at or above ${level}` : `unknown risk level ${JSON.stringify(gate.conditionalOnRiskLevel)}`,
+        reasons,
+      });
     }
 
     // C8 coverage
@@ -622,12 +743,27 @@ export class QualityGate {
       reasons,
       runtimeManifestId: input.runtimeManifestId,
       policyRevision: input.policyRevision,
+      gateSpecDigest: sha256Hex(canonicalJson(gate as unknown as JsonValue)),
+      gateOverrides: gateOverrides(gate),
       decidedAt: input.now,
     };
     if (input.supersedes !== undefined) decision.supersedes = input.supersedes;
     if (run.systemModelRevision !== undefined) decision.systemModelRevision = run.systemModelRevision;
     return decision;
   }
+}
+
+/** conformance-9: the effective gate's fields that differ from DEFAULT_GATE_SPEC, as `field=<canonical JSON>`. */
+export function gateOverrides(gate: GateSpec): string[] {
+  const base = DEFAULT_GATE_SPEC as unknown as Record<string, unknown>;
+  const eff = gate as unknown as Record<string, unknown>;
+  const out: string[] = [];
+  for (const k of [...new Set([...Object.keys(base), ...Object.keys(eff)])].sort()) {
+    const a = eff[k] === undefined ? undefined : canonicalJson(eff[k] as JsonValue);
+    const b = base[k] === undefined ? undefined : canonicalJson(base[k] as JsonValue);
+    if (a !== b) out.push(`${k}=${a ?? 'unset'}`);
+  }
+  return out;
 }
 
 function verdictWhy(verdict: QualityVerdict, violated: CriterionResult[], unknown: CriterionResult[]): string {

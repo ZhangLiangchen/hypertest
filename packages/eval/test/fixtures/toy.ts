@@ -19,7 +19,7 @@ import type { ScriptedBrain } from '@hypertest/model';
 import type { HypertestConfig } from '@hypertest/app';
 import { startProcessSupervisor } from '@hypertest/tools';
 import { createGitRepo } from '@hypertest/testkit';
-import { evidenceIdsIn, operationIdsIn, recordIdsIn, roleRouter, toolCall, type ChildBrainContext, type EvalArm, type EvalTask, type RoleBrain, type TrialFixture } from '../../src/index.ts';
+import { evidenceIdsIn, operationIdsIn, recordIdsIn, roleRouter, toolCall, type ChildBrainContext, type EvalArm, type EvalOracle, type EvalTask, type RoleBrain, type TrialFixture } from '../../src/index.ts';
 
 export const TOY_MODULE = import.meta.filename;
 
@@ -208,6 +208,24 @@ export function restartBrains(): Record<string, ScriptedBrain> {
 }
 
 /**
+ * The toy service's correctness criterion (conformance-1: a run is judged against an oracle in force, established by a
+ * human authority): after the restart it serves `ok` on `/`.
+ */
+export const TOY_SVC_ORACLE: EvalOracle = {
+  oracleId: 'toy-svc-serves',
+  scope: { components: ['toy-svc'], description: 'The toy service answers on its root path.' },
+  assertions: [
+    {
+      assertionId: 'serves-ok', description: 'GET / answers 200 with body ok', kind: 'requirement', severity: 'P1',
+      check: { type: 'http_expectation', method: 'GET', path: '/', expectStatus: 200, expectBodyContains: 'ok' },
+    },
+  ],
+  authorities: [{ sourceRef: 'toy-svc README', authority: 'approved_requirement' }],
+  judgePolicy: { deterministicRequiredForCritical: true, allowLlmOnlyDecision: false, independentReviewerRequired: false },
+  changePolicy: { agentMayPropose: true, selfApprove: false, invalidatesPriorDecisions: true, approvers: ['human'] },
+};
+
+/**
  * The restart task: a process-supervised loopback service registered as a `local` environment. Ground truth comes from
  * the supervisor: every restart it performed, keyed by operation id (idempotent per id), and the logical number of
  * restarts (generation − 1) — a resumed run that restarted again would show 2.
@@ -220,6 +238,7 @@ export function toyRestartTask(overrides: Partial<EvalTask> = {}): EvalTask {
     goal: 'Restart toy-svc once, verify it serves, and decide whether it is releasable.',
     hiddenFaults: [],
     expectedVerdict: 'pass',
+    oracles: [TOY_SVC_ORACLE],
     chaos: { killAfterOperationDispatch: 1 },
     graders: ['verdict', 'noDuplicateSideEffects', 'evidenceCompleteness', 'evidenceIntegrity', 'policyViolation', 'auditReconstruction'],
     async setup(ctx): Promise<TrialFixture> {

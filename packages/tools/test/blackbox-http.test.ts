@@ -3,9 +3,13 @@ import assert from 'node:assert/strict';
 import { createEnvironmentRegistry, httpRequestTool, type ToolSpec } from '../src/index.ts';
 import { EVIDENCE_BODY_LIMIT } from '../src/blackbox/http.ts';
 import { checkHost, hostMatches, isLoopbackHost, joinUrl, redactHeaders, redactUrl } from '../src/blackbox/common.ts';
-import { allowPermit, fakeContext, newRuntime, openBlackboxEnv, startServer, structuredOf, toolRequest, type BlackboxEnv, type TestServer } from './blackbox-helpers.ts';
+import { AdapterRegistry, createLeaseService, createOperationLedger, createSideEffectGateway, type OperationLedger } from '@hypertest/operation';
+import { recordEffectAdapters } from '../src/index.ts';
+import { allowPermit, fakeContext, newGateway, newRuntime, openBlackboxEnv, startServer, structuredOf, toolRequest, type BlackboxEnv, type TestServer } from './blackbox-helpers.ts';
 
 let server: TestServer;
+const transfers = new Map<string, { applied: number; body: string }>();
+let appliedTransfers = 0;
 let env: BlackboxEnv;
 let tool: ToolSpec;
 const BIG = 'b'.repeat(EVIDENCE_BODY_LIMIT + 512 * 1024);
@@ -27,6 +31,15 @@ before(async () => {
         res.writeHead(201, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ method: req.method, idempotencyKey: req.headers['idempotency-key'] ?? null, body }));
         return;
+      case '/transfer':
+      case '/api/transfer': {
+        // a SUT that applies each POST once per Idempotency-Key (a resend with the same key gets the recorded answer)
+        const key = String(req.headers['idempotency-key'] ?? '');
+        if (!transfers.has(key)) transfers.set(key, { applied: ++appliedTransfers, body });
+        res.writeHead(201, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ transfer: transfers.get(key)!.applied }));
+        return;
+      }
       case '/slow':
         await new Promise((r) => setTimeout(r, 1500));
         res.writeHead(200);
@@ -67,6 +80,7 @@ before(async () => {
     environments: [
       { environmentId: 'env_local', environmentClass: 'local', generation: 1, baseUrl: `${server.url}/api/` },
       { environmentId: 'env_prod', environmentClass: 'production', generation: 1, baseUrl: `http://127.0.0.2:${server.port}` },
+      { environmentId: 'env_idem', environmentClass: 'local', generation: 1, baseUrl: `${server.url}/api/`, honoursIdempotencyKey: true },
     ],
   });
   tool = httpRequestTool({}) as ToolSpec;
@@ -345,4 +359,105 @@ test('environmentId + path cannot climb above the environment base path (dot seg
   assert.equal(server.requests.length, before);
   assert.equal(evidence.length, 0);
   assert.equal(joinUrl('http://h:1/api/', '/v1/../v2').href, 'http://h:1/api/v2', 'dot segments inside the base path are fine');
+});
+
+// ------------------------------------------------------------------------------------ conformance-7 (I4): POST through the ledger
+
+/**
+ * A gateway whose ledger dies (throws) at the first transition to `at` (default `acknowledged`): the process is killed
+ * after the request was sent, before (or, with `verified`, after) its receipt was recorded.
+ */
+function killedAfterSend(at: 'acknowledged' | 'verified' = 'acknowledged'): ReturnType<typeof createSideEffectGateway> {
+  const opDeps = { ...env.deps, db: env.db, events: env.events };
+  const real = createOperationLedger(opDeps);
+  let killed = false;
+  const ledger: OperationLedger = {
+    prepare: (i, c, t) => real.prepare(i, c, t),
+    get: (id) => real.get(id),
+    findByIdempotencyKey: (k) => real.findByIdempotencyKey(k),
+    findByToolInvocation: (i, t) => real.findByToolInvocation(i, t),
+    list: (f) => real.list(f),
+    listUnsettled: (r) => real.listUnsettled(r),
+    transition: async (id, to, patch, ctx, options) => {
+      if (!killed && to === at) {
+        killed = true;
+        throw new Error('process killed after the request was sent, before its outcome was recorded');
+      }
+      return real.transition(id, to, patch, ctx, options);
+    },
+  };
+  return createSideEffectGateway({ ...opDeps, ledger, leases: createLeaseService(opDeps), adapters: new AdapterRegistry(recordEffectAdapters()), pollIntervalMs: 20 });
+}
+
+test('conformance-7: a POST is recorded in the Operation Ledger; its durable replay returns the recorded response without sending again', async () => {
+  const runtime = newRuntime(env, [tool], newGateway(env, []).gateway);
+  const req = toolRequest('http.request', { method: 'POST', environmentId: 'env_local', path: '/transfer', json: { amount: 5 } });
+  const before = server.requests.length;
+  const first = await runtime.execute(req);
+  assert.equal(first.status, 'success', JSON.stringify(first.error));
+  assert.ok(first.operationId);
+  const replay = await newRuntime(env, [tool], newGateway(env, []).gateway).execute({ ...req });
+  assert.equal(replay.status, 'success');
+  assert.deepEqual(replay.structured, first.structured);
+  assert.equal(replay.operationId, first.operationId);
+  assert.equal(server.requests.length - before, 1, 'exactly one POST');
+  // GET stays a plain read (no operation)
+  const get = await runtime.execute(toolRequest('http.request', { method: 'GET', environmentId: 'env_local', path: '/ok' }));
+  assert.equal(get.status, 'success');
+  assert.equal(get.operationId, undefined);
+});
+
+test('conformance-7: a replay after a kill between send and settle sends exactly one POST (the unknown outcome goes to manual review)', async () => {
+  const req = toolRequest('http.request', { method: 'POST', environmentId: 'env_local', path: '/transfer', json: { amount: 7 } });
+  const before = server.requests.length;
+  const killed = await newRuntime(env, [tool], killedAfterSend()).execute(req);
+  assert.equal(killed.status, 'failed');
+  assert.equal(server.requests.length - before, 1, 'the POST reached the SUT');
+  // restart: a fresh process (fresh gateway state) replays the committed turn's tool call
+  const replay = await newRuntime(env, [tool], newGateway(env, []).gateway).execute({ ...req });
+  assert.equal(replay.status, 'failed');
+  assert.equal(replay.error?.code, 'manual_review');
+  assert.ok(replay.operationId);
+  assert.equal(server.requests.length - before, 1, 'exactly one POST: never re-sent blindly');
+  const again = await newRuntime(env, [tool], newGateway(env, []).gateway).execute({ ...req });
+  assert.equal(again.error?.code, 'manual_review');
+  assert.equal(server.requests.length - before, 1);
+});
+
+test('conformance-7: for an environment that honours Idempotency-Key the interrupted POST is re-sent ONCE with the same key; the SUT applies it once', async () => {
+  const req = toolRequest('http.request', { method: 'POST', environmentId: 'env_idem', path: '/transfer', json: { amount: 9 } });
+  const before = server.requests.length;
+  const appliedBefore = appliedTransfers;
+  const killed = await newRuntime(env, [tool], killedAfterSend()).execute(req);
+  assert.equal(killed.status, 'failed');
+  const replay = await newRuntime(env, [tool], newGateway(env, []).gateway).execute({ ...req });
+  assert.equal(replay.status, 'success', JSON.stringify(replay.error));
+  const sent = server.requests.slice(before);
+  assert.equal(sent.length, 2, 'one safe resend');
+  assert.deepEqual(sent.map((r) => r.headers['idempotency-key']), [req.invocationId, req.invocationId], 'the resend carries the same key');
+  assert.equal(appliedTransfers - appliedBefore, 1, 'the SUT applied the transfer once');
+  // settled: further replays return the recorded response
+  const third = await newRuntime(env, [tool], newGateway(env, []).gateway).execute({ ...req });
+  assert.deepEqual(third.structured, replay.structured);
+  assert.equal(server.requests.length - before, 2);
+});
+
+test('conformance-7: a kill between the recorded receipt and verification recovers the outcome from the (compact) receipt — not sent again', async () => {
+  const req = toolRequest('http.request', { method: 'POST', environmentId: 'env_local', path: '/transfer', json: { amount: 11 } });
+  const before = server.requests.length;
+  const killed = await newRuntime(env, [tool], killedAfterSend('verified')).execute(req);
+  assert.equal(killed.status, 'failed');
+  const evidenceOfTheCall = (await env.evidence.query({ runId: 'run_bb' })).filter((e) => e.toolInvocationId === req.invocationId).map((e) => e.evidenceId);
+  assert.equal(evidenceOfTheCall.length, 1);
+  const replay = await newRuntime(env, [tool], newGateway(env, []).gateway).execute({ ...req });
+  assert.equal(replay.status, 'success', JSON.stringify(replay.error));
+  assert.match(replay.modelText, /recovered after an interruption.*not sent again/s);
+  assert.deepEqual(replay.evidenceRefs, evidenceOfTheCall, 'the full response is in the evidence of the original call');
+  assert.equal(server.requests.length - before, 1, 'exactly one POST');
+  // the receipt in the L0 event stays small (never the whole response)
+  const acked = env.events.events.filter((e) => e.eventType === 'operation.acknowledged' && (e.payload as { toolInvocationId?: string }).toolInvocationId === req.invocationId);
+  assert.equal(acked.length, 1);
+  const receipt = String((acked[0]!.payload as { externalReceipt: string }).externalReceipt);
+  assert.ok(receipt.length < 2048, `receipt ${receipt.length} bytes`);
+  assert.doesNotMatch(receipt, /transfer/);
 });

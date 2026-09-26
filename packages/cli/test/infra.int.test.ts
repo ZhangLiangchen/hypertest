@@ -15,12 +15,12 @@ import { join } from 'node:path';
 import { after, before, describe, test } from 'node:test';
 import { promisify } from 'node:util';
 import { MemoryLogger } from '@hypertest/core';
-import { createHypertest, loadConfig } from '@hypertest/app';
+import { createHypertest, loadConfig, manifestTaskQueue } from '@hypertest/app';
 import type { TestRun } from '@hypertest/domain';
 import { openDatabase } from '@hypertest/store';
 import { infraEnv, skipUnless, tempDir } from '@hypertest/testkit';
 import { clientOnlyConfig, type DoctorReport } from '../src/index.ts';
-import { BRAINS, GOAL, SIM_ROUTE, cli, parseJson, sumRepo, type CliResult } from './helpers.ts';
+import { BRAINS, GOAL, SIM_ROUTE, SUM_ORACLE, cli, parseJson, sumRepo, type CliResult } from './helpers.ts';
 
 const infra = infraEnv();
 const exec = promisify(execFile);
@@ -108,6 +108,7 @@ describe('hypertest worker (Temporal, workerMode external) over PostgreSQL', () 
       policy: { capabilitySecretEnv: 'HT_CLI_WORKER_CAP' },
       models: { providers: [{ id: 'sim', kind: 'scripted' }], routes: [SIM_ROUTE] },
       gate: { requireIndependentReview: false },
+      oracles: [SUM_ORACLE],
     }));
     const ctrl = new AbortController();
     let resolveReady!: () => void;
@@ -168,9 +169,11 @@ describe('short-lived commands never host a Temporal worker (durable.workerMode 
   const env: Record<string, string> = { HT_CLI_SCENARIO: 'pass', HT_CLI_CLIENT_PG: infra.pgUrl ?? '', HT_CLI_CLIENT_CAP: 'client-capability-secret-0123456789' };
   let runId: string | undefined;
 
+  /** The runtime's effective task queue (durability-6: scoped to the runtime manifest). */
+  let effectiveQueue = taskQueue;
   /** The pollers Temporal recorded on the task queue (kept for 5 minutes after their last poll). */
   async function pollers(type: 'workflow' | 'activity'): Promise<unknown[]> {
-    const { stdout } = await exec(temporalCli, ['task-queue', 'describe', '--task-queue', taskQueue, '--task-queue-type', type, '--address', infra.temporalAddress!, '-o', 'json'], { timeout: 20_000 });
+    const { stdout } = await exec(temporalCli, ['task-queue', 'describe', '--task-queue', effectiveQueue, '--task-queue-type', type, '--address', infra.temporalAddress!, '-o', 'json'], { timeout: 20_000 });
     return ((JSON.parse(stdout) as { pollers?: unknown[] | null }).pollers ?? []);
   }
 
@@ -210,6 +213,8 @@ describe('short-lived commands never host a Temporal worker (durable.workerMode 
     const config = clientOnlyConfig(await loadConfig(join(dir.path, 'hypertest.config.yaml'), { env }));
     const ht = await createHypertest(config, { env, scriptedBrains: { sim: () => ({ text: 'unused' }) }, logger: new MemoryLogger() });
     let approvalId: string;
+    effectiveQueue = (ht.durable as unknown as { taskQueue: string }).taskQueue;
+    assert.equal(effectiveQueue, manifestTaskQueue(taskQueue, ht.manifest.manifestId), 'the queue the CLI commands used');
     try {
       approvalId = (await ht.services.approvals.request(
         { runId, kind: 'action', subject: { tool: 'env.restart', target: 'staging' }, requestedBy: { kind: 'agent', id: 'ag_requester', role: 'environment' }, rationale: 'restart staging' },

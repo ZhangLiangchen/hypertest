@@ -1,11 +1,12 @@
-import { canonicalJson, isHypertestError } from '@hypertest/core';
+import { canonicalJson, isHypertestError, sha256Hex } from '@hypertest/core';
 import {
-  isTerminalWorkState, workItemFingerprint,
+  EVENT_TYPES, isTerminalWorkState, workItemFingerprint,
   type BlackboardRecord, type CoverageGap, type EventContext, type Finding, type Hypothesis, type PlanRevision, type QualityDecision, type Review, type Risk,
   type TestRun, type WorkItem,
 } from '@hypertest/domain';
 import { DEFAULT_GATE_SPEC, type GateInput } from '@hypertest/policy';
 import type { NewWorkItem } from '@hypertest/collab';
+import { EVIDENCE_PRODUCER_ROLES } from '@hypertest/agents';
 import type { ConvergenceState } from './contracts.ts';
 import type { ControlDeps, ResolvedControlConfig } from './deps.ts';
 import { acceptedPlanCount } from './domain-tools/plan.ts';
@@ -17,8 +18,12 @@ import { clip, compact, event, runCtx, workBudgetFor } from './util.ts';
 export const FEEDBACK_CRITERIA: ReadonlySet<string> = new Set(['C3', 'C4', 'C6', 'C8']);
 /** Gate evaluations per run: the first may send the lead back for more evidence, the second is final. */
 export const MAX_GATE_ATTEMPTS = 2;
-/** Roles whose model providers produced findings/tests/evidence (reviewer independence input of the gate). */
-export const PRODUCER_ROLES = ['executor', 'test_designer', 'rca', 'fixer'];
+/**
+ * Roles whose model providers produced findings/tests/evidence/fixes (reviewer independence input of the gate, C6). The
+ * agents catalog's EVIDENCE_PRODUCER_ROLES — the very list the reviewer's routing avoids (independentFromRoles) — so the
+ * gate and the router always count the same producers (H10: metrics_analyst and environment included).
+ */
+export const PRODUCER_ROLES: readonly string[] = EVIDENCE_PRODUCER_ROLES;
 const PRODUCT_CATEGORIES: ReadonlySet<string> = new Set(['product_defect', 'security', 'performance']);
 
 export type ReplanReason = 'plan_drained' | 'gate_feedback';
@@ -50,6 +55,18 @@ export interface ConvergenceMonitor {
   gate(run: TestRun): Promise<GateOutcome>;
   /** Replan digest shown to the lead (exported for tests and reports). */
   digest(run: TestRun, items: WorkItem[], reason: ReplanReason, ordinal: number, replans: ReplanState): Promise<string>;
+  /**
+   * (H7) Before the gate: when the run's gate requires an independent review and no review of the run (or of a decision)
+   * exists, emits `review.requested` for the run — once per gate attempt (deterministic event id) — so the reviewer's
+   * subscription creates the run-level review work. True when it was emitted now (the gate waits for the review); the
+   * gate still fails safe (C6) when the review never arrives.
+   */
+  requestRunReview(run: TestRun): Promise<boolean>;
+}
+
+/** (H7) Deterministic id of the run-level `review.requested` of one gate attempt. */
+export function runReviewRequestEventId(runId: string, gateAttempt: number): string {
+  return `evt_review_run_${sha256Hex(`review.requested\u0000${runId}\u0000${gateAttempt}`).slice(0, 32)}`;
 }
 
 function objectiveLine(o: PlanRevision['objectives'][number]): string {
@@ -241,14 +258,41 @@ export function createConvergenceMonitor(deps: ControlDeps, config: ResolvedCont
     return !items.some((w) => w.state === 'claimed' || w.state === 'running' || w.state === 'waiting' || w.state === 'ready');
   }
 
+  /**
+   * conformance-11: the run's approved gate waivers (approvals of kind `gate_exception`). The gate applies only those
+   * decided by a human/system actor, unexpired, and never for C1.
+   */
+  async function gateExceptions(runId: string): Promise<GateInput['exceptions']> {
+    const out: GateInput['exceptions'] = [];
+    for (const a of await deps.approvals.list({ runId, status: ['approved'] })) {
+      if (a.kind !== 'gate_exception' || !a.decidedBy) continue;
+      const subject = (a.subject ?? {}) as { criterionId?: unknown; expiresAt?: unknown };
+      if (typeof subject.criterionId !== 'string') continue;
+      const ex: GateInput['exceptions'][number] = { criterionId: subject.criterionId, approvedBy: a.decidedBy, rationale: a.rationale ?? '' };
+      if (typeof subject.expiresAt === 'string') ex.expiresAt = subject.expiresAt;
+      out.push(ex);
+    }
+    return out;
+  }
+
   async function gateInput(run: TestRun, ctx: EventContext): Promise<GateInput> {
     const runId = run.runId;
     const gateSpec = (await store.getGate(runId)) ?? DEFAULT_GATE_SPEC;
     const plan = await blackboard.latestAcceptedPlan(runId);
     const oracles = [];
+    /** conformance-4: pinned oracles approved in a newer revision meanwhile (the gate reports them superseded). */
+    const currentOracleRevisions: Record<string, number> = {};
     for (const [oracleId, revision] of Object.entries(run.oracleRevisions)) {
       const o = await specs.getOracle(oracleId, revision);
       if (o) oracles.push(o);
+      const latest = await specs.getOracle(oracleId);
+      for (let rev = latest?.revision ?? 0; rev > revision; rev--) {
+        const cand = rev === latest?.revision ? latest : await specs.getOracle(oracleId, rev);
+        if (cand?.status === 'approved') {
+          currentOracleRevisions[oracleId] = rev;
+          break;
+        }
+      }
     }
     // Bind the decision to a sealed root when a signer is available (latestSeal() is unverified: use seal()'s result).
     let root: { rootHash: string; count: number; lastSeq: number };
@@ -270,6 +314,7 @@ export function createConvergenceMonitor(deps: ControlDeps, config: ResolvedCont
       gate: gateSpec,
       objectives: plan?.objectives ?? [],
       oracles,
+      ...(Object.keys(currentOracleRevisions).length > 0 ? { currentOracleRevisions } : {}),
       experiments: await specs.listExperiments(runId),
       findings: await blackboard.query<Finding>({ runId, recordType: 'finding' }),
       risks: await blackboard.query<Risk>({ runId, recordType: 'risk' }),
@@ -280,12 +325,12 @@ export function createConvergenceMonitor(deps: ControlDeps, config: ResolvedCont
       evidenceRoot: { rootHash: root.rootHash, count: root.count },
       workItems: await blackboard.listWorkItems({ runId }),
       claims: await store.claims(runId),
-      exceptions: [],
+      exceptions: await gateExceptions(runId),
       runtimeManifestId: run.runtimeManifestId,
       policyRevision: run.policyRevision,
       decisionId: ids.next('qd'),
       now: clock.isoNow(),
-      producerProviders: await epochs.providersUsedByRoles(runId, PRODUCER_ROLES),
+      producerProviders: await epochs.providersUsedByRoles(runId, [...PRODUCER_ROLES]),
       revision: (latestDecision?.revision ?? 0) + 1,
     };
     if (latestDecision) input.supersedes = latestDecision.decisionId;
@@ -386,12 +431,37 @@ export function createConvergenceMonitor(deps: ControlDeps, config: ResolvedCont
     return { decision: saved.decision, final: !loop, run: saved.run };
   }
 
+  async function requestRunReview(run: TestRun): Promise<boolean> {
+    const gateSpec = (await store.getGate(run.runId)) ?? DEFAULT_GATE_SPEC;
+    if (!gateSpec.requireIndependentReview) return false;
+    // a review of the run (or of a decision) already exists — whatever its verdict, the gate judges it
+    const reviews = await blackboard.query<Review>({ runId: run.runId, recordType: 'review' });
+    if (reviews.some((r) => r.payload.subjectRef.kind === 'decision' || (r.payload.subjectRef.kind === 'run' && r.payload.subjectRef.id === run.runId))) return false;
+    // nobody would react (no reviewer subscription): the gate fails safe on C6 instead of waiting
+    if (!roles.subscriptions().some((sub) => sub.eventTypes.includes(EVENT_TYPES.reviewRequested))) return false;
+    const attempt = (await store.replans(run.runId)).gateAttempts + 1;
+    const eventId = runReviewRequestEventId(run.runId, attempt);
+    if (await events.get(eventId)) return false; // requested for this gate attempt already (the review failed or was capped)
+    const subjectRef = { kind: 'run', id: run.runId };
+    const payload = {
+      subjectRef,
+      title: `run ${run.runId} before quality gate attempt ${attempt}`,
+      summary: `The QualityGate requires an independent review of the run and none exists. Review the run as a whole: judge its recorded execution evidence (test results, HTTP exchanges, metrics) and its findings against the oracles in force — never the producers' narrative — and record the verdict with blackboard.post_review on subjectRef {"kind":"run","id":"${run.runId}"}.`,
+      attempt,
+      requiredBy: gateSpec.gateId,
+    };
+    await events.append([{ ...event(runCtx(run.runId, workerId), EVENT_TYPES.reviewRequested, 'run', run.runId, payload), eventId }]);
+    logger.info('independent run review requested before the gate', { runId: run.runId, attempt });
+    return true;
+  }
+
   return {
     exhaustion,
     maybeReplan,
     evaluate,
     gateReady,
     digest,
+    requestRunReview,
     async gate(run) {
       try {
         return await gateRun(run);

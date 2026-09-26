@@ -100,6 +100,11 @@ export function createReportBuilder(deps: ControlDeps): ReportBuilder {
       if (interim) md.push(`- **Interim gate decision (not final):** ${interim.verdict} (decision ${interim.decisionId}, revision ${interim.revision})`);
       if (decision) {
         md.push(`- **Requires human review:** ${decision.requiresHumanReview ? 'yes' : 'no'}`);
+        // conformance-9: the gate that produced the verdict, and how the run's overrides changed it
+        if (decision.gateSpecDigest) {
+          const overrides = decision.gateOverrides ?? [];
+          md.push(`- **Gate:** ${decision.gateId} (spec ${decision.gateSpecDigest.slice(0, 16)}; ${overrides.length === 0 ? 'the default gate' : `overrides: ${overrides.join(', ')}`})`);
+        }
         md.push('');
         md.push('## Decision reasons');
         for (const r of decision.reasons) md.push(`- ${r}`);

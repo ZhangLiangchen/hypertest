@@ -1,5 +1,5 @@
 import type { Command } from '../command.ts';
-import { approvalsCommand, approveCommand, oracleCommand } from './decide.ts';
+import { approvalsCommand, approveCommand, experienceCommand, oracleCommand, waiveCommand } from './decide.ts';
 import { doctorCommand } from './doctor.ts';
 import { evalCommand } from './eval.ts';
 import { initCommand } from './init.ts';
@@ -20,6 +20,8 @@ export const ALL_COMMANDS: readonly Command[] = Object.freeze([
   approvalsCommand,
   approveCommand,
   oracleCommand,
+  waiveCommand,
+  experienceCommand,
   cancelCommand,
   evalCommand,
   serveCommand,

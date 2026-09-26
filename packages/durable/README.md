@@ -37,6 +37,12 @@ Depends on `core`, `domain`, `control` (the `ControlPlane` facade: `tick`, `exec
 - New types `TemporalWorkflowBundle`, `TemporalWorkerOptions`, `TemporalWorkerHandle`; activity
   `claimAfterResume({ workItemId, fencingToken? })` (+ type `ClaimAfterResumeInput`); `TestRunWorkflowState.maxIdleMs`.
   `WorkItemWorkflowInput.mayReresolve` is deprecated and ignored.
+- (hardening) `LocalDurableOptions.claimKeepaliveMs` (default 10 s; H6): the local loop ticks with
+  `maxDispatch` = its free turn slots and renews (`ControlPlane.renewClaim`) a claim that still waits for a slot.
+  `TemporalDurableOptions.turnTimeoutMs` (default 24 h, ≥ 1000; durability-5): the `executeTurn` activity's
+  start-to-close timeout (was 2 h 10 min, shorter than a turn may legitimately run), inherited by the item workflows
+  (`TestRunWorkflowState.turnTimeoutMs`, `WorkItemWorkflowInput.turnTimeoutMs`); `DEFAULT_TURN_ACTIVITY_TIMEOUT_MS`.
+  Both runtimes pass the dispatch's `nextTurn` as the first call's `expectedTurn` (durability-9).
 
 ## Semantics
 

@@ -414,6 +414,47 @@ export function reviewerOfFinding(expectation: { evidenceType: string; supports:
   };
 }
 
+/**
+ * Independent reviewer of the RUN (the run-level review the QualityGate requires, requested by the control plane before
+ * the gate — H7): queries the run's recorded evidence of the expected type, fetches it itself (evidence.get) and approves
+ * only when a recorded payload shows what the run's verdict rests on; otherwise it asks for more evidence.
+ */
+export function reviewerOfRun(expectation: { evidenceType: string; supports: (structured: unknown) => boolean; what: string }): RoleBrain {
+  return (v) => {
+    if (v.step === 0) return toolCall('evidence.query', { evidenceType: expectation.evidenceType });
+    const listing = jsonOf(resultText(v, 0));
+    const ids = (Array.isArray(listing['evidence']) ? (listing['evidence'] as Array<{ evidenceId: string }>) : []).map((e) => e.evidenceId).slice(0, 5);
+    const fetched = v.step - 1;
+    if (fetched < ids.length) return toolCall('evidence.get', { evidenceId: ids[fetched]! });
+    const inspected = ids.slice(0, fetched);
+    const supporting = inspected.filter((_id, i) => expectation.supports(jsonOf(resultText(v, 1 + i))['structured']));
+    const verdict = supporting.length > 0 ? 'approve' : 'needs_more_evidence';
+    if (v.step === 1 + ids.length) {
+      return toolCall('blackboard.post_review', {
+        subjectRef: { kind: 'run', id: v.runId },
+        verdict,
+        rationale: supporting.length > 0
+          ? `The recorded ${expectation.evidenceType} ${supporting.join(', ')} shows ${expectation.what}: the run's findings and verdict rest on execution evidence.`
+          : `No inspected ${expectation.evidenceType} (${inspected.join(', ') || 'none'}) shows ${expectation.what}.`,
+        checkedEvidenceRefs: inspected,
+      });
+    }
+    const review = str(jsonOf(resultText(v, 1 + ids.length)), 'recordId')!;
+    const summary = `Independent review of run ${v.runId}: ${verdict} (checked ${inspected.join(', ') || 'no evidence'}).`;
+    return toolCall('complete_work', { summary, evidenceRefs: inspected, recordRefs: [review], output: { summary, verdict, reviews: [review], checkedEvidenceIds: inspected } });
+  };
+}
+
+/** A run-level review request (H7): its task names the run as the review subject. */
+export function isRunReview(v: BrainView): boolean {
+  return v.role === 'reviewer' && /subjectRef \{"kind":"run","id":"/.test(v.userText) && inputRecord(v, 'finding') === undefined;
+}
+
+/** The reviewer of a PoC: run-level review requests go to `run`, finding reviews to `finding`. */
+export function pocReviewer(finding: RoleBrain, run: RoleBrain): RoleBrain {
+  return (v) => (isRunReview(v) ? run(v) : finding(v));
+}
+
 /** A test-result whose recorded cases show `name` with status failed. */
 export function caseFailed(name: string): (structured: unknown) => boolean {
   return (s) => {
@@ -422,11 +463,18 @@ export function caseFailed(name: string): (structured: unknown) => boolean {
   };
 }
 
-export const pocAReviewer: RoleBrain = reviewerOfFinding({
-  evidenceType: 'test-result',
-  supports: caseFailed('paginate returns every item exactly once across pages'),
-  what: 'the pagination contract case failing on the candidate',
-});
+export const pocAReviewer: RoleBrain = pocReviewer(
+  reviewerOfFinding({
+    evidenceType: 'test-result',
+    supports: caseFailed('paginate returns every item exactly once across pages'),
+    what: 'the pagination contract case failing on the candidate',
+  }),
+  reviewerOfRun({
+    evidenceType: 'test-result',
+    supports: caseFailed('paginate returns every item exactly once across pages'),
+    what: 'the pagination contract case failing on the candidate',
+  }),
+);
 
 export const POC_A_ROLES: Record<string, RoleBrain> = {
   lead: pocALead,

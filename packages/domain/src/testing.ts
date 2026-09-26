@@ -216,6 +216,11 @@ export interface TestValidation {
   status: 'passed' | 'failed' | 'not_run';
   evidenceRefs: string[];
   detail?: string;
+  /**
+   * (additive, conformance-10) The tree digest of the code the validating run executed (its evidence's
+   * `workspaceDelta.treeDigest`): known-good and known-bad must have run on different code.
+   */
+  codeDigest?: string;
 }
 
 export type TestArtifactApproval = 'draft' | 'validated' | 'approved' | 'quarantined' | 'retired';
@@ -271,6 +276,12 @@ export interface GateSpec {
   requireDeterministicForCritical: boolean;
   requireIndependentReview: boolean;
   minCoverage?: { lines?: number; branches?: number };
+  /**
+   * (additive, conformance-1) A verdict other than `inconclusive` needs an oracle in force (criterion C0): at least one
+   * approved oracle pinned by the run with at least one deterministic P0/P1 assertion. Absent means true; only an explicit
+   * `false` (a recorded gate override) clears it.
+   */
+  requireOracle?: boolean;
 }
 
 export interface CriterionResult {
@@ -320,6 +331,16 @@ export interface QualityDecision {
   reasons: string[];
   runtimeManifestId: string;
   policyRevision: string;
+  /**
+   * (additive, conformance-9) sha256 of the canonical JSON of the effective GateSpec that produced this verdict — signed
+   * with the decision, so the gate is bound to it, not only its `gateId`.
+   */
+  gateSpecDigest?: string;
+  /**
+   * (additive, conformance-9) The effective GateSpec fields that differ from the default gate, as `field=value`
+   * (canonical JSON values): a weakened run-level override is visible in the signed decision and the report.
+   */
+  gateOverrides?: string[];
   signature?: { keyId: string; algorithm: string; value: string };
   decidedAt: string;
 }

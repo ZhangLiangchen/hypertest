@@ -1,7 +1,8 @@
 import { readFile, stat } from 'node:fs/promises';
-import { HypertestError, type JsonValue } from '@hypertest/core';
+import { HypertestError, canonicalJson, sha256Hex, type JsonValue } from '@hypertest/core';
 import type { ArtifactRef } from '@hypertest/domain';
-import type { BuiltinToolOptions, CoverageMap, TestRunnerAdapter, TestRunResult, ToolContext, ToolSpec, WorkspaceHandle } from '../../contracts.ts';
+import { DEFAULT_TEST_PATH_PATTERNS, matchesGlob } from '@hypertest/policy';
+import type { BuiltinToolOptions, CoverageMap, TestRunnerAdapter, TestRunResult, ToolContext, ToolSpec, WorkspaceHandle, WorkspaceManager } from '../../contracts.ts';
 import { detectCoverageFormat, parseCoverage, type CoverageFormat } from '../coverage.ts';
 import { MUTATION_OPERATORS, runMutationAnalysis } from '../mutation.ts';
 import { commandRunner } from '../runners/command.ts';
@@ -9,7 +10,7 @@ import { defaultTestRunners } from '../runners/index.ts';
 import { rebase } from '../runners/node.ts';
 import { normalizeRel } from '../paths.ts';
 import { assertNotGitMetadata, pathResource, rootResource } from './common.ts';
-import { DEFAULT_SHELL_ALLOWLIST, shellDenial } from './shell.ts';
+import { DEFAULT_SHELL_ALLOWLIST, confinedArguments, shellDenial } from './shell.ts';
 
 const FRAMEWORKS = ['auto', 'node_test', 'vitest', 'jest', 'pytest', 'go_test', 'command'] as const;
 const MAX_CASES_INLINE = 500;
@@ -24,6 +25,58 @@ export async function selectRunner(runners: readonly TestRunnerAdapter[], ws: Wo
   }
   for (const r of runners) if (await r.detect(ws)) return r;
   throw new HypertestError('precondition_failed', `no test framework detected in workspace ${ws.workspaceId}; pass framework explicitly`);
+}
+
+/**
+ * Paths whose change can alter which test cases run or what they assert: the policy's test path patterns plus the
+ * default discovery patterns of the supported runners (node:test `*-test.*`, `*_test.*`, `test-*.*`, `test.*`; spec dirs).
+ */
+export const TEST_FILE_PATTERNS: readonly string[] = Object.freeze([
+  ...DEFAULT_TEST_PATH_PATTERNS,
+  '**/*-test.*', '**/*_test.*', '**/test-*.*', '**/test.*', '**/*_spec.*', '**/spec/**', '**/__tests__/**',
+]);
+const MAX_DELTA_TEST_FILES = 500;
+
+export function isTestFilePath(path: string): boolean {
+  return TEST_FILE_PATTERNS.some((g) => matchesGlob(g, path));
+}
+
+/**
+ * conformance-2: what was tested, relative to the workspace's base commit — recorded on every test-result (and
+ * coverage) record as `workspaceDelta`, computed by the tool (never a caller claim) BEFORE the run:
+ *   { status: 'computed', baseCommit?, readOnly, treeDigest, changedFiles, testFiles: [{ path, change, sha256 }], testFilesTruncated? }
+ *   { status: 'unavailable', readOnly, reason }
+ * `testFiles` = changed files that are test files (TEST_FILE_PATTERNS) or the file the selector names; `treeDigest` =
+ * sha256 of the canonical { baseCommit, every change with its digest }. The QualityGate counts such evidence only when
+ * every added/modified test file is covered by a validated TestArtifact with exactly that digest (sensitivity proven).
+ */
+export async function workspaceDelta(ws: WorkspaceHandle, workspaces: WorkspaceManager, selector: string | undefined): Promise<Record<string, JsonValue>> {
+  if (typeof workspaces.changedFiles !== 'function') return { status: 'unavailable', readOnly: ws.readOnly, reason: 'the workspace manager cannot list changes against the base commit' };
+  let changes: Awaited<ReturnType<NonNullable<WorkspaceManager['changedFiles']>>>;
+  try {
+    changes = await workspaces.changedFiles(ws);
+  } catch (e) {
+    return { status: 'unavailable', readOnly: ws.readOnly, reason: (e as Error).message.slice(0, 500) };
+  }
+  const selected = selector === undefined ? undefined : normalizeRel(selector.split('::')[0]!);
+  const tests = changes.filter((c) => isTestFilePath(c.path) || c.path === selected);
+  const delta: Record<string, JsonValue> = {
+    status: 'computed',
+    readOnly: ws.readOnly,
+    treeDigest: sha256Hex(canonicalJson({ baseCommit: ws.baseCommit ?? null, changes: changes.map((c) => ({ path: c.path, change: c.change, sha256: c.sha256 ?? null })) })),
+    changedFiles: changes.length,
+    testFiles: tests.slice(0, MAX_DELTA_TEST_FILES).map((c) => ({ path: c.path, change: c.change, sha256: c.sha256 ?? null })),
+  };
+  if (ws.baseCommit !== undefined) delta['baseCommit'] = ws.baseCommit;
+  if (tests.length > MAX_DELTA_TEST_FILES) delta['testFilesTruncated'] = true;
+  return delta;
+}
+
+function deltaNote(delta: Record<string, JsonValue>): string {
+  if (delta['status'] !== 'computed') return `\nWORKSPACE DELTA UNAVAILABLE (${String(delta['reason'])}): unless the workspace is read-only, this evidence does not count for the quality gate.`;
+  const files = (delta['testFiles'] as Array<{ path: string; change: string }>).filter((f) => f.change !== 'deleted');
+  if (files.length === 0) return '';
+  return `\n${files.length} test file(s) differ from the base commit (${files.slice(0, 10).map((f) => `${f.change} ${f.path}`).join(', ')}${files.length > 10 ? ', …' : ''}): this evidence counts for the quality gate only once each of them is registered and validated as a TestArtifact with exactly this content.`;
 }
 
 function summarize(r: TestRunResult): string {
@@ -43,6 +96,7 @@ async function recordTestEvidence(
   ctx: ToolContext,
   run: Awaited<ReturnType<TestRunnerAdapter['run']>>,
   testArtifactIds: string[],
+  delta: Record<string, JsonValue>,
 ): Promise<{ evidenceRefs: string[]; testResultIds: string[]; coverageIds: string[]; artifactRefs: ArtifactRef[] }> {
   const evidenceRefs: string[] = [];
   const parents: string[] = [];
@@ -66,6 +120,7 @@ async function recordTestEvidence(
   }
   const base = JSON.parse(JSON.stringify(run.result)) as Record<string, JsonValue>;
   if (raw) base['rawReport'] = raw;
+  base['workspaceDelta'] = delta;
   // The QualityGate reads the singular `testArtifactId`: one record per linked artifact keeps its
   // eligibility check per artifact (an ineligible artifact can never ride along with an eligible one).
   const links: Array<string | undefined> = testArtifactIds.length > 0 ? testArtifactIds : [undefined];
@@ -89,12 +144,13 @@ async function recordTestEvidence(
   }
   const coverageIds: string[] = [];
   if (run.coverage) {
+    const coverage = { ...(JSON.parse(JSON.stringify(run.coverage)) as Record<string, JsonValue>), workspaceDelta: delta };
     const ev = await ctx.recordEvidence({
       evidenceType: 'coverage',
-      data: JSON.stringify(run.coverage),
+      data: JSON.stringify(coverage),
       mimeType: 'application/json',
       summary: `${run.coverage.format} coverage from ${run.result.framework}: lines ${run.coverage.totals.lines.covered}/${run.coverage.totals.lines.total}, branches ${run.coverage.totals.branches === 'unknown' ? 'unknown' : `${run.coverage.totals.branches.covered}/${run.coverage.totals.branches.total}`}`,
-      structured: run.coverage as unknown as JsonValue,
+      structured: coverage,
       parentEvidenceIds: testResultIds,
       provenance,
     });
@@ -145,6 +201,8 @@ export function testRunTool(options: BuiltinToolOptions): ToolSpec<TestRunInput>
         if (!input.command) throw new HypertestError('invalid_argument', 'framework "command" requires command');
         const denial = shellDenial(input.command, allowlist, ctx.permit.constraints?.allowedCommands);
         if (denial) return { status: 'denied', error: { code: 'permission_denied', message: denial } };
+        const argDenial = options.sandbox.kind === 'oci' ? undefined : await confinedArguments(ctx.workspace, undefined, input.command);
+        if (argDenial) return { status: 'denied', error: { code: 'permission_denied', message: argDenial } };
         // no agent-controlled allowNoCases: an exit code alone must never become `passed: true` (fake green);
         // a trusted exit-code runner can still be configured through BuiltinToolOptions.runners
         runner = commandRunner({ command: input.command });
@@ -156,9 +214,11 @@ export function testRunTool(options: BuiltinToolOptions): ToolSpec<TestRunInput>
       const request: Parameters<TestRunnerAdapter['run']>[1] = { timeoutMs, signal: ctx.signal };
       if (input.selector !== undefined) request.selector = input.selector;
       if (input.coverage) request.coverage = true;
+      // the tree that is about to be tested (derived by the tool, never claimed by the caller): conformance-2
+      const delta = await workspaceDelta(ctx.workspace, options.workspaces, input.selector);
       const run = await runner.run(ctx.workspace, request, options.sandbox);
       const ids = [...new Set([...(input.testArtifactId ? [input.testArtifactId] : []), ...(input.testArtifactIds ?? [])])];
-      const ev = await recordTestEvidence(ctx, run, ids);
+      const ev = await recordTestEvidence(ctx, run, ids, delta);
       const structured = JSON.parse(JSON.stringify(run.result)) as Record<string, JsonValue>;
       if (run.result.cases.length > MAX_CASES_INLINE) {
         structured['cases'] = run.result.cases.slice(0, MAX_CASES_INLINE) as unknown as JsonValue;
@@ -167,7 +227,8 @@ export function testRunTool(options: BuiltinToolOptions): ToolSpec<TestRunInput>
       if (ids.length > 0) structured['testArtifactIds'] = ids;
       structured['evidence'] = { testResult: ev.testResultIds, coverage: ev.coverageIds };
       if (run.coverage) structured['coverage'] = { format: run.coverage.format, totals: run.coverage.totals as unknown as JsonValue };
-      return { status: 'success', structured, text: summarize(run.result), evidenceRefs: ev.evidenceRefs, artifactRefs: ev.artifactRefs };
+      structured['workspaceDelta'] = delta;
+      return { status: 'success', structured, text: summarize(run.result) + deltaNote(delta), evidenceRefs: ev.evidenceRefs, artifactRefs: ev.artifactRefs };
     },
   };
 }

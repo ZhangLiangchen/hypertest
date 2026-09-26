@@ -115,11 +115,33 @@ export function createBudgetLedger(deps: OperationDeps): BudgetLedger {
     await tx.query('UPDATE ht_budget_scopes SET used = $2::jsonb, reserved = $3::jsonb, updated_at = $4 WHERE scope = $1', [scope, jsonParam(used), jsonParam(reserved), clock.isoNow()]);
   }
 
-  async function reserveOrCharge(scopes: string[], rawAmounts: BudgetAmounts, reason: string, mode: 'reserve' | 'charge'): Promise<ReserveOutcome> {
+  async function reserveOrCharge(scopes: string[], rawAmounts: BudgetAmounts, reason: string, mode: 'reserve' | 'charge', idempotencyKey?: string): Promise<ReserveOutcome> {
     requireScopes(scopes);
     const amounts = normalizeAmounts(rawAmounts, 'amounts');
     if (typeof reason !== 'string') throw new HypertestError('invalid_argument', 'reason must be a string');
+    if (idempotencyKey !== undefined && (typeof idempotencyKey !== 'string' || idempotencyKey.length === 0)) throw new HypertestError('invalid_argument', 'idempotencyKey must be a non-empty string');
     return db.transaction(async (tx) => {
+      if (idempotencyKey !== undefined) {
+        // Serializes every charge under this key (also across processes): the lookup below then sees a concurrent
+        // duplicate's committed row instead of racing it into a second charge.
+        await tx.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`ht_budget_charge:${idempotencyKey}`]);
+        const prior = await tx.query<{ reservation_id: string; scopes: unknown; amounts: unknown }>('SELECT reservation_id, scopes, amounts FROM ht_budget_reservations WHERE idempotency_key = $1', [idempotencyKey]);
+        const row = prior.rows[0];
+        if (row) {
+          const recordedAmounts = fromJsonColumn<BudgetAmounts>(row.amounts);
+          const sameAmounts = BUDGET_DIMENSIONS.every((d) => (recordedAmounts[d] ?? 0) === (amounts[d] ?? 0));
+          const recordedChain = new Set(fromJsonColumn<string[]>(row.scopes));
+          const chain = await expandChain(tx, scopes);
+          const sameScopes = chain.length === recordedChain.size && chain.every((sc) => recordedChain.has(sc));
+          if (!sameAmounts || !sameScopes) {
+            throw new HypertestError('conflict', `budget charge key ${idempotencyKey} was already used for different scopes or amounts`, {
+              details: { idempotencyKey, reservationId: row.reservation_id },
+            });
+          }
+          logger.debug('budget charge already recorded under this key', { idempotencyKey, reservationId: row.reservation_id });
+          return { ok: true, reservationId: row.reservation_id };
+        }
+      }
       const chain = await expandChain(tx, scopes);
       const rows = await lockScopes(tx, chain);
       const violation = firstViolation(chain, rows, amounts);
@@ -135,9 +157,9 @@ export function createBudgetLedger(deps: OperationDeps): BudgetLedger {
       const reservationId = ids.next('bres');
       const now = clock.isoNow();
       await tx.query(
-        `INSERT INTO ht_budget_reservations (reservation_id, scopes, amounts, actual, status, reason, created_at, updated_at)
-         VALUES ($1, $2::jsonb, $3::jsonb, $4::jsonb, $5, $6, $7, $7)`,
-        [reservationId, jsonParam(chain), jsonParam(amounts), mode === 'charge' ? jsonParam(amounts) : null, mode === 'charge' ? 'settled' : 'reserved', reason, now],
+        `INSERT INTO ht_budget_reservations (reservation_id, scopes, amounts, actual, status, reason, created_at, updated_at, idempotency_key)
+         VALUES ($1, $2::jsonb, $3::jsonb, $4::jsonb, $5, $6, $7, $7, $8)`,
+        [reservationId, jsonParam(chain), jsonParam(amounts), mode === 'charge' ? jsonParam(amounts) : null, mode === 'charge' ? 'settled' : 'reserved', reason, now, idempotencyKey ?? null],
       );
       return { ok: true, reservationId };
     });
@@ -220,8 +242,20 @@ export function createBudgetLedger(deps: OperationDeps): BudgetLedger {
       await finish(reservationId, undefined);
     },
 
-    charge(scopes, amounts, reason): Promise<ReserveOutcome> {
-      return reserveOrCharge(scopes, amounts, reason, 'charge');
+    charge(scopes, amounts, reason, options): Promise<ReserveOutcome> {
+      return reserveOrCharge(scopes, amounts, reason, 'charge', options?.idempotencyKey);
+    },
+
+    async releaseOpen(scope: string): Promise<string[]> {
+      if (typeof scope !== 'string' || scope.length === 0) throw new HypertestError('invalid_argument', 'scope must be a non-empty string');
+      const r = await db.query<{ reservation_id: string }>("SELECT reservation_id FROM ht_budget_reservations WHERE status = 'reserved' AND scopes @> $1::jsonb ORDER BY created_at, reservation_id", [jsonParam([scope])]);
+      const released: string[] = [];
+      for (const row of r.rows) {
+        await finish(row.reservation_id, undefined);
+        released.push(row.reservation_id);
+      }
+      if (released.length > 0) logger.info('released open budget reservations', { scope, released });
+      return released;
     },
 
     async usage(scope: string): Promise<BudgetUsage | undefined> {

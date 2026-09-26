@@ -266,7 +266,7 @@ describe('a plan may tighten, never weaken, a role\'s model routing policy (I3)'
   test('tightenModelPolicy: unions, intersections, floors and the stricter privacy class; preferences are the item\'s', () => {
     const reviewer = BUILTIN_ROLES.find((r) => r.role === 'reviewer')!.defaultModelPolicy;
     const weakened = tightenModelPolicy(reviewer, { independentFromRoles: [], minQuality: 0.1, requiredCapabilities: [], fallback: 'revalidated', temperature: 0.7 });
-    assert.deepEqual(weakened.independentFromRoles, ['executor', 'test_designer', 'rca']);
+    assert.deepEqual(weakened.independentFromRoles, ['executor', 'test_designer', 'rca', 'fixer', 'metrics_analyst', 'environment']);
     assert.equal(weakened.minQuality, 0.75);
     assert.deepEqual(weakened.requiredCapabilities, ['tool_use', 'structured_output', 'reasoning']);
     assert.equal(weakened.temperature, 0.7);
@@ -294,7 +294,7 @@ describe('a plan may tighten, never weaken, a role\'s model routing policy (I3)'
       const reviewItem = (await items(h, run.runId)).find((w) => w.role === 'reviewer')!;
       const agent = (await h.deps.agents.byWorkItem(reviewItem.workItemId))!;
       const spec = (await new ControlStore(h.db).agentHost(agent.agentId))!;
-      assert.deepEqual(spec.modelPolicy.independentFromRoles, ['executor', 'test_designer', 'rca']);
+      assert.deepEqual(spec.modelPolicy.independentFromRoles, ['executor', 'test_designer', 'rca', 'fixer', 'metrics_analyst', 'environment']);
       assert.equal(spec.modelPolicy.minQuality, 0.75);
     } finally {
       await h.dispose();

@@ -164,7 +164,9 @@ export function createReactorService(deps: ControlDeps): ReactorService {
       }
       const roleDef = roles.require(sub.role);
       const rendered = renderSubscriptionWork(sub, vars);
-      const inputRefs: Ref[] = recordId !== undefined ? [{ kind: 'record', id: recordId }] : [];
+      // a run-level review request (H7) names the run, not a record
+      const runSubject = e.eventType === 'review.requested' && subjectRef?.['kind'] === 'run' && str(subjectRef['id']) === e.runId;
+      const inputRefs: Ref[] = runSubject ? [{ kind: 'run', id: e.runId }] : recordId !== undefined ? [{ kind: 'record', id: recordId }] : [];
       const item: NewWorkItem = {
         runId: e.runId,
         kind: 'reaction',

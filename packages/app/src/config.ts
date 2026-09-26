@@ -3,10 +3,10 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { HypertestError, jsonClone, validateJson } from '@hypertest/core';
 import { MODEL_CAPABILITY_PROFILE_SCHEMA, anthropicCompatibilityClass, type ModelCapabilityProfile } from '@hypertest/model';
-import { DEFAULT_POLICY_RULES, POLICY_RULE_SCHEMA } from '@hypertest/policy';
+import { DEFAULT_POLICY_RULES, POLICY_RULE_SCHEMA, type OracleGovernance } from '@hypertest/policy';
 import { DEFAULT_SHELL_ALLOWLIST } from '@hypertest/tools';
 import { BUILTIN_ROLES, RoleCatalog, type RoleOverrides } from '@hypertest/agents';
-import type { HypertestConfig, HypertestConfigInput, LoadConfigOptions, ProviderConfig, RouteConfig } from './contracts.ts';
+import type { HypertestConfig, HypertestConfigInput, LoadConfigOptions, OracleConfig, ProviderConfig, RouteConfig } from './contracts.ts';
 
 /**
  * Configuration: defaults, deep merge, `${VAR}` interpolation, relative path resolution and human-readable
@@ -37,7 +37,7 @@ export const ROUTE_DEFAULTS = Object.freeze({
 
 const TOP_LEVEL_KEYS = new Set([
   'version', 'project', 'store', 'bus', 'durable', 'artifacts', 'models', 'roles', 'budget', 'gate', 'policy', 'bugate', 'engines', 'sandbox',
-  'environments', 'tools', 'signing', 'memory', 'observability',
+  'environments', 'tools', 'signing', 'memory', 'observability', 'oracles',
 ]);
 /** Discriminated sections: a patch with another `kind` replaces the section instead of merging into it. */
 const KIND_SECTIONS = new Set(['store', 'bus', 'durable', 'artifacts', 'memory']);
@@ -573,7 +573,7 @@ function validatePolicy(errors: Errors, policy: unknown): void {
 const BUDGET_KEYS = ['maxWallClockMs', 'maxAgentConcurrency', 'maxModelTokens', 'maxModelCostUsd', 'maxToolCalls', 'maxComputeMinutes', 'maxExternalQps', 'maxArtifactBytes', 'maxWorkItems', 'maxAgentDepth', 'maxPlanRevisions'];
 /** Budget caps the control plane requires to be integers (≥ 1; maxAgentDepth ≥ 0): a run with another value is refused at start. */
 const INTEGER_BUDGET_KEYS: Record<string, number> = { maxWallClockMs: 1, maxAgentConcurrency: 1, maxModelTokens: 1, maxToolCalls: 1, maxWorkItems: 1, maxPlanRevisions: 1, maxAgentDepth: 0 };
-const GATE_KEYS = ['gateId', 'description', 'failOnUnresolvedSeverity', 'conditionalOnRiskLevel', 'requiredEvidence', 'requireDeterministicForCritical', 'requireIndependentReview', 'minCoverage'];
+const GATE_KEYS = ['gateId', 'description', 'failOnUnresolvedSeverity', 'conditionalOnRiskLevel', 'requiredEvidence', 'requireDeterministicForCritical', 'requireIndependentReview', 'minCoverage', 'requireOracle'];
 
 function validateBudget(errors: Errors, budget: unknown, path: string): void {
   if (budget === undefined || !objectAt(errors, path, budget, false)) return;
@@ -597,9 +597,9 @@ function validateGate(errors: Errors, gate: unknown, path: string): void {
   unknownKeys(errors, path, gate, GATE_KEYS);
   if (gate['gateId'] !== undefined) str(errors, `${path}.gateId`, gate['gateId'], false);
   if (gate['description'] !== undefined && typeof gate['description'] !== 'string') errors.push(`${path}.description must be a string`);
-  oneOf(errors, `${path}.failOnUnresolvedSeverity`, gate['failOnUnresolvedSeverity'], ['P0', 'P1', 'P2', 'P3', 'P4'], false);
+  oneOf(errors, `${path}.failOnUnresolvedSeverity`, gate['failOnUnresolvedSeverity'], ['P0', 'P1', 'P2', 'P3'], false); // the domain's Severity (H3: 'P4' would disable C2)
   oneOf(errors, `${path}.conditionalOnRiskLevel`, gate['conditionalOnRiskLevel'], ['low', 'medium', 'high', 'critical'], false);
-  for (const k of ['requireDeterministicForCritical', 'requireIndependentReview']) if (gate[k] !== undefined && typeof gate[k] !== 'boolean') errors.push(`${path}.${k} must be a boolean`);
+  for (const k of ['requireDeterministicForCritical', 'requireIndependentReview', 'requireOracle']) if (gate[k] !== undefined && typeof gate[k] !== 'boolean') errors.push(`${path}.${k} must be a boolean`);
   const required = gate['requiredEvidence'];
   if (required !== undefined) {
     if (!Array.isArray(required)) errors.push(`${path}.requiredEvidence must be a list`);
@@ -637,9 +637,122 @@ export function validateRunOverrides(input: { budget?: unknown; gate?: unknown }
   return errors;
 }
 
+const ORACLE_KINDS = ['deterministic_invariant', 'requirement', 'differential', 'metamorphic', 'statistical', 'llm_semantic'];
+const ORACLE_AUTHORITIES = ['formal_spec', 'approved_requirement', 'business_rule', 'known_good_reference', 'differential_reference', 'expert_approved'];
+const CHECK_TYPES = ['test_outcome', 'metric_threshold', 'http_expectation', 'evidence_predicate', 'llm_rubric'];
+const COMPARATORS = ['<', '<=', '>', '>=', '==', '!='];
+
+/** (conformance-1) `oracles`: configured oracles established by a named human authority. */
+function validateOracles(errors: Errors, oracles: unknown): void {
+  if (oracles === undefined) return;
+  if (!Array.isArray(oracles)) {
+    errors.push('oracles must be a list');
+    return;
+  }
+  const seen = new Set<string>();
+  oracles.forEach((o: unknown, i: number) => {
+    const at = `oracles[${i}]`;
+    if (!objectAt(errors, at, o, true)) return;
+    unknownKeys(errors, at, o, ['oracleId', 'scope', 'assertions', 'authorities', 'judgePolicy', 'changePolicy', 'establishedBy']);
+    str(errors, `${at}.oracleId`, o['oracleId'], true);
+    if (typeof o['oracleId'] === 'string') {
+      if (seen.has(o['oracleId'])) errors.push(`${at}.oracleId: duplicate oracle id ${o['oracleId']}`);
+      seen.add(o['oracleId']);
+    }
+    str(errors, `${at}.establishedBy`, o['establishedBy'], true);
+    if (typeof o['establishedBy'] === 'string' && !/^[\p{L}\p{N}._@+-][\p{L}\p{N}._@+\- ]{0,127}$/u.test(o['establishedBy'])) errors.push(`${at}.establishedBy must be a person's name or handle`);
+    const scope = o['scope'];
+    if (objectAt(errors, `${at}.scope`, scope, true)) {
+      unknownKeys(errors, `${at}.scope`, scope, ['components', 'description']);
+      stringList(errors, `${at}.scope.components`, scope['components']);
+      if (!Array.isArray(scope['components'])) errors.push(`${at}.scope.components is required (a list)`);
+      str(errors, `${at}.scope.description`, scope['description'], true);
+    }
+    const assertions = o['assertions'];
+    if (!Array.isArray(assertions) || assertions.length === 0) errors.push(`${at}.assertions must be a non-empty list`);
+    else {
+      const ids = new Set<string>();
+      assertions.forEach((a: unknown, j: number) => {
+        const aat = `${at}.assertions[${j}]`;
+        if (!objectAt(errors, aat, a, true)) return;
+        unknownKeys(errors, aat, a, ['assertionId', 'description', 'kind', 'severity', 'check']);
+        str(errors, `${aat}.assertionId`, a['assertionId'], true);
+        if (typeof a['assertionId'] === 'string') {
+          if (ids.has(a['assertionId'])) errors.push(`${aat}.assertionId: duplicate ${a['assertionId']}`);
+          ids.add(a['assertionId']);
+        }
+        str(errors, `${aat}.description`, a['description'], true);
+        oneOf(errors, `${aat}.kind`, a['kind'], ORACLE_KINDS, true);
+        oneOf(errors, `${aat}.severity`, a['severity'], ['P0', 'P1', 'P2', 'P3'], true);
+        const check = a['check'];
+        if (check !== undefined && objectAt(errors, `${aat}.check`, check, false)) {
+          oneOf(errors, `${aat}.check.type`, check['type'], CHECK_TYPES, true);
+          if (check['type'] === 'test_outcome') {
+            str(errors, `${aat}.check.testSelector`, check['testSelector'], true);
+            if (check['expected'] !== 'pass') errors.push(`${aat}.check.expected must be "pass"`);
+          } else if (check['type'] === 'metric_threshold') {
+            str(errors, `${aat}.check.metric`, check['metric'], true);
+            oneOf(errors, `${aat}.check.comparator`, check['comparator'], COMPARATORS, true);
+            if (typeof check['threshold'] !== 'number' || !Number.isFinite(check['threshold'])) errors.push(`${aat}.check.threshold must be a finite number`);
+            oneOf(errors, `${aat}.check.aggregation`, check['aggregation'], ['avg', 'p50', 'p95', 'p99', 'max', 'min', 'rate'], false);
+          } else if (check['type'] === 'http_expectation') {
+            str(errors, `${aat}.check.method`, check['method'], true);
+            str(errors, `${aat}.check.path`, check['path'], true);
+          } else if (check['type'] === 'evidence_predicate') {
+            str(errors, `${aat}.check.evidenceType`, check['evidenceType'], true);
+            str(errors, `${aat}.check.field`, check['field'], true);
+            oneOf(errors, `${aat}.check.comparator`, check['comparator'], COMPARATORS, true);
+          } else if (check['type'] === 'llm_rubric') str(errors, `${aat}.check.rubric`, check['rubric'], true);
+        }
+      });
+    }
+    const authorities = o['authorities'];
+    if (authorities !== undefined) {
+      if (!Array.isArray(authorities)) errors.push(`${at}.authorities must be a list`);
+      else authorities.forEach((x: unknown, j: number) => {
+        if (!objectAt(errors, `${at}.authorities[${j}]`, x, true)) return;
+        str(errors, `${at}.authorities[${j}].sourceRef`, x['sourceRef'], true);
+        oneOf(errors, `${at}.authorities[${j}].authority`, x['authority'], ORACLE_AUTHORITIES, true);
+      });
+    }
+    const judge = o['judgePolicy'];
+    if (judge !== undefined && objectAt(errors, `${at}.judgePolicy`, judge, false)) {
+      unknownKeys(errors, `${at}.judgePolicy`, judge, ['deterministicRequiredForCritical', 'allowLlmOnlyDecision', 'independentReviewerRequired']);
+      for (const k of ['deterministicRequiredForCritical', 'allowLlmOnlyDecision', 'independentReviewerRequired']) if (judge[k] !== undefined && typeof judge[k] !== 'boolean') errors.push(`${at}.judgePolicy.${k} must be a boolean`);
+    }
+    const change = o['changePolicy'];
+    if (change !== undefined && objectAt(errors, `${at}.changePolicy`, change, false)) {
+      unknownKeys(errors, `${at}.changePolicy`, change, ['agentMayPropose', 'invalidatesPriorDecisions', 'approvers']);
+      for (const k of ['agentMayPropose', 'invalidatesPriorDecisions']) if (change[k] !== undefined && typeof change[k] !== 'boolean') errors.push(`${at}.changePolicy.${k} must be a boolean`);
+      const approvers = change['approvers'];
+      if (approvers !== undefined && (!Array.isArray(approvers) || approvers.length === 0 || approvers.some((x) => x !== 'human' && x !== 'independent_agent'))) errors.push(`${at}.changePolicy.approvers must list human and/or independent_agent`);
+    }
+  });
+}
+
+/** (additive, conformance-1) Problems of an `oracles` list (the configuration section, or a file `hypertest oracle establish` reads). */
+export function oracleConfigProblems(oracles: unknown): string[] {
+  const errors: Errors = [];
+  validateOracles(errors, oracles);
+  return errors;
+}
+
+/** (additive, conformance-1) The OracleGovernance.establish input of a configured oracle (defaults applied). */
+export function oracleSpecFromConfig(o: OracleConfig): Parameters<OracleGovernance['establish']>[0] {
+  return {
+    oracleId: o.oracleId,
+    scope: { components: [...o.scope.components], description: o.scope.description },
+    assertions: o.assertions.map((a) => ({ ...a })),
+    authorities: o.authorities?.map((a) => ({ ...a })) ?? [{ sourceRef: 'hypertest.config', authority: 'approved_requirement' }],
+    judgePolicy: { deterministicRequiredForCritical: true, allowLlmOnlyDecision: false, independentReviewerRequired: true, ...(o.judgePolicy ?? {}) },
+    changePolicy: { agentMayPropose: true, invalidatesPriorDecisions: true, approvers: ['human'], ...(o.changePolicy ?? {}), selfApprove: false },
+  };
+}
+
 function validateRest(errors: Errors, c: Record<string, unknown>): void {
   validateBudget(errors, c['budget'], 'budget');
   validateGate(errors, c['gate'], 'gate');
+  validateOracles(errors, c['oracles']);
   const bugate = c['bugate'];
   if (bugate !== undefined && objectAt(errors, 'bugate', bugate, false)) {
     unknownKeys(errors, 'bugate', bugate, ['path']);

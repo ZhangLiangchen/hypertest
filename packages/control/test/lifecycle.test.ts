@@ -108,14 +108,15 @@ describe('convergence: replans, gate feedback loop, caps, exhaustion', () => {
       const gateTicks = r.ticks.filter((t) => t.decision);
       assert.deepEqual(gateTicks.map((t) => [t.decision!.verdict, t.final, t.status]), [['inconclusive', false, 'running'], ['inconclusive', true, 'completed']]);
       const [first, second] = gateTicks.map((t) => t.decision!);
-      assert.deepEqual(first!.unknownCriteria.map((c) => c.criterionId), ['C1', 'C4']);
+      // C0: no oracle is pinned by this run either (conformance-1) — reported first, in criterion order
+      assert.deepEqual(first!.unknownCriteria.map((c) => c.criterionId), ['C0', 'C1', 'C4']);
       assert.equal(second!.revision, 2);
       assert.equal(second!.supersedes, first!.decisionId);
       assert.equal((await h.deps.decisions.latestForRun(run.runId))!.decisionId, second!.decisionId);
       const feedback = (await items(h, run.runId)).filter((w) => w.kind === 'replan');
       assert.equal(feedback.length, 1);
       assert.deepEqual(feedback[0]!.origin, { kind: 'system', reason: 'replan:gate_feedback' });
-      assert.match(feedback[0]!.objective, new RegExp(`### QualityGate feedback \\(decision ${first!.decisionId}, verdict inconclusive\\)\\n- unknown C1 C1 evidence_integrity: no evidence recorded\\n- unknown C4 C4 required_evidence`));
+      assert.match(feedback[0]!.objective, new RegExp(`### QualityGate feedback \\(decision ${first!.decisionId}, verdict inconclusive\\)\\n- unknown C0 C0 oracle_in_force: no approved oracle is pinned by the run\\n- unknown C1 C1 evidence_integrity: no evidence recorded\\n- unknown C4 C4 required_evidence`));
       const replans = await new ControlStore(h.db).replans(run.runId);
       assert.equal(replans.gateAttempts, 2);
       assert.equal(replans.feedbackPending, false);

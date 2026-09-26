@@ -105,8 +105,6 @@ export function planTools(deps: ControlDeps): ToolSpec[] {
         // Retry-stable plan id: a replayed call (crash after the plan committed, before the tool call settled) finds
         // the revision it already recorded instead of accepting a second copy with duplicate work (I5).
         const planId = `plan_${sha256Hex(`${run.runId}\u0000${ctx.invocationId}`).slice(0, 26)}`;
-        const recorded = (await blackboard.listPlans(run.runId)).find((p) => p.planId === planId);
-        if (recorded) return replayedOutcome(recorded);
         const objectives: Objective[] = input.objectives.map((o) => ({
           objectiveId: o.objectiveId,
           description: o.description,
@@ -122,39 +120,38 @@ export function planTools(deps: ControlDeps): ToolSpec[] {
           cancelWorkItems: input.cancelWorkItems ?? [],
           readyForGate: input.readyForGate ?? false,
         };
-        const existing = await blackboard.listWorkItems({ runId: run.runId });
-        const plans = await blackboard.listPlans(run.runId);
-        const latest = await blackboard.latestAcceptedPlan(run.runId);
-        const validation = validatePlan({ run, proposal, existingWorkItems: existing, roles, acceptedPlanCount: acceptedPlanCount(plans), proposerRole: ctx.role });
-        const base: Omit<PlanRevision, 'revision' | 'status' | 'createdAt' | 'validationIssues' | 'decidedAt'> = {
-          planId,
-          runId: run.runId,
-          rationale: proposal.rationale,
-          objectives,
-          workItems: proposal.workItems,
-          cancelWorkItems: proposal.cancelWorkItems,
-          assumptions: (input.assumptions ?? []).map((a) => ({ statement: a.statement, status: a.status ?? 'unverified' })),
-          readyForGate: proposal.readyForGate,
-          createdFromSnapshot: ctx.snapshot?.snapshotId ?? 'none',
-          proposedBy: ctx.agentId,
-        };
-        if (latest) base.parentRevision = latest.revision;
-
-        if (!validation.valid) {
-          const rejected = await db.transaction(async (tx) => {
-            const p = await blackboard.proposePlan(base, evCtx, tx);
-            return blackboard.decidePlan(run.runId, p.revision, 'rejected', validation.issues, evCtx, tx);
-          });
-          return success(
-            { accepted: false, revision: rejected.revision, issues: validation.issues, workItemIds: [] },
-            `plan revision ${rejected.revision} REJECTED:\n- ${validation.issues.join('\n- ')}\nFix the issues and propose again.`,
-          );
-        }
-
-        const byId = new Map(existing.map((w) => [w.workItemId, w]));
         const toInterrupt: WorkItem[] = [];
+        // (H4) the replay lookup, the validation and the write happen under the run's work-creation lock in ONE
+        // transaction: two concurrent executions of one replayed invocation cannot both accept a revision
         const outcome = await db.transaction(async (tx) => {
           await factory.lock(run.runId, tx); // lock order: work creation lock before the plan's event appends
+          const recorded = (await blackboard.listPlans(run.runId)).find((p) => p.planId === planId);
+          if (recorded) return { kind: 'replayed' as const, plan: recorded };
+          const existing = await blackboard.listWorkItems({ runId: run.runId });
+          const plans = await blackboard.listPlans(run.runId);
+          const latest = await blackboard.latestAcceptedPlan(run.runId);
+          const validation = validatePlan({ run, proposal, existingWorkItems: existing, roles, acceptedPlanCount: acceptedPlanCount(plans), proposerRole: ctx.role });
+          const base: Omit<PlanRevision, 'revision' | 'status' | 'createdAt' | 'validationIssues' | 'decidedAt'> = {
+            planId,
+            runId: run.runId,
+            rationale: proposal.rationale,
+            objectives,
+            workItems: proposal.workItems,
+            cancelWorkItems: proposal.cancelWorkItems,
+            assumptions: (input.assumptions ?? []).map((a) => ({ statement: a.statement, status: a.status ?? 'unverified' })),
+            readyForGate: proposal.readyForGate,
+            createdFromSnapshot: ctx.snapshot?.snapshotId ?? 'none',
+            proposedBy: ctx.agentId,
+          };
+          if (latest) base.parentRevision = latest.revision;
+
+          if (!validation.valid) {
+            const p = await blackboard.proposePlan(base, evCtx, tx);
+            const rejected = await blackboard.decidePlan(run.runId, p.revision, 'rejected', validation.issues, evCtx, tx);
+            return { kind: 'rejected' as const, revision: rejected.revision, issues: validation.issues };
+          }
+
+          const byId = new Map(existing.map((w) => [w.workItemId, w]));
           const p = await blackboard.proposePlan(base, evCtx, tx);
           await blackboard.decidePlan(run.runId, p.revision, 'accepted', [], evCtx, tx);
           const localToId = new Map(proposal.workItems.map((w) => [w.localId, ids.next('wi')]));
@@ -201,8 +198,15 @@ export function planTools(deps: ControlDeps): ToolSpec[] {
             if (cur.state === 'claimed' || cur.state === 'running') toInterrupt.push(cur);
           }
           await runs.update(run.runId, { currentPlanRevision: p.revision }, evCtx, tx);
-          return { revision: p.revision, workItemIds: created };
+          return { kind: 'accepted' as const, revision: p.revision, workItemIds: created };
         });
+        if (outcome.kind === 'replayed') return replayedOutcome(outcome.plan);
+        if (outcome.kind === 'rejected') {
+          return success(
+            { accepted: false, revision: outcome.revision, issues: outcome.issues, workItemIds: [] },
+            `plan revision ${outcome.revision} REJECTED:\n- ${outcome.issues.join('\n- ')}\nFix the issues and propose again.`,
+          );
+        }
         // Cancelled work: stop its agents and free its leases/claims (outside the plan transaction).
         for (const w of toInterrupt) {
           const agent = await agents.byWorkItem(w.workItemId);

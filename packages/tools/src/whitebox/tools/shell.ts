@@ -1,5 +1,7 @@
-import type { JsonValue } from '@hypertest/core';
+import { HypertestError, type JsonValue } from '@hypertest/core';
 import type { BuiltinToolOptions, ToolSpec } from '../../contracts.ts';
+import { argumentPathDenial } from '../argv-guard.ts';
+import { sandboxCwd } from '../sandbox.ts';
 import { pathResource, rootResource } from './common.ts';
 
 /** Default shell.exec allowlist. Shells (bash/sh/zsh) are deliberately absent: argv only, no shell. */
@@ -30,7 +32,7 @@ export function shellExecTool(options: BuiltinToolOptions): ToolSpec<ShellInput>
   return {
     id: 'shell.exec',
     title: 'Run command',
-    description: `Run an allowlisted program with an argv array (no shell: no pipes, globbing or redirection) in the workspace sandbox with a scrubbed environment. Allowed programs: ${allowlist.join(', ')}. stdout/stderr are recorded as evidence.`,
+    description: `Run an allowlisted program with an argv array (no shell: no pipes, globbing or redirection) in the workspace sandbox with a scrubbed environment. Allowed programs: ${allowlist.join(', ')}. Arguments may only name paths inside the workspace (no absolute paths outside it, no .. escapes). stdout/stderr are recorded as evidence.`,
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -51,6 +53,10 @@ export function shellExecTool(options: BuiltinToolOptions): ToolSpec<ShellInput>
     async execute(input, ctx) {
       const denial = shellDenial(input.command, allowlist, ctx.permit.constraints?.allowedCommands);
       if (denial) return { status: 'denied', error: { code: 'permission_denied', message: denial } };
+      // security-H1a: the local sandbox confines only the cwd; the program resolves its arguments itself (inside an OCI
+      // container argv names container paths — the mount namespace is the boundary there)
+      const argDenial = options.sandbox.kind === 'oci' ? undefined : await confinedArguments(ctx.workspace, input.cwd, input.command);
+      if (argDenial) return { status: 'denied', error: { code: 'permission_denied', message: argDenial } };
       const timeoutMs = Math.min(input.timeoutMs ?? DEFAULT_TIMEOUT_MS, ctx.permit.constraints?.maxDurationMs ?? MAX_TIMEOUT_MS);
       const runOpts: Parameters<typeof options.sandbox.run>[2] = { timeoutMs, signal: ctx.signal };
       if (input.cwd !== undefined) runOpts.cwd = input.cwd;
@@ -83,4 +89,19 @@ export function shellExecTool(options: BuiltinToolOptions): ToolSpec<ShellInput>
       return { status: 'success', structured, text, evidenceRefs };
     },
   };
+}
+
+/**
+ * Why agent argv would reach outside the workspace (see argumentPathDenial), resolved against the confined cwd.
+ * A cwd that escapes the root is refused here too (the sandbox would refuse it as well).
+ */
+export async function confinedArguments(ws: Parameters<typeof argumentPathDenial>[0], cwd: string | undefined, command: readonly string[]): Promise<string | undefined> {
+  let abs: string;
+  try {
+    abs = await sandboxCwd(ws, cwd);
+  } catch (e) {
+    if (e instanceof HypertestError) return `cwd ${JSON.stringify(cwd)}: ${e.message}`;
+    throw e;
+  }
+  return argumentPathDenial(ws, abs, command);
 }

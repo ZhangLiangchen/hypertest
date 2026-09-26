@@ -2,7 +2,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { HypertestError, isHypertestError, type JsonValue } from '@hypertest/core';
 import {
-  isTerminalWorkState, type ActionCapability, type AgentInstance, type ChatMessage, type EventContext, type ModelPolicy, type PermissionProfile, type TestRun,
+  EVENT_TYPES, isTerminalWorkState, type ActionCapability, type AgentInstance, type ChatMessage, type EventContext, type ModelPolicy, type PermissionProfile, type TestRun,
   type WorkItem, type WorkResult,
 } from '@hypertest/domain';
 import { PERMISSION_PROFILES, attenuateCapability, createRootCapability, intersectPatterns, resourcePatternCovers, type PermissionProfileName } from '@hypertest/policy';
@@ -14,20 +14,31 @@ import type { ControlDeps, ResolvedControlConfig } from './deps.ts';
 import { createContextProvider, type TurnState } from './context-provider.ts';
 import { createToolDispatcher, offeredRisk } from './dispatcher.ts';
 import { parseDelegationOperationId } from './domain-tools/work.ts';
-import { workLeaseKey } from './scheduler.ts';
+import { workLeaseKey, yieldWorkClaim } from './scheduler.ts';
 import { ControlStore, type AgentHostSpec, type WorkspaceRecipe } from './store.ts';
 import { runScope, workScope } from './work-factory.ts';
-import { KeyedMutex, clip, event, failureReason, itemCtx, jsonBlock, notFound, systemActor, tightenModelPolicy } from './util.ts';
+import { KeyedMutex, assertRunPinned, clip, event, failureReason, itemCtx, jsonBlock, notFound, systemActor, tightenModelPolicy } from './util.ts';
 
 export interface AgentWorker {
   /** The work item's agent: reused when it exists, else spawned with its workspace, capability and task context. */
   ensureAgent(item: WorkItem, run: TestRun, fencingToken: number): Promise<{ agent: AgentInstance; spec: AgentHostSpec }>;
   /** The EngineHost of one turn (model invoker, governed tool dispatcher, context provider). */
-  buildHost(item: WorkItem, run: TestRun, agent: AgentInstance, spec: AgentHostSpec, fencingToken?: number): Promise<EngineHost>;
+  buildHost(item: WorkItem, run: TestRun, agent: AgentInstance, spec: AgentHostSpec, fencingToken?: number, claimGuard?: ClaimGuard): Promise<EngineHost>;
   executeTurn(workItemId: string, fencingToken: number, signal?: AbortSignal, options?: ExecuteTurnOptions): Promise<TurnOutcome>;
   observeWaiting(workItemId: string, signal?: AbortSignal): Promise<TurnOutcome>;
+  /** (H6) Keeps a held, not-yet-running claim alive (ControlPlane.renewClaim). */
+  renewClaim(workItemId: string, fencingToken: number): Promise<boolean>;
   /** Stops an item's agent after a cancellation. */
   interruptAgent(workItemId: string, reason: string, ctx: EventContext): Promise<void>;
+}
+
+/**
+ * (durability-2) State of the claim a turn runs under, shared by the lease heartbeat and the tool dispatcher: once the
+ * item's resource claims could not be renewed (another holder took them), `lost` says why and every further tool call of
+ * the turn is refused — two conflicting experiments never run on the same resources.
+ */
+export interface ClaimGuard {
+  lost?: string;
 }
 
 /** Raised internally when a fenced write is refused: the caller lost the work item. */
@@ -189,6 +200,11 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
       // the item (a plan's choice) may tighten, never weaken, the role's routing requirements (I3)
       const modelPolicy: ModelPolicy = tightenModelPolicy(role.defaultModelPolicy, item.modelPolicy);
       const scopes = [`${ws.resourcePrefix}/**`, `run/${run.runId}/**`, ...blackboxScopes(profile)];
+      // I2 (H9): child = parent ∩ role ∩ … ∩ ENVIRONMENT policy — the role's environment classes narrowed to the classes
+      // of the environments actually registered, plus `local` (this host, always present): a run whose only environments
+      // are sandboxes never carries a staging- or production-capable token
+      const registeredClasses = new Set(['local', ...deps.environments.list().map((e) => e.environmentClass)]);
+      const environmentClasses = profile.environmentClasses.filter((c) => registeredClasses.has(c));
       const expiresAt = new Date(clock.nowMs() + item.budget.maxWallClockMs).toISOString();
       const ctx = itemCtx(item, workerActor);
 
@@ -212,13 +228,13 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
           // I2: a child is attenuated from its parent's recorded capability, never granted a root one.
           granted = attenuateCapability(
             parentCapability,
-            [{ tools: allow, resourceScopes: scopes, allowedEffects: profile.allowedEffects, environmentClasses: profile.environmentClasses, credentialScopes: profile.credentialScopes, maxRiskClass: profile.maxRiskClass, expiresAt }],
+            [{ tools: allow, resourceScopes: scopes, allowedEffects: profile.allowedEffects, environmentClasses, credentialScopes: profile.credentialScopes, maxRiskClass: profile.maxRiskClass, expiresAt }],
             { subjectAgentId: agentId, workItemId: item.workItemId },
             { secret: config.capabilitySecret },
           );
         } else {
           granted = createRootCapability(
-            { runId: run.runId, subjectAgentId: agentId, workItemId: item.workItemId, profile: { ...profile, name: role.permissionProfile as PermissionProfileName, resourceScopes: scopes }, tools: allow, expiresAt },
+            { runId: run.runId, subjectAgentId: agentId, workItemId: item.workItemId, profile: { ...profile, name: role.permissionProfile as PermissionProfileName, resourceScopes: scopes, environmentClasses }, tools: allow, expiresAt },
             config.capabilitySecret,
           );
         }
@@ -265,7 +281,7 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
     });
   }
 
-  async function buildHost(item: WorkItem, run: TestRun, agent: AgentInstance, spec: AgentHostSpec, fencingToken?: number): Promise<EngineHost> {
+  async function buildHost(item: WorkItem, run: TestRun, agent: AgentInstance, spec: AgentHostSpec, fencingToken?: number, claimGuard?: ClaimGuard): Promise<EngineHost> {
     const role = roles.require(item.role);
     const ws = await openWorkspace(spec.workspace, run.runId, item.workItemId, spec.workspaceId);
     const eventContext = itemCtx(item, agent.agentId, agent.agentId);
@@ -281,6 +297,7 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
       allow: spec.toolPolicy.allow, deny: spec.toolPolicy.deny ?? [], workspace: ws, eventContext, turnState, ...(fencingToken !== undefined ? { fencingToken } : {}),
       ...(spec.quarantine ? { quarantine: spec.quarantine } : {}),
       ...(spec.guard ? { guard: spec.guard } : {}),
+      ...(claimGuard ? { claimGuard } : {}),
     });
     const offeredIds = tools.definitions().map((d) => d.name.replaceAll('__', '.'));
     const independent = spec.modelPolicy.independentFromRoles ?? [];
@@ -305,6 +322,12 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
     });
     const context = createContextProvider(deps, config, { run, item, role, agentId: agent.agentId, workspace: ws, eventContext, turnState, tools });
     return { model, tools, context, sessions, eventContext, events };
+  }
+
+  /** (H2, I11) EngineRegistry.assertPinned when the registry offers it (the runtime's EngineRegistry does). */
+  function assertEnginePinned(kind: string): void {
+    const registry = deps.engines as typeof deps.engines & { assertPinned?(manifest: typeof config.runtimeManifest, kind: string): unknown };
+    if (typeof registry.assertPinned === 'function') registry.assertPinned(config.runtimeManifest, kind);
   }
 
   // ------------------------------------------------------------------------------------------------ fenced writes
@@ -337,7 +360,7 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
   }
 
   /** Renews the lease (and the claim's expiry) while a turn runs; stops before the result is written. */
-  function heartbeat(item: WorkItem, leaseId: string, token: number, ctx: EventContext): () => Promise<void> {
+  function heartbeat(item: WorkItem, leaseId: string, token: number, ctx: EventContext, guard: ClaimGuard): () => Promise<void> {
     let inflight: Promise<void> | undefined;
     const beat = () => {
       if (inflight) return;
@@ -346,7 +369,8 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
         const cur = await blackboard.getWorkItem(item.workItemId);
         if (!cur?.claim || cur.claim.fencingToken !== token || isTerminalWorkState(cur.state)) return;
         await blackboard.transitionWorkItem(item.workItemId, cur.state, { claim: { ...cur.claim, expiresAt: lease.expiresAt } }, ctx, { expectedFencingToken: token, expectedFrom: [cur.state] });
-        if (cur.resourceClaims.length > 0) await admission.admit({ holderId: cur.workItemId, runId: cur.runId, claims: cur.resourceClaims, ttlMs: config.leaseTtlMs });
+        // durability-2: a resource claim that could not be renewed stops the turn's tool calls (never ignored)
+        if (!guard.lost && !(await renewResourceClaims(cur, ctx, 'heartbeat'))) guard.lost = 'the resource claims of this work item were taken by another holder';
       })()
         .catch((e: unknown) => logger.warn('lease heartbeat failed', { workItemId: item.workItemId, error: (e as Error).message }))
         .finally(() => {
@@ -363,11 +387,46 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
 
   // ------------------------------------------------------------------------------------------------ executeTurn
 
-  /** Keeps the item's resource claims alive with its lease (a claim that lapsed and was taken by another holder is logged). */
-  async function renewResourceClaims(item: WorkItem): Promise<void> {
-    if (item.resourceClaims.length === 0) return;
+  /**
+   * Keeps the item's resource claims alive with its lease. `false` when they lapsed and another holder took them
+   * (durability-2: recorded on L0 as `admission.lapsed`; the caller stops the item's work — never runs on regardless).
+   */
+  async function renewResourceClaims(item: WorkItem, ctx: EventContext, phase: string): Promise<boolean> {
+    if (item.resourceClaims.length === 0) return true;
     const r = await admission.admit({ holderId: item.workItemId, runId: item.runId, claims: item.resourceClaims, ttlMs: config.leaseTtlMs });
-    if (!r.admitted) logger.warn('resource claims of a held work item could not be renewed (taken by another holder)', { workItemId: item.workItemId, conflicts: r.conflicts.map((c) => `${c.requested.resourceKey}@${c.heldBy}`) });
+    if (r.admitted) return true;
+    const conflicts = r.conflicts.map((c) => `${c.requested.resourceKey}@${c.heldBy}`).sort();
+    logger.warn('resource claims of a held work item could not be renewed (taken by another holder); the item stops', { workItemId: item.workItemId, conflicts, phase });
+    await events.append([event({ ...ctx, workItemId: item.workItemId }, EVENT_TYPES.admissionLapsed, 'work_item', item.workItemId, { workItemId: item.workItemId, conflicts, claims: item.resourceClaims, phase })]);
+    return false;
+  }
+
+  /** (H13, durability-2) Gives the claim back without consuming an attempt; a claim already gone is not an error. */
+  async function yieldClaim(item: WorkItem, token: number, ctx: EventContext, reason: string): Promise<void> {
+    try {
+      await yieldWorkClaim(deps, item, token, ctx, reason);
+    } catch (e) {
+      if (!isHypertestError(e, 'conflict') && !isHypertestError(e, 'stale_fence')) throw e;
+    }
+  }
+
+  async function renewClaim(workItemId: string, token: number): Promise<boolean> {
+    const item = await blackboard.getWorkItem(workItemId);
+    if (!item || !item.claim || item.claim.fencingToken !== token || (item.state !== 'claimed' && item.state !== 'running')) return false;
+    if (!(await leases.checkFence(workLeaseKey(workItemId), token))) return false;
+    const ctx = itemCtx(item, workerActor);
+    try {
+      const renewed = await leases.renew(item.claim.leaseId, config.leaseTtlMs);
+      await blackboard.transitionWorkItem(workItemId, item.state, { claim: { ...item.claim, expiresAt: renewed.expiresAt } }, ctx, { expectedFencingToken: token, expectedFrom: [item.state] });
+    } catch (e) {
+      if (isHypertestError(e, 'stale_fence') || isHypertestError(e, 'conflict') || isHypertestError(e, 'precondition_failed')) return false;
+      throw e;
+    }
+    if (!(await renewResourceClaims(item, ctx, 'queued'))) {
+      await yieldClaim(item, token, ctx, 'resource claims lapsed while the claim waited for an executor');
+      return false;
+    }
+    return true;
   }
 
   /** The item ended while this worker held it (e.g. cancelled by a plan revision mid-turn): report its final state. */
@@ -383,7 +442,15 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
     if (isTerminalWorkState(item0.state)) return { status: item0.state as 'completed' | 'failed' | 'cancelled', workItemId };
     const run = await runs.get(item0.runId);
     if (!run) throw notFound('run', item0.runId);
-    if (run.status === 'paused') return { status: 'paused', workItemId, reason: run.pauseReason ?? 'operator' };
+    assertRunPinned(run, config.runtimeManifest.manifestId); // I11 (H2): never run a turn of a live run pinned elsewhere
+    if (run.status === 'paused') {
+      // H13: a pause never costs a work attempt — the held claim is given back (ready, attempts unchanged; its lease and
+      // resource claims released) and the scheduler re-admits the item when the run resumes (its session continues)
+      if ((item0.state === 'claimed' || item0.state === 'running') && item0.claim?.fencingToken === fencingToken && (await leases.checkFence(workLeaseKey(workItemId), fencingToken))) {
+        await yieldClaim(item0, fencingToken, itemCtx(item0, workerActor), `run ${run.runId} paused`);
+      }
+      return { status: 'paused', workItemId, reason: run.pauseReason ?? 'operator' };
+    }
     // fencing (I4): the caller's token must be the item's claim AND the live lease of work/<id>
     if (!item0.claim || item0.claim.fencingToken !== fencingToken) return { status: 'lease_lost', workItemId };
     if (!(await leases.checkFence(workLeaseKey(workItemId), fencingToken))) return { status: 'lease_lost', workItemId };
@@ -402,7 +469,14 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
         throw e;
       });
       let item = await fenced(() => blackboard.transitionWorkItem(workItemId, item0.state, { claim: { ...claim, expiresAt: renewed.expiresAt } }, ctx, { expectedFencingToken: fencingToken }));
-      await renewResourceClaims(item);
+      if (!(await renewResourceClaims(item, ctx, 'turn'))) {
+        // durability-2: its resources are held by another item now — no turn runs on them; the claim is given back
+        // (attempts unchanged) and admission re-admits the item once the conflicting holder releases them
+        if (item.state !== 'waiting') {
+          await yieldClaim(item, fencingToken, ctx, 'resource claims lapsed and were taken by another holder');
+          return { status: 'lease_lost', workItemId };
+        }
+      }
       if (item.state === 'waiting') return { status: 'waiting', workItemId, operationIds: item.waitingOn };
       if (item.state === 'claimed') item = await fenced(() => blackboard.transitionWorkItem(workItemId, 'running', {}, ctx, { expectedFencingToken: fencingToken, expectedFrom: ['claimed'] }));
 
@@ -421,6 +495,8 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
         return { status: 'failed', workItemId };
       }
       const { agent, spec } = ensured;
+      // I11 (H2): the agent's engine must be the one (and the version) the run's manifest pins
+      assertEnginePinned(agent.engineKind);
       const agentCtx = itemCtx(item, workerActor, agent.agentId);
       if (agent.status === 'completed' || agent.status === 'failed') {
         // The agent already settled (e.g. a previous owner's turn completed but its fenced item write was refused, or
@@ -452,8 +528,9 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
         const last = await sessions.lastTurn(agent.sessionId);
         if (session && session.status === 'active' && last && last.status === 'completed' && last.turn >= options.expectedTurn) return { status: 'continue', workItemId, turn: last.turn };
       }
-      const host = await buildHost(item, run, agent, spec, fencingToken);
-      const stop = heartbeat(item, claim.leaseId, fencingToken, agentCtx);
+      const guard: ClaimGuard = {};
+      const host = await buildHost(item, run, agent, spec, fencingToken, guard);
+      const stop = heartbeat(item, claim.leaseId, fencingToken, agentCtx, guard);
       let step;
       try {
         step = await runner.step(agent.agentId, host, { limits: config.turnLimits, signal: signal ?? new AbortController().signal });
@@ -601,6 +678,9 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
     const item0 = await blackboard.getWorkItem(workItemId);
     if (!item0) throw notFound('work item', workItemId);
     if (isTerminalWorkState(item0.state)) return { status: item0.state as 'completed' | 'failed' | 'cancelled', workItemId };
+    const run = await runs.get(item0.runId);
+    if (!run) throw notFound('run', item0.runId);
+    assertRunPinned(run, config.runtimeManifest.manifestId); // I11 (H2)
     const agent = await agents.byWorkItem(workItemId);
     const lastTurn = agent ? ((await sessions.lastTurn(agent.sessionId))?.turn ?? 0) : 0;
     if (item0.state !== 'waiting') return { status: 'continue', workItemId, turn: lastTurn };
@@ -620,12 +700,14 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
       hooks.onClaim?.(workItemId, lease.fencingToken);
     }
     const token = item.claim!.fencingToken;
-    // the external operation still occupies its resources: keep the item's resource claims alive with the lease
-    await renewResourceClaims(item);
+    // the external operation still occupies its resources: keep the item's resource claims alive with the lease (a lapse
+    // is recorded; the in-flight operation is still observed to its outcome)
+    await renewResourceClaims(item, ctx, 'waiting');
 
     const lines: string[] = [];
     const evidenceIds: string[] = [];
     let settled = true;
+    const pending: string[] = [];
     for (const op of item.waitingOn) {
       const childId = parseDelegationOperationId(op);
       if (childId !== undefined) {
@@ -636,6 +718,7 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
         }
         if (!isTerminalWorkState(child.state)) {
           settled = false;
+          pending.push(op);
           continue;
         }
         const childAgent = await agents.byWorkItem(childId);
@@ -652,6 +735,7 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
         const outcome = await gateway.observe(op, ctx, signal ?? new AbortController().signal);
         if (outcome.status === 'pending') {
           settled = false;
+          pending.push(op);
           continue;
         }
         const refs = outcome.operation.evidenceRefs;
@@ -660,7 +744,30 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
         lines.push(`- operation ${op} (${outcome.operation.operationType}) ${detail}${refs.length ? `; evidence ${refs.join(', ')}` : ''}`);
       }
     }
-    if (!settled) return { status: 'waiting', workItemId, operationIds: item.waitingOn };
+    if (!settled) {
+      // durability-7: a wait has a deadline — the item's maxWallClockMs (counted from its agent's start) and the run's
+      // wall clock. Past it the item fails (budget_exhausted) instead of keeping the run from its gate forever; the
+      // unsettled operations stay in the ledger for reconciliation (never blindly retried).
+      const now = clock.nowMs();
+      const expired =
+        now - Date.parse(agent.createdAt) >= item.budget.maxWallClockMs
+          ? `the work item's maxWallClockMs (${item.budget.maxWallClockMs} ms)`
+          : now - Date.parse(run.createdAt) > run.budget.maxWallClockMs
+            ? `the run's maxWallClockMs (${run.budget.maxWallClockMs} ms)`
+            : undefined;
+      if (!expired) return { status: 'waiting', workItemId, operationIds: item.waitingOn };
+      const message = `waited past ${expired} for ${pending.join(', ')}: still unsettled (left in the operation ledger for reconciliation)`;
+      try {
+        const done = await blackboard.transitionWorkItem(workItemId, 'failed', { failure: { reason: 'budget_exhausted', message } }, ctx, { expectedFencingToken: token, expectedFrom: ['waiting'] });
+        await release(done);
+      } catch (e) {
+        if (isHypertestError(e, 'stale_fence') || isHypertestError(e, 'conflict')) return { status: 'lease_lost', workItemId };
+        throw e;
+      }
+      await interruptAgent(workItemId, message, ctx).catch((e: unknown) => logger.warn('interrupt after a wait deadline failed', { workItemId, error: (e as Error).message }));
+      logger.warn('waiting work item timed out', { runId: item.runId, workItemId, pending });
+      return { status: 'failed', workItemId };
+    }
     const message: ChatMessage = { role: 'user', content: `Results of pending operations/delegations:\n${lines.join('\n')}${evidenceIds.length ? `\nEvidence ids: ${[...new Set(evidenceIds)].join(', ')}` : ''}` };
     try {
       await db.transaction(async () => {
@@ -684,6 +791,7 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
     buildHost,
     executeTurn: (workItemId, fencingToken, signal, options) => itemMutex.run(workItemId, () => executeTurn(workItemId, fencingToken, signal, options)),
     observeWaiting: (workItemId, signal) => itemMutex.run(workItemId, () => observeWaiting(workItemId, signal)),
+    renewClaim,
     interruptAgent,
   };
 }

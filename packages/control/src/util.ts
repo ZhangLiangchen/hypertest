@@ -1,7 +1,7 @@
 import { HypertestError, type JsonValue } from '@hypertest/core';
 import {
-  CLASSIFICATION_ORDER, DEFAULT_WORK_BUDGET, RISK_ORDER, eventFrom,
-  type DomainEventInput, type EventContext, type ModelPolicy, type RiskClass, type TestRun, type WorkBudget, type WorkItem,
+  CLASSIFICATION_ORDER, DEFAULT_WORK_BUDGET, RISK_ORDER, SEVERITY_ORDER, eventFrom,
+  type DomainEventInput, type EventContext, type GateSpec, type ModelPolicy, type RiskClass, type TestRun, type WorkBudget, type WorkItem,
 } from '@hypertest/domain';
 import type { RoleDefinition } from '@hypertest/agents';
 
@@ -13,6 +13,53 @@ export function mergeDefined<T extends object>(...parts: Array<Partial<T> | unde
     for (const [k, v] of Object.entries(p)) if (v !== undefined) out[k] = v;
   }
   return out as T;
+}
+
+/**
+ * (H3) Problems of an effective (merged) GateSpec. A value the QualityGate cannot interpret would silently weaken a
+ * criterion (e.g. an unknown `failOnUnresolvedSeverity` compares as "nothing blocks" and disables C2), so startRun
+ * refuses the run instead of storing such a gate.
+ */
+export function gateSpecProblems(gate: GateSpec): string[] {
+  const out: string[] = [];
+  const g = gate as unknown as Record<string, unknown>;
+  if (typeof g['gateId'] !== 'string' || (g['gateId'] as string).trim() === '') out.push('gate.gateId must be a non-empty string');
+  if (typeof g['description'] !== 'string') out.push('gate.description must be a string');
+  if (typeof g['failOnUnresolvedSeverity'] !== 'string' || !Object.hasOwn(SEVERITY_ORDER, g['failOnUnresolvedSeverity'] as string)) {
+    out.push(`gate.failOnUnresolvedSeverity must be one of ${Object.keys(SEVERITY_ORDER).join(', ')} (got ${JSON.stringify(g['failOnUnresolvedSeverity'])})`);
+  }
+  if (typeof g['conditionalOnRiskLevel'] !== 'string' || !Object.hasOwn(RISK_ORDER, g['conditionalOnRiskLevel'] as string)) {
+    out.push(`gate.conditionalOnRiskLevel must be one of ${Object.keys(RISK_ORDER).join(', ')} (got ${JSON.stringify(g['conditionalOnRiskLevel'])})`);
+  }
+  for (const k of ['requireDeterministicForCritical', 'requireIndependentReview'] as const) {
+    if (typeof g[k] !== 'boolean') out.push(`gate.${k} must be a boolean (got ${JSON.stringify(g[k])})`);
+  }
+  if (g['requireOracle'] !== undefined && typeof g['requireOracle'] !== 'boolean') out.push(`gate.requireOracle must be a boolean (got ${JSON.stringify(g['requireOracle'])})`);
+  const required = g['requiredEvidence'];
+  if (!Array.isArray(required)) out.push('gate.requiredEvidence must be a list');
+  else {
+    required.forEach((r: unknown, i) => {
+      const e = r as Record<string, unknown> | null;
+      if (!e || typeof e !== 'object' || Array.isArray(e)) {
+        out.push(`gate.requiredEvidence[${i}] must be an object`);
+        return;
+      }
+      if (typeof e['evidenceType'] !== 'string' || e['evidenceType'] === '') out.push(`gate.requiredEvidence[${i}].evidenceType must be a non-empty string`);
+      if (!Number.isSafeInteger(e['minCount']) || (e['minCount'] as number) < 1) out.push(`gate.requiredEvidence[${i}].minCount must be an integer ≥ 1`);
+      if (e['critical'] !== undefined && typeof e['critical'] !== 'boolean') out.push(`gate.requiredEvidence[${i}].critical must be a boolean`);
+    });
+  }
+  const cov = g['minCoverage'];
+  if (cov !== undefined) {
+    if (!cov || typeof cov !== 'object' || Array.isArray(cov)) out.push('gate.minCoverage must be an object');
+    else {
+      for (const k of ['lines', 'branches'] as const) {
+        const v = (cov as Record<string, unknown>)[k];
+        if (v !== undefined && (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > 100)) out.push(`gate.minCoverage.${k} must be a number in [0, 100]`);
+      }
+    }
+  }
+  return out;
 }
 
 /** A work item budget: DEFAULT_WORK_BUDGET ⊕ role default ⊕ overrides. */
@@ -64,6 +111,19 @@ export function clip(s: string, max: number): string {
 
 export function isTerminalRunStatus(status: TestRun['status']): boolean {
   return status === 'completed' || status === 'failed' || status === 'cancelled';
+}
+
+/**
+ * (H2, I11) A live run is driven only by the runtime whose RuntimeManifest it is pinned to: `precondition_failed` when a
+ * non-terminal run names another manifest (never retried by the durable runtimes). Finished runs stay readable.
+ */
+export function assertRunPinned(run: Pick<TestRun, 'runId' | 'runtimeManifestId' | 'status'>, manifestId: string): void {
+  if (run.runtimeManifestId === manifestId || isTerminalRunStatus(run.status)) return;
+  throw new HypertestError(
+    'precondition_failed',
+    `run ${run.runId} is pinned to runtime manifest ${run.runtimeManifestId}; this runtime is ${manifestId} (I11: a live run is never driven by another runtime — resume it with the runtime it was created on, or cancel it)`,
+    { details: { runId: run.runId, pinnedManifestId: run.runtimeManifestId, runtimeManifestId: manifestId } },
+  );
 }
 
 export function notFound(what: string, id: string): HypertestError {

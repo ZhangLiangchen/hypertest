@@ -1,4 +1,4 @@
-import { HypertestError, retry, toHypertestError, type JsonValue } from '@hypertest/core';
+import { HypertestError, retry, sleep, toHypertestError, type JsonValue } from '@hypertest/core';
 import {
   CLASSIFICATION_ORDER,
   EVENT_TYPES,
@@ -28,6 +28,13 @@ type OkDecision = Extract<RouteDecision, { ok: true }>;
 
 /** Filter stages in their normative order (I3). `excluded` is reported for routes that already failed. */
 export const ROUTING_STAGES = ['security', 'capability', 'role', 'quality', 'latency', 'cost'] as const;
+
+/**
+ * Attempts to append `model.invoked` after a SUCCESSFUL provider call (with a short backoff): the tokens are spent, so a
+ * transient audit-store failure (lock or statement timeout) is retried rather than discarding the paid response.
+ */
+export const AUDIT_APPEND_ATTEMPTS = 3;
+const AUDIT_RETRY_BASE_MS = 20;
 
 /** Output tokens reserved inside the context window when checking fit. */
 export const OUTPUT_RESERVE_CAP = 4096;
@@ -311,7 +318,7 @@ class DefaultModelRouter implements ModelRouter {
         responseClass: opaque.compatibilityClass,
       });
     }
-    await this.#emit(ctx, EVENT_TYPES.modelInvoked, routeRequest.agentId, {
+    const invoked: Record<string, JsonValue> = {
       ok: true,
       ...identity,
       attempts,
@@ -319,8 +326,29 @@ class DefaultModelRouter implements ModelRouter {
       latencyMs: response.latencyMs,
       stopReason: response.stopReason,
       providerResponseId: response.providerResponseId ?? null,
-    });
-    return { ok: true, response, routeId: decision.routeId, attempts };
+    };
+    const outcome: InvokeOutcome = { ok: true, response, routeId: decision.routeId, attempts };
+    // The provider answered: its tokens are spent. An audit append that fails now must not discard the response
+    // (the caller would release the budget reservation — usage never charged — and re-pay the call on retry): retry
+    // the append, and if the store stays unavailable return the response flagged as audit-pending.
+    for (let i = 1; ; i++) {
+      try {
+        await this.#emit(ctx, EVENT_TYPES.modelInvoked, routeRequest.agentId, invoked);
+        break;
+      } catch (e) {
+        const err = toHypertestError(e);
+        if (i >= AUDIT_APPEND_ATTEMPTS) {
+          this.#deps.logger.error('model.invoked could not be recorded after a successful (paid) call; returning the response as audit-pending', {
+            routeId: decision.routeId, provider: decision.provider, attempts: i, code: err.code, error: err.message, usage: response.usage as unknown as JsonValue,
+          });
+          outcome.auditPending = { code: err.code, message: err.message };
+          break;
+        }
+        this.#deps.logger.warn('model.invoked append failed after a successful call; retrying', { routeId: decision.routeId, attempt: i, code: err.code, error: err.message });
+        await sleep(AUDIT_RETRY_BASE_MS * 2 ** (i - 1));
+      }
+    }
+    return outcome;
   }
 
   /**

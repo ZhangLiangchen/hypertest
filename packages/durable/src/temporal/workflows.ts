@@ -53,8 +53,20 @@ export const WORKFLOW_ZERO_IDLE_YIELD_MS = 50;
 const retry = { maximumAttempts: 5, nonRetryableErrorTypes: [...WORKFLOW_NON_RETRYABLE_ERROR_TYPES] };
 /** Scheduling steps: tick, observe, cancel, claim lookup. */
 const control = proxyActivities<TemporalActivities>({ startToCloseTimeout: '2 minutes', retry });
+
+/**
+ * (durability-5) Default start-to-close bound of ONE agent-turn attempt: a turn is a model call plus up to
+ * maxToolCallsPerTurn tool calls, each of which may legitimately run for an hour or two (test.run ≤ 1 h, mutation.run ≤ 2
+ * h), so the bound must never be what ends a healthy turn. Liveness comes from the heartbeat timeout (the activity
+ * heartbeats every 10 s): a crashed worker's attempt is retried within a minute. Override per runtime with
+ * TemporalDurableOptions.turnTimeoutMs.
+ */
+export const DEFAULT_TURN_ACTIVITY_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+
 /** Agent turns (heartbeating: a crashed worker's attempt is retried after the heartbeat timeout). */
-const turns = proxyActivities<TemporalActivities>({ startToCloseTimeout: '10 minutes', heartbeatTimeout: '1 minute', retry });
+function turnActivities(timeoutMs: number | undefined): TemporalActivities {
+  return proxyActivities<TemporalActivities>({ startToCloseTimeout: timeoutMs ?? DEFAULT_TURN_ACTIVITY_TIMEOUT_MS, heartbeatTimeout: '1 minute', retry });
+}
 /**
  * Recovery. `unavailable` (the run is owned by another live worker until its lease expires, or the store is down) is
  * not retried by the policy: the run workflow stands by (every maxIdleMs, unbounded — as the local runtime) instead of
@@ -85,6 +97,8 @@ export interface TestRunWorkflowState {
   maxIterations?: number;
   /** Cap of the idle wait between ticks and interval of the recover standby (default DEFAULT_WORKFLOW_MAX_IDLE_MS). */
   maxIdleMs?: number;
+  /** (additive, durability-5) Start-to-close bound of one agent-turn attempt (default DEFAULT_TURN_ACTIVITY_TIMEOUT_MS). */
+  turnTimeoutMs?: number;
 }
 
 export interface WorkItemWorkflowInput {
@@ -101,6 +115,8 @@ export interface WorkItemWorkflowInput {
   mayReresolve?: boolean;
   maxIterations?: number;
   parentWorkflowId?: string;
+  /** (additive, durability-5) Start-to-close bound of one agent-turn attempt (default DEFAULT_TURN_ACTIVITY_TIMEOUT_MS). */
+  turnTimeoutMs?: number;
 }
 
 export interface WorkItemWorkflowResult {
@@ -173,8 +189,11 @@ export async function testRunWorkflow(runId: string, state: TestRunWorkflowState
   function nextState(recovered: boolean): TestRunWorkflowState {
     const next: TestRunWorkflowState = { recovered, children: [...children].map(([workItemId, workflowId]) => ({ workItemId, workflowId })), maxIterations };
     if (state.maxIdleMs !== undefined) next.maxIdleMs = state.maxIdleMs;
+    if (state.turnTimeoutMs !== undefined) next.turnTimeoutMs = state.turnTimeoutMs;
     return next;
   }
+  /** Fields every child inherits from the run workflow's state. */
+  const inherited = (): Pick<WorkItemWorkflowInput, 'turnTimeoutMs'> => (state.turnTimeoutMs !== undefined ? { turnTimeoutMs: state.turnTimeoutMs } : {});
 
   async function startWorkItem(workflowId: string, input: WorkItemWorkflowInput): Promise<void> {
     ended.delete(workflowId);
@@ -255,11 +274,14 @@ export async function testRunWorkflow(runId: string, state: TestRunWorkflowState
         return outcomeOf(r);
       }
       for (const d of r.dispatched) {
-        await startWorkItem(workItemWorkflowId(d.workItemId, d.fencingToken), { workItemId: d.workItemId, fencingToken: d.fencingToken, runId, maxIterations });
+        const input: WorkItemWorkflowInput = { workItemId: d.workItemId, fencingToken: d.fencingToken, runId, maxIterations, ...inherited() };
+        // durability-9: even the first turn names the turn it expects (a retried first call never advances twice)
+        if (d.nextTurn !== undefined) input.expectedTurn = d.nextTurn;
+        await startWorkItem(workItemWorkflowId(d.workItemId, d.fencingToken), input);
       }
       for (const w of r.waiting) {
         if (children.has(w.workItemId)) continue;
-        await startWorkItem(workItemWorkflowId(w.workItemId), { workItemId: w.workItemId, runId, phase: 'observe', maxIterations });
+        await startWorkItem(workItemWorkflowId(w.workItemId), { workItemId: w.workItemId, runId, phase: 'observe', maxIterations, ...inherited() });
       }
       const idle = Math.min(Math.max(0, r.idleMs), maxIdleMs);
       if (idle > 0) {
@@ -295,11 +317,13 @@ export async function workItemWorkflow(input: WorkItemWorkflowInput): Promise<Wo
   let expectedTurn = input.expectedTurn;
   let phase: 'turn' | 'observe' = input.phase ?? (token === undefined ? 'observe' : 'turn');
   let backoff = input.backoffMs ?? WORKFLOW_OBSERVE_BACKOFF_MIN_MS;
+  const turns = turnActivities(input.turnTimeoutMs);
 
   async function drive(): Promise<WorkItemWorkflowResult> {
     for (let iteration = 0; ; iteration++) {
       if (iteration >= maxIterations) {
         const next: WorkItemWorkflowInput = { workItemId, runId: input.runId, phase, backoffMs: backoff, maxIterations, parentWorkflowId };
+        if (input.turnTimeoutMs !== undefined) next.turnTimeoutMs = input.turnTimeoutMs;
         if (token !== undefined) next.fencingToken = token;
         if (expectedTurn !== undefined) next.expectedTurn = expectedTurn;
         return await continueAsNew<typeof workItemWorkflow>(next);

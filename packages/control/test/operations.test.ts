@@ -278,3 +278,76 @@ describe('recover(): reconcile, then take over orphaned work with new fencing to
     }
   });
 });
+
+describe('durability-7: a wait has a deadline', () => {
+  test('an operation that never settles fails its waiting item at the item\'s maxWallClockMs (resources released); the run can converge', async () => {
+    const target = new FakeDeployTarget();
+    const deployer: RoleBrain = (v) => (v.step === 0 ? call('ops.deploy', { version: '3.0.0' }) : call('complete_work', { summary: 'deployed' }));
+    const claims = [{ resourceKey: 'env/local/app', mode: 'write_exclusive' }];
+    const lead: RoleBrain = (v) => {
+      if (v.step === 0) {
+        return call('plan.propose_revision', {
+          rationale: 'deploy',
+          objectives: [{ objectiveId: 'o', description: 'deploy', priority: 'P2' }],
+          workItems: [{ localId: 'd', title: 'deploy', objective: 'deploy 3.0.0', role: 'deployer', dependsOn: [], objectiveIds: ['o'], resourceClaims: claims, budget: { maxWallClockMs: 300_000 } }],
+        });
+      }
+      return call('complete_work', { summary: 'planned', output: { summary: 'planned', planProposed: true, readyForGate: false, objectives: [] } });
+    };
+    const roles = new RoleCatalog(BUILTIN_ROLES, { custom: [DEPLOYER] }, { extraToolIds: ['ops.deploy'] });
+    const h = await createHarness({ roles, brains: { lead, deployer } });
+    (h.deps.adapters as unknown as { register(a: SideEffectAdapter): void }).register(target.adapter());
+    h.deps.registry.register(DEPLOY_TOOL);
+    try {
+      const run = await h.control.startRun({ goal: 'a wait that never ends', target: {} });
+      const t1 = await h.control.tick(run.runId);
+      assert.equal(await runItem(h.control, t1.dispatched[0]!.workItemId, t1.dispatched[0]!.fencingToken), 'completed');
+      const d = (await h.control.tick(run.runId)).dispatched[0]!;
+      assert.equal((await h.control.executeTurn(d.workItemId, d.fencingToken)).status, 'waiting');
+      // the deployment never finishes; before the deadline the item keeps waiting
+      h.clock.advance(200_000);
+      assert.equal((await h.control.observeWaiting(d.workItemId)).status, 'waiting');
+      h.clock.advance(100_001);
+      assert.equal((await h.control.observeWaiting(d.workItemId)).status, 'failed');
+      const item = (await h.deps.blackboard.getWorkItem(d.workItemId)) as WorkItem;
+      assert.equal(item.state, 'failed');
+      assert.equal(item.failure?.reason, 'budget_exhausted');
+      assert.match(item.failure!.message, /waited past the work item's maxWallClockMs \(300000 ms\) for op_\S+: still unsettled/);
+      assert.deepEqual(await h.deps.admission.active(run.runId), [], 'its resources are free again');
+      const unsettled = await h.deps.ledger.listUnsettled(run.runId);
+      assert.equal(unsettled.length, 1, 'the operation itself is left to reconciliation, never retried blindly');
+      // the run is no longer held by a waiting item
+      const t = await h.control.tick(run.runId);
+      assert.deepEqual(t.waiting, []);
+    } finally {
+      await h.dispose();
+    }
+  });
+});
+
+describe('durability-1: a crash between reserve and settle leaks no budget', () => {
+  test('recover releases the open model reservations of the claims it takes from a dead worker; the retried turn fits again', async () => {
+    const lead: RoleBrain = () => call('complete_work', { summary: 'done', output: { summary: 'done', planProposed: false, readyForGate: false, objectives: [] } });
+    const h: Harness = await createHarness({ brains: { lead } });
+    try {
+      const run = await h.control.startRun({ goal: 'budget leak', target: {} });
+      const d = (await h.control.tick(run.runId)).dispatched[0]!;
+      // worker-1 started the item's agent (its work budget scope) and reserved its turn's model budget, then died
+      await h.deps.budget.open(`work:${d.workItemId}`, { tokens: 5000 }, `run:${run.runId}`);
+      const leak = await h.deps.budget.reserve([`work:${d.workItemId}`], { tokens: 1000 }, 'model call of a turn that never returned');
+      assert.equal(leak.ok, true);
+      const before = (await h.deps.budget.usage(`work:${d.workItemId}`))!.reserved.tokens;
+      assert.equal(before, 1000);
+      const worker2 = createControlPlane({ ...h.deps, config: { ...h.deps.config, workerId: 'worker-2' } });
+      h.clock.advance(60_001);
+      const report = await worker2.recover(run.runId);
+      assert.deepEqual(report.requeued, [d.workItemId]);
+      assert.equal((await h.deps.budget.usage(`work:${d.workItemId}`))!.reserved.tokens, 0, 'the leaked reservation is released');
+      assert.equal((await h.deps.budget.usage(`run:${run.runId}`))!.reserved.tokens ?? 0, 0);
+      const d2 = (await worker2.tick(run.runId)).dispatched[0]!;
+      assert.equal(await runItem(worker2, d2.workItemId, d2.fencingToken), 'completed');
+    } finally {
+      await h.dispose();
+    }
+  });
+});

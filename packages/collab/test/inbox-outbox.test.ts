@@ -178,3 +178,32 @@ test('stop() then start() while a flush is in flight leaves exactly one poll loo
   assert.equal(pollsAfterStop, 0, 'no poll loop survived stop()');
   assert.equal(bus.published.length, 1);
 });
+
+test('durability-11: prune() deletes only rows sent longer ago than the retention; the poll loop prunes; unsent rows stay', async () => {
+  await settleOutbox();
+  await env.events.append([ev('ob-prune', 'old'), ev('ob-prune', 'recent'), ev('ob-prune', 'unsent')]);
+  const rows = (await env.db.query<{ id: unknown; envelope: { eventType: string } }>("SELECT id, envelope FROM ht_outbox WHERE envelope->>'runId' = 'ob-prune' ORDER BY id")).rows;
+  const idOf = (t: string) => Number(rows.find((r) => (typeof r.envelope === 'string' ? JSON.parse(r.envelope) : r.envelope).eventType === t)!.id);
+  const now = Date.parse(env.deps.clock.isoNow());
+  await env.db.query('UPDATE ht_outbox SET sent_at = $2 WHERE id = $1', [idOf('old'), new Date(now - 2 * 3600_000).toISOString()]);
+  await env.db.query('UPDATE ht_outbox SET sent_at = $2 WHERE id = $1', [idOf('recent'), new Date(now - 60_000).toISOString()]);
+  const bus = new RecordingBus();
+  const relay = createOutboxRelay({ ...env.deps, bus, sentRetentionMs: 3600_000 });
+  // the unsent row must not be published by this test's prune call: prune never looks at unsent rows
+  assert.equal(await relay.prune!(), 1);
+  const left = async () => (await env.db.query<{ id: unknown }>("SELECT id FROM ht_outbox WHERE envelope->>'runId' = 'ob-prune' ORDER BY id")).rows.map((r) => Number(r.id));
+  assert.deepEqual(await left(), [idOf('recent'), idOf('unsent')]);
+  assert.equal((await env.events.read('ob-prune')).length, 3, 'the event store keeps every event');
+  // the poll loop publishes, then prunes (retention 0: everything already sent goes)
+  const looping = createOutboxRelay({ ...env.deps, bus, sentRetentionMs: 0, pruneIntervalMs: 1, pollMs: 5 });
+  looping.start();
+  try {
+    for (let i = 0; i < 200 && (await left()).length > 0; i++) await sleep(10);
+  } finally {
+    await looping.stop();
+  }
+  assert.deepEqual(await left(), []);
+  assert.ok(bus.published.some((e) => e.eventType === 'unsent'), 'the unsent row was published before it was pruned');
+  assert.throws(() => createOutboxRelay({ ...env.deps, bus, sentRetentionMs: -1 }), /sentRetentionMs/);
+  assert.throws(() => createOutboxRelay({ ...env.deps, bus, pruneIntervalMs: 0 }), /pruneIntervalMs/);
+});

@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import type { JsonValue } from '@hypertest/core';
+import { canonicalJson, sha256Hex, type JsonValue } from '@hypertest/core';
 import type {
   BlackboardRecord, EvidenceRecord, Finding, GateSpec, Objective, OracleAssertion, OracleSpec, ReportClaim, Review, Risk, TestArtifact, TestRun, WorkItem,
 } from '@hypertest/domain';
-import { DEFAULT_GATE_SPEC, QualityGate, type GateInput } from '../src/index.ts';
+import { DEFAULT_GATE_SPEC, QualityGate, evaluateOracleCheck, gateOverrides, type GateInput } from '../src/index.ts';
 
 const RUN = 'run_gate';
 const gate = new QualityGate();
@@ -122,7 +122,7 @@ const criterion = (d: ReturnType<QualityGate['evaluate']>, id: string) => [...d.
 test('baseline: every criterion satisfied ⇒ pass, with every decision field filled', () => {
   const d = gate.evaluate(baseline());
   assert.equal(d.verdict, 'pass', d.reasons.join('\n'));
-  assert.deepEqual(ids(d.satisfiedCriteria), ['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8', 'C9']);
+  assert.deepEqual(ids(d.satisfiedCriteria), ['C0', 'C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8', 'C9']);
   assert.deepEqual(d.violatedCriteria, []);
   assert.deepEqual(d.unknownCriteria, []);
   assert.equal(d.requiresHumanReview, false);
@@ -177,7 +177,7 @@ test('C1: evidence root count mismatch ⇒ unknown ⇒ inconclusive (not waivabl
 });
 
 test('C1: pass is impossible with zero evidence, even with a permissive gate', () => {
-  const permissive: GateSpec = { ...DEFAULT_GATE_SPEC, requiredEvidence: [], requireIndependentReview: false };
+  const permissive: GateSpec = { ...DEFAULT_GATE_SPEC, requiredEvidence: [], requireIndependentReview: false, requireOracle: false };
   const d = gate.evaluate({ ...baseline(), gate: permissive, oracles: [], claims: [], workItems: [], evidence: [], evidenceRoot: { rootHash: 'empty', count: 0 } });
   assert.equal(d.verdict, 'inconclusive');
   assert.deepEqual(ids(d.unknownCriteria), ['C1']);
@@ -582,7 +582,7 @@ test('DEFAULT_GATE_SPEC matches the documented defaults', () => {
 });
 
 test('I7: pass is impossible when every evidence record comes from an ineligible generated test (permissive gate)', () => {
-  const permissive: GateSpec = { ...DEFAULT_GATE_SPEC, requiredEvidence: [], requireIndependentReview: false };
+  const permissive: GateSpec = { ...DEFAULT_GATE_SPEC, requiredEvidence: [], requireIndependentReview: false, requireOracle: false };
   const draft: TestArtifact = {
     artifactId: 'ta_draft', runId: RUN, revision: 1, path: 'test/gen.test.ts', artifactDigest: 'd', sourceType: 'generated', oracleRefs: [], runner: { framework: 'node_test', selector: 'x' },
     validations: {}, approvalState: 'draft', createdAt: '2026-01-01T00:00:00.000Z',
@@ -595,4 +595,174 @@ test('I7: pass is impossible when every evidence record comes from an ineligible
   // C1 stays non-waivable
   const waived = gate.evaluate({ ...baseline(), gate: permissive, oracles: [], claims: [], workItems: [], testArtifacts: [draft], evidence, evidenceRoot: { rootHash: 'r', count: 1 }, exceptions: [{ criterionId: 'C1', approvedBy: { kind: 'human', id: 'u' }, rationale: 'x' }] });
   assert.equal(waived.verdict, 'inconclusive');
+});
+
+test('H8: evaluateOracleCheck is the gate\'s own C3 evaluator (exported): same outcome for each check type', () => {
+  const b = baseline();
+  // metric threshold: a recorded p99 of 500 violates p99 < 200 and satisfies p99 < 1000 (what a flip detector asks)
+  const metric = [ev('ev_m', 1, 'metric', { metric: 'latency_ms', p99: 500 })];
+  const strict = { type: 'metric_threshold', metric: 'latency_ms', comparator: '<', threshold: 200, aggregation: 'p99' } as const;
+  assert.deepEqual(evaluateOracleCheck(strict, metric), { status: 'violated', refs: ['ev_m'], detail: 'latency_ms < 200 violated' });
+  assert.equal(evaluateOracleCheck({ ...strict, threshold: 1000 }, metric).status, 'satisfied');
+  assert.equal(evaluateOracleCheck({ ...strict, aggregation: 'p95' }, metric).status, 'unknown');
+  // identical to what C3 reports for the same assertion and evidence
+  const p0 = { ...P0_LATENCY, check: strict };
+  const d = gate.evaluate({ ...b, oracles: [oracle([p0])], evidence: [...b.evidence, ev('ev_m', 5, 'metric', { metric: 'latency_ms', p99: 500 })], evidenceRoot: { rootHash: 'r', count: b.evidence.length + 1 } });
+  assert.equal(criterion(d, 'C3').status, 'violated');
+  assert.deepEqual(criterion(d, 'C3').evidenceRefs, evaluateOracleCheck(strict, [...b.evidence, ev('ev_m', 5, 'metric', { metric: 'latency_ms', p99: 500 })]).refs);
+  // test outcome: xfail is a violation, a pass satisfies; llm rubric is never decidable
+  const tr = [testResult('ev_t', 1, [{ id: 'cart > total', name: 'total', status: 'xfail' }])];
+  assert.equal(evaluateOracleCheck({ type: 'test_outcome', testSelector: 'cart > total', expected: 'pass' }, tr).status, 'violated');
+  assert.equal(evaluateOracleCheck({ type: 'test_outcome', testSelector: 'cart > *', expected: 'pass' }, [testResult('ev_t2', 1, [{ id: 'cart > total', name: 'total', status: 'passed' }])]).status, 'satisfied');
+  assert.equal(evaluateOracleCheck({ type: 'llm_rubric', rubric: 'r' }, tr).status, 'unknown');
+  assert.equal(evaluateOracleCheck({ type: 'http_expectation', method: 'GET', path: '/cart', expectStatus: 500 }, b.evidence).status, 'violated');
+});
+
+// ------------------------------------------------------------------------------------ conformance-2: derived artifact linkage
+
+const GEN_SHA = 'a'.repeat(64);
+function artifact(extra: Partial<TestArtifact> = {}): TestArtifact {
+  return {
+    artifactId: 'ta_gen', runId: RUN, revision: 1, path: 'test/new_generated.test.js', artifactDigest: GEN_SHA, sourceType: 'generated', oracleRefs: [], runner: { framework: 'node_test', selector: 'test/new_generated.test.js' },
+    validations: { knownBad: { status: 'passed', evidenceRefs: ['ev_bad'] } }, approvalState: 'validated', createdAt: '2026-01-01T00:00:00.000Z', ...extra,
+  };
+}
+const delta = (testFiles: Array<{ path: string; change: string; sha256: string | null }>, extra: Record<string, unknown> = {}) =>
+  ({ status: 'computed', baseCommit: 'c0ffee', readOnly: false, treeDigest: 't', changedFiles: testFiles.length, testFiles, ...extra });
+/** The audit PoC: an UNLINKED generated test (no testArtifactId) whose single trivial case matches the oracle selector. */
+function generatedRun(d: unknown): GateInput {
+  const cases = [{ id: 'cart > total', name: 'total', file: 'test/new_generated.test.js', status: 'passed' }];
+  const evidence = [ev('ev_gen', 1, 'test-result', { framework: 'node_test', passed: true, cases, workspaceDelta: d } as unknown as JsonValue, { workItemId: 'wi_exec' })];
+  const b = baseline();
+  const { minCoverage: _noCoverageGate, ...spec } = b.gate;
+  return { ...b, gate: spec, oracles: [oracle([P1_TEST])], claims: [], evidence, evidenceRoot: { rootHash: 'r', count: 1 } };
+}
+
+test('conformance-2: a run over a new test file that no validated artifact covers cannot satisfy C1/C3/C4 — without any caller-declared link', () => {
+  const d = gate.evaluate({ ...generatedRun(delta([{ path: 'test/new_generated.test.js', change: 'added', sha256: GEN_SHA }])), testArtifacts: [] });
+  assert.notEqual(d.verdict, 'pass');
+  assert.equal(d.verdict, 'inconclusive');
+  for (const c of ['C1', 'C3', 'C4']) assert.equal(criterion(d, c).status, 'unknown', c);
+  assert.ok(d.reasons.some((r) => r.includes('ev_gen (test file test/new_generated.test.js is added since the base commit and no validated test artifact has its content')), d.reasons.join('\n'));
+});
+
+test('conformance-2: the same run counts once a validated artifact has exactly that content digest (derived from digests, not a claim)', () => {
+  const covered = gate.evaluate({ ...generatedRun(delta([{ path: 'test/new_generated.test.js', change: 'added', sha256: GEN_SHA }])), testArtifacts: [artifact()] });
+  assert.equal(covered.verdict, 'pass', covered.reasons.join('\n'));
+  // the artifact covers only the content it validated: a later edit of the file is uncovered again
+  const edited = gate.evaluate({ ...generatedRun(delta([{ path: 'test/new_generated.test.js', change: 'added', sha256: 'b'.repeat(64) }])), testArtifacts: [artifact()] });
+  assert.equal(edited.verdict, 'inconclusive');
+  // a draft / quarantined / insensitive artifact, or a superseded validated revision, does not cover it
+  for (const a of [
+    artifact({ approvalState: 'draft' }),
+    artifact({ approvalState: 'quarantined' }),
+    artifact({ validations: { knownGood: { status: 'passed', evidenceRefs: ['ev_good'] } } }),
+    artifact({ sourceType: 'existing', validations: {} }),
+  ]) {
+    const r = gate.evaluate({ ...generatedRun(delta([{ path: 'test/new_generated.test.js', change: 'added', sha256: GEN_SHA }])), testArtifacts: [a] });
+    assert.equal(r.verdict, 'inconclusive', JSON.stringify(a));
+  }
+  const retired = gate.evaluate({ ...generatedRun(delta([{ path: 'test/new_generated.test.js', change: 'added', sha256: GEN_SHA }])), testArtifacts: [artifact(), artifact({ revision: 2, approvalState: 'retired' })] });
+  assert.equal(retired.verdict, 'inconclusive', 'only the latest revision counts');
+});
+
+test('conformance-2: modified test files need coverage too; deletions, unchanged trees and read-only unavailable deltas are not judged here; a writable unavailable delta is', () => {
+  const modified = gate.evaluate({ ...generatedRun(delta([{ path: 'test/cart.test.js', change: 'modified', sha256: GEN_SHA }, { path: 'test/old.test.js', change: 'deleted', sha256: null }])), testArtifacts: [] });
+  assert.equal(modified.verdict, 'inconclusive');
+  const repaired = gate.evaluate({ ...generatedRun(delta([{ path: 'test/cart.test.js', change: 'modified', sha256: GEN_SHA }, { path: 'test/old.test.js', change: 'deleted', sha256: null }])), testArtifacts: [artifact({ sourceType: 'repaired', path: 'test/cart.test.js' })] });
+  assert.equal(repaired.verdict, 'pass', repaired.reasons.join('\n'));
+  assert.equal(gate.evaluate(generatedRun(delta([]))).verdict, 'pass', 'nothing changed: the existing suite ran');
+  assert.equal(gate.evaluate(generatedRun({ status: 'unavailable', readOnly: true, reason: 'not a git repository' })).verdict, 'pass');
+  assert.equal(gate.evaluate(generatedRun({ status: 'unavailable', readOnly: false, reason: 'git failed' })).verdict, 'inconclusive');
+  assert.equal(gate.evaluate(generatedRun(delta([{ path: 'test/a.test.js', change: 'added', sha256: null }]))).verdict, 'inconclusive', 'no digest ⇒ cannot be covered');
+  assert.equal(gate.evaluate(generatedRun(delta([], { testFilesTruncated: true }))).verdict, 'inconclusive');
+  assert.equal(gate.evaluate(generatedRun('garbage')).verdict, 'inconclusive');
+});
+
+test('conformance-2: one uncovered file in the run taints its evidence even when the declared artifact is eligible (no riding along)', () => {
+  const i = generatedRun(delta([{ path: 'test/new_generated.test.js', change: 'added', sha256: GEN_SHA }, { path: 'test/unregistered.test.js', change: 'added', sha256: 'c'.repeat(64) }]));
+  (i.evidence[0]!.structured as Record<string, unknown>)['testArtifactId'] = 'ta_gen';
+  const d = gate.evaluate({ ...i, testArtifacts: [artifact()] });
+  assert.equal(d.verdict, 'inconclusive');
+  assert.ok(d.reasons.some((r) => r.includes('test/unregistered.test.js')), d.reasons.join('\n'));
+});
+
+// ----------------------------------------------------------------------------- H3: uninterpretable thresholds fail closed
+
+test('H3: an unknown failOnUnresolvedSeverity / conditionalOnRiskLevel never disables C2 / C7 — every unresolved finding and open risk counts', () => {
+  // an open P0 product defect fails the default gate …
+  const withDefect = { ...baseline(), findings: [finding('rec_f_p0', { severity: 'P0' })] };
+  assert.equal(gate.evaluate(withDefect).verdict, 'fail');
+  // … and still fails when the threshold is a value the gate cannot interpret (it used to compare as "nothing blocks")
+  for (const bogus of ['critical', 'P4', undefined]) {
+    const d = gate.evaluate({ ...withDefect, gate: { ...withDefect.gate, failOnUnresolvedSeverity: bogus as never } });
+    assert.equal(d.verdict, 'fail', `threshold ${String(bogus)}`);
+    assert.equal(criterion(d, 'C2').status, 'violated');
+  }
+  // without findings, an uninterpretable threshold is not "satisfied": the gate cannot tell what would block
+  const clean = gate.evaluate({ ...baseline(), findings: [], gate: { ...baseline().gate, failOnUnresolvedSeverity: 'critical' as never } });
+  assert.equal(criterion(clean, 'C2').status, 'unknown');
+  assert.notEqual(clean.verdict, 'pass');
+  // a P3 finding blocks under an uninterpretable threshold (every unresolved finding counts)
+  const minor = gate.evaluate({ ...baseline(), gate: { ...baseline().gate, failOnUnresolvedSeverity: 'P9' as never } });
+  assert.equal(criterion(minor, 'C2').status, 'violated');
+  // C7: an unknown risk level counts every open risk (the baseline's medium risk) instead of none
+  const risky = gate.evaluate({ ...baseline(), gate: { ...baseline().gate, conditionalOnRiskLevel: 'severe' as never } });
+  assert.equal(criterion(risky, 'C7').status, 'violated');
+  const noRisk = gate.evaluate({ ...baseline(), risks: [], gate: { ...baseline().gate, conditionalOnRiskLevel: 'severe' as never } });
+  assert.equal(criterion(noRisk, 'C7').status, 'unknown');
+});
+
+// ----------------------------------------------------------------------------- conformance-1: C0 oracle in force
+
+test('conformance-1: a run with no oracle in force is never pass (C0 unknown ⇒ at best inconclusive); only an explicit gate override clears it', () => {
+  // the audit reproduction: no oracles, a passing test-result and an independent approving review used to give `pass`
+  const noOracle = { ...baseline(), oracles: [], run: { ...run, oracleRevisions: {} } };
+  const d = gate.evaluate(noOracle);
+  assert.equal(d.verdict, 'inconclusive');
+  assert.equal(criterion(d, 'C0').status, 'unknown');
+  assert.equal(criterion(d, 'C0').detail, 'no approved oracle is pinned by the run');
+  assert.equal(criterion(d, 'C3').status, 'satisfied', '(C3 alone was vacuous: 0 critical assertions)');
+  // an oracle with only LLM-judged or minor assertions is not a deterministic criterion in force
+  const soft = gate.evaluate({ ...baseline(), oracles: [oracle([P2_LLM, { ...P1_TEST, severity: 'P2' }])] });
+  assert.equal(criterion(soft, 'C0').status, 'unknown');
+  assert.match(criterion(soft, 'C0').detail ?? '', /no deterministic P0\/P1 assertion/);
+  // a draft oracle, or one the run did not pin, is not in force
+  assert.equal(criterion(gate.evaluate({ ...baseline(), oracles: [oracle([P1_TEST], { status: 'draft' })] }), 'C0').status, 'unknown');
+  assert.equal(criterion(gate.evaluate({ ...baseline(), run: { ...run, oracleRevisions: { other: 1 } } }), 'C0').status, 'unknown');
+  // an explicit override (recorded in the gate spec) is the only way out; absent means required
+  const off = gate.evaluate({ ...noOracle, gate: { ...noOracle.gate, requireOracle: false } });
+  assert.equal(off.verdict, 'pass');
+  assert.match(criterion(off, 'C0').detail ?? '', /requireOracle false/);
+  const { requireOracle: _r, ...legacy } = DEFAULT_GATE_SPEC;
+  assert.equal(gate.evaluate({ ...noOracle, gate: { ...legacy, minCoverage: { lines: 0.8 } } }).verdict, 'inconclusive', 'a gate spec without the flag requires an oracle');
+  // an agent-approved waiver of C0 is ignored; the baseline oracle satisfies it
+  assert.equal(gate.evaluate({ ...noOracle, exceptions: [{ criterionId: 'C0', approvedBy: { kind: 'agent', id: 'a' }, rationale: 'x' }] }).verdict, 'inconclusive');
+  assert.equal(criterion(gate.evaluate(baseline()), 'C0').status, 'satisfied');
+});
+
+test('conformance-4: an oracle approved in a newer revision during the run makes C0 unknown (never a verdict on a replaced criterion)', () => {
+  const pinned = baseline();
+  const [id, rev] = Object.entries(pinned.run.oracleRevisions)[0]!;
+  assert.equal(gate.evaluate({ ...pinned, currentOracleRevisions: { [id]: rev } }).verdict, 'pass', 'the pinned revision is still the current one');
+  const d = gate.evaluate({ ...pinned, currentOracleRevisions: { [id]: rev + 1 } });
+  assert.equal(d.verdict, 'inconclusive');
+  assert.equal(criterion(d, 'C0').status, 'unknown');
+  assert.equal(criterion(d, 'C0').detail, `oracle ${id} revision ${rev} is superseded by approved revision ${rev + 1}: the verdict would rest on a replaced criterion — judge the candidate against the new revision in a new run`);
+  // even a gate that waives the oracle requirement does not judge on a superseded pin
+  assert.equal(gate.evaluate({ ...pinned, gate: { ...pinned.gate, requireOracle: false }, currentOracleRevisions: { [id]: rev + 1 } }).verdict, 'inconclusive');
+});
+
+test('conformance-9: the decision binds the effective gate spec (digest) and names every override of the default gate', () => {
+  const d = gate.evaluate(baseline());
+  const b = baseline();
+  assert.equal(d.gateSpecDigest, sha256Hex(canonicalJson(b.gate as never)));
+  const weakened = gate.evaluate({ ...b, gate: { ...b.gate, requireIndependentReview: false, requiredEvidence: [], requireDeterministicForCritical: false } });
+  assert.notEqual(weakened.gateSpecDigest, d.gateSpecDigest, 'a different gate yields a different digest (same gateId)');
+  assert.equal(weakened.gateId, d.gateId);
+  assert.deepEqual(gateOverrides({ ...DEFAULT_GATE_SPEC }), []);
+  assert.deepEqual(gateOverrides({ ...DEFAULT_GATE_SPEC, requireIndependentReview: false, requiredEvidence: [] }), ['requireIndependentReview=false', 'requiredEvidence=[]']);
+  assert.ok(weakened.gateOverrides!.includes('requireIndependentReview=false') && weakened.gateOverrides!.includes('requireDeterministicForCritical=false') && weakened.gateOverrides!.includes('requiredEvidence=[]'), JSON.stringify(weakened.gateOverrides));
+  const { requireOracle: _r, ...legacy } = DEFAULT_GATE_SPEC;
+  assert.deepEqual(gateOverrides(legacy as never), ['requireOracle=unset']);
 });

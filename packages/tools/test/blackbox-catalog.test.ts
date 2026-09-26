@@ -67,12 +67,16 @@ test('side-effect-bound tools never execute outside the runtime gateway', async 
 test('builtinSideEffectAdapters register in the AdapterRegistry with the declared capabilities', () => {
   const adapters = builtinSideEffectAdapters({ stateDir: '/tmp/x', environments: envs, docker: '/usr/bin/false', kubectl: '/usr/bin/false' });
   const registry = new AdapterRegistry(adapters);
-  assert.deepEqual(registry.list().map((a) => a.adapterId), ['load.http', 'load.http.stop', 'env.control', 'env.process', 'env.docker', 'env.kubectl']);
+  assert.deepEqual(registry.list().map((a) => a.adapterId), ['load.http', 'load.http.stop', 'env.control', 'env.process', 'env.docker', 'env.kubectl', 'tool.effect', 'tool.effect.resendable']);
   const caps = Object.fromEntries(registry.list().map((a) => [a.adapterId, a.capabilities]));
   assert.deepEqual(caps['load.http'], { supportsNativeIdempotency: true, supportsExternalLookupByOperationId: true, supportsFencing: false, supportsCompensation: true, reconciliationClass: 'deterministic', riskClass: 'high' });
   assert.deepEqual(caps['env.docker'], { supportsNativeIdempotency: false, supportsExternalLookupByOperationId: false, supportsFencing: false, supportsCompensation: false, reconciliationClass: 'best_effort', riskClass: 'high' });
   assert.equal(caps['env.kubectl']!.supportsExternalLookupByOperationId, true);
   assert.equal(caps['env.process']!.reconciliationClass, 'deterministic');
+  // conformance-7: the record-only adapters — an unknown outcome is never blindly retried (manual review), except a
+  // resend the target deduplicates
+  assert.deepEqual(caps['tool.effect'], { supportsNativeIdempotency: false, supportsExternalLookupByOperationId: false, supportsFencing: false, supportsCompensation: false, reconciliationClass: 'non_reconcilable', riskClass: 'high' });
+  assert.deepEqual(caps['tool.effect.resendable'], { supportsNativeIdempotency: true, supportsExternalLookupByOperationId: true, supportsFencing: false, supportsCompensation: false, reconciliationClass: 'best_effort', riskClass: 'medium' });
 });
 
 test('the white-box builtinTools() coordination point includes the black-box catalog', () => {

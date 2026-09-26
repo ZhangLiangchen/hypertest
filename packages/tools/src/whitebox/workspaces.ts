@@ -1,9 +1,12 @@
-import { mkdir, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
-import { basename, dirname, join, resolve } from 'node:path';
+import { createHash } from 'node:crypto';
+import { createReadStream } from 'node:fs';
+import { lstat, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { HypertestError, jsonClone, sha256Hex } from '@hypertest/core';
-import type { WorkspaceDeps, WorkspaceHandle, WorkspaceManager } from '../contracts.ts';
+import type { WorkspaceChange, WorkspaceDeps, WorkspaceHandle, WorkspaceManager } from '../contracts.ts';
 import { gitRun, isGitRepo, resolveCommit } from './git-exec.ts';
 import { confineExisting } from './paths.ts';
+import { baseTreeOf, renderWorktreeDiff, worktreeChanges, type BlobCache, type WorktreeChange } from './worktree-state.ts';
 
 const SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
@@ -12,6 +15,54 @@ function segment(value: string, what: string): string {
     throw new HypertestError('invalid_argument', `${what} ${JSON.stringify(value)} is not a safe path segment`);
   }
   return value;
+}
+
+/** Upper bound of files a scratch workspace listing walks (a runaway tree must not stall a test run). */
+const MAX_SCRATCH_FILES = 20_000;
+
+/** sha256 of a regular file's content (streamed); undefined for anything else (symlink, directory, missing). */
+export async function fileSha256(abs: string): Promise<string | undefined> {
+  let st;
+  try {
+    st = await lstat(abs);
+  } catch {
+    return undefined;
+  }
+  if (!st.isFile()) return undefined;
+  const hash = createHash('sha256');
+  await new Promise<void>((res, rej) => {
+    const stream = createReadStream(abs);
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('error', rej);
+    stream.on('end', () => res());
+  });
+  return hash.digest('hex');
+}
+
+/** Every file below `root` (no .git, no node_modules), workspace-relative POSIX paths, sorted; bounded. */
+async function listTree(root: string): Promise<string[]> {
+  const out: string[] = [];
+  const walk = async (dir: string): Promise<void> => {
+    let names: string[];
+    try {
+      names = await readdir(dir);
+    } catch {
+      return;
+    }
+    for (const name of names.sort()) {
+      if (name === '.git' || name === 'node_modules') continue;
+      const abs = join(dir, name);
+      const st = await lstat(abs).catch(() => undefined);
+      if (!st) continue;
+      if (st.isDirectory()) await walk(abs);
+      else {
+        out.push(relative(root, abs).split(sep).join('/'));
+        if (out.length > MAX_SCRATCH_FILES) throw new HypertestError('precondition_failed', `scratch workspace has more than ${MAX_SCRATCH_FILES} files; changes cannot be listed`);
+      }
+    }
+  };
+  await walk(root);
+  return out;
 }
 
 /** Deterministic workspace id from its slot: restarts that recompute the slot get the same id. */
@@ -38,6 +89,9 @@ interface Entry {
    * trusted git (diff) never follows the `.git` pointer inside the (agent-writable) root.
    */
   git?: { gitDir: string; workTree: string };
+  /** (security-1) Blob ids of on-disk files keyed by stat, and the (immutable) base tree: see worktree-state.ts. */
+  blobs?: BlobCache;
+  baseTree?: Map<string, { mode: string; blob: string }>;
 }
 
 interface WorktreeMeta {
@@ -83,6 +137,14 @@ export function createWorkspaceManager(deps: WorkspaceDeps): WorkspaceManager {
    */
   function gitAdmin<T>(repo: string, fn: () => Promise<T>): Promise<T> {
     return serialized(`git-admin:${repo}`, fn);
+  }
+
+  /** (security-1) The tamper-proof change list of a git workspace (see worktree-state.ts). */
+  async function trustedChanges(e: Entry): Promise<WorktreeChange[]> {
+    const env = { GIT_DIR: e.git!.gitDir, GIT_WORK_TREE: e.git!.workTree };
+    e.blobs ??= new Map();
+    e.baseTree ??= await baseTreeOf(e.git!.workTree, env, e.handle.baseCommit!);
+    return worktreeChanges({ root: e.git!.workTree, gitEnv: env, baseCommit: e.handle.baseCommit!, cache: e.blobs, baseTree: e.baseTree });
   }
 
   async function makeHandle(input: Omit<WorkspaceHandle, 'workspaceId' | 'resourcePrefix' | 'sandbox' | 'tempDir'>, slotKey: string, runId: string): Promise<WorkspaceHandle> {
@@ -265,17 +327,37 @@ export function createWorkspaceManager(deps: WorkspaceDeps): WorkspaceManager {
       const { handle } = e;
       if (!handle.baseCommit || !e.git) throw new HypertestError('precondition_failed', `workspace ${ws.workspaceId} has no git base commit`);
       // GIT_DIR/GIT_WORK_TREE: a rewritten `.git` pointer in the root cannot redirect trusted git to
-      // attacker-controlled config (filters would otherwise run on the host, outside any sandbox)
+      // attacker-controlled config. security-1: the diff is computed from the RAW bytes on disk against the real base
+      // tree — index flags (skip-worktree, assume-unchanged), replace refs, excludes, attributes and filters an agent's
+      // command can set never hide a change (worktree-state.ts)
       const env = { GIT_DIR: e.git.gitDir, GIT_WORK_TREE: e.git.workTree };
-      const tracked = await gitRun(handle.root, ['diff', '--no-color', '--no-ext-diff', '--no-textconv', handle.baseCommit, '--'], { env });
-      const others = await gitRun(handle.root, ['ls-files', '--others', '--exclude-standard', '-z'], { env });
-      const untracked = others.stdout.split('\0').filter((f) => f.length > 0).sort();
-      let out = tracked.stdout;
-      for (const f of untracked) {
-        const d = await gitRun(handle.root, ['diff', '--no-index', '--no-color', '--no-ext-diff', '--no-textconv', '--', '/dev/null', f], { allowCodes: [1], env });
-        out += d.stdout;
+      return renderWorktreeDiff(e.git.workTree, env, await trustedChanges(e));
+    },
+
+    async changedFiles(ws): Promise<WorkspaceChange[]> {
+      const e = entries.get(ws.workspaceId);
+      if (!e) throw new HypertestError('precondition_failed', `workspace ${ws.workspaceId} is not registered with this manager; re-attach it (call its creator) first`);
+      const { handle } = e;
+      const root = await realpath(handle.root);
+      const hashed = async (path: string, change: WorkspaceChange['change']): Promise<WorkspaceChange> => {
+        const c: WorkspaceChange = { path, change };
+        if (change !== 'deleted') {
+          // confined like every workspace read: a path leading out through a symlinked directory is never hashed
+          const abs = await confineExisting(root, path).catch(() => undefined);
+          const digest = abs === undefined ? undefined : await fileSha256(abs);
+          if (digest !== undefined) c.sha256 = digest;
+        }
+        return c;
+      };
+      if (!handle.baseCommit || !e.git) {
+        // a scratch directory starts empty: everything in it was created in this run
+        if (handle.kind !== 'scratch') throw new HypertestError('precondition_failed', `workspace ${ws.workspaceId} has no git base commit`);
+        return Promise.all((await listTree(root)).map((p) => hashed(p, 'added')));
       }
-      return out;
+      // every file whose raw bytes differ from the base tree (committed on the branch, staged, unstaged or untracked):
+      // the same tamper-proof comparison as diff() (security-1), so index flags or replace refs never hide a test file
+      const changes = await trustedChanges(e);
+      return Promise.all(changes.map((c) => hashed(c.path, c.change)));
     },
 
     async dispose(workspaceId) {

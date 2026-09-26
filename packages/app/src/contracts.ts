@@ -1,5 +1,5 @@
 import type { Clock, EventBus, IdGenerator, Logger, SqlDatabase } from '@hypertest/core';
-import type { BudgetEnvelope, DomainEvent, GateSpec, ModelPolicy, RuntimeManifest, TestRun } from '@hypertest/domain';
+import type { BudgetEnvelope, DomainEvent, GateSpec, ModelPolicy, OracleAssertion, OracleSpec, RuntimeManifest, TestRun } from '@hypertest/domain';
 import type { ModelCapabilityProfile, ModelCatalog, ModelRouter, ProviderRegistry, ScriptedBrain } from '@hypertest/model';
 import type { ApprovalRequest, ApprovalService, OracleGovernance, PolicyDecisionLog, PolicyEngine, PolicyRule, ResolvedProtocol } from '@hypertest/policy';
 import type { EnvironmentDescriptor, EnvironmentRegistry, SandboxProfile, ToolRegistryLike } from '@hypertest/tools';
@@ -69,6 +69,25 @@ export interface HypertestConfig {
   signing?: { keyFile?: string };
   memory?: { kind: 'sql' } | { kind: 'powercontext'; baseUrl: string; apiKeyEnv?: string };
   observability?: { logLevel?: 'debug' | 'info' | 'warn' | 'error' };
+  /**
+   * (additive, conformance-1) Oracles established by a named human authority at composition (OracleGovernance.establish;
+   * an oracle that already exists is kept: it changes only through governed proposals). Runs started without explicit
+   * `oracleIds` pin every configured oracle.
+   */
+  oracles?: OracleConfig[];
+}
+
+/** (additive, conformance-1) A configured oracle: the OracleSpec content plus the human who establishes it. */
+export interface OracleConfig {
+  oracleId: string;
+  scope: OracleSpec['scope'];
+  assertions: OracleAssertion[];
+  /** Where the criteria come from (default `[{ sourceRef: 'hypertest.config', authority: 'approved_requirement' }]`). */
+  authorities?: OracleSpec['authorities'];
+  judgePolicy?: Partial<OracleSpec['judgePolicy']>;
+  changePolicy?: Partial<Omit<OracleSpec['changePolicy'], 'selfApprove'>>;
+  /** The human authority establishing it (`human:<establishedBy>` in the audit trail). */
+  establishedBy: string;
 }
 
 export interface HypertestOverrides {

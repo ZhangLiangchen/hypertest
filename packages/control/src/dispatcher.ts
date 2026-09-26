@@ -4,7 +4,7 @@ import { sha256Hex, type JsonValue } from '@hypertest/core';
 import {
   type ActorRef,
   EFFECT_ORDER, RISK_ORDER, isTerminalWorkState,
-  type ActionCapability, type ContextSnapshot, type EventContext, type RiskClass, type TestArtifact, type ToolCall, type ToolEffect, type ToolResultMessage,
+  type ActionCapability, type ContextSnapshot, type EventContext, type RiskClass, type TestArtifact, type ToolCall, type ToolEffect, type ToolResultMessage, type WorkClaim,
 } from '@hypertest/domain';
 import { categoryDecision, classifyTestChange, holdsProductFix, parseUnifiedDiff, type ApprovalRequest, type SelfHealDecision, type TestChangeClassification } from '@hypertest/policy';
 import { toolNameToId, type ToolExecutionRequest, type WorkspaceHandle } from '@hypertest/tools';
@@ -48,6 +48,8 @@ export interface DispatcherInput {
   quarantine?: WorkspaceQuarantine;
   /** The recorded pre-execution diff of a guarded call that was in flight when the previous host stopped. */
   guard?: { invocationId: string; before: string };
+  /** (durability-2) The turn's claim state: once `lost` is set (resource claims taken), every further call is refused. */
+  claimGuard?: { lost?: string };
 }
 
 export type GovernanceVerdict =
@@ -95,6 +97,19 @@ async function canonicalRel(root: string, abs: string): Promise<string> {
 }
 
 const DECISION_RANK: Record<SelfHealDecision, number> = { auto_allowed: 0, conditional: 1, approval_required: 2, forbidden: 3 };
+
+/**
+ * (H4) Owner of the side-effect leases a tool call takes under a work claim: `<workerId>:<workItemId>:<fencingToken>`. A
+ * re-granted claim (new token) is a different owner, so a stale worker never shares the live claim's resource lease.
+ */
+export function claimLeaseOwner(workerId: string, workItemId: string, fencingToken: number): string {
+  return `${workerId}:${workItemId}:${fencingToken}`;
+}
+
+/** (H5) The deterministic event id of a test.run invocation's `test.passed` / `test.failed` event. */
+export function testOutcomeEventId(invocationId: string): string {
+  return `evt_test_${sha256Hex(`test.outcome\u0000${invocationId}`).slice(0, 32)}`;
+}
 
 /** Highest risk class among the offered tools (dynamic risks are evaluated on an empty input, else assumed high). */
 export function offeredRisk(deps: ControlDeps, toolIds: string[]): RiskClass {
@@ -395,10 +410,12 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
       if (!offered.has(call.name)) {
         return deny(call, toolId, invocationId, 'not_offered', `[denied] tool ${call.name} is not available to this agent (not in its tool policy/capability)`);
       }
+      let heldClaim: WorkClaim | undefined;
       if (input.fencingToken !== undefined) {
         // fencing (I4) before any effect: a worker whose claim was revoked (lease expired, item requeued, item ended by
         // a cancellation that kept the claim for the audit) acts no more
         const item = await deps.blackboard.getWorkItem(input.workItemId);
+        heldClaim = item?.claim;
         const held = !!item?.claim && item.claim.fencingToken === input.fencingToken && (item.state === 'claimed' || item.state === 'running');
         if (!held || !(await deps.leases.checkFence(workLeaseKey(input.workItemId), input.fencingToken))) {
           const why = item && isTerminalWorkState(item.state) ? `work item ${input.workItemId} is ${item.state}` : `work item ${input.workItemId} is no longer held with fencing token ${input.fencingToken}`;
@@ -406,7 +423,19 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
           return { message: toolMessage(call, `[denied] lease_lost: ${why}; stop working on it`, true) };
         }
       }
+      if (input.claimGuard?.lost && !TERMINAL_TOOL_IDS.includes(toolId)) {
+        return deny(call, toolId, invocationId, 'resource_claim_lost', `[denied] resource_claim_lost: ${input.claimGuard.lost}; no further tool calls run on them in this turn`);
+      }
       const args = obj(call.arguments);
+      if (toolId === 'load.start') {
+        // conformance-5: the run's maxExternalQps bounds every load job it starts (a user's cap on load against a
+        // shared environment is never silently ignored)
+        const cap = (await deps.runs.get(input.runId))?.budget.maxExternalQps;
+        const rate = args['ratePerSecond'];
+        if (cap !== undefined && typeof rate === 'number' && rate > cap) {
+          return deny(call, toolId, invocationId, 'external_qps_exceeded', `[denied] external_qps_exceeded: load.start ratePerSecond ${rate} exceeds the run's maxExternalQps ${cap}; start the job at ≤ ${cap} requests per second`);
+        }
+      }
       const effect = effectOf(toolId, call.arguments);
       const guarded = driftGuarded && effect === 'execute';
       if (quarantine && (QUARANTINE_BLOCKED_TOOL_IDS.includes(toolId) || (guarded && toolId !== QUARANTINE_RESTORE_TOOL))) {
@@ -414,7 +443,8 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
         if (refusal) return deny(call, toolId, invocationId, 'quarantined_worktree', refusal);
       }
       if (!TERMINAL_TOOL_IDS.includes(toolId)) {
-        const charged = await budget.charge([workScope(input.workItemId)], { toolCalls: 1 }, `tool:${invocationId}`);
+        // idempotent per invocation (H5): a replayed call (durable retry, re-dispatch after a crash) is charged once
+        const charged = await budget.charge([workScope(input.workItemId)], { toolCalls: 1 }, `tool:${invocationId}`, { idempotencyKey: `tool:${invocationId}` });
         if (!charged.ok) {
           await events.append([event(input.eventContext, 'budget.exhausted', 'budget', workScope(input.workItemId), { ...charged.exhausted, reason: 'tool_calls', invocationId, toolId })]);
           return deny(call, toolId, invocationId, 'budget_exhausted', `[denied] budget_exhausted: the tool-call budget of ${charged.exhausted.scope} is spent (${charged.exhausted.used}/${charged.exhausted.limit}); finish with complete_work or fail_work`);
@@ -455,6 +485,14 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
         signal: meta.signal,
       };
       if (snapshot) request.snapshot = snapshot;
+      if (input.fencingToken !== undefined) {
+        // (H4, I4) the call runs under the work claim: side-effect leases are owned by THIS claim (a stale worker of the
+        // same agent is another owner and never reuses the live claim's lease), and record-effect tools re-check the
+        // claim's fencing token inside their own write transaction
+        request.leaseOwner = claimLeaseOwner(heldClaim?.ownerId ?? deps.config.workerId, input.workItemId, input.fencingToken);
+        request.claim = { workItemId: input.workItemId, fencingToken: input.fencingToken, ownerId: heldClaim?.ownerId ?? deps.config.workerId };
+        if (heldClaim?.leaseId) request.claim.leaseId = heldClaim.leaseId;
+      }
       const execution = await toolRuntime.execute(request);
       const drift = before !== undefined ? await checkDrift(toolId, invocationId, before) : undefined;
       if (before !== undefined) {
@@ -486,7 +524,11 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
           evidenceIds: execution.evidenceRefs,
           toolInvocationId: invocationId,
         };
-        await events.append([event(input.eventContext, structured['passed'] === true ? 'test.passed' : 'test.failed', 'tool', invocationId, payload)]);
+        // one test outcome per invocation on L0 (H5): a replayed test.run keeps the first recorded outcome event
+        const eventId = testOutcomeEventId(invocationId);
+        if (!(await events.get(eventId))) {
+          await events.append([{ ...event(input.eventContext, structured['passed'] === true ? 'test.passed' : 'test.failed', 'tool', invocationId, payload), eventId }]);
+        }
       }
       return result;
     },

@@ -1,5 +1,5 @@
 import { HypertestError, abortReason, hashCanonical, isHypertestError, sleep, throwIfAborted, toHypertestError } from '@hypertest/core';
-import { RISK_ORDER, eventFrom, type EventContext, type OperationRecord, type OperationStatus, type ResourceLease } from '@hypertest/domain';
+import { RISK_ORDER, eventFrom, isTerminalOperation, type EventContext, type OperationRecord, type OperationStatus, type ResourceLease } from '@hypertest/domain';
 import type {
   CompensationResult,
   DispatchReceipt,
@@ -33,6 +33,8 @@ interface Flow {
   verifyWithinMs: number;
   dispatchTimeoutMs?: number;
   redispatchesLeft: number;
+  /** Lease this drive keeps alive while it polls (run() with a lease request): id, ttl and current expiry. */
+  renewal?: { leaseId: string; ttlMs: number; expiresAtMs: number };
 }
 
 /** Another actor moved the operation first (optimistic concurrency); converted to a passive outcome. */
@@ -45,6 +47,14 @@ class Superseded extends Error {
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 250;
+/** Default TTL a lease is extended to while its operation is observed unsettled (GatewayDeps.leaseRenewTtlMs). */
+export const DEFAULT_LEASE_RENEW_TTL_MS = 60_000;
+/**
+ * Unsettled statuses whose lease an observation extends. Not `dispatching`: a live lease on a dispatching operation is
+ * how observe/reconcile tell a dispatcher that is still alive from a crashed one — only the dispatching drive itself
+ * keeps that lease alive, an observer extending it would hide a crash forever.
+ */
+const RENEWED_WHILE_OBSERVED: ReadonlySet<OperationStatus> = new Set(['acknowledged', 'outcome_unknown', 'reconciling']);
 const WORK_STATUSES: ReadonlySet<OperationStatus> = new Set(['prepared', 'not_applied', 'dispatching', 'acknowledged', 'outcome_unknown', 'reconciling']);
 const OBSERVATION_STATES = new Set(['present', 'absent', 'uncertain']);
 
@@ -73,12 +83,14 @@ class InFlight {
 interface ProcessState {
   flights: Map<string, Promise<SideEffectOutcome>>;
   inFlight: InFlight;
+  /** Leases (by id) used by drives in flight in this process: a settled drive never releases a lease another one uses. */
+  leaseUsers: InFlight;
 }
 const processStateByLedger = new WeakMap<OperationLedger, ProcessState>();
 function processStateFor(ledger: OperationLedger): ProcessState {
   let s = processStateByLedger.get(ledger);
   if (!s) {
-    s = { flights: new Map(), inFlight: new InFlight() };
+    s = { flights: new Map(), inFlight: new InFlight(), leaseUsers: new InFlight() };
     processStateByLedger.set(ledger, s);
   }
   return s;
@@ -198,14 +210,19 @@ class SideEffectEngine {
   readonly #pollIntervalMs: number;
   readonly #flights: Map<string, Promise<SideEffectOutcome>>;
   readonly #inFlight: InFlight;
+  readonly #leaseUsers: InFlight;
+  readonly #renewTtlMs: number;
 
   constructor(deps: GatewayDeps) {
     this.#deps = deps;
     this.#pollIntervalMs = deps.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     if (!Number.isFinite(this.#pollIntervalMs) || this.#pollIntervalMs <= 0) throw new HypertestError('invalid_argument', 'pollIntervalMs must be positive');
+    this.#renewTtlMs = deps.leaseRenewTtlMs ?? DEFAULT_LEASE_RENEW_TTL_MS;
+    if (!Number.isFinite(this.#renewTtlMs) || this.#renewTtlMs <= 0) throw new HypertestError('invalid_argument', 'leaseRenewTtlMs must be positive');
     const state = processStateFor(deps.ledger);
     this.#flights = state.flights;
     this.#inFlight = state.inFlight;
+    this.#leaseUsers = state.leaseUsers;
   }
 
   // ------------------------------------------------------------------------------------------ run
@@ -259,54 +276,68 @@ class SideEffectEngine {
 
     let prepared: PreparedOperation | undefined;
     if (!op) {
-      const operationId = ids.next('op');
-      const now = clock.isoNow();
-      const provisional: OperationRecord = {
-        operationId,
-        runId: req.runId,
-        workItemId: req.workItemId,
-        toolInvocationId: req.toolInvocationId,
-        operationType: req.operationType,
-        adapterId: req.adapterId,
-        target: req.target,
-        desiredStateHash: '',
-        inputHash,
-        idempotencyKey: operationId,
-        status: 'prepared',
-        attempt: 0,
-        evidenceRefs: [],
-        createdAt: now,
-        updatedAt: now,
-      };
-      if (req.agentId !== undefined) provisional.agentId = req.agentId;
-      if (lease) provisional.lease = toLeaseRef(lease);
-      prepared = await this.#prepareWith(adapter, provisional, lease?.fencingToken, req.input, req.signal);
-      op = await ledger.prepare(
-        {
+      try {
+        const operationId = ids.next('op');
+        const now = clock.isoNow();
+        const provisional: OperationRecord = {
           operationId,
           runId: req.runId,
           workItemId: req.workItemId,
-          ...(req.agentId !== undefined ? { agentId: req.agentId } : {}),
           toolInvocationId: req.toolInvocationId,
           operationType: req.operationType,
           adapterId: req.adapterId,
-          target: prepared.target,
-          desiredStateHash: prepared.desiredStateHash,
+          target: req.target,
+          desiredStateHash: '',
           inputHash,
-          ...(lease ? { lease: toLeaseRef(lease) } : {}),
-        },
-        req.ctx,
-      );
-      if (op.operationId !== operationId) {
-        // Lost a prepare race to another process: continue with the persisted record only.
-        this.#assertSameRequest(op, req, inputHash);
-        prepared = undefined;
-        if (!WORK_STATUSES.has(op.status)) return outcomeForOperation(op);
+          idempotencyKey: operationId,
+          status: 'prepared',
+          attempt: 0,
+          evidenceRefs: [],
+          createdAt: now,
+          updatedAt: now,
+        };
+        if (req.agentId !== undefined) provisional.agentId = req.agentId;
+        if (lease) provisional.lease = toLeaseRef(lease);
+        prepared = await this.#prepareWith(adapter, provisional, lease?.fencingToken, req.input, req.signal);
+        op = await ledger.prepare(
+          {
+            operationId,
+            runId: req.runId,
+            workItemId: req.workItemId,
+            ...(req.agentId !== undefined ? { agentId: req.agentId } : {}),
+            toolInvocationId: req.toolInvocationId,
+            operationType: req.operationType,
+            adapterId: req.adapterId,
+            target: prepared.target,
+            desiredStateHash: prepared.desiredStateHash,
+            inputHash,
+            ...(lease ? { lease: toLeaseRef(lease) } : {}),
+          },
+          req.ctx,
+        );
+        if (op.operationId !== operationId) {
+          // Lost a prepare race to another process: continue with the persisted record only.
+          this.#assertSameRequest(op, req, inputHash);
+          prepared = undefined;
+          if (!WORK_STATUSES.has(op.status)) {
+            if (lease) await this.#releaseLeaseIfUnused(toLeaseRef(lease), req.runId);
+            return outcomeForOperation(op);
+          }
+        }
+      } catch (e) {
+        // nothing will be dispatched under the lease this call obtained (prepare failed): free it unless it still guards
+        // another operation of this owner
+        if (lease) await this.#releaseLeaseIfUnused(toLeaseRef(lease), req.runId);
+        throw e;
       }
     }
 
     if (busy) {
       this.#deps.logger.info('side-effect resource busy', { operationId: op.operationId, resourceKey: req.lease?.resourceKey, owner: req.lease?.owner });
+      // Never dispatched: the ledger says so (not_applied) instead of keeping an orphaned `prepared` intent. A retry of
+      // the same invocation re-enters through not_applied → dispatching once the resource is free. Only a `prepared`
+      // operation is marked: an operation that was dispatched before stays unsettled for its live lease holder.
+      if (op.status === 'prepared') op = await this.#markBusy(op, req);
       return { status: 'failed', operation: op, reason: 'resource_busy' };
     }
 
@@ -321,6 +352,7 @@ class SideEffectEngine {
     };
     const fence = lease ? toLeaseRef(lease) : op.lease;
     if (fence) flow.fence = fence;
+    if (lease && req.lease) flow.renewal = { leaseId: lease.leaseId, ttlMs: req.lease.ttlMs, expiresAtMs: Date.parse(lease.expiresAt) };
     if (prepared) flow.prepared = prepared;
     const timeout = req.dispatchTimeoutMs ?? this.#deps.dispatchTimeoutMs;
     if (timeout !== undefined) flow.dispatchTimeoutMs = timeout;
@@ -328,13 +360,99 @@ class SideEffectEngine {
     // Defensive: never reconcile a dispatch that another drive in this process still has in flight.
     if (op.status === 'dispatching' && this.#inFlight.has(op.operationId)) return outcomeForOperation(op);
     this.#inFlight.add(op.operationId);
+    if (fence) this.#leaseUsers.add(fence.leaseId);
+    let outcome: SideEffectOutcome | undefined;
     try {
-      return await this.#drive(op, flow);
+      outcome = await this.#drive(op, flow);
+      return outcome;
     } catch (e) {
-      if (e instanceof Superseded) return outcomeForOperation(e.current);
+      if (e instanceof Superseded) {
+        outcome = outcomeForOperation(e.current);
+        return outcome;
+      }
       throw e;
     } finally {
       this.#inFlight.delete(op.operationId);
+      if (fence) this.#leaseUsers.delete(fence.leaseId);
+      if (outcome && fence) await this.#releaseIfSettled(outcome.operation, fence);
+    }
+  }
+
+  /** A busy refusal of a never-dispatched operation: prepared → not_applied (lastError names the busy resource). */
+  async #markBusy(op: OperationRecord, req: RunSideEffectRequest<unknown>): Promise<OperationRecord> {
+    const reason = `resource_busy: ${req.lease?.resourceKey ?? op.target.resourceKey} is leased by another owner; nothing was dispatched`;
+    try {
+      return await this.#deps.ledger.transition(op.operationId, 'not_applied', { lastError: reason }, req.ctx, { expectedFrom: ['prepared'], expectedAttempt: op.attempt });
+    } catch (e) {
+      // The lease holder moved it first (e.g. to dispatching): report what is recorded now.
+      if (!isHypertestError(e, 'conflict')) throw e;
+      return (await this.#deps.ledger.get(op.operationId)) ?? op;
+    }
+  }
+
+  /**
+   * Releases the lease a drive held once its operation settled (verified / not_applied / failed / manual_review /
+   * compensated): the resource is free for the next owner at once instead of staying busy until the TTL. Never while
+   * another drive in this process still uses the lease; `release` deletes only this very lease (a superseded one is
+   * untouched). A failed release is logged, never surfaced: the operation's outcome is already recorded.
+   */
+  async #releaseIfSettled(op: OperationRecord, lease: LeaseRef): Promise<void> {
+    if (!isTerminalOperation(op.status)) return;
+    await this.#releaseLeaseIfUnused(lease, op.runId, op.operationId);
+  }
+
+  /**
+   * Releases a lease nothing needs any more: no drive in this process uses it, and no OTHER unsettled operation of the
+   * run is recorded under it (an owner reuses its live lease across operations: a load job still running on the
+   * resource keeps its exclusivity). A failed release is logged, never surfaced (the lease expires with its TTL).
+   */
+  async #releaseLeaseIfUnused(lease: LeaseRef, runId: string, settledOperationId?: string): Promise<void> {
+    if (this.#leaseUsers.has(lease.leaseId)) return;
+    try {
+      const guarding = (await this.#deps.ledger.listUnsettled(runId)).filter((o) => o.operationId !== settledOperationId && o.lease?.leaseId === lease.leaseId);
+      if (guarding.length > 0) {
+        this.#deps.logger.debug('side-effect lease kept: it still guards unsettled operations', { leaseId: lease.leaseId, operations: guarding.map((o) => o.operationId) });
+        return;
+      }
+      await this.#deps.leases.release(lease.leaseId);
+      this.#deps.logger.debug('side-effect lease released', { operationId: settledOperationId ?? null, resourceKey: lease.resourceKey, leaseId: lease.leaseId });
+    } catch (e) {
+      const err = toHypertestError(e);
+      this.#deps.logger.warn('side-effect lease release failed (it expires with its TTL)', { operationId: settledOperationId ?? null, leaseId: lease.leaseId, code: err.code, error: err.message });
+    }
+  }
+
+  /**
+   * Keeps the lease of an operation whose effect exists or may exist (acknowledged / outcome_unknown / reconciling)
+   * alive while it is observed: while its lease is still the live one and expires within `ttlMs`, it is extended to
+   * now + ttlMs (never shortened). A lease that expired or was superseded is left alone: exclusivity already passed on,
+   * the fence refuses the old token.
+   */
+  async #renewUnsettled(op: OperationRecord, ttlMs: number): Promise<void> {
+    if (!op.lease || !RENEWED_WHILE_OBSERVED.has(op.status)) return;
+    try {
+      const live = await this.#deps.leases.current(op.lease.resourceKey);
+      if (!live || live.leaseId !== op.lease.leaseId) return;
+      if (Date.parse(live.expiresAt) - this.#deps.clock.nowMs() >= ttlMs) return;
+      await this.#deps.leases.renew(live.leaseId, ttlMs);
+    } catch (e) {
+      const err = toHypertestError(e);
+      this.#deps.logger.warn('side-effect lease renewal failed', { operationId: op.operationId, leaseId: op.lease.leaseId, code: err.code, error: err.message });
+    }
+  }
+
+  /** During a run() drive's polling: extends the drive's own lease before it runs out (half its TTL left). */
+  async #keepLeaseAlive(flow: Flow): Promise<void> {
+    const r = flow.renewal;
+    if (!r || r.expiresAtMs - this.#deps.clock.nowMs() > r.ttlMs / 2) return;
+    try {
+      const renewed = await this.#deps.leases.renew(r.leaseId, r.ttlMs);
+      r.expiresAtMs = Date.parse(renewed.expiresAt);
+    } catch (e) {
+      // expired or superseded: the next fence check (or the target) refuses this drive
+      delete flow.renewal;
+      const err = toHypertestError(e);
+      this.#deps.logger.warn('side-effect lease could not be kept alive', { leaseId: r.leaseId, code: err.code, error: err.message });
     }
   }
 
@@ -466,7 +584,14 @@ class SideEffectEngine {
     if (!(await this.#fenceOk(flow))) return this.#stale(op, flow);
 
     // Persist the intent to dispatch BEFORE touching the external system.
-    op = await this.#move(op, 'dispatching', {}, flow);
+    try {
+      op = await this.#move(op, 'dispatching', {}, flow);
+    } catch (e) {
+      // A caller refused as busy marked the never-dispatched operation not_applied meanwhile (same attempt: nothing was
+      // sent). This drive holds the live lease (fence checked above), so it is the rightful dispatcher: go on from there.
+      if (!(e instanceof Superseded) || op.status !== 'prepared' || e.current.status !== 'not_applied' || e.current.attempt !== op.attempt) throw e;
+      op = await this.#move(e.current, 'dispatching', {}, flow);
+    }
     const dispatching = op;
     let receipt: DispatchReceipt;
     try {
@@ -587,6 +712,7 @@ class SideEffectEngine {
         } catch {
           break;
         }
+        await this.#keepLeaseAlive(flow);
       }
       const obs = await this.#observeSafely(op, flow);
       if (obs === undefined) {
@@ -703,15 +829,22 @@ class SideEffectEngine {
     assertSameRun(op, ctx);
     // A dispatch in flight in this process, or under a still-live lease (its dispatcher may be alive in
     // another process), is not a crash: do not reconcile underneath it. Its receipt or lease expiry settles it.
+    // An operation whose effect exists keeps its exclusivity while it is observed (e.g. a long-running load job polled
+    // by durable waits): its live lease is extended, never left to lapse under a running job.
+    await this.#renewUnsettled(op, this.#renewTtlMs);
     if (op.status === 'dispatching' && (this.#inFlight.has(op.operationId) || (await this.#leaseStillHeld(op)))) return outcomeForOperation(op);
     if (op.status !== 'acknowledged' && op.status !== 'dispatching' && op.status !== 'outcome_unknown' && op.status !== 'reconciling') return outcomeForOperation(op);
     const flow: Flow = { adapter: this.#deps.adapters.get(op.adapterId), ctx, signal, verifyWithinMs: 0, redispatchesLeft: 0 };
+    let outcome: SideEffectOutcome;
     try {
-      return op.status === 'acknowledged' ? await this.#attach(op, flow) : await this.#reconcile(op, flow);
+      outcome = op.status === 'acknowledged' ? await this.#attach(op, flow) : await this.#reconcile(op, flow);
     } catch (e) {
-      if (e instanceof Superseded) return outcomeForOperation(e.current);
-      throw e;
+      if (!(e instanceof Superseded)) throw e;
+      outcome = outcomeForOperation(e.current);
     }
+    // settled by this observation: the resource is free again
+    if (op.lease) await this.#releaseIfSettled(outcome.operation, op.lease);
+    return outcome;
   }
 
   async compensate(operationId: string, ctx: EventContext, signal: AbortSignal): Promise<SideEffectOutcome> {

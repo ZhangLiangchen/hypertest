@@ -237,3 +237,27 @@ HYPERTEST_TEST_DB=postgres node scripts/run-tests.mjs --package app  # e2e runs 
 - (eval review, behaviour) `persistentEnvironmentRegistry().bumpGeneration(id, digest?, operationId?)` records the bump
   of an operation in the state file (`operations`, additive) and returns it when the same operation is re-verified in a
   later process: no double bump after a crash between the adapter's bump and the ledger's `verified`.
+- (hardening) `HypertestConfig.oracles?: OracleConfig[]` (conformance-1): oracles established at composition by
+  their named human authority (`establishedBy`, recorded as `{ kind: 'human' }`); an existing oracle is never changed
+  by a config edit (it changes only through governed proposals). A run that names no `oracleIds` pins the configured
+  oracles. `gate.requireOracle` (boolean). New exports `oracleConfigProblems`, `oracleSpecFromConfig`,
+  `manifestTaskQueue`, `flipsRecordedViolation`; `FlipDetectorDeps.evidence?` (H8: the flip detector evaluates the
+  proposed revision with the gate's `evaluateOracleCheck`).
+- (hardening, behaviour) `store.kind: postgres` uses the shared SQL environment registry (`toolsMigrations`,
+  H12); freshness resolves environments with `load`. A Temporal worker's default id is
+  `worker:temporal:<namespace>/<taskQueue>` (durability-4) and its effective task queue is
+  `manifestTaskQueue(taskQueue, manifestId)` = `<taskQueue>@<manifest digest prefix>` (durability-6: workers of
+  another runtime manifest never poll a run's tasks — point external workers at the same effective queue).
+  `gate.failOnUnresolvedSeverity` accepts P0–P3 only (P4 is not a finding severity).
+- (hardening, security-2/H1, behaviour) the default local sandbox (`network: loopback`) now runs agents' commands in
+  user + network (+ PID + mount) namespaces with only their own loopback (tools README), hiding `sandboxHiddenPaths()`
+  (new export: keys, state, the PGlite store, the fs artifacts) and every other workspace, and relaying only
+  `sandboxEgressOrigins()` (new export: the registered environments' base URLs and URL entries of
+  `tools.httpAllowlist`; loopback endpoints only); `diagnose()` reports the
+  strategy, a warning when only the network is isolated or for `network: open`, and an error when the host cannot
+  enforce the configured network.
+- (hardening) conformance-8: `RuntimeManifest.hypertest.sourceDigest` (domain, additive) = `hypertestSourceDigest()`
+  (new export): sha256 over every file under the packages' `src/` — changed code at the same version is another
+  runtime (I11). conformance-12: an OPA policy engine's revision is `opa:<path>@<digest>` of the policy modules of the
+  decision package served by OPA (`GET /v1/policies`; new export `opaPolicyRevision`; `@unverified` when OPA cannot list
+  them), so a changed policy changes `policyRevision` and the manifest.

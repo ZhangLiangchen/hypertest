@@ -57,7 +57,11 @@ export interface ModelEpoch {
 export interface RuntimeManifest {
   /** SHA-256 of the canonical JSON of the other fields. */
   manifestId: string;
-  hypertest: { version: string; gitSha?: string };
+  /**
+   * `sourceDigest` (additive, conformance-8): sha256 over the source files of every Hypertest package — a rebuilt
+   * Hypertest with changed code at the same version is a different runtime (I11).
+   */
+  hypertest: { version: string; gitSha?: string; sourceDigest?: string };
   agentEngines: Array<{ kind: string; version?: string; gitSha?: string; imageDigest?: string }>;
   providerAdapters: Array<{ provider: string; package: string; version: string }>;
   modelCatalogRevision: string;

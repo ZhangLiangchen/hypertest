@@ -12,6 +12,10 @@ import type { Migration } from '@hypertest/core';
  * 003 — revisioned specs and decisions: ht_system_models, ht_oracles, ht_oracle_proposals, ht_experiments,
  *       ht_test_artifacts, ht_decisions.
  * 004 — ht_work_items.fence_high_water (monotonic fencing across requeues).
+ * 005 — append-only enforcement in the database (defence in depth for I6/I10 and the append-only Domain Contract
+ *       history): UPDATE/DELETE/TRUNCATE of ht_events (L0) and of the revision tables ht_system_models, ht_oracles,
+ *       ht_experiments, ht_test_artifacts are rejected by triggers; ht_decisions rows are immutable except for the
+ *       one-way reassessment flag (needs_reassessment false → true with its reason), and cannot be deleted.
  *
  * Domain objects are stored whole in a jsonb column (the value returned to callers); the scalar columns
  * beside them exist for filtering, uniqueness and ordering and are written in the same statement.
@@ -212,6 +216,66 @@ CREATE INDEX ht_decisions_oracle_revisions_idx ON ht_decisions USING gin (oracle
     id: 'collab/004-work-fencing',
     sql: `
 ALTER TABLE ht_work_items ADD COLUMN fence_high_water bigint NOT NULL DEFAULT 0 CHECK (fence_high_water >= 0);
+`,
+  },
+  {
+    // The L0 event store and the revisioned Domain Contract history are append-only in the database itself, not only
+    // in application code: a bug or a hand-written statement can never rewrite or drop history (SQLSTATE 42501).
+    id: 'collab/005-append-only',
+    sql: `
+CREATE OR REPLACE FUNCTION ht_collab_append_only() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE EXCEPTION 'append-only table %: % is not permitted', TG_TABLE_NAME, TG_OP USING ERRCODE = '42501';
+END
+$$;
+
+DROP TRIGGER IF EXISTS ht_events_no_mutation ON ht_events;
+CREATE TRIGGER ht_events_no_mutation BEFORE UPDATE OR DELETE ON ht_events FOR EACH ROW EXECUTE FUNCTION ht_collab_append_only();
+DROP TRIGGER IF EXISTS ht_events_no_truncate ON ht_events;
+CREATE TRIGGER ht_events_no_truncate BEFORE TRUNCATE ON ht_events FOR EACH STATEMENT EXECUTE FUNCTION ht_collab_append_only();
+
+DROP TRIGGER IF EXISTS ht_system_models_no_mutation ON ht_system_models;
+CREATE TRIGGER ht_system_models_no_mutation BEFORE UPDATE OR DELETE ON ht_system_models FOR EACH ROW EXECUTE FUNCTION ht_collab_append_only();
+DROP TRIGGER IF EXISTS ht_system_models_no_truncate ON ht_system_models;
+CREATE TRIGGER ht_system_models_no_truncate BEFORE TRUNCATE ON ht_system_models FOR EACH STATEMENT EXECUTE FUNCTION ht_collab_append_only();
+
+DROP TRIGGER IF EXISTS ht_oracles_no_mutation ON ht_oracles;
+CREATE TRIGGER ht_oracles_no_mutation BEFORE UPDATE OR DELETE ON ht_oracles FOR EACH ROW EXECUTE FUNCTION ht_collab_append_only();
+DROP TRIGGER IF EXISTS ht_oracles_no_truncate ON ht_oracles;
+CREATE TRIGGER ht_oracles_no_truncate BEFORE TRUNCATE ON ht_oracles FOR EACH STATEMENT EXECUTE FUNCTION ht_collab_append_only();
+
+DROP TRIGGER IF EXISTS ht_experiments_no_mutation ON ht_experiments;
+CREATE TRIGGER ht_experiments_no_mutation BEFORE UPDATE OR DELETE ON ht_experiments FOR EACH ROW EXECUTE FUNCTION ht_collab_append_only();
+DROP TRIGGER IF EXISTS ht_experiments_no_truncate ON ht_experiments;
+CREATE TRIGGER ht_experiments_no_truncate BEFORE TRUNCATE ON ht_experiments FOR EACH STATEMENT EXECUTE FUNCTION ht_collab_append_only();
+
+DROP TRIGGER IF EXISTS ht_test_artifacts_no_mutation ON ht_test_artifacts;
+CREATE TRIGGER ht_test_artifacts_no_mutation BEFORE UPDATE OR DELETE ON ht_test_artifacts FOR EACH ROW EXECUTE FUNCTION ht_collab_append_only();
+DROP TRIGGER IF EXISTS ht_test_artifacts_no_truncate ON ht_test_artifacts;
+CREATE TRIGGER ht_test_artifacts_no_truncate BEFORE TRUNCATE ON ht_test_artifacts FOR EACH STATEMENT EXECUTE FUNCTION ht_collab_append_only();
+
+-- ht_decisions: only the one-way reassessment flag may change (false → true, with its reason); nothing else, never back.
+CREATE OR REPLACE FUNCTION ht_decisions_reassessment_only() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF (NEW.decision_id, NEW.run_id, NEW.revision, NEW.supersedes, NEW.verdict, NEW.decision, NEW.oracle_revisions, NEW.decided_at)
+     IS DISTINCT FROM (OLD.decision_id, OLD.run_id, OLD.revision, OLD.supersedes, OLD.verdict, OLD.decision, OLD.oracle_revisions, OLD.decided_at) THEN
+    RAISE EXCEPTION 'append-only table ht_decisions: only the reassessment flag may be updated' USING ERRCODE = '42501';
+  END IF;
+  IF OLD.needs_reassessment AND NOT NEW.needs_reassessment THEN
+    RAISE EXCEPTION 'append-only table ht_decisions: a reassessment flag cannot be cleared' USING ERRCODE = '42501';
+  END IF;
+  IF OLD.reassessment_reason IS NOT NULL AND NEW.reassessment_reason IS DISTINCT FROM OLD.reassessment_reason THEN
+    RAISE EXCEPTION 'append-only table ht_decisions: a recorded reassessment reason cannot be rewritten' USING ERRCODE = '42501';
+  END IF;
+  RETURN NEW;
+END
+$$;
+DROP TRIGGER IF EXISTS ht_decisions_update_guard ON ht_decisions;
+CREATE TRIGGER ht_decisions_update_guard BEFORE UPDATE ON ht_decisions FOR EACH ROW EXECUTE FUNCTION ht_decisions_reassessment_only();
+DROP TRIGGER IF EXISTS ht_decisions_no_delete ON ht_decisions;
+CREATE TRIGGER ht_decisions_no_delete BEFORE DELETE ON ht_decisions FOR EACH ROW EXECUTE FUNCTION ht_collab_append_only();
+DROP TRIGGER IF EXISTS ht_decisions_no_truncate ON ht_decisions;
+CREATE TRIGGER ht_decisions_no_truncate BEFORE TRUNCATE ON ht_decisions FOR EACH STATEMENT EXECUTE FUNCTION ht_collab_append_only();
 `,
   },
 ];

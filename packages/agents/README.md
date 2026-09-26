@@ -20,6 +20,7 @@ Depends only on `@hypertest/core` and `@hypertest/domain`.
 | `KNOWN_TOOL_IDS` (`BUILTIN_TOOL_IDS` + `DOMAIN_TOOL_IDS`), `TERMINAL_TOOLS`, `WORKSPACE_WRITE_TOOL_IDS`, `DYNAMIC_TOOL_NAMESPACES` | Tool ids role allowlists may reference (`mcp.*` is dynamic); the workspace-writing subset. |
 | `matchesToolPattern`, `isKnownToolPattern`, `toolPermitted` | Tool-pattern semantics identical to `@hypertest/policy`. |
 | `ROLE_DEFINITION_SCHEMA`, `validateRoleDefinition(role, options?)` | Structural + semantic role validation (returns issues). |
+| `EVIDENCE_PRODUCER_ROLES` | (additive) The roles whose agents produce evidence, findings, test artifacts or fixes (`executor`, `test_designer`, `rca`, `fixer`, `metrics_analyst`, `environment`); the reviewer's `independentFromRoles`. Use it wherever producers are counted (e.g. the gate's `producerProviders`), so routing and gate agree. |
 | `*_OUTPUT_SCHEMA` | Output contracts validated on `complete_work` (JSON Schema 2020-12 incl. `if/then` — meant for Ajv validation of the completion, not for strict provider `response_format`). |
 
 ### Overrides (`hypertest.config.yaml` → `roles:`)
@@ -41,7 +42,7 @@ overridden too. Unknown tools/events can be admitted explicitly with `options.ex
 | executor | execution | test_executor / isolated_worktree | tool_use+structured_output, 0.6, low effort, taskType `execute_tests` (router ranks by tool reliability) | – |
 | rca | diagnosis | test_executor / isolated_worktree | tool_use+reasoning, 0.7, high | `finding.created` (≥P2; product_defect/performance/security/unknown) |
 | fixer | implementation | product_fixer / isolated_worktree | 0.75, **fallback fail_closed** | – |
-| reviewer | review | test_executor / isolated_worktree | +structured_output+reasoning, 0.75, **independentFromRoles executor/test_designer/rca** | `review.requested`, `finding.confirmed` (≥P1) |
+| reviewer | review | test_executor / isolated_worktree | +structured_output+reasoning, 0.75, **independentFromRoles = `EVIDENCE_PRODUCER_ROLES`** (executor/test_designer/rca/fixer/metrics_analyst/environment) | `review.requested`, `finding.confirmed` (≥P1) |
 | metrics_analyst | diagnosis | analyst / scratch | 0.65, medium | `finding.created` (performance, not its own findings) |
 | environment | execution | environment_operator / scratch | tool_use, 0.6, **fail_closed** | – |
 | condenser | analysis | read_only / scratch | tool_use+long_context, **0.5, cost cap $0.5/call** | – |
@@ -58,7 +59,7 @@ the role `outputSchema`; `priority` is 0–100, higher = more urgent.
 | Every role terminates explicitly (`complete_work` and `fail_work`) | `validation.ts` | `test/catalog.test.ts` (cannot terminate) |
 | Evidence-first output contracts: executions/observations cite `ev_…`; id lists are sets (a minimum count cannot be met by repeating one id); XPASS/NOT RUN are distinct non-pass outcomes; every review verdict is posted and approve/reject need inspected evidence; a confirmed root cause needs evidence and a stated one a posted hypothesis; `fixed` needs a SHA-shaped commit + passing regression; `readyForGate` needs a non-empty objective list with none open; an environment with a pending/unknown action is not ready; validated tests need two distinct (known-good + known-bad) evidence ids | `roles/*.ts` schemas | `test/roles.test.ts` (output contract tests) |
 | Every prompt has the `{{protocol}}` slot, only known and well-formed placeholders, the universal discipline, names only tools the role holds and explains every tool it holds | `validation.ts`, `roles/shared.ts` | `test/roles.test.ts` (prompts …), `test/catalog.test.ts` (malformed placeholders) |
-| I3 reviewer heterogeneity declared (`independentFromRoles`) | reviewer | `test/roles.test.ts` (reviewer) |
+| I3 reviewer heterogeneity declared (`independentFromRoles`): independent from EVERY role that produces evidence, findings, test artifacts or fixes (a role holding a producing tool and missing from the list fails the test) | reviewer | `test/roles.test.ts` (reviewer, H10) |
 | I12 livelock guards on every subscription; unique rule ids catalog-wide; self-trigger guard (`excludeFromRoles`), no contradictory actor filters | `validation.ts`, `catalog.ts`, `subscriptions.ts` | `test/roles.test.ts`, `test/catalog.test.ts` (ruleId reuse, actor filters), `test/subscriptions.test.ts` (self-trigger) |
 | Immutability + pinning: roles deep-frozen, inputs never mutated, revision changes iff effective roles change | `catalog.ts` | `test/catalog.test.ts` (frozen, revision) |
 | Config safety: prototype pollution, unknown roles/keys, dangling role references, reserved ids (`constructor`, `prototype`) and malformed options rejected with `invalid_argument` | `catalog.ts`, `validation.ts` | `test/catalog.test.ts` (fault injection section) |
@@ -73,6 +74,11 @@ clarifications (`maxDepth` semantics, `ruleId` uniqueness, filter AND/fail-close
 `expectedOutput` default), `SubscriptionFilter.excludeFromRoles`, `WORKSPACE_WRITE_TOOL_IDS`, reserved role/rule
 ids, and the `renderSubscriptionWork` bounds (UTF-16 units, data shortened first, no live placeholders). The condenser holds `fail_work` in addition to `complete_work` so it can hand
 over to the deterministic condenser instead of producing an unfaithful summary.
+
+(hardening) `EVIDENCE_PRODUCER_ROLES` export; the reviewer's default `independentFromRoles` now also names `fixer`,
+`metrics_analyst` and `environment` (before, a reviewer could be routed to the provider that produced the fix or the
+metric/environment evidence it judged, and the gate would then discard or — counting fewer producers — accept that
+self-review).
 
 ## Testing
 

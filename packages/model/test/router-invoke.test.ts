@@ -4,6 +4,7 @@ import { HypertestError } from '@hypertest/core';
 import { InMemoryEventSink, type ChatMessage, type DomainEventSink, type ModelPolicy } from '@hypertest/domain';
 import { eventCtx, testDeps } from '@hypertest/testkit';
 import {
+  AUDIT_APPEND_ATTEMPTS,
   ModelCatalog,
   OpenAICompatibleProvider,
   ProviderRegistry,
@@ -266,26 +267,56 @@ test('invoke: policy with no fallback field defaults to revalidated fallback', a
 
 // ----------------------------------------------------------------------------- adversarial review fixes
 
-test('invoke: an event-sink failure after a SUCCESSFUL call is a fault, never reported as a model failure with a fallback (I10)', async () => {
+function flakySink(failures: number): { sink: DomainEventSink; inner: InMemoryEventSink; attempts: () => number } {
   const inner = new InMemoryEventSink();
-  let failInvokedOnce = true;
+  let left = failures;
+  let tries = 0;
   const sink: DomainEventSink = {
     emit: async (evs) => {
-      if (failInvokedOnce && evs.some((e) => e.eventType === 'model.invoked')) {
-        failInvokedOnce = false;
-        throw new HypertestError('unavailable', 'event store down');
+      if (evs.some((e) => e.eventType === 'model.invoked')) {
+        tries++;
+        if (left > 0) {
+          left--;
+          throw new HypertestError('unavailable', 'event store down');
+        }
       }
       return inner.emit(evs);
     },
   };
+  return { sink, inner, attempts: () => tries };
+}
+
+test('invoke: an event-sink failure after a SUCCESSFUL call is never reported as a model failure with a fallback, and the paid response is never discarded (I10, durability-10)', async () => {
+  const { sink, inner, attempts } = flakySink(1);
   const providers = { pa: new ScriptedProvider({ providerId: 'pa', brain: okText }), pb: new ScriptedProvider({ providerId: 'pb', brain: okText }), pc: new ScriptedProvider({ providerId: 'pc', brain: okText }) };
   const router = createModelRouter({ ...testDeps(), catalog: new ModelCatalog(three), providers: new ProviderRegistry(Object.values(providers)), events: sink, retry: { baseDelayMs: 1, maxDelayMs: 2 } });
   const rq = routeRequest();
   const decision = await decide(router, rq);
-  await assert.rejects(router.invoke(invokeReq(decision), rq), (e: unknown) => e instanceof HypertestError && e.code === 'unavailable' && e.message === 'event store down');
+  const out = await router.invoke(invokeReq(decision), rq);
+  assert.equal(out.ok, true, 'a transient audit failure is retried: the response is returned');
+  if (out.ok) assert.equal(out.auditPending, undefined);
+  assert.equal(attempts(), 2);
   assert.equal(providers.pa.callCount, 1, 'the successful call is not retried');
   assert.equal(providers.pb.callCount + providers.pc.callCount, 0);
-  assert.deepEqual(inner.events.map((e) => e.eventType), ['model.routed'], 'no false model.invoked(ok:false), re-route or model.fallback');
+  assert.deepEqual(inner.events.map((e) => e.eventType), ['model.routed', 'model.invoked'], 'no false model.invoked(ok:false), re-route or model.fallback');
+  assert.equal((inner.events[1]!.payload as Record<string, unknown>)['ok'], true);
+});
+
+test('durability-10: an audit store that stays down after a paid call ⇒ the response is returned flagged audit-pending (usage kept), never thrown away', async () => {
+  const { sink, inner, attempts } = flakySink(Number.POSITIVE_INFINITY);
+  const providers = { pa: new ScriptedProvider({ providerId: 'pa', brain: () => ({ text: 'paid answer', usage: { inputTokens: 1000, outputTokens: 300 } }) }), pb: new ScriptedProvider({ providerId: 'pb', brain: okText }), pc: new ScriptedProvider({ providerId: 'pc', brain: okText }) };
+  const router = createModelRouter({ ...testDeps(), catalog: new ModelCatalog(three), providers: new ProviderRegistry(Object.values(providers)), events: sink, retry: { baseDelayMs: 1, maxDelayMs: 2 } });
+  const rq = routeRequest();
+  const out = await router.invoke(invokeReq(await decide(router, rq)), rq);
+  assert.equal(out.ok, true);
+  if (!out.ok) return;
+  assert.deepEqual(out.auditPending, { code: 'unavailable', message: 'event store down' });
+  assert.equal(out.response.usage.inputTokens, 1000);
+  assert.equal(out.response.usage.outputTokens, 300);
+  assert.equal(attempts(), AUDIT_APPEND_ATTEMPTS, 'the append was retried before giving up');
+  assert.equal(providers.pa.callCount, 1, 'the model is not called again');
+  assert.equal(providers.pb.callCount + providers.pc.callCount, 0, 'no fallback');
+  assert.deepEqual(inner.events.map((e) => e.eventType), ['model.routed']);
 });
 
 test('invoke re-validates the decided route against the CURRENT request: escalated data classification never reaches a cloud route', async () => {

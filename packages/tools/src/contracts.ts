@@ -1,4 +1,4 @@
-import type { BaseDeps, JsonSchema, JsonValue, Logger } from '@hypertest/core';
+import type { BaseDeps, Clock, JsonSchema, JsonValue, Logger, SqlDatabase } from '@hypertest/core';
 import type { ActionCapability, ArtifactRef, ContextSnapshot, DomainEventSink, EventContext, EvidenceInput, EvidenceRecord, EvidenceType, ResourceRef, RiskClass, ToolDefinition, ToolEffect } from '@hypertest/domain';
 import type { ArtifactStore, EvidenceLedger } from '@hypertest/evidence';
 import type { SideEffectAdapter, SideEffectGateway } from '@hypertest/operation';
@@ -14,6 +14,12 @@ import type { ActionPermit, PolicyDecisionLog, PolicyEngine } from '@hypertest/p
  *   → evidence records → tool.called / tool.completed / tool.denied events.
  * A failing test is `status: 'success'` at the transport level with `outcome.passed = false` inside the
  * structured result — never a thrown error (domain failure ≠ tool failure).
+ * (additive, conformance-7) A tool WITHOUT a side-effect binding whose computed effect is `external`/`destructive`
+ * (http.request POST/PUT/PATCH/DELETE, browser.click/fill, mcp.*) runs — when a gateway is configured — through
+ * `SideEffectGateway.run` with the record-only adapter (`tool.effect`, or `tool.effect.resendable` when
+ * `spec.resendable(input)`): executed once per invocation id; a replay returns the recorded outcome; an interrupted
+ * call ends in manual_review (or one deduplicated resend), never a blind resend. Register `recordEffectAdapters()`
+ * (included in `builtinSideEffectAdapters`) with the gateway.
  *
  * Implementations to export from src/index.ts:
  *   createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime
@@ -65,6 +71,25 @@ export interface ToolContext {
   logger: Logger;
   /** Environment registry for black-box tools (base URLs, metrics endpoints, env classes). */
   environments: EnvironmentRegistry;
+  /**
+   * (additive) Owner of the side-effect resource leases this call takes (the gateway's `lease.owner`):
+   * `ToolExecutionRequest.leaseOwner`, else the agent id. Set by the runtime.
+   */
+  leaseOwner?: string;
+  /**
+   * (additive) The work-item claim the call runs under (`ToolExecutionRequest.claim`). Tools that record effects
+   * themselves (e.g. blackboard writes) re-check it right before they write, so a worker whose claim was revoked while
+   * the call was in flight never writes.
+   */
+  claim?: ToolClaim;
+}
+
+/** (additive) A work-item claim a tool call runs under: the claim lease's fencing token (and lease id / holder). */
+export interface ToolClaim {
+  workItemId: string;
+  fencingToken: number;
+  leaseId?: string;
+  ownerId?: string;
 }
 
 export type ToolStatus = 'success' | 'failed' | 'timeout' | 'denied' | 'pending' | 'stale_context';
@@ -104,6 +129,14 @@ export interface ToolSpec<I = any, O = JsonValue> {
   resources(input: I, ctx: Pick<ToolContext, 'workspace' | 'runId' | 'environments'>): string[];
   environmentClass?: (input: I, ctx: Pick<ToolContext, 'environments'>) => string | undefined;
   sideEffect?: SideEffectBinding;
+  /**
+   * (additive) For a tool WITHOUT a side-effect binding whose computed effect is `external`/`destructive` (the runtime
+   * records such calls in the Operation Ledger through the record-only adapter, keyed by the invocation id): true when
+   * the target deduplicates a resend of this very invocation (e.g. http.request to an environment declaring
+   * `honoursIdempotencyKey`, the request carrying `Idempotency-Key: <invocationId>`). An interrupted call is then
+   * re-sent once instead of going to manual review. Ignored at risk `high` or above.
+   */
+  resendable?(input: I, ctx: Pick<ToolContext, 'environments'>): boolean;
   timeoutMs: number;
   /** Bytes of model-visible text before offloading to an artifact (default 16 KiB). */
   maxInlineBytes?: number;
@@ -134,6 +167,17 @@ export interface ToolExecutionRequest {
   eventContext: EventContext;
   signal: AbortSignal;
   timeoutMs?: number;
+  /**
+   * (additive) Owner of the side-effect resource leases the call takes (default `agentId`). Pass a claim-scoped owner
+   * (e.g. `${agentId}#${claim fencing token}`): a stale worker of the same agent — whose claim was revoked and
+   * re-granted to another worker — is then a different owner and never reuses the live claim's resource lease.
+   */
+  leaseOwner?: string;
+  /**
+   * (additive) The work-item claim the call is made under; it must be a claim on `workItemId` (else `denied`). Handed to
+   * the tool as `ToolContext.claim` so tools that record effects re-check it right before writing.
+   */
+  claim?: ToolClaim;
 }
 
 export interface ToolExecutionResult {
@@ -229,7 +273,24 @@ export interface WorkspaceManager {
   resolvePath(ws: WorkspaceHandle, relPath: string): Promise<string>;
   /** Unified diff of the worktree against its base. */
   diff(ws: WorkspaceHandle): Promise<string>;
+  /**
+   * (additive, optional) Every file that differs between the workspace and its base commit — committed on the work
+   * branch, staged, unstaged or untracked (ignored files excluded) — with the sha256 of its current content (regular
+   * files; absent for deletions and non-regular files). A scratch workspace (no repository: everything in it was
+   * created in the run) lists every file as `added`. `precondition_failed` for a workspace without a git base that
+   * is not a scratch workspace, or a handle this manager did not create/re-attach.
+   */
+  changedFiles?(ws: WorkspaceHandle): Promise<WorkspaceChange[]>;
   dispose(workspaceId: string): Promise<void>;
+}
+
+/** (additive) One file of a workspace that differs from the workspace's base commit (see WorkspaceManager.changedFiles). */
+export interface WorkspaceChange {
+  /** Workspace-relative POSIX path. */
+  path: string;
+  change: 'added' | 'modified' | 'deleted';
+  /** sha256 hex of the current content (regular files only). */
+  sha256?: string;
 }
 
 export interface ProcessResult {
@@ -265,6 +326,12 @@ export interface EnvironmentDescriptor {
   buildDigest?: string;
   /** Process/docker/k8s control descriptors for env.* adapters. */
   control?: { kind: 'process' | 'docker' | 'kubectl'; target: string; namespace?: string; command?: string[] };
+  /**
+   * (additive) The SUT deduplicates non-idempotent requests by their `Idempotency-Key` header: a request interrupted
+   * between sending and recording may be re-sent once with the same key (conformance-7); otherwise it goes to manual
+   * review. Declare it only for SUTs that really honour the header.
+   */
+  honoursIdempotencyKey?: boolean;
 }
 
 export interface EnvironmentRegistry {
@@ -278,6 +345,40 @@ export interface EnvironmentRegistry {
    * bump and the ledger's `verified`) never counts one restart twice.
    */
   bumpGeneration(environmentId: string, buildDigest?: string, operationId?: string): EnvironmentDescriptor;
+  /**
+   * (additive, optional) Authoritative read of an environment's generation from a store shared by every process
+   * (the SQL registry); updates this registry's view. Freshness resolvers should prefer it over `get` when present.
+   */
+  load?(environmentId: string): Promise<EnvironmentDescriptor | undefined>;
+  /**
+   * (additive, optional) Durable, cross-process atomic `bumpGeneration` (the same operation bumps once across every
+   * process sharing the store). The env.* adapters prefer it when present.
+   */
+  bumpGenerationAsync?(environmentId: string, buildDigest?: string, operationId?: string): Promise<EnvironmentDescriptor>;
+}
+
+/** (additive) Dependencies of createSqlEnvironmentRegistry (the core SqlDatabase port; migrations `toolsMigrations`). */
+export interface SqlEnvironmentRegistryDeps {
+  db: SqlDatabase;
+  clock?: Clock;
+  logger?: Logger;
+}
+
+/**
+ * (additive) EnvironmentRegistry whose generations (and generation bumps by operation id) live in SQL, shared by every
+ * worker process: a restart never forgets a deploy/restart (stale snapshots stay stale), and one operation bumps once
+ * across processes. Descriptors themselves (URLs, control targets — possibly secret) come from the configuration of each
+ * process and are never stored. `get`/`list` answer from the local view; `load`/`refresh` read the store.
+ */
+export interface SqlEnvironmentRegistry extends EnvironmentRegistry {
+  load(environmentId: string): Promise<EnvironmentDescriptor | undefined>;
+  bumpGenerationAsync(environmentId: string, buildDigest?: string, operationId?: string): Promise<EnvironmentDescriptor>;
+  /** Durable `register` (generation = max(stored, given)); the sync `register` queues the same write. */
+  registerAsync(env: EnvironmentDescriptor): Promise<EnvironmentDescriptor>;
+  /** Re-reads every locally registered environment's generation from the store (never moves one backwards). */
+  refresh(): Promise<void>;
+  /** Resolves once every write queued by the sync `register`/`bumpGeneration` is durable; rejects with the first failure. */
+  flush(): Promise<void>;
 }
 
 // ----------------------------------------------------------------------------- test runners + coverage
@@ -379,6 +480,25 @@ export interface LocalSandboxOptions {
   killGraceMs?: number;
   /** Default per-stream capture limit (default 4 MiB). */
   maxOutputBytes?: number;
+  /**
+   * (additive, security-2) Programs used to isolate the network of commands whose profile is not `network: 'open'`
+   * (a fresh user + network namespace). Default: `unshare` and `python3` from PATH. Local sandbox only.
+   */
+  networkIsolation?: { unshare?: string; python?: string | false; path?: string };
+  /**
+   * (additive, H1) Paths hidden from sandboxed commands (an empty read-only tmpfs over a directory, `/dev/null` over a
+   * file) — e.g. the capability secret, signing keys, the store, the artifacts. Enforced where the host supports the
+   * jail strategy (`networkIsolation().jail`); a hidden path containing the workspace is refused.
+   */
+  hiddenPaths?: string[];
+  /** (additive, H1) Directory holding every workspace: a jailed command sees only its own root and temp dir in it. */
+  workspacesDir?: string;
+  /**
+   * (additive, security-2) Origins (`http(s)://host:port`) a command of a `loopback` / `egress_allowlist` profile may
+   * reach — typically the registered environments' base URLs and the operator's http allowlist. Only this host's
+   * loopback endpoints can be relayed into the namespace (jail strategy); everything else stays unreachable.
+   */
+  egress?: (ws: WorkspaceHandle) => readonly string[] | Promise<readonly string[]>;
 }
 
 /** (additive) Options of createOciSandbox(). */

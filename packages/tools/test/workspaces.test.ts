@@ -2,7 +2,7 @@ import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, realpath, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { isHypertestError } from '@hypertest/core';
 import { createGitRepo, testDeps } from '@hypertest/testkit';
@@ -207,10 +207,15 @@ test('trusted git (diff) never hands the parent secrets to repository filters', 
     process.env['HT_WS_PARENT_SECRET'] = 'parent-secret-9431';
     const diff = await wm.diff(ws);
     assert.match(diff, /-one\n\+two/);
-    assert.equal(existsSync(dump), true, 'the (trusted, user-configured) filter did run');
-    const seen = await readFile(dump, 'utf8');
-    assert.doesNotMatch(seen, /parent-secret-9431/);
-    assert.doesNotMatch(seen, /HYPERTEST_TEST_PG_URL/);
+    // security-1: trusted diff compares raw bytes and renders them outside the repository — repository filters (which
+    // an agent can configure, and which could rewrite or hide what it changed) never run at all, so they can never see
+    // the parent's secrets either
+    assert.equal(existsSync(dump), false, 'no repository filter ran on the host');
+    if (existsSync(dump)) {
+      const seen = await readFile(dump, 'utf8');
+      assert.doesNotMatch(seen, /parent-secret-9431/);
+      assert.doesNotMatch(seen, /HYPERTEST_TEST_PG_URL/);
+    }
   } finally {
     delete process.env['HT_WS_PARENT_SECRET'];
     await r.cleanup();
@@ -245,4 +250,139 @@ test('dangling symlinks are refused (permission_denied), never followed to creat
     await assert.rejects(wm.resolvePath(ws, p), (e) => isHypertestError(e, 'permission_denied'), p);
   }
   assert.equal(existsSync(join(outside.path, 'created-through-link')), false);
+});
+
+test('security-1: index flags, replace refs, excludes and clean filters an agent\'s command sets never hide a change from diff() / changedFiles()', async () => {
+  const r = await createGitRepo({ 'test/a.test.js': "test('adds', () => { assert.equal(1 + 1, 2); });\n", 'src/sum.js': 'module.exports = (a, b) => a + b;\n' });
+  try {
+    const weaken = (root: string) => writeFile(join(root, 'test/a.test.js'), "test('adds', () => { assert.ok(true); });\n");
+    const expectWeakened = (diff: string, how: string) => {
+      assert.match(diff, /diff --git a\/test\/a\.test\.js b\/test\/a\.test\.js[\s\S]*-test\('adds', \(\) => \{ assert\.equal\(1 \+ 1, 2\); \}\);\n\+test\('adds', \(\) => \{ assert\.ok\(true\); \}\);/, how);
+    };
+    const run = (root: string, ...args: string[]) => execFileSync('git', args, { cwd: root, stdio: 'pipe' });
+
+    // 1 skip-worktree (the audit PoC): `git diff` reports nothing, the file on disk is gutted
+    const ws1 = await wm.isolatedWorktree({ runId: 'run_sec1', workItemId: 'wi_skip', repoPath: r.path });
+    assert.equal(await wm.diff(ws1), '');
+    run(ws1.root, 'update-index', '--skip-worktree', 'test/a.test.js');
+    await weaken(ws1.root);
+    assert.equal(run(ws1.root, 'diff', r.commits[0]!).toString(), '', 'plain git diff is blind to it');
+    expectWeakened(await wm.diff(ws1), 'skip-worktree');
+    assert.deepEqual((await wm.changedFiles!(ws1)).map((c) => `${c.change} ${c.path}`), ['modified test/a.test.js']);
+
+    // 2 assume-unchanged + core.ignoreStat
+    const ws2 = await wm.isolatedWorktree({ runId: 'run_sec1', workItemId: 'wi_assume', repoPath: r.path });
+    run(ws2.root, 'update-index', '--assume-unchanged', 'test/a.test.js');
+    run(ws2.root, 'config', 'core.ignoreStat', 'true');
+    await weaken(ws2.root);
+    expectWeakened(await wm.diff(ws2), 'assume-unchanged');
+    run(ws2.root, 'config', '--unset', 'core.ignoreStat');
+
+    // 3 commit, then `git replace <base> HEAD`: the base now resolves to the agent's commit
+    const ws3 = await wm.isolatedWorktree({ runId: 'run_sec1', workItemId: 'wi_replace', repoPath: r.path });
+    await weaken(ws3.root);
+    run(ws3.root, '-c', 'user.email=a@b', '-c', 'user.name=a', 'commit', '-qam', 'weaken');
+    const head = run(ws3.root, 'rev-parse', 'HEAD').toString().trim();
+    run(ws3.root, 'replace', r.commits[0]!, head);
+    try {
+      assert.equal(run(ws3.root, 'diff', r.commits[0]!).toString(), '', 'plain git diff is blind to it');
+      expectWeakened(await wm.diff(ws3), 'git replace');
+    } finally {
+      run(ws3.root, 'replace', '-d', r.commits[0]!);
+    }
+
+    // 4 a clean filter that hands git the original text (attributes in the worktree, filter in the repo config)
+    const ws4 = await wm.isolatedWorktree({ runId: 'run_sec1', workItemId: 'wi_filter', repoPath: r.path });
+    const original = join(outside.path, 'original.js');
+    await writeFile(original, "test('adds', () => { assert.equal(1 + 1, 2); });\n");
+    run(r.path, 'config', 'filter.hide.clean', `cat ${original}`);
+    try {
+      await writeFile(join(ws4.root, '.gitattributes'), 'test/* filter=hide -diff\n');
+      await weaken(ws4.root);
+      const d4 = await wm.diff(ws4);
+      expectWeakened(d4, 'clean filter / -diff');
+      assert.match(d4, /diff --git a\/\.gitattributes b\/\.gitattributes\nnew file mode 100644/, 'the attributes file itself is a visible change');
+    } finally {
+      run(r.path, 'config', '--unset', 'filter.hide.clean');
+    }
+
+    // 5 a new test file hidden through .git/info/exclude is still listed (only the worktree's .gitignore files count)
+    const ws5 = await wm.isolatedWorktree({ runId: 'run_sec1', workItemId: 'wi_exclude', repoPath: r.path });
+    const commonDir = run(ws5.root, 'rev-parse', '--git-common-dir').toString().trim();
+    const infoDir = commonDir.startsWith('/') ? join(commonDir, 'info') : join(ws5.root, commonDir, 'info');
+    await mkdir(infoDir, { recursive: true });
+    const excludeFile = join(infoDir, 'exclude');
+    const before = existsSync(excludeFile) ? await readFile(excludeFile, 'utf8') : '';
+    await writeFile(excludeFile, `${before}test/hidden.test.js\n`);
+    try {
+      await writeFile(join(ws5.root, 'test/hidden.test.js'), "test('always', () => {});\n");
+      assert.match(await wm.diff(ws5), /diff --git a\/test\/hidden\.test\.js b\/test\/hidden\.test\.js\nnew file mode 100644/);
+      assert.ok((await wm.changedFiles!(ws5)).some((c) => c.path === 'test/hidden.test.js' && c.change === 'added'));
+    } finally {
+      await writeFile(excludeFile, before);
+    }
+  } finally {
+    await r.cleanup();
+  }
+});
+
+test('security-1: a .gitignore the agent writes or edits (even one that ignores itself) never hides a file it added; the base commit\'s ignore rules still apply', async () => {
+  const r = await createGitRepo({
+    '.gitignore': 'node_modules/\n*.log\n!keep.log\n/build\n# comment\n',
+    'pkg/.gitignore': 'dist/\n/local.txt\n**/gen/*.out\n',
+    'tests/test_a.py': 'def test_a():\n    assert 1 + 1 == 2\n',
+    'pkg/index.js': 'module.exports = 1;\n',
+  });
+  const placeholder = '# placeholder\n';
+  const listed = async (ws: Parameters<WorkspaceManager['diff']>[0]) => (await wm.changedFiles!(ws)).map((c) => `${c.change} ${c.path}`).sort();
+  // files the BASE rules ignore (must stay invisible) and files they do not (must be listed)
+  const populate = async (root: string) => {
+    for (const p of ['node_modules/dep/index.js', 'x.log', 'build/out.js', 'pkg/dist/a.js', 'pkg/local.txt', 'pkg/sub/gen/y.out']) {
+      await mkdir(join(root, p, '..'), { recursive: true });
+      await writeFile(join(root, p), placeholder);
+    }
+    for (const p of ['keep.log', 'pkg/sub/local.txt', 'sub/build/out.js', 'pkg/gen/y.txt']) {
+      await mkdir(join(root, p, '..'), { recursive: true });
+      await writeFile(join(root, p), placeholder);
+    }
+  };
+  const visible = ['added keep.log', 'added pkg/gen/y.txt', 'added pkg/sub/local.txt', 'added sub/build/out.js'];
+  try {
+    // untainted: git's own per-directory rules (the reference for the base-rule translation below)
+    const ws0 = await wm.isolatedWorktree({ runId: 'run_sec1i', workItemId: 'wi_ref', repoPath: r.path });
+    await populate(ws0.root);
+    assert.deepEqual(await listed(ws0), visible);
+
+    // A: a new, self-ignoring tests/.gitignore hides a new tests/conftest.py from plain git
+    const wsA = await wm.isolatedWorktree({ runId: 'run_sec1i', workItemId: 'wi_a', repoPath: r.path });
+    const beforeA = await wm.diff(wsA);
+    await writeFile(join(wsA.root, 'tests/.gitignore'), '*\n');
+    await writeFile(join(wsA.root, 'tests/conftest.py'), placeholder);
+    assert.equal(git(wsA.root, 'status', '--porcelain'), '', 'plain git sees nothing');
+    assert.notEqual(await wm.diff(wsA), beforeA);
+    assert.match(await wm.diff(wsA), /diff --git a\/tests\/conftest\.py b\/tests\/conftest\.py\nnew file mode 100644/);
+    assert.deepEqual(await listed(wsA), ['added tests/.gitignore', 'added tests/conftest.py']);
+
+    // B: a new root-level ignore file in a sub-tree the base does not ignore, ignoring itself and the new file
+    const wsB = await wm.isolatedWorktree({ runId: 'run_sec1i', workItemId: 'wi_b', repoPath: r.path });
+    await mkdir(join(wsB.root, 'extra'), { recursive: true });
+    await writeFile(join(wsB.root, 'extra/.gitignore'), '.gitignore\nconftest.py\n');
+    await writeFile(join(wsB.root, 'extra/conftest.py'), placeholder);
+    assert.deepEqual(await listed(wsB), ['added extra/.gitignore', 'added extra/conftest.py']);
+
+    // C: editing the tracked .gitignore to ignore a new file: both the edit and the file are changes
+    const wsC = await wm.isolatedWorktree({ runId: 'run_sec1i', workItemId: 'wi_c', repoPath: r.path });
+    await writeFile(join(wsC.root, '.gitignore'), 'node_modules/\n*.log\n!keep.log\n/build\nconftest.py\n');
+    await writeFile(join(wsC.root, 'tests/conftest.py'), placeholder);
+    assert.deepEqual(await listed(wsC), ['added tests/conftest.py', 'modified .gitignore']);
+
+    // C': deleting the tracked .gitignore does not un-ignore what the base ignores (no flood of dependency files)
+    const wsD = await wm.isolatedWorktree({ runId: 'run_sec1i', workItemId: 'wi_d', repoPath: r.path });
+    await populate(wsD.root);
+    await rm(join(wsD.root, 'pkg/.gitignore'));
+    await writeFile(join(wsD.root, 'tests/.gitignore'), '*\n');
+    assert.deepEqual(await listed(wsD), [...visible, 'added tests/.gitignore', 'deleted pkg/.gitignore'].sort(), 'tainted: the base rules, translated, ignore exactly what git ignores');
+  } finally {
+    await r.cleanup();
+  }
 });

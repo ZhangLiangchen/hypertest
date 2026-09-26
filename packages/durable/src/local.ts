@@ -111,9 +111,16 @@ function deferred<T>(): Deferred<T> {
 interface WorkLoop {
   readonly workItemId: string;
   token: number | undefined;
+  /** 'turn': holds (or is about to take) a turn slot; 'observe': polls a waiting item (no slot). */
+  phase: 'turn' | 'observe';
+  /** (durability-9) The turn the claim's first executeTurn expects (from the tick's dispatch). */
+  nextTurn?: number;
   done: boolean;
   promise: Promise<void>;
 }
+
+/** (H6) Interval of the claim keepalive while a work loop waits for a free turn slot (default; `claimKeepaliveMs`). */
+export const DEFAULT_CLAIM_KEEPALIVE_MS = 10_000;
 
 interface RunLoop {
   readonly runId: string;
@@ -159,6 +166,8 @@ export class LocalDurableRuntime implements DurableRuntime {
   readonly #resolveClaim: ((workItemId: string) => Promise<number | undefined>) | undefined;
   readonly #logger: Logger;
   readonly #semaphore: Semaphore;
+  readonly #maxConcurrentTurns: number;
+  readonly #claimKeepaliveMs: number;
   readonly #maxIdleMs: number;
   readonly #maxAttempts: number;
   readonly #root = new AbortController();
@@ -182,6 +191,10 @@ export class LocalDurableRuntime implements DurableRuntime {
     this.#resolveClaim = options.resolveClaim;
     this.#logger = (options.logger ?? options.control.deps.logger).child({ component: 'durable.local' });
     this.#semaphore = new Semaphore(options.maxConcurrentTurns);
+    this.#maxConcurrentTurns = options.maxConcurrentTurns;
+    const keepalive = options.claimKeepaliveMs ?? DEFAULT_CLAIM_KEEPALIVE_MS;
+    if (!Number.isFinite(keepalive) || keepalive <= 0) throw new HypertestError('invalid_argument', `LocalDurableRuntime: claimKeepaliveMs must be > 0 (got ${String(options.claimKeepaliveMs)})`);
+    this.#claimKeepaliveMs = keepalive;
     this.#maxIdleMs = maxIdleMs;
     this.#maxAttempts = maxAttempts;
   }
@@ -297,14 +310,15 @@ export class LocalDurableRuntime implements DurableRuntime {
         loop.waker.clear();
         // standby on `unavailable` (the store is down): the run loop outlives an outage of any length — it is the only
         // thing that re-dispatches this run's work in this process
-        const r = await this.#retrying('tick', { runId }, () => this.#control.tick(runId), signal, true);
+        // H6: claims are handed out only up to the free turn slots of this runtime (a claim never waits unrenewed)
+        const r = await this.#retrying('tick', { runId }, () => this.#control.tick(runId, { maxDispatch: this.#freeTurnSlots() }), signal, true);
         if (r.final) {
           final = true;
           loop.outcome.resolve(outcomeOf(r));
           this.#logger.info('run finished', { runId, status: r.status, verdict: r.decision?.verdict });
           return;
         }
-        for (const d of r.dispatched) this.#startWork(loop, d.workItemId, d.fencingToken);
+        for (const d of r.dispatched) this.#startWork(loop, d.workItemId, d.fencingToken, d.nextTurn);
         for (const w of r.waiting) if (!loop.workers.has(w.workItemId)) this.#startWork(loop, w.workItemId, undefined);
         const idle = Math.min(Math.max(0, r.idleMs), this.#maxIdleMs);
         if (idle > 0) {
@@ -358,11 +372,39 @@ export class LocalDurableRuntime implements DurableRuntime {
 
   // ------------------------------------------------------------------------------------------------ work loops
 
-  #startWork(loop: RunLoop, workItemId: string, fencingToken: number | undefined): void {
+  /** (H6) Turn slots not held or promised to a work loop in its turn phase, across every run of this runtime. */
+  #freeTurnSlots(): number {
+    let busy = 0;
+    for (const run of this.#runs.values()) for (const w of run.workers.values()) if (!w.done && w.phase === 'turn') busy++;
+    return Math.max(0, this.#maxConcurrentTurns - busy);
+  }
+
+  /**
+   * (H6) A turn slot. While the loop waits for one, the claim is kept alive (ControlPlane.renewClaim every
+   * claimKeepaliveMs): a claim queued behind busy slots is never requeued as if its worker had died.
+   */
+  async #turnSlot(workItemId: string, token: number): Promise<() => void> {
+    const renew = this.#control.renewClaim;
+    let timer: NodeJS.Timeout | undefined;
+    if (renew) {
+      timer = setInterval(() => {
+        renew.call(this.#control, workItemId, token).catch((e: unknown) => this.#logger.warn('claim keepalive failed', { workItemId, fencingToken: token, error: errorMessage(e) }));
+      }, this.#claimKeepaliveMs);
+      timer.unref();
+    }
+    try {
+      return await this.#semaphore.acquire();
+    } finally {
+      if (timer) clearInterval(timer);
+    }
+  }
+
+  #startWork(loop: RunLoop, workItemId: string, fencingToken: number | undefined, nextTurn?: number): void {
     const current = loop.workers.get(workItemId);
     // one loop per item; a new claim (new token: the old one was requeued and lost its lease) gets its own loop
     if (current && !current.done && (fencingToken === undefined || current.token === fencingToken)) return;
-    const w: WorkLoop = { workItemId, token: fencingToken, done: false, promise: Promise.resolve() };
+    const w: WorkLoop = { workItemId, token: fencingToken, phase: fencingToken === undefined ? 'observe' : 'turn', done: false, promise: Promise.resolve() };
+    if (nextTurn !== undefined) w.nextTurn = nextTurn;
     loop.workers.set(workItemId, w);
     w.promise = this.#work(loop, w)
       .catch((e: unknown) => this.#logger.error('work loop crashed', { runId: loop.runId, workItemId, error: errorMessage(e) }))
@@ -377,16 +419,16 @@ export class LocalDurableRuntime implements DurableRuntime {
     const signal = loop.workSignal;
     const { workItemId } = w;
     const fields = { runId: loop.runId, workItemId };
-    let phase: 'turn' | 'observe' = w.token === undefined ? 'observe' : 'turn';
-    let expectedTurn: number | undefined;
+    // durability-9: the first call already names its turn (a retry after a committed first turn never runs another)
+    let expectedTurn: number | undefined = w.nextTurn;
     let backoff = OBSERVE_BACKOFF_MIN_MS;
     try {
       while (!signal.aborted) {
-        if (phase === 'turn' && w.token !== undefined) {
+        if (w.phase === 'turn' && w.token !== undefined) {
           const token = w.token;
           const options = expectedTurn === undefined ? undefined : { expectedTurn };
           const o = await this.#retrying('executeTurn', { ...fields, fencingToken: token, expectedTurn }, async () => {
-            const release = await this.#semaphore.acquire();
+            const release = await this.#turnSlot(workItemId, token);
             try {
               if (signal.aborted) throw new HypertestError('cancelled', 'work loop stopped');
               return await this.#control.executeTurn(workItemId, token, signal, options);
@@ -399,7 +441,7 @@ export class LocalDurableRuntime implements DurableRuntime {
             continue;
           }
           if (o.status === 'waiting') {
-            phase = 'observe';
+            w.phase = 'observe';
             backoff = OBSERVE_BACKOFF_MIN_MS;
             continue;
           }
@@ -420,7 +462,7 @@ export class LocalDurableRuntime implements DurableRuntime {
             return;
           }
           w.token = token;
-          phase = 'turn';
+          w.phase = 'turn';
           expectedTurn = o.turn + 1;
           backoff = OBSERVE_BACKOFF_MIN_MS;
           continue;

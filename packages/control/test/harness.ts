@@ -22,7 +22,7 @@ import {
   ExactSearch, contextMigrations, createExperienceStore, createFreshnessGuard, createProvenanceService, createResolverRegistry, createSnapshotBuilder,
   createSnapshotStore, createWorkingContextManager,
 } from '@hypertest/context';
-import { ToolRegistry, builtinTools, createEnvironmentRegistry, createLocalSandbox, createToolRuntime, createWorkspaceManager, type EnvironmentDescriptor, type ToolRuntimeDeps } from '@hypertest/tools';
+import { ToolRegistry, builtinTools, createEnvironmentRegistry, createLocalSandbox, createToolRuntime, createWorkspaceManager, recordEffectAdapters, type EnvironmentDescriptor, type ToolRuntimeDeps } from '@hypertest/tools';
 import {
   EngineRegistry, NativeEngine, buildRuntimeManifest, createAgentRepository, createAgentRunner, createEpochManager, createSessionStore, createSubagentRuntime,
   runtimeMigrations,
@@ -194,7 +194,9 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
   const inbox = createInbox({ ...base, db });
   const ledger = createOperationLedger({ ...base, db, events });
   const leases = createLeaseService({ ...base, db, events });
-  const adapters = new AdapterRegistry();
+  // the record-only adapters are part of every realistic gateway: external effects without an adapter of their own
+  // (http.request POST, browser clicks, MCP calls) run through the ledger with them
+  const adapters = new AdapterRegistry(recordEffectAdapters());
   const gateway = createSideEffectGateway({ ...base, db, events, ledger, leases, adapters, pollIntervalMs: 5 });
   const reconciler = createReconciler({ ...base, db, events, ledger, leases, adapters, pollIntervalMs: 5 });
   const admission = createResourceAdmission({ ...base, db, events });

@@ -245,5 +245,7 @@ The ripgrep-vs-JS test skips with a reason when `rg` is not on `PATH`.
   are `invalid_argument`; pinned snapshot versions are always validated; `type:parent` resources match; the acting
   `ctx.actorId`/`agentId` counts for reviewer ≠ creator; vector indexes honour `query.root`; `ht_vectors` is keyed
   by `(model_id, id)`.
+- (hardening) `finding` joins the always-checked resource types of the freshness guard (conformance-3: a mutating
+  call is refused when a finding it was based on has been superseded).
 
 Events emitted that are not in the domain `EVENT_TYPES` catalog: `experience.reviewed` (aggregate `context`).

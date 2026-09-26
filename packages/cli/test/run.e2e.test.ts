@@ -221,6 +221,80 @@ describe('hypertest run → status / report / events / evidence verify on the fi
     assert.deepEqual([r.code, r.stderr], [1, 'hypertest oracle: oracle change proposal ocp_nope not found [not_found]\n']);
   });
 
+  test('conformance-1: oracle establish records a human-established oracle; malformed or existing oracles are refused', async () => {
+    const file = join(dir.path, 'extra-oracle.yaml');
+    await writeFile(file, [
+      'oracleId: sum-negatives',
+      'scope: { components: [sum], description: sum handles negative numbers }',
+      'assertions:',
+      '  - { assertionId: negatives, description: "sum(-1, -2) is -3", kind: requirement, severity: P1, check: { type: test_outcome, testSelector: "*negative*", expected: pass } }',
+      '',
+    ].join('\n'));
+    const r = await cli(['oracle', 'establish', 'extra-oracle.yaml', '--by', 'alice'], { cwd: dir.path, env });
+    assert.deepEqual([r.code, r.stdout, r.stderr], [0, 'oracle sum-negatives revision 1 established by human:alice\n', '']);
+    const config = await loadConfig(project.configPath, { env: { ...process.env, ...env } });
+    const ht = await createHypertest(config, { env: { ...process.env, ...env }, scriptedBrains: { sim: () => ({ text: 'unused' }) }, logger: new MemoryLogger() });
+    try {
+      const o = (await ht.services.specs.getOracle('sum-negatives'))!;
+      assert.equal(o.status, 'approved');
+      assert.deepEqual(o.approvedBy, [{ kind: 'human', id: 'alice' }]);
+    } finally {
+      await ht.close();
+    }
+    const again = await cli(['oracle', 'establish', 'extra-oracle.yaml', '--by', 'bob'], { cwd: dir.path, env });
+    assert.deepEqual([again.code, again.stderr], [1, 'hypertest oracle: oracle sum-negatives already exists: it changes only through governed proposals (oracle proposals / decide) [conflict]\n']);
+    await writeFile(join(dir.path, 'bad-oracle.yaml'), 'oracleId: bad\nscope: { components: [], description: d }\nassertions: []\n');
+    const bad = await cli(['oracle', 'establish', 'bad-oracle.yaml', '--by', 'alice'], { cwd: dir.path, env });
+    assert.equal(bad.code, 2);
+    assert.match(bad.stderr, /^hypertest oracle: invalid oracle file bad-oracle\.yaml:\n {2}- oracles\[0\]\.assertions must be a non-empty list\n/);
+  });
+
+  test('conformance-11: waive records a human gate waiver on a live run; a finished run\'s decision is final', async () => {
+    const final = await cli(['waive', run.runId, 'C6', '--by', 'alice', '--reason', 'late'], { cwd: dir.path, env });
+    assert.deepEqual([final.code, final.stderr], [1, `hypertest waive: run ${run.runId} is completed: its decision is final (a waiver applies at a gate evaluation) [conflict]\n`]);
+    const unknown = await cli(['waive', 'run_nope', 'C6', '--by', 'alice', '--reason', 'x'], { cwd: dir.path, env });
+    assert.deepEqual([unknown.code, unknown.stderr], [1, 'hypertest waive: run run_nope not found [not_found]\n']);
+    // a live run (its lead's turn never returns; the instance is closed mid-run, the run stays resumable)
+    const config = await loadConfig(project.configPath, { env: { ...process.env, ...env } });
+    const ht = await createHypertest(config, { env: { ...process.env, ...env }, scriptedBrains: { sim: () => new Promise(() => undefined) as never }, logger: new MemoryLogger() });
+    let live: TestRun;
+    try {
+      live = await ht.start({ goal: GOAL, target: {} });
+    } finally {
+      await ht.close();
+    }
+    const w = parseJson<{ approvalId: string; criterionId: string; expiresAt: string; approvedBy: string }>(await cli(['waive', live.runId, 'C6', '--by', 'alice', '--reason', 'no independent reviewer route this week', '--expires', '2099-01-01T00:00:00Z', '--json'], { cwd: dir.path, env }));
+    assert.deepEqual([w.criterionId, w.expiresAt, w.approvedBy], ['C6', '2099-01-01T00:00:00.000Z', 'human:alice']);
+    const approvals = parseJson<Array<{ approvalId: string; kind: string; status: string; decidedBy: { kind: string; id: string } }>>(await cli(['approvals', '--run', live.runId, '--all', '--json'], { cwd: dir.path, env }));
+    assert.deepEqual(approvals.map((a) => [a.approvalId, a.kind, a.status, `${a.decidedBy.kind}:${a.decidedBy.id}`]), [[w.approvalId, 'gate_exception', 'approved', 'human:alice']]);
+    await cli(['cancel', live.runId, '--reason', 'test done'], { cwd: dir.path, env });
+  });
+
+  test('conformance-13: experience list / review — a human approves a candidate; its creator never can', async () => {
+    const config = await loadConfig(project.configPath, { env: { ...process.env, ...env } });
+    const ht = await createHypertest(config, { env: { ...process.env, ...env }, scriptedBrains: { sim: () => ({ text: 'unused' }) }, logger: new MemoryLogger() });
+    let fromAgent: string;
+    let fromAlice: string;
+    try {
+      const ctx = { runId: run.runId, correlationId: run.runId, actorId: 'agent:ag_rca' };
+      fromAgent = (await ht.services.memory.propose({ scope: { project: 'calc', role: 'rca' }, kind: 'lesson', content: 'sum() regressions show up with negative operands first', sourceRunId: run.runId, evidenceRefs: [], createdBy: 'agent:ag_rca' }, ctx)).experienceId;
+      fromAlice = (await ht.services.memory.propose({ scope: { project: 'calc' }, kind: 'test_idea', content: 'property test: sum is commutative', sourceRunId: run.runId, evidenceRefs: [], createdBy: 'human:alice' }, { ...ctx, actorId: 'human:alice' })).experienceId;
+    } finally {
+      await ht.close();
+    }
+    const listed = parseJson<Array<{ experienceId: string; status: string }>>(await cli(['experience', 'list', '--run', run.runId, '--json'], { cwd: dir.path, env }));
+    assert.deepEqual(listed.filter((e) => [fromAgent, fromAlice].includes(e.experienceId)).map((e) => e.status), ['candidate', 'candidate']);
+    const approved = await cli(['experience', 'review', fromAgent, '--decision', 'approve', '--by', 'bob'], { cwd: dir.path, env });
+    assert.deepEqual([approved.code, approved.stdout, approved.stderr], [0, `experience ${fromAgent} approved by human:bob\n`, '']);
+    const self = await cli(['experience', 'review', fromAlice, '--decision', 'approve', '--by', 'alice'], { cwd: dir.path, env });
+    assert.equal(self.code, 1);
+    assert.match(self.stderr, /cannot be reviewed by its creator human:alice \[permission_denied\]\n$/);
+    const table = await cli(['experience', 'list', '--status', 'approved'], { cwd: dir.path, env });
+    assert.match(table.stdout, new RegExp(`${fromAgent}\\s+approved\\s+lesson`));
+    const unknown = await cli(['experience', 'review', 'exp_nope', '--decision', 'reject', '--by', 'bob'], { cwd: dir.path, env });
+    assert.deepEqual([unknown.code, unknown.stderr], [1, 'hypertest experience: experience exp_nope not found [not_found]\n']);
+  });
+
   test('evidence verify reports a tampered artifact (exit 1) — I6 through the CLI', async () => {
     const artifactsDir = join(dir.path, '.hypertest', 'artifacts');
     const stored = await files(artifactsDir);
@@ -279,7 +353,8 @@ describe('verdict-aware exit codes of hypertest run', () => {
     assert.equal(types[0], 'run.created');
     assert.equal(types.at(-1), 'run.completed');
     for (const t of ['test.failed', 'finding.created', 'gate.evaluated', 'gate.failed']) assert.ok(types.includes(t), t);
-    assert.match(r.stdout, /^run run_\S+ completed\nverdict FAIL {2}decision qd_\S+\n {2}violated {2}C2 unresolved_findings: 1 product and 0 test\/infrastructure findings unresolved\n {2}unresolved findings: rec_\S+\n {2}evidence root [0-9a-f]{64} \(\d+ records\)\nreport: hypertest report run_\S+\n$/);
+    // the failing case also violates the pinned sum oracle (conformance-1: the run is judged against an oracle in force)
+    assert.match(r.stdout, /^run run_\S+ completed\nverdict FAIL {2}decision qd_\S+\n {2}violated {2}C2 unresolved_findings: 1 product and 0 test\/infrastructure findings unresolved\n {2}violated {2}C3 critical_oracles: 1 critical assertions: 1 violated, 0 unproven\n {2}unresolved findings: rec_\S+\n {2}evidence root [0-9a-f]{64} \(\d+ records\)\nreport: hypertest report run_\S+\n$/);
   });
 
   test('conditional ⇒ 4: the suite passes but the gate requires an independent review nobody gave', async () => {

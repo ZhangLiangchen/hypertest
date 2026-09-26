@@ -69,11 +69,9 @@ test('recovery-chaos: two SIGKILLs (restart in flight, load job running) ⇒ zer
   const passes = a.recovery.filter((r) => r.startsWith('recovery by worker:eval:'));
   assert.equal(passes.length, 2, a.recovery.join('\n'));
   const loadRecovery = passes[1]!;
-  assert.ok(
-    loadRecovery.includes(`re-attached ${a.loadItem} (environment) to ${a.loadOpId} — still waiting, nothing re-created`) ||
-      loadRecovery.includes(`re-runs ${a.loadItem} (environment, was running, attempt 1) — orphaned by the previous process`),
-    loadRecovery,
-  );
+  // (the kill may also land while other items run: they are listed in the same re-run clause)
+  const reRun = new RegExp(`re-runs (?:[^—]*, )?${a.loadItem} \\(environment, was running, attempt 1\\)(?:, [^—]*)? — orphaned by the previous process`);
+  assert.ok(loadRecovery.includes(`re-attached ${a.loadItem} (environment) to ${a.loadOpId} — still waiting, nothing re-created`) || reRun.test(loadRecovery), loadRecovery);
   assert.ok(a.recovery.some((r) => r.startsWith(`operation ${a.restartOpId} reconciled:`)), a.recovery.join('\n'));
 });
 

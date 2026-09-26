@@ -136,7 +136,9 @@ roles:
   reviewer:                          # independent judge: a different provider than the roles it reviews
     defaultModelPolicy:
       preferredRoutes: [claude-sonnet, claude-opus]
-      independentFromRoles: [executor, test_designer, rca]
+      # every role that produces evidence, findings, tests or fixes (a list here REPLACES the built-in default: keep it
+      # complete, or leave it out to inherit the catalog's list)
+      independentFromRoles: [executor, test_designer, rca, fixer, metrics_analyst, environment]
       fallback: fail_closed
   condenser:                         # context summaries; a local route keeps them on the machine
     defaultModelPolicy:
@@ -153,12 +155,31 @@ gate:
   requireIndependentReview: true   # without an independent approval the best verdict is \`conditional\`
   failOnUnresolvedSeverity: P1     # unresolved P0/P1 findings fail the gate
   # minCoverage: { lines: 80 }
+  # requireOracle: false           # only to accept a verdict with NO oracle in force (default true: such a run is inconclusive)
+
+# Oracles: what \`correct\` means, decided by a named human, never by an agent. A run that names no oracles pins the
+# ones configured here; without an approved oracle in force the best verdict is \`inconclusive\` (gate criterion C0).
+# An oracle is established once (here or with \`hypertest oracle establish <file> --by <name>\`); later edits of this
+# section never change it: changes go through governed proposals (\`hypertest oracle proposals\` / \`decide\`).
+# oracles:
+#   - oracleId: checkout-contract
+#     establishedBy: alice             # the human authority recorded as the approver
+#     scope: { components: [checkout], description: checkout accepts valid orders and rejects invalid ones }
+#     assertions:
+#       - assertionId: suite-passes
+#         description: every checkout test passes
+#         kind: requirement            # deterministic_invariant | requirement | differential | metamorphic | statistical | llm_semantic
+#         severity: P1                 # P0/P1 assertions are critical; at least one must be deterministic
+#         check: { type: test_outcome, testSelector: "*checkout*", expected: pass }
 
 # BUGate checkout providing the protocol binding (the embedded protocol is used when absent).
 # bugate:
 #   path: ../BUGate
 
-# Sandbox for commands agents run: local processes with a scrubbed environment and loopback-only network.
+# Sandbox for commands agents run: local processes with a scrubbed environment in Linux namespaces (\`hypertest doctor\`
+# checks the host supports them): no network but their own loopback and the registered environments' / allowlisted
+# endpoints on this host (the SUT); keys, the store and other workspaces hidden. \`network: open\` lets commands reach
+# any host (no egress governance); agents otherwise reach networks only through the governed black-box tools.
 sandbox:
   kind: local
   network: loopback

@@ -1,5 +1,8 @@
+import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
+import { parse as parseYaml } from 'yaml';
 import { HypertestError } from '@hypertest/core';
-import type { HypertestInstance } from '@hypertest/app';
+import { oracleConfigProblems, oracleSpecFromConfig, type HypertestInstance, type OracleConfig } from '@hypertest/app';
 import { UsageError, flag, list, positionals, required, str } from '../args.ts';
 import type { Command } from '../command.ts';
 import { withInstance } from '../context.ts';
@@ -14,7 +17,7 @@ const PROPOSAL_STATUSES = ['pending', 'approved', 'rejected'] as const;
  * Marker variable of a Hypertest sandbox. A command an agent runs (`shell.exec` allows `node`) can reach this CLI; a
  * human decision taken from there would let an agent approve its own side effect or oracle change as a "human" (I1, I8)
  * — the API refuses human decisions without a token for the same reason. When the variable is set (non-empty) the
- * decision commands refuse. NOTE: the local sandbox of @hypertest/tools does not set it yet (reported open issue).
+ * decision commands refuse. Both sandboxes of @hypertest/tools (local and OCI) set it in every child process (H1).
  */
 export const SANDBOX_ENV = 'HYPERTEST_SANDBOX';
 
@@ -88,17 +91,61 @@ export const approveCommand: Command = {
   },
 };
 
+/** Reads one oracle (or a list of them) from a YAML/JSON file for `oracle establish`. */
+async function readOracleFile(command: string, cwd: string, file: string): Promise<unknown[]> {
+  let text: string;
+  try {
+    text = await readFile(resolve(cwd, file), 'utf8');
+  } catch (e) {
+    throw new UsageError(`cannot read ${file}: ${(e as Error).message}`, command);
+  }
+  let parsed: unknown;
+  try {
+    parsed = parseYaml(text);
+  } catch (e) {
+    throw new UsageError(`${file} is not valid YAML/JSON: ${(e as Error).message}`, command);
+  }
+  const doc = parsed && typeof parsed === 'object' && !Array.isArray(parsed) && Array.isArray((parsed as { oracles?: unknown }).oracles) ? (parsed as { oracles: unknown[] }).oracles : parsed;
+  return Array.isArray(doc) ? doc : [doc];
+}
+
 export const oracleCommand: Command = {
   name: 'oracle',
-  summary: 'oracle change proposals: list them, or decide one as a human',
-  usage: ['oracle proposals [--run <runId>] [--status s1,s2 | --all] [--json]', 'oracle decide <proposalId> [--reject] --by <name> --reason "<text>"'],
+  summary: 'oracles: establish one as a human authority; list or decide change proposals',
+  usage: [
+    'oracle establish <file.yaml> --by <name>',
+    'oracle proposals [--run <runId>] [--status s1,s2 | --all] [--json]',
+    'oracle decide <proposalId> [--reject] --by <name> --reason "<text>"',
+  ],
   notes: [
+    'Correctness criteria are never decided by agents: an oracle is established by a named human (`establish`, or the `oracles:` configuration section) and a run pins it; without an oracle in force the gate is at best inconclusive (C0).',
     'Agents only propose oracle changes; a change that would flip a recorded failure needs an independent (human) decision (I8).',
-    `\`oracle decide\` is refused (permission_denied) when $${SANDBOX_ENV} is set.`,
+    `\`oracle establish\` and \`oracle decide\` are refused (permission_denied) when $${SANDBOX_ENV} is set.`,
   ],
   options: { reject: { type: 'boolean' }, by: { type: 'string' }, reason: { type: 'string' }, run: { type: 'string' }, status: { type: 'string' }, all: { type: 'boolean' } },
   async run(ctx, values, args) {
     const sub = args[0];
+    if (sub === 'establish') {
+      const [, file] = positionals('oracle', args, ['establish', 'file']);
+      const by = deciderName('oracle', values);
+      assertNotSandboxed(ctx.io.env, 'oracle establish');
+      const docs = (await readOracleFile('oracle', ctx.io.cwd, file!)).map((d) => (d && typeof d === 'object' && !Array.isArray(d) ? { ...(d as Record<string, unknown>), establishedBy: by } : d));
+      const problems = oracleConfigProblems(docs);
+      if (problems.length > 0) throw new UsageError(`invalid oracle file ${file}:\n  - ${problems.join('\n  - ')}`, 'oracle');
+      return withInstance(ctx, { drivesAgents: false }, async ({ ht }) => {
+        const established: Array<{ oracleId: string; revision: number }> = [];
+        for (const o of docs as OracleConfig[]) {
+          if (await ht.services.specs.getOracle(o.oracleId)) {
+            throw new HypertestError('conflict', `oracle ${o.oracleId} already exists: it changes only through governed proposals (oracle proposals / decide)`, { details: { oracleId: o.oracleId } });
+          }
+          const saved = await ht.services.oracles.establish(oracleSpecFromConfig(o), { kind: 'human', id: by }, { runId: `cli-${o.oracleId}`, correlationId: `cli-${o.oracleId}`, actorId: `human:${by}` });
+          established.push({ oracleId: saved.oracleId, revision: saved.revision });
+        }
+        if (ctx.global.json) ctx.json({ established, establishedBy: `human:${by}` });
+        else for (const e of established) ctx.out(`oracle ${e.oracleId} revision ${e.revision} established by human:${by}`);
+        return EXIT_CODES.ok;
+      });
+    }
     if (sub === 'proposals') {
       positionals('oracle', args, ['proposals']);
       const statuses = list(values, 'status');
@@ -122,7 +169,7 @@ export const oracleCommand: Command = {
         return EXIT_CODES.ok;
       });
     }
-    if (sub !== 'decide') throw new UsageError(sub === undefined ? 'missing sub-command (oracle proposals | oracle decide <proposalId>)' : `unknown sub-command oracle ${sub}`, 'oracle');
+    if (sub !== 'decide') throw new UsageError(sub === undefined ? 'missing sub-command (oracle establish <file> | oracle proposals | oracle decide <proposalId>)' : `unknown sub-command oracle ${sub}`, 'oracle');
     const [, proposalId] = positionals('oracle', args, ['decide', 'proposalId']);
     const by = deciderName('oracle', values);
     const reason = required('oracle', values, 'reason');
@@ -133,6 +180,111 @@ export const oracleCommand: Command = {
       const decided = await ht.services.specs.getOracleProposal(proposalId!);
       if (ctx.global.json) ctx.json({ proposalId, status: decided?.status ?? null, runId: decided?.runId ?? null, decidedBy: `human:${by}` });
       else ctx.out(`oracle change proposal ${proposalId} ${decided?.status ?? (approve ? 'approved' : 'rejected')} by human:${by}`);
+      return EXIT_CODES.ok;
+    });
+  },
+};
+
+const EXPERIENCE_STATUSES = ['candidate', 'reviewed', 'approved', 'published', 'quarantined', 'rejected'] as const;
+const EXPERIENCE_DECISIONS = ['review', 'approve', 'publish', 'reject', 'quarantine'] as const;
+
+/**
+ * conformance-13: the human surface of the learning loop. Experience candidates proposed by runs are only ever retrieved
+ * once approved/published; `experience review` is that decision (never by the candidate's creator, never from inside a
+ * sandbox).
+ */
+export const experienceCommand: Command = {
+  name: 'experience',
+  summary: 'experience candidates of the learning loop: list them, or review one as a human',
+  usage: [
+    'experience list [--run <runId>] [--status s1,s2 | --all] [--json]',
+    'experience review <experienceId> --decision review|approve|publish|reject|quarantine --by <name>',
+  ],
+  notes: [
+    'Only approved or published experience is retrieved into later runs. The creator of a candidate can never review it.',
+    `\`experience review\` is refused (permission_denied) when $${SANDBOX_ENV} is set.`,
+  ],
+  options: { run: { type: 'string' }, status: { type: 'string' }, all: { type: 'boolean' }, decision: { type: 'string' }, by: { type: 'string' } },
+  async run(ctx, values, args) {
+    const sub = args[0];
+    if (sub === 'list') {
+      positionals('experience', args, ['list']);
+      const statuses = list(values, 'status');
+      for (const s of statuses) if (!(EXPERIENCE_STATUSES as readonly string[]).includes(s)) throw new UsageError(`--status: unknown experience status ${JSON.stringify(s)} (${EXPERIENCE_STATUSES.join(', ')})`, 'experience');
+      if (statuses.length > 0 && flag(values, 'all')) throw new UsageError('--status and --all are mutually exclusive', 'experience');
+      const filter: { status?: Array<(typeof EXPERIENCE_STATUSES)[number]>; sourceRunId?: string } = {};
+      if (!flag(values, 'all')) filter.status = statuses.length > 0 ? (statuses as Array<(typeof EXPERIENCE_STATUSES)[number]>) : ['candidate', 'reviewed'];
+      const runId = str(values, 'run');
+      if (runId) filter.sourceRunId = runId;
+      return withInstance(ctx, { drivesAgents: false }, async ({ ht }) => {
+        const items = await ht.services.memory.list(filter);
+        if (ctx.global.json) {
+          ctx.json(items);
+          return EXIT_CODES.ok;
+        }
+        if (items.length === 0) {
+          ctx.out(`no ${filter.status ? filter.status.join('/') + ' ' : ''}experience${runId ? ` from run ${runId}` : ''}`);
+          return EXIT_CODES.ok;
+        }
+        const rows = items.map((e) => [e.experienceId, e.status, e.kind, e.sourceRunId, e.createdBy, truncate(e.content, 60)]);
+        for (const l of table(['EXPERIENCE', 'STATUS', 'KIND', 'RUN', 'CREATED BY', 'CONTENT'], rows)) ctx.out(l);
+        return EXIT_CODES.ok;
+      });
+    }
+    if (sub !== 'review') throw new UsageError(sub === undefined ? 'missing sub-command (experience list | experience review <experienceId>)' : `unknown sub-command experience ${sub}`, 'experience');
+    const [, experienceId] = positionals('experience', args, ['review', 'experienceId']);
+    const decision = required('experience', values, 'decision');
+    if (!(EXPERIENCE_DECISIONS as readonly string[]).includes(decision)) throw new UsageError(`--decision must be one of ${EXPERIENCE_DECISIONS.join(', ')} (got ${JSON.stringify(decision)})`, 'experience');
+    const by = deciderName('experience', values);
+    assertNotSandboxed(ctx.io.env, 'experience review');
+    return withInstance(ctx, { drivesAgents: false }, async ({ ht }) => {
+      const cur = (await ht.services.memory.list({})).find((e) => e.experienceId === experienceId);
+      if (!cur) throw new HypertestError('not_found', `experience ${experienceId} not found`);
+      const reviewer = `human:${by}`;
+      const out = await ht.services.memory.review(experienceId!, decision as (typeof EXPERIENCE_DECISIONS)[number], reviewer, { runId: cur.sourceRunId, correlationId: experienceId!, actorId: reviewer });
+      if (ctx.global.json) ctx.json({ experienceId, status: out.status, reviewedBy: reviewer });
+      else ctx.out(`experience ${experienceId} ${out.status} by ${reviewer}`);
+      return EXIT_CODES.ok;
+    });
+  },
+};
+
+/**
+ * conformance-11: a governed waiver of one QualityGate criterion for a run, decided by a named human (an approval of
+ * kind `gate_exception`, requested by `system:cli` and approved by `human:<name>`). The gate applies it at the run's next
+ * evaluation — never for C1 (evidence integrity), never after `--expires`; the decision and the report list it.
+ */
+export const waiveCommand: Command = {
+  name: 'waive',
+  summary: 'waive one quality-gate criterion for a run, as a human (recorded, optionally expiring)',
+  usage: ['waive <runId> <criterionId> --by <name> --reason "<text>" [--expires <ISO-8601 time>]'],
+  notes: [
+    'Applies at the run\'s next gate evaluation (waive before the gate, e.g. while the run is running or paused). C1 evidence_integrity is never waivable.',
+    `Refused (permission_denied) when $${SANDBOX_ENV} is set.`,
+  ],
+  options: { by: { type: 'string' }, reason: { type: 'string' }, expires: { type: 'string' } },
+  async run(ctx, values, args) {
+    const [runId, criterionId] = positionals('waive', args, ['runId', 'criterionId']);
+    if (!/^C[0-9]$/.test(criterionId!)) throw new UsageError(`<criterionId> must be a gate criterion id C0..C9 (got ${JSON.stringify(criterionId)})`, 'waive');
+    if (criterionId === 'C1') throw new UsageError('C1 evidence_integrity is not waivable', 'waive');
+    const by = deciderName('waive', values);
+    const reason = required('waive', values, 'reason');
+    const expires = str(values, 'expires');
+    if (expires !== undefined && !Number.isFinite(Date.parse(expires))) throw new UsageError(`--expires must be an ISO-8601 time (got ${JSON.stringify(expires)})`, 'waive');
+    assertNotSandboxed(ctx.io.env, 'waive');
+    return withInstance(ctx, { drivesAgents: false }, async ({ ht }) => {
+      const run = await ht.services.runs.get(runId!);
+      if (!run) throw new HypertestError('not_found', `run ${runId} not found`);
+      if (run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled') {
+        throw new HypertestError('conflict', `run ${runId} is ${run.status}: its decision is final (a waiver applies at a gate evaluation)`);
+      }
+      const subject: Record<string, string> = { criterionId: criterionId! };
+      if (expires !== undefined) subject['expiresAt'] = new Date(Date.parse(expires)).toISOString();
+      const eventCtx = { runId: runId!, correlationId: runId!, actorId: `human:${by}` };
+      const req = await ht.services.approvals.request({ runId: runId!, kind: 'gate_exception', subject, requestedBy: { kind: 'system', id: 'cli' }, rationale: reason }, eventCtx);
+      await ht.approve(req.approvalId, true, { kind: 'human', id: by }, reason);
+      if (ctx.global.json) ctx.json({ approvalId: req.approvalId, runId, criterionId, expiresAt: subject['expiresAt'] ?? null, approvedBy: `human:${by}` });
+      else ctx.out(`criterion ${criterionId} waived for run ${runId} by human:${by} (approval ${req.approvalId}${subject['expiresAt'] ? `, until ${subject['expiresAt']}` : ''})`);
       return EXIT_CODES.ok;
     });
   },

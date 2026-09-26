@@ -1,15 +1,25 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, relative, sep } from 'node:path';
+import { connect, createServer, type Server, type Socket } from 'node:net';
+import { join, relative, resolve, sep } from 'node:path';
 import { HypertestError } from '@hypertest/core';
 import type { LocalSandboxOptions, OciSandboxOptions, ProcessResult, SandboxProfile, SandboxRunner, WorkspaceHandle } from '../contracts.ts';
 import { DEFAULT_KILL_GRACE_MS, DEFAULT_MAX_OUTPUT_BYTES, spawnProcess } from './process.ts';
 import { confineExisting } from './paths.ts';
+import { networkIsolation, resolveProgram, type IsolationSpec, type NetworkIsolation } from './netns.ts';
 
 /** Variables every sandboxed process gets regardless of the allowlist (values chosen by the sandbox). */
 export const SANDBOX_BASE_ENV = ['PATH', 'HOME', 'LANG', 'TMPDIR'] as const;
+
+/**
+ * Marker every sandboxed process gets (value: the sandbox kind, `local` | `oci`), set LAST so neither the profile's
+ * allowlist nor the caller's `env` can remove or spoof it. Programs that must never act for a sandboxed agent check it —
+ * e.g. the CLI refuses human decisions (`approve`, `oracle decide`) under `$HYPERTEST_SANDBOX`.
+ */
+export const SANDBOX_MARKER_ENV = 'HYPERTEST_SANDBOX';
 
 type RunOptions = Parameters<SandboxRunner['run']>[2];
 
@@ -48,13 +58,25 @@ async function privateHome(ws: WorkspaceHandle): Promise<{ home: string; tmp: st
 /**
  * Local process sandbox: argv (no shell), cwd confined to the workspace root, environment = the profile's
  * allowlisted parent variables + PATH, HOME (a private temp home), LANG, TMPDIR, then the caller's explicit
- * `env` (runner-trusted, never agent input). The parent's secrets are never inherited. Detached process
- * group; timeout ⇒ SIGTERM to the group then SIGKILL after `killGraceMs`; abort honoured; stdout/stderr
- * captured up to `maxOutputBytes` each with truncation flags.
+ * `env` (runner-trusted, never agent input), then `HYPERTEST_SANDBOX=local`. The parent's secrets are never inherited.
+ * Detached process group; timeout ⇒ SIGTERM to the group then SIGKILL after `killGraceMs`; abort honoured;
+ * stdout/stderr captured up to `maxOutputBytes` each with truncation flags.
+ *
+ * Isolation (security-2, H1): unless the workspace's profile says `network: 'open'`, the command runs in fresh user +
+ * network namespaces with nothing but its own loopback (`netns.ts`; the local analogue of the OCI sandbox's
+ * `--network none`): no egress, no host services. Where the host supports the jail strategy it also gets PID + mount
+ * namespaces: a fresh `/proc` (the Hypertest process is invisible), `hiddenPaths` hidden and every other workspace of
+ * `workspacesDir` hidden. A host that cannot isolate the network refuses such profiles (`precondition_failed`) —
+ * never a silent downgrade to the open network.
+ *
+ * NOT a complete file-system boundary: the command runs as the same uid and sees the host file system except what the
+ * jail hides. Agent argv is confined by the tools (`argumentPathDenial`: no `..` escapes, no absolute paths outside
+ * the workspace) as defence in depth; untrusted execution needs the OCI sandbox.
  */
 export function createLocalSandbox(options: LocalSandboxOptions = {}): SandboxRunner {
   const grace = options.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
   const defaultMax = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
+  const isolation = (): Promise<NetworkIsolation> => networkIsolation(options.networkIsolation ?? {});
   return {
     kind: 'local',
     async available() {
@@ -68,6 +90,7 @@ export function createLocalSandbox(options: LocalSandboxOptions = {}): SandboxRu
       }
       const cwd = await sandboxCwd(ws, opts.cwd);
       const { home, tmp, cleanup } = await privateHome(ws);
+      const cleanups: Array<() => Promise<void>> = [];
       try {
         const env: Record<string, string> = {
           ...allowlistedEnv(ws.sandbox),
@@ -76,15 +99,154 @@ export function createLocalSandbox(options: LocalSandboxOptions = {}): SandboxRu
           LANG: process.env['LANG'] ?? 'C.UTF-8',
           TMPDIR: tmp,
           ...(opts.env ?? {}),
+          [SANDBOX_MARKER_ENV]: 'local',
         };
-        const req: Parameters<typeof spawnProcess>[0] = { argv: command, cwd, env, timeoutMs: opts.timeoutMs, signal: opts.signal, maxOutputBytes: opts.maxOutputBytes ?? defaultMax, killGraceMs: grace };
+        let argv = command;
+        const network = ws.sandbox?.network;
+        if (network !== 'open') {
+          // fail closed: every profile but an explicitly open network (and a workspace without a profile) is isolated
+          const iso = await isolation();
+          if (!iso.available) {
+            throw new HypertestError(
+              'precondition_failed',
+              `the local sandbox cannot enforce network '${network ?? 'none'}' for workspace ${ws.workspaceId}: ${iso.reason}. Use the OCI sandbox, or set the sandbox profile's network to 'open' to accept an unrestricted network explicitly`,
+              { details: { workspaceId: ws.workspaceId, network: network ?? null } },
+            );
+          }
+          if (Array.isArray(command) && command.length > 0 && typeof command[0] === 'string') {
+            // a program that cannot be started is reported like an unwrapped spawn (exit 127 + spawnError), without
+            // ever starting it outside the namespace
+            if (!resolveProgram(command[0], env['PATH'], cwd)) return notStarted(command[0]);
+            const spec = isolationSpec(ws, cwd, options);
+            // allowlisted egress (the SUT's loopback endpoints) for every profile but `none` — jail strategy only
+            if (network !== 'none' && network !== undefined && iso.jail && options.egress) {
+              const endpoints = loopbackEndpoints(await options.egress(ws));
+              if (endpoints.length > 0) {
+                const fw = await startEgressForwarders(endpoints);
+                cleanups.push(fw.close);
+                spec.egress = fw.list;
+              }
+            }
+            argv = iso.wrap(command, spec);
+          }
+        }
+        const req: Parameters<typeof spawnProcess>[0] = { argv, cwd, env, timeoutMs: opts.timeoutMs, signal: opts.signal, maxOutputBytes: opts.maxOutputBytes ?? defaultMax, killGraceMs: grace };
         if (opts.stdin !== undefined) req.stdin = opts.stdin;
         return await spawnProcess(req);
       } finally {
+        for (const c of cleanups) await c().catch(() => undefined);
         await cleanup();
       }
     },
   };
+}
+
+/** A loopback endpoint a namespace can be given: bound inside at `bind:port`, served outside by `host:port`. */
+interface LoopbackEndpoint {
+  bind: string;
+  host: string;
+  port: number;
+}
+
+/**
+ * The loopback endpoints among `origins` (`http(s)://host:port` of the registered environments and the operator
+ * allowlist): only this host's loopback can be relayed into a namespace; any other host stays unreachable.
+ */
+export function loopbackEndpoints(origins: readonly string[]): LoopbackEndpoint[] {
+  const out: LoopbackEndpoint[] = [];
+  const add = (e: LoopbackEndpoint) => {
+    if (!out.some((o) => o.bind === e.bind && o.port === e.port)) out.push(e);
+  };
+  for (const o of origins) {
+    let url: URL;
+    try {
+      url = new URL(o);
+    } catch {
+      continue;
+    }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') continue;
+    const port = url.port !== '' ? Number(url.port) : url.protocol === 'https:' ? 443 : 80;
+    const host = url.hostname.replace(/^\[|\]$/g, '');
+    if (host === 'localhost') {
+      add({ bind: '127.0.0.1', host: '127.0.0.1', port });
+      add({ bind: '::1', host: '::1', port });
+    } else if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host) || host === '::1') {
+      add({ bind: host, host, port });
+    }
+  }
+  return out;
+}
+
+/**
+ * Serves each endpoint on a unix socket (a short private directory under the system temp dir, visible inside the jail):
+ * a connection is relayed to the real endpoint. `close()` stops the servers and their connections.
+ */
+async function startEgressForwarders(endpoints: readonly LoopbackEndpoint[]): Promise<{ list: Array<{ host: string; port: number; socket: string }>; close: () => Promise<void> }> {
+  const dir = await mkdtemp(join(tmpdir(), 'hte-'));
+  const servers: Server[] = [];
+  const sockets = new Set<Socket>();
+  const list: Array<{ host: string; port: number; socket: string }> = [];
+  try {
+    for (const [i, e] of endpoints.entries()) {
+      const path = join(dir, `${i}.sock`);
+      const server = createServer((inner) => {
+        const outer = connect({ host: e.host, port: e.port });
+        for (const s of [inner, outer]) {
+          sockets.add(s);
+          s.once('close', () => sockets.delete(s));
+          s.on('error', () => {
+            inner.destroy();
+            outer.destroy();
+          });
+        }
+        inner.pipe(outer);
+        outer.pipe(inner);
+      });
+      await new Promise<void>((resolveListen, rejectListen) => {
+        server.once('error', rejectListen);
+        server.listen(path, () => resolveListen());
+      });
+      servers.push(server);
+      list.push({ host: e.bind, port: e.port, socket: path });
+    }
+  } catch (e) {
+    for (const s of servers) s.close();
+    await rm(dir, { recursive: true, force: true });
+    throw e;
+  }
+  return {
+    list,
+    close: async () => {
+      for (const s of sockets) s.destroy();
+      await Promise.all(servers.map((s) => new Promise<void>((r) => s.close(() => r()))));
+      await rm(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+/**
+ * What the jail hides from one command (H1): the configured `hiddenPaths` (secrets, the store) and every workspace but
+ * the command's own. A hidden path that contains the command's workspace is a configuration error.
+ */
+function isolationSpec(ws: WorkspaceHandle, cwd: string, options: LocalSandboxOptions): IsolationSpec {
+  const inside = (p: string, dir: string) => p === dir || p.startsWith(dir.endsWith(sep) ? dir : dir + sep);
+  const hide = (options.hiddenPaths ?? []).map((p) => resolve(p));
+  for (const h of hide) {
+    for (const p of [ws.root, ws.tempDir]) {
+      if (p !== undefined && inside(resolve(p), h)) {
+        throw new HypertestError('precondition_failed', `sandbox hidden path ${h} contains workspace path ${p}: nothing could run there`, { details: { workspaceId: ws.workspaceId, hiddenPath: h } });
+      }
+    }
+  }
+  const spec: IsolationSpec = { cwd, hide };
+  if (options.workspacesDir !== undefined) spec.privateDir = { dir: resolve(options.workspacesDir), keep: [ws.root, ...(ws.tempDir ? [ws.tempDir] : [])] };
+  return spec;
+}
+
+/** The result of a command whose program does not exist (what `spawnProcess` reports for a failed spawn). */
+function notStarted(program: string): ProcessResult {
+  const code = program.includes('/') && existsSync(program) ? 'EACCES' : 'ENOENT';
+  return { exitCode: 127, signal: null, stdout: '', stderr: `failed to start ${program}: spawn ${program} ${code}`, durationMs: 0, timedOut: false, stdoutTruncated: false, stderrTruncated: false, spawnError: code };
 }
 
 /** Docker `--network` for a profile. Egress allowlists cannot be enforced by plain docker ⇒ `none` (fail closed). */
@@ -200,6 +362,7 @@ export function createOciSandbox(options: OciSandboxOptions): SandboxRunner {
         TMPDIR: ws.tempDir ? join(ws.tempDir, 'tmp') : '/tmp',
         LANG: 'C.UTF-8',
         ...(opts.env ?? {}),
+        [SANDBOX_MARKER_ENV]: 'oci',
       });
       const name = `ht-${randomUUID()}`;
       const argv = buildDockerArgs({ docker, image: options.image, name, ws, cwdRel, env, user: options.user ?? currentUser(), command, interactive: opts.stdin !== undefined });

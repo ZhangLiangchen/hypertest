@@ -5,6 +5,16 @@ and [architecture improvements](../design/architecture-improvements.zh-CN.md). W
 improvements document wins (it revises the selection report). Every package's `src/contracts.ts` is the
 binding ABI; this document explains it.
 
+## Implementation status
+
+This blueprint is normative: it states what Hypertest must be, not what is built today. The current state is recorded
+in [CONFORMANCE.md](CONFORMANCE.md) ([简体中文](CONFORMANCE.zh-CN.md)): one row per requirement of the design sources and
+invariants, with status, code location and known gaps. Of 164 requirements, 108 are implemented, 48 partial, 5 missing
+and 3 deferred. Of the invariants, I2 is partial (work-item capability requirements are not intersected); the others
+are implemented, with limits noted there. Parts of this blueprint that are not built yet include the `runtime-dsh`
+adapter and runtime release states; the context package's vector index exists but the app does not wire it.
+Deployment and recovery procedures are in [OPERATIONS.md](OPERATIONS.md).
+
 ## 1. What we are building
 
 > **Hypertest is a versioned, multi-model, durable and evidence-verifiable autonomous testing system whose

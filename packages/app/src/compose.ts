@@ -1,9 +1,11 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { mkdir } from 'node:fs/promises';
 import { hostname } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 import {
-  HypertestError, UlidIdGenerator, canonicalJson, isHypertestError, jsonLogger, sha256Hex, systemClock, type EventBus, type Logger, type Migration, type SqlDatabase,
+  HypertestError, UlidIdGenerator, canonicalJson, isHypertestError, jsonLogger, sha256Hex, systemClock, type EventBus, type JsonValue, type Logger, type Migration,
+  type SqlDatabase,
 } from '@hypertest/core';
 import { isTerminalRun, type EventContext, type Finding, type RuntimeManifest, type TestRun } from '@hypertest/domain';
 import { migrate, openDatabase } from '@hypertest/store';
@@ -31,7 +33,8 @@ import {
 } from '@hypertest/context';
 import {
   ToolRegistry, builtinSideEffectAdapters, builtinTools, closeBlackboxResources, createEnvironmentRegistry, createLocalSandbox, createOciSandbox,
-  createToolRuntime, createWorkspaceManager, type BuiltinToolOptions, type SandboxProfile, type ToolRuntimeDeps,
+  createSqlEnvironmentRegistry, createToolRuntime, createWorkspaceManager, toolsMigrations, type BuiltinToolOptions, type EnvironmentRegistry, type SandboxProfile,
+  type ToolRuntimeDeps,
 } from '@hypertest/tools';
 import {
   EngineRegistry, NativeEngine, RUNTIME_PACKAGE_VERSION, buildRuntimeManifest, createAgentRepository, createAgentRunner, createEpochManager,
@@ -41,20 +44,23 @@ import { PI_AGENT_CORE_VERSION, PiEngine, RUNTIME_PI_PACKAGE_VERSION } from '@hy
 import { BUILTIN_ROLES, RoleCatalog, type RoleCatalogLike } from '@hypertest/agents';
 import { controlMigrations, createControlPlane, createDomainTools, type ControlConfig, type ControlDeps, type ControlPlane, type StartRunInput } from '@hypertest/control';
 import {
-  LocalDurableRuntime, RESUMABLE_RUN_STATUSES, TemporalDurableRuntime, type DurableHooks, type DurableRuntime, type RunOutcome, type TemporalDurableOptions,
+  DEFAULT_TEMPORAL_NAMESPACE, DEFAULT_TEMPORAL_TASK_QUEUE, LocalDurableRuntime, RESUMABLE_RUN_STATUSES, TemporalDurableRuntime, type DurableHooks, type DurableRuntime,
+  type RunOutcome, type TemporalDurableOptions,
 } from '@hypertest/durable';
 import {
-  DEFAULT_ENV_ALLOWLIST, completeRoute, providerCompatibilityClass, resolveConfigPaths, roleOverrides, validateConfig, validateRunOverrides, withDerivedPaths,
+  DEFAULT_ENV_ALLOWLIST, completeRoute, oracleSpecFromConfig, providerCompatibilityClass, resolveConfigPaths, roleOverrides, validateConfig, validateRunOverrides,
+  withDerivedPaths,
 } from './config.ts';
 import { ENVIRONMENT_STATE_FILE, persistentEnvironmentRegistry, resolveEnvironments } from './environments.ts';
 import { recordedFailureFlipDetector } from './governance.ts';
-import { loadCapabilitySecret, loadSigningKeys } from './keys.ts';
+import { keysDir, loadCapabilitySecret, loadSigningKeys } from './keys.ts';
 import { acquireDirectoryLock, lockFileFor } from './lock.ts';
 import type { HypertestConfig, HypertestInstance, HypertestOverrides, HypertestServices, ProviderConfig } from './contracts.ts';
 
 /** Every migration of the stateful packages, in dependency order (applied idempotently at startup). */
 export const ALL_MIGRATIONS: readonly Migration[] = Object.freeze([
   ...collabMigrations, ...operationMigrations, ...evidenceMigrations, ...policyMigrations, ...contextMigrations, ...runtimeMigrations, ...controlMigrations,
+  ...toolsMigrations,
 ]);
 
 /** Outbox relay poll interval (one relay per database per process). */
@@ -80,6 +86,35 @@ export const HYPERTEST_VERSION: string = (() => {
   return readVersion(new URL('../package.json', import.meta.url)).version ?? '0.0.0';
 })();
 
+const sourceDigests = new Map<string, string>();
+
+/**
+ * conformance-8: sha256 over every file under `<package>/src` of the Hypertest packages (sorted relative paths and their
+ * content digests), so the RuntimeManifest identifies the code, not only its version: a rebuilt Hypertest with changed
+ * gate, scheduler or tool logic at the same version has another manifest and cannot drive the old runs (I11). Cached
+ * per process. `packagesDir` defaults to this installation's packages directory.
+ */
+export function hypertestSourceDigest(packagesDir: string = fileURLToPath(new URL('../../', import.meta.url))): string {
+  const cached = sourceDigests.get(packagesDir);
+  if (cached) return cached;
+  const files: Array<{ rel: string; digest: string }> = [];
+  const walk = (dir: string, rel: string) => {
+    for (const e of readdirSync(dir, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))) {
+      if (e.name === 'node_modules') continue;
+      const p = join(dir, e.name);
+      if (e.isDirectory()) walk(p, `${rel}/${e.name}`);
+      else if (e.isFile()) files.push({ rel: `${rel}/${e.name}`, digest: sha256Hex(readFileSync(p)) });
+    }
+  };
+  for (const pkg of readdirSync(packagesDir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name).sort()) {
+    const src = join(packagesDir, pkg, 'src');
+    if (existsSync(src)) walk(src, `${pkg}/src`);
+  }
+  const digest = sha256Hex(files.map((f) => `${f.rel}\0${f.digest}\n`).join(''));
+  sourceDigests.set(packagesDir, digest);
+  return digest;
+}
+
 function lastId(migrations: readonly Migration[]): string {
   return [...migrations].map((m) => m.id).sort().at(-1) ?? 'none';
 }
@@ -88,9 +123,28 @@ function invalid(message: string, details: Record<string, unknown> = {}): Hypert
   return new HypertestError('invalid_argument', message, { details });
 }
 
-/** Worker identity: stable per host for PGlite (one process per data directory); per process for PostgreSQL. */
+/**
+ * Worker identity: stable per host for PGlite (one process per data directory); per process for PostgreSQL with the
+ * local durable runtime. With Temporal (durability-4) every worker of one deployment shares ONE identity
+ * (`worker:temporal:<namespace>/<taskQueue>`): Temporal schedules a run's tick/turn/observe activities on any of its
+ * workers, and a single run workflow / child workflow per claim already guarantees one driver — a per-process identity
+ * would make every activity that lands on another worker find the run lease, the waiting item's lease or its claim
+ * "owned by someone else" (no-op ticks, lease_lost observations, `no_claim` children, wasted work attempts). Fencing
+ * tokens still separate claims.
+ */
 export function defaultWorkerId(config: HypertestConfig): string {
+  if (config.durable.kind === 'temporal') return `worker:temporal:${config.durable.namespace ?? DEFAULT_TEMPORAL_NAMESPACE}/${config.durable.taskQueue ?? DEFAULT_TEMPORAL_TASK_QUEUE}`;
   return config.store.kind === 'pglite' ? `worker:${hostname()}` : `worker:${hostname()}:${process.pid}`;
+}
+
+/**
+ * (durability-6) The Temporal task queue of a runtime manifest: `<configured queue>@<manifest digest prefix>`. Workers
+ * poll only their own manifest's queue and runs are started on the queue of the manifest they are pinned to (I11), so a
+ * rolling upgrade or two differently configured workers never receive each other's activities (a pin refusal would fail
+ * the run workflow instead).
+ */
+export function manifestTaskQueue(taskQueue: string, manifestId: string): string {
+  return `${taskQueue}@${manifestId.replace(/^rm_/, '').slice(0, 16)}`;
 }
 
 // ------------------------------------------------------------------------------------------------ models
@@ -204,7 +258,37 @@ function openArtifacts(config: HypertestConfig, env: Record<string, string | und
   return new S3ArtifactStore(options);
 }
 
-function policyEngine(config: HypertestConfig, capabilitySecret: string, deps: { clock: typeof systemClock; newId: () => string }): PolicyEngine {
+/**
+ * conformance-12: the revision of the policies an OPA server serves for the decision path — `opa:<path>@<sha256 of the
+ * policy modules (id + source) of that package subtree, 16 hex>` from its policy API (`GET /v1/policies`) — so a changed
+ * policy is a changed policyRevision and
+ * RuntimeManifest. An OPA server that cannot list its policies yields `opa:<path>@unverified` (logged): the decisions
+ * still fail closed on OPA errors, and the manifest says the policy content is unknown.
+ */
+export async function opaPolicyRevision(url: string, path: string, options: { fetch?: typeof fetch; timeoutMs?: number; logger?: Logger } = {}): Promise<string> {
+  const doFetch = options.fetch ?? fetch;
+  try {
+    const res = await doFetch(`${url.replace(/\/+$/, '')}/v1/policies`, { signal: AbortSignal.timeout(options.timeoutMs ?? 2000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const body = (await res.json()) as { result?: Array<{ id?: unknown; raw?: unknown }> };
+    if (!Array.isArray(body.result)) throw new Error('no result list');
+    // the modules of the decision's package subtree (another tenant's policies on a shared server do not count)
+    const pkg = path.replace(/^\/+|\/+$/g, '').replace(/\//g, '.');
+    const modules = body.result
+      .map((m) => ({ id: String(m.id ?? ''), raw: String(m.raw ?? '') }))
+      .filter((m) => {
+        const declared = /^\s*package\s+([A-Za-z0-9_.]+)/m.exec(m.raw)?.[1];
+        return declared !== undefined && (declared === pkg || declared.startsWith(`${pkg}.`));
+      })
+      .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    return `opa:${path}@${sha256Hex(canonicalJson(modules)).slice(0, 16)}`;
+  } catch (e) {
+    options.logger?.warn('OPA policies could not be listed: the policy revision is unverified', { url, error: (e as Error).message });
+    return `opa:${path}@unverified`;
+  }
+}
+
+async function policyEngine(config: HypertestConfig, capabilitySecret: string, deps: { clock: typeof systemClock; newId: () => string; logger: Logger }): Promise<PolicyEngine> {
   const rules = [...DEFAULT_POLICY_RULES, ...(config.policy?.rules ?? [])];
   const builtin = new BuiltinPolicyEngine(rules, `builtin:${sha256Hex(canonicalJson(rules)).slice(0, 16)}`, { clock: deps.clock, capabilitySecret, newId: deps.newId });
   const opa = config.policy?.opa;
@@ -213,13 +297,47 @@ function policyEngine(config: HypertestConfig, capabilitySecret: string, deps: {
   const engine = new OpaPolicyEngine({
     url: opa.url,
     path,
-    revision: `opa:${path}`,
+    revision: await opaPolicyRevision(opa.url, path, { logger: deps.logger, ...(opa.timeoutMs !== undefined ? { timeoutMs: opa.timeoutMs } : {}) }),
     clock: deps.clock,
     capabilitySecret,
     newId: deps.newId,
     ...(opa.timeoutMs !== undefined ? { timeoutMs: opa.timeoutMs } : {}),
   });
   return new CompositePolicyEngine([builtin, engine], { newId: deps.newId });
+}
+
+/**
+ * security-2: the origins a command agents run may reach from the sandbox (its `loopback` / `egress_allowlist` profile):
+ * the registered environments' base URLs (the systems under test) and the operator's http allowlist entries that are
+ * URLs. The local sandbox relays only this host's loopback endpoints among them; nothing else is reachable.
+ */
+export function sandboxEgressOrigins(environments: Pick<EnvironmentRegistry, 'list'>, httpAllowlist: readonly string[] | undefined): string[] {
+  const out = new Set<string>();
+  for (const e of environments.list()) if (e.baseUrl) out.add(e.baseUrl);
+  for (const a of httpAllowlist ?? []) if (/^https?:\/\//.test(a)) out.add(a);
+  return [...out];
+}
+
+/**
+ * H1: what the local sandbox hides from the commands agents run (enforced by its jail where the host supports it): the
+ * signing keys and capability secret, the embedded store, the evidence artifacts and the runtime state. A configured
+ * path that contains the workspaces directory cannot be hidden (nothing could run) and is reported, never silently
+ * dropped.
+ */
+export function sandboxHiddenPaths(config: HypertestConfig, dataDir: string, stateDir: string, logger?: Logger): string[] {
+  const workspacesDir = resolve(join(dataDir, 'workspaces'));
+  const candidates = [keysDir(dataDir), stateDir];
+  if (config.store.kind === 'pglite' && config.store.dataDir) candidates.push(config.store.dataDir);
+  if (config.artifacts?.kind === 'fs' && config.artifacts.root) candidates.push(config.artifacts.root);
+  const out: string[] = [];
+  for (const c of candidates.map((p) => resolve(p))) {
+    if (workspacesDir === c || workspacesDir.startsWith(c.endsWith(sep) ? c : c + sep)) {
+      logger?.warn('sandbox: a path holding the workspaces cannot be hidden from sandboxed commands', { path: c, workspacesDir });
+      continue;
+    }
+    if (!out.includes(c)) out.push(c);
+  }
+  return out;
 }
 
 /** The local sandbox profile: loopback network, minimal environment allowlist, merged with `config.sandbox`. */
@@ -250,11 +368,11 @@ function cachedRetrievers(logger: Logger): (root: string) => Retriever {
 }
 
 /** The durable runtime of the configuration: LocalDurableRuntime (in-process) or TemporalDurableRuntime. */
-function createDurable(config: HypertestConfig, base: { control: ControlPlane; listRuns: () => Promise<TestRun[]> } & DurableHooks): DurableRuntime {
+function createDurable(config: HypertestConfig, base: { control: ControlPlane; listRuns: () => Promise<TestRun[]> } & DurableHooks, manifestId: string): DurableRuntime {
   if (config.durable.kind === 'temporal') {
     const options: TemporalDurableOptions = { ...base, address: config.durable.address };
     if (config.durable.namespace) options.namespace = config.durable.namespace;
-    if (config.durable.taskQueue) options.taskQueue = config.durable.taskQueue;
+    options.taskQueue = manifestTaskQueue(config.durable.taskQueue ?? DEFAULT_TEMPORAL_TASK_QUEUE, manifestId);
     if (config.durable.workerMode) options.workerMode = config.durable.workerMode;
     return new TemporalDurableRuntime(options);
   }
@@ -316,11 +434,11 @@ export function pinnedControlPlane(control: ControlPlane, manifestId: string, lo
     }
     await assertRun(runId);
   }
-  return {
+  const pinned: ControlPlane = {
     ...control,
-    async tick(runId) {
+    async tick(runId, options) {
       await assertRun(runId);
-      return control.tick(runId);
+      return control.tick(runId, options);
     },
     async recover(runId, signal) {
       await assertRun(runId);
@@ -335,6 +453,14 @@ export function pinnedControlPlane(control: ControlPlane, manifestId: string, lo
       return control.observeWaiting(workItemId, signal);
     },
   };
+  const renew = control.renewClaim;
+  if (renew) {
+    pinned.renewClaim = async (workItemId, fencingToken) => {
+      await assertWork(workItemId);
+      return renew.call(control, workItemId, fencingToken);
+    };
+  }
+  return pinned;
 }
 
 /**
@@ -448,11 +574,15 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
     // ---- external world (operation) + environments (generations persisted: a restart never forgets a deploy)
     const stateDir = join(dataDir, 'state');
     await mkdir(stateDir, { recursive: true, mode: 0o700 });
-    const environments = persistentEnvironmentRegistry(
-      createEnvironmentRegistry([...resolveEnvironments(config.environments ?? [], env, logger), ...(overrides.environments ?? [])]),
-      join(stateDir, ENVIRONMENT_STATE_FILE),
-      logger,
-    );
+    const configuredEnvironments = [...resolveEnvironments(config.environments ?? [], env, logger), ...(overrides.environments ?? [])];
+    // H12: workers sharing one PostgreSQL store share the generations (and bumps by operation) in SQL — a worker never
+    // validates freshness against a generation another worker already bumped; the embedded store keeps its state file
+    const environments: EnvironmentRegistry =
+      config.store.kind === 'postgres'
+        ? await createSqlEnvironmentRegistry({ db, clock, logger: logger.child({ component: 'environments' }) }, configuredEnvironments)
+        : persistentEnvironmentRegistry(createEnvironmentRegistry(configuredEnvironments), join(stateDir, ENVIRONMENT_STATE_FILE), logger);
+    const flushEnvironments = (environments as { flush?: () => Promise<void> }).flush;
+    if (flushEnvironments) pending.push({ name: 'environments', close: () => flushEnvironments.call(environments) });
     const ledger = createOperationLedger({ ...base, db, events });
     const leases = createLeaseService({ ...base, db, events });
     const adapters = new AdapterRegistry(builtinSideEffectAdapters({ stateDir, environments }));
@@ -462,7 +592,7 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
     const budget = createBudgetLedger({ ...base, db, events });
 
     // ---- governance
-    const policy = policyEngine(config, capabilitySecret, { clock, newId: () => ids.next('pdec') });
+    const policy = await policyEngine(config, capabilitySecret, { clock, newId: () => ids.next('pdec'), logger });
     const decisionLog = createPolicyDecisionLog({ ...base, db, events });
     const approvals = createApprovalService({ ...base, db, events });
     // SpecRepository.saveOracleProposal already emits oracle.change_* events: no `events` here (no double emission)
@@ -476,8 +606,26 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
         findings: (runId) => blackboard.query<Finding>({ runId, recordType: 'finding', includeSuperseded: true }),
         getEvidence: (ids) => evidence.getMany(ids),
         testResults: (runId) => evidence.query({ runId, evidenceType: 'test-result' }),
+        // H8: every recorded evidence type, judged by the QualityGate's own evaluator
+        evidence: (runId) => evidence.query({ runId }),
       }),
     });
+    // conformance-1: configured oracles are established by their named human authority (an existing oracle is kept: it
+    // changes only through governed proposals); runs started without explicit oracleIds pin them
+    const configuredOracleIds: string[] = [];
+    for (const o of config.oracles ?? []) {
+      configuredOracleIds.push(o.oracleId);
+      const existing = await specs.getOracle(o.oracleId);
+      if (existing) {
+        if (canonicalJson(existing.assertions as unknown as JsonValue) !== canonicalJson(o.assertions as unknown as JsonValue)) {
+          logger.warn('a configured oracle differs from the established one; the established revision stays in force (oracles change only through governed proposals: hypertest oracle proposals / decide)', {
+            oracleId: o.oracleId, revision: existing.revision,
+          });
+        }
+        continue;
+      }
+      await oracles.establish(oracleSpecFromConfig(o), { kind: 'human', id: o.establishedBy }, { runId: `config-${o.oracleId}`, correlationId: `config-${o.oracleId}`, actorId: `human:${o.establishedBy}` });
+    }
     const protocol = await resolveProtocolBinding(config.bugate?.path ? { bugatePath: config.bugate.path } : {});
 
     // ---- models
@@ -487,7 +635,8 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
     // ---- context engine
     const snapshots = createSnapshotStore({ ...base, db, events });
     const resolvers = createResolverRegistry([
-      environmentResolver((id) => environments.get(id)),
+      // the authoritative generation (the shared store when the registry has one: H12), not this process's view
+      environmentResolver((id) => (environments.load ? environments.load(id) : environments.get(id))),
       oracleResolver((id) => specs.getOracle(id)),
       experimentResolver((id) => specs.getExperiment(id)),
       recordResolver((lineage) => blackboard.head(lineage)),
@@ -519,8 +668,12 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
 
     // ---- tools
     const profile = sandboxProfile(config);
-    const workspaces = createWorkspaceManager({ ...base, baseDir: join(dataDir, 'workspaces'), defaultSandbox: profile });
-    const sandbox = profile.kind === 'oci' ? createOciSandbox({ image: profile.image! }) : createLocalSandbox();
+    const workspacesDir = join(dataDir, 'workspaces');
+    const workspaces = createWorkspaceManager({ ...base, baseDir: workspacesDir, defaultSandbox: profile });
+    const sandbox =
+      profile.kind === 'oci'
+        ? createOciSandbox({ image: profile.image! })
+        : createLocalSandbox({ hiddenPaths: sandboxHiddenPaths(config, dataDir, stateDir, logger), workspacesDir, egress: () => sandboxEgressOrigins(environments, config.tools?.httpAllowlist) });
     const toolOptions: BuiltinToolOptions = { sandbox, workspaces, stateDir };
     if (config.tools?.shellAllowlist) toolOptions.shellAllowlist = [...config.tools.shellAllowlist];
     if (config.tools?.httpAllowlist) toolOptions.httpAllowlist = [...config.tools.httpAllowlist];
@@ -594,7 +747,7 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
     }
     const manifest = buildRuntimeManifest(
       {
-        hypertest: { version: HYPERTEST_VERSION },
+        hypertest: { version: HYPERTEST_VERSION, sourceDigest: hypertestSourceDigest() },
         agentEngines: engines.manifestEntries(),
         providerAdapters: [...providers.adapters(), ...engineAdapters],
         modelCatalogRevision: catalog.revision,
@@ -634,7 +787,7 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
         return claim && claim.ownerId === workerId ? claim.fencingToken : undefined;
       },
       logger: logger.child({ component: 'durable' }),
-    });
+    }, manifest.manifestId);
     pending.push({ name: 'durable', close: () => durable.shutdown() });
 
     const services: HypertestServices = {
@@ -693,8 +846,10 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
         const overrideErrors = validateRunOverrides({ budget: runInput?.budget, gate: runInput?.gate });
         if (overrideErrors.length > 0) throw new HypertestError('invalid_argument', `invalid run overrides:\n  - ${overrideErrors.join('\n  - ')}`, { details: { errors: overrideErrors } });
         await preflight();
+        // conformance-1: a run without explicit oracles pins the configured ones (the gate's C0 needs an oracle in force)
+        const input: StartRunInput = runInput && runInput.oracleIds === undefined && configuredOracleIds.length > 0 ? { ...runInput, oracleIds: [...configuredOracleIds] } : runInput;
         // startRun is idempotent for an existing runId: never drive a run created by another runtime (I11)
-        const run = await control.startRun(runInput, { actorId: 'system:app' });
+        const run = await control.startRun(input, { actorId: 'system:app' });
         if (run.runtimeManifestId !== manifest.manifestId && !isTerminalRun(run.status)) throw pinViolation(run, manifest.manifestId);
         try {
           await durable.startRun(run.runId);

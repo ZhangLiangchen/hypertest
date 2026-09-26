@@ -570,3 +570,35 @@ describe('TemporalDurableRuntime (Temporal server)', { concurrency: false }, () 
     }
   });
 });
+
+describe('durability-5: the agent-turn activity bound is the runtime\'s (long tools finish; liveness is the heartbeat)', { concurrency: false }, () => {
+  test('the default bound exceeds the longest tool timeouts; a turn longer than a configured bound is cut, one within it completes', temporal, async () => {
+    const { DEFAULT_TURN_ACTIVITY_TIMEOUT_MS } = await import('../src/temporal/workflows.ts');
+    // test.run ≤ 1 h, mutation.run ≤ 2 h per call: the old fixed 10-minute bound cut every longer turn
+    assert.ok(DEFAULT_TURN_ACTIVITY_TIMEOUT_MS >= 2 * 60 * 60 * 1000 + 10 * 60 * 1000, `default ${DEFAULT_TURN_ACTIVITY_TIMEOUT_MS} ms`);
+    for (const [bound, expectDone] of [[1000, false], [20_000, true]] as const) {
+      const s = unique();
+      const runId = `run_${s}`;
+      const store = new MemoryWorld();
+      await addRun(store, runId, [{ workItemId: `wi_${s}`, turns: 1 }]);
+      // every turn takes 2.5 s of work (heartbeating meanwhile)
+      const control = new FakeControl({ instance: 'p1', store, turnMs: 2500 });
+      const rt = newRuntime(control, `ht-dur5-${s}`, { turnTimeoutMs: bound });
+      try {
+        await rt.startRun(runId);
+        track(runId, control);
+        if (expectDone) {
+          const outcome = await rt.awaitCompletion(runId, { timeoutMs: 60_000 });
+          assert.equal(outcome.status, 'completed', `bound ${bound} ms`);
+        } else {
+          // every attempt is cut at 1 s: the turn never commits (the child gives up after its retry policy)
+          await until(async () => control.callsOf('executeTurn').length >= 2, 60_000);
+          const world = await store.read();
+          assert.deepEqual(turnsOf(world, `wi_${s}`), [], 'no attempt within a 1 s bound could finish a 2.5 s turn');
+        }
+      } finally {
+        await rt.shutdown();
+      }
+    }
+  });
+});

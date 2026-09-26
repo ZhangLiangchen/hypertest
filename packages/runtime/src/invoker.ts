@@ -214,6 +214,14 @@ export function createModelInvoker(deps: InvokerDeps): ModelInvoker {
 
       if (outcome.ok) {
         const usage = outcome.response.usage;
+        if (outcome.auditPending) {
+          // The router could not append model.invoked after the provider answered (retried already). The call is paid:
+          // keep the response and settle its usage below (durability-10); the gap in L0 is logged loudly here.
+          logger.error('model.invoked audit event missing for a paid call; response kept and usage settled', {
+            routeId: outcome.routeId, turn: request.turn, code: outcome.auditPending.code, error: outcome.auditPending.message,
+            inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
+          });
+        }
         if (deps.budget && reservationId !== undefined) {
           const actual: { tokens: number; costUsd?: number } = { tokens: usage.inputTokens + usage.outputTokens };
           if (usage.costUsd !== undefined) actual.costUsd = usage.costUsd;

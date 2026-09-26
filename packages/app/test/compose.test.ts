@@ -12,8 +12,9 @@ import type { ControlPlane } from '@hypertest/control';
 import type { TestRun } from '@hypertest/domain';
 import { splitControlTarget } from '@hypertest/tools';
 import {
-  buildCatalog, createHypertest, defaultConfig, defaultWorkerId, lockFileFor, pinnedControlPlane, roleOverrides, sandboxProfile, type HypertestConfig,
+  buildCatalog, createHypertest, defaultConfig, hypertestSourceDigest, opaPolicyRevision, defaultWorkerId, lockFileFor, manifestTaskQueue, pinnedControlPlane, roleOverrides, sandboxProfile, type HypertestConfig,
 } from '../src/index.ts';
+import { scriptedConfig } from './helpers.ts';
 
 function cfg(models: HypertestConfig['models'], extra: Partial<HypertestConfig> = {}): HypertestConfig {
   return { ...defaultConfig(), models, ...extra };
@@ -89,6 +90,36 @@ describe('role overrides', () => {
     assert.deepEqual(sandboxProfile(defaultConfig({ sandbox: { network: 'none' } })).network, 'none');
     assert.equal(defaultWorkerId(defaultConfig()), `worker:${hostname()}`);
     assert.equal(defaultWorkerId(defaultConfig({ store: { kind: 'postgres', urlEnv: 'X' } })), `worker:${hostname()}:${process.pid}`);
+    // durability-4: every Temporal worker of one deployment is ONE identity (activities land on any of them)
+    const temporal = defaultConfig({ store: { kind: 'postgres', urlEnv: 'X' }, durable: { kind: 'temporal', address: '127.0.0.1:7233', namespace: 'ns', taskQueue: 'q' } });
+    assert.equal(defaultWorkerId(temporal), 'worker:temporal:ns/q');
+    assert.ok(!defaultWorkerId(temporal).includes(String(process.pid)), 'never the process id');
+    assert.equal(defaultWorkerId(defaultConfig({ durable: { kind: 'temporal', address: '127.0.0.1:7233' } })), 'worker:temporal:default/hypertest');
+  });
+
+  test('durability-6: the Temporal task queue is scoped to the runtime manifest (workers of another manifest never get its activities)', async () => {
+    assert.equal(manifestTaskQueue('hypertest', 'rm_0123456789abcdef0123'), 'hypertest@0123456789abcdef');
+    const dir = await tempDir('ht-app-queue-');
+    try {
+      const base = { durable: { kind: 'temporal' as const, address: '127.0.0.1:1', taskQueue: 'q', workerMode: 'external' as const } };
+      const a = await createHypertest(scriptedConfig(join(dir.path, 'a'), base), { scriptedBrains: { sim: () => ({ text: 'x' }) }, logger: new MemoryLogger() });
+      const b = await createHypertest(
+        scriptedConfig(join(dir.path, 'b'), { ...base, policy: { rules: [{ id: 'site.extra', description: 'another bundle', match: { effects: ['read'] }, decision: 'allow' }] } }),
+        { scriptedBrains: { sim: () => ({ text: 'x' }) }, logger: new MemoryLogger() },
+      );
+      try {
+        const queueOf = (ht: typeof a) => (ht.durable as unknown as { taskQueue: string }).taskQueue;
+        assert.equal(queueOf(a), manifestTaskQueue('q', a.manifest.manifestId));
+        assert.notEqual(a.manifest.manifestId, b.manifest.manifestId);
+        assert.notEqual(queueOf(a), queueOf(b), 'another manifest ⇒ another queue');
+        assert.equal(a.services.workerId, 'worker:temporal:default/q');
+      } finally {
+        await a.close();
+        await b.close();
+      }
+    } finally {
+      await dir.cleanup();
+    }
   });
 });
 
@@ -265,6 +296,85 @@ describe('createHypertest: embedded store ownership and durable environments', (
       assert.deepEqual([shop.generation, shop.buildDigest], [2, 'build-2'], 'the deploy is not forgotten: pre-deploy snapshots stay stale');
     } finally {
       await second.close();
+    }
+  });
+});
+
+describe('conformance-8: the RuntimeManifest identifies the code', () => {
+  test('the source digest changes with any source file (content, new file) and is pinned in the manifest', async () => {
+    const dir = await tempDir('ht-app-srcdigest-');
+    try {
+      const pkgs = join(dir.path, 'packages');
+      await mkdir(join(pkgs, 'gate', 'src', 'sub'), { recursive: true });
+      await mkdir(join(pkgs, 'gate', 'test'), { recursive: true });
+      await writeFile(join(pkgs, 'gate', 'src', 'gate.ts'), 'export const threshold = 1;\n');
+      await writeFile(join(pkgs, 'gate', 'test', 'x.test.ts'), 'test\n');
+      const d1 = hypertestSourceDigest(pkgs);
+      assert.match(d1, /^[0-9a-f]{64}$/);
+      // another copy (the cache is per directory) with one changed byte in the gate logic
+      const other = join(dir.path, 'other');
+      await mkdir(join(other, 'gate', 'src', 'sub'), { recursive: true });
+      await writeFile(join(other, 'gate', 'src', 'gate.ts'), 'export const threshold = 2;\n');
+      assert.notEqual(hypertestSourceDigest(other), d1, 'changed code at the same version is another runtime');
+      const third = join(dir.path, 'third');
+      await mkdir(join(third, 'gate', 'src', 'sub'), { recursive: true });
+      await writeFile(join(third, 'gate', 'src', 'gate.ts'), 'export const threshold = 1;\n');
+      assert.equal(hypertestSourceDigest(third), d1, 'tests and other files outside src do not count; the same sources give the same digest');
+      await writeFile(join(third, 'gate', 'src', 'sub', 'extra.ts'), 'export {};\n');
+      const fourth = join(dir.path, 'fourth');
+      await mkdir(join(fourth, 'gate', 'src', 'sub'), { recursive: true });
+      await writeFile(join(fourth, 'gate', 'src', 'gate.ts'), 'export const threshold = 1;\n');
+      await writeFile(join(fourth, 'gate', 'src', 'sub', 'extra.ts'), 'export {};\n');
+      assert.notEqual(hypertestSourceDigest(fourth), d1, 'a new source file changes it');
+      // the composed runtime pins this installation's digest
+      const ht = await createHypertest(defaultConfig({ project: { name: 'd', dataDir: join(dir.path, 'data') }, models: { providers: [{ id: 'sim', kind: 'scripted' }], routes: [] } } as never), { scriptedBrains: { sim: () => ({ text: 'unused' }) }, logger: new MemoryLogger() });
+      try {
+        assert.equal(ht.manifest.hypertest.sourceDigest, hypertestSourceDigest());
+        assert.match(ht.manifest.hypertest.sourceDigest!, /^[0-9a-f]{64}$/);
+      } finally {
+        await ht.close();
+      }
+    } finally {
+      await dir.cleanup();
+    }
+  });
+});
+
+describe('conformance-12: the OPA policy revision is the content of the served policies', () => {
+  test('a changed module of the decision package changes the revision; another package does not; an unlistable server is unverified', async () => {
+    const { createServer } = await import('node:http');
+    let modules: Array<{ id: string; raw: string }> = [
+      { id: 'authz.rego', raw: 'package hypertest.authz\n\ndefault allow := false\n' },
+      { id: 'other.rego', raw: 'package tenant.other\n\nallow := true\n' },
+    ];
+    let status = 200;
+    const server = createServer((req, res) => {
+      if (req.url === '/v1/policies' && status === 200) {
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ result: modules }));
+      } else {
+        res.statusCode = status === 200 ? 404 : status;
+        res.end('{}');
+      }
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+    const url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    try {
+      const r1 = await opaPolicyRevision(url, 'hypertest/authz');
+      assert.match(r1, /^opa:hypertest\/authz@[0-9a-f]{16}$/);
+      modules = [modules[0]!, { id: 'other.rego', raw: 'package tenant.other\n\nallow := false\n' }];
+      assert.equal(await opaPolicyRevision(url, 'hypertest/authz'), r1, 'another package on a shared server does not count');
+      modules = [{ id: 'authz.rego', raw: 'package hypertest.authz\n\ndefault allow := true\n' }, modules[1]!];
+      assert.notEqual(await opaPolicyRevision(url, 'hypertest/authz'), r1, 'a changed policy is a changed revision');
+      modules = [...modules, { id: 'authz_sub.rego', raw: 'package hypertest.authz.helpers\n\nx := 1\n' }];
+      const withSub = await opaPolicyRevision(url, '/hypertest/authz/');
+      assert.notEqual(withSub, r1);
+      status = 403;
+      const logger = new MemoryLogger();
+      assert.equal(await opaPolicyRevision(url, 'hypertest/authz', { logger }), 'opa:hypertest/authz@unverified');
+      assert.ok(logger.entries.some((e) => e.level === 'warn'));
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
     }
   });
 });

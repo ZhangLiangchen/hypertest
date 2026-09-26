@@ -197,7 +197,12 @@ export interface PolicyDecisionLog {
 export interface ApprovalRequest {
   approvalId: string;
   runId: string;
-  kind: 'action' | 'oracle_change' | 'test_change' | 'budget' | 'manual_review';
+  /**
+   * `gate_exception` (additive, conformance-11): a waiver of one QualityGate criterion for the run — subject
+   * `{ criterionId, expiresAt? }`. Only an approved one decided by a human/system actor is applied (never C1, never
+   * expired; the gate enforces it).
+   */
+  kind: 'action' | 'oracle_change' | 'test_change' | 'budget' | 'manual_review' | 'gate_exception';
   subject: JsonValue;
   requestedBy: ActorRef;
   status: 'pending' | 'approved' | 'denied' | 'expired';
@@ -324,6 +329,12 @@ export interface GateInput {
   /** Additive: QualityDecision.revision / supersedes (default 1 / none). */
   revision?: number;
   supersedes?: string;
+  /**
+   * (additive, conformance-4) The latest APPROVED revision of each oracle the run pins, when it is newer than the pinned
+   * one: a pinned revision below it was superseded during the run, and C0 is unknown (the verdict would rest on a
+   * replaced criterion).
+   */
+  currentOracleRevisions?: Record<string, number>;
 }
 
 // ----------------------------------------------------------------------------- BUGate protocol

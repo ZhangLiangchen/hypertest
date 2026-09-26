@@ -145,7 +145,18 @@ export const FULL_ROUTE = {
   maxActionRisk: 'critical',
 } as const;
 
-/** defaultConfig over `dataDir` with one scripted provider `sim` and one route `sim-large`. */
+/**
+ * The sum module's correctness criterion (conformance-1: a run is judged against an oracle in force): every case of the
+ * suite passes. Established by a named human through the configuration.
+ */
+export const SUM_ORACLE = {
+  oracleId: 'sum-contract',
+  scope: { components: ['sum'], description: 'the sum module adds numbers' },
+  assertions: [{ assertionId: 'suite-passes', description: 'every case of the sum suite passes', kind: 'requirement', severity: 'P1', check: { type: 'test_outcome', testSelector: '*', expected: 'pass' } }],
+  establishedBy: 'alice',
+} as const;
+
+/** defaultConfig over `dataDir` with one scripted provider `sim`, one route `sim-large` and the sum oracle. */
 export function scriptedConfig(dataDir: string, extra: HypertestConfigInput = {}): HypertestConfig {
   return defaultConfig({
     project: { name: 'app-test', dataDir },
@@ -154,6 +165,7 @@ export function scriptedConfig(dataDir: string, extra: HypertestConfigInput = {}
       routes: [{ routeId: 'sim-large', provider: 'sim', model: 'sim-1', ...FULL_ROUTE, capabilities: [...FULL_ROUTE.capabilities], quality: { ...FULL_ROUTE.quality } }],
     },
     observability: { logLevel: 'warn' },
+    oracles: [SUM_ORACLE],
     ...extra,
   } as HypertestConfigInput);
 }

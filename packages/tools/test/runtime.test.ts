@@ -5,6 +5,7 @@ import type { DomainEvent } from '@hypertest/domain';
 import { BuiltinPolicyEngine, DEFAULT_POLICY_RULES, createRootCapability, type ActionRequest, type PolicyEngine } from '@hypertest/policy';
 import { DEFAULT_MAX_INLINE_BYTES, SIDE_EFFECT_SETTLE_MS, ToolRegistry, createToolRuntime, redactSecrets, type FreshnessPort, type ToolSpec, type WorkspaceHandle } from '../src/index.ts';
 import { AGENT, FAR, FakeLoadAdapter, RUN, SECRET, WORK, capability, gatewayFor, openToolEnv, request, runtimeFor, snapshot, type ToolEnv } from './helpers.ts';
+import { createLeaseService } from '@hypertest/operation';
 
 let env: ToolEnv;
 let ws: WorkspaceHandle;
@@ -13,6 +14,7 @@ const calls = new Map<string, number>();
 const bump = (id: string) => calls.set(id, (calls.get(id) ?? 0) + 1);
 const count = (id: string) => calls.get(id) ?? 0;
 let slowAborted = false;
+const seenCtx: Array<{ claim?: unknown; leaseOwner?: string }> = [];
 
 const obj = (props: Record<string, unknown>, required: string[] = []) => ({ type: 'object', additionalProperties: false, properties: props, required });
 
@@ -90,6 +92,39 @@ function specs(): ToolSpec[] {
       execute: async (input: { path: string }) => {
         bump('t.write');
         return { status: 'success', text: 'written', structured: { path: input.path } };
+      },
+    },
+    {
+      id: 't.poke',
+      title: 'poke',
+      description: 'an external effect WITHOUT a side-effect adapter (like http.request POST, browser.click, mcp.*)',
+      inputSchema: obj({ target: { type: 'string' }, fail: { type: 'string' }, hang: { type: 'boolean' } }, ['target']),
+      effect: 'external',
+      riskClass: 'medium',
+      timeoutMs: 5000,
+      environmentClass: () => 'local',
+      resources: (input: { target: string }) => [`env/${input.target}`],
+      execute: async (input: { target: string; fail?: string; hang?: boolean }, ctx) => {
+        bump(`t.poke:${input.target}`);
+        if (input.hang) await sleep(60_000, ctx.signal);
+        if (input.fail === 'hypertest') throw new HypertestError('unavailable', 'the target answered 503');
+        const ev = await ctx.recordEvidence({ evidenceType: 'api-response', data: `poked ${input.target}`, mimeType: 'text/plain', summary: 'poke' });
+        return { status: 'success', structured: { poked: input.target, n: count(`t.poke:${input.target}`) }, text: `poked ${input.target}`, evidenceRefs: [ev.evidenceId] };
+      },
+    },
+    {
+      id: 't.record',
+      title: 'record',
+      description: 'a tool that records effects itself (like a blackboard write)',
+      inputSchema: obj({ note: { type: 'string' } }),
+      effect: 'record',
+      riskClass: 'low',
+      timeoutMs: 5000,
+      resources: () => [`run/${RUN}/notes`],
+      execute: async (_input, ctx) => {
+        bump('t.record');
+        seenCtx.push({ ...(ctx.claim ? { claim: ctx.claim } : {}), ...(ctx.leaseOwner !== undefined ? { leaseOwner: ctx.leaseOwner } : {}) });
+        return { status: 'success' };
       },
     },
     {
@@ -664,4 +699,118 @@ test('I4: an interrupted side-effect call reports the operation (pending/outcome
   assert.equal(lost.error?.code, 'cancelled');
   assert.match(lost.modelText, /the external outcome is unknown: do not re-issue this action as a new call/);
   assert.ok(Date.now() - started >= SIDE_EFFECT_SETTLE_MS - 100, 'the gateway was given the settle grace period');
+});
+
+// ------------------------------------------------------------------------------------ H4 lease owner / claim, durability-3
+
+test('H4: the lease owner of a side-effect call is the request\'s claim-scoped leaseOwner — a stale worker of the same agent never reuses the live claim\'s lease', async () => {
+  const adapter = new FakeLoadAdapter();
+  adapter.verifyPending = true; // the job keeps running: the lease stays held
+  const rt = runtimeFor(env, specs(), { policy, sideEffects: gatewayFor(env, [adapter]) });
+  const leases = createLeaseService({ ...env.deps, db: env.db });
+  const live = await rt.execute(request('t.load', { name: 'claimed' }, ws, { leaseOwner: `${AGENT}#7`, claim: { workItemId: WORK, fencingToken: 7 } }));
+  assert.equal(live.status, 'pending', JSON.stringify(live.error));
+  assert.equal((await leases.current('loadgen/claimed'))?.owner, `${AGENT}#7`);
+  // the same agent id under a revoked claim (token 6): another owner ⇒ refused as busy, nothing dispatched
+  const stale = await rt.execute(request('t.load', { name: 'claimed' }, ws, { leaseOwner: `${AGENT}#6`, claim: { workItemId: WORK, fencingToken: 6 } }));
+  assert.equal(stale.status, 'failed');
+  assert.match(stale.error!.message, /resource_busy/);
+  assert.equal(adapter.calls.dispatch, 1, 'the stale worker dispatched nothing');
+  assert.equal(adapter.external.applied, 1);
+  // without leaseOwner the owner stays the agent id (backward compatible)
+  const plain = await rt.execute(request('t.load', { name: 'unclaimed' }, ws));
+  assert.equal(plain.status, 'pending');
+  assert.equal((await leases.current('loadgen/unclaimed'))?.owner, AGENT);
+});
+
+test('H4: the claim and the lease owner reach the tool context (record-effect tools re-check the claim); a claim on another work item is refused', async () => {
+  seenCtx.length = 0;
+  const rt = runtimeFor(env, specs(), { policy });
+  const ok = await rt.execute(request('t.record', {}, ws, { leaseOwner: `${AGENT}#9`, claim: { workItemId: WORK, fencingToken: 9, leaseId: 'lease_9', ownerId: 'worker_a' } }));
+  assert.equal(ok.status, 'success', JSON.stringify(ok.error));
+  assert.deepEqual(seenCtx.at(-1), { claim: { workItemId: WORK, fencingToken: 9, leaseId: 'lease_9', ownerId: 'worker_a' }, leaseOwner: `${AGENT}#9` });
+  await rt.execute(request('t.record', {}, ws));
+  assert.deepEqual(seenCtx.at(-1), { leaseOwner: AGENT }, 'no claim ⇒ none in the context; the owner defaults to the agent');
+  const before = count('t.record');
+  const foreign = await rt.execute(request('t.record', {}, ws, { claim: { workItemId: 'wi_other', fencingToken: 3 } }));
+  assert.equal(foreign.status, 'denied');
+  assert.match(foreign.error!.message, /claim_work_item_mismatch/);
+  assert.equal(count('t.record'), before, 'never executed');
+  await assert.rejects(rt.execute(request('t.record', {}, ws, { leaseOwner: '' })), (e: unknown) => e instanceof HypertestError && e.code === 'invalid_argument');
+  await assert.rejects(rt.execute(request('t.record', {}, ws, { claim: { workItemId: WORK, fencingToken: 0 } })), (e: unknown) => e instanceof HypertestError && e.code === 'invalid_argument');
+});
+
+test('durability-3 (tools): after agent A\'s side effect on a resource is verified, agent B acts on it at once (lease released, no resource_busy, no orphaned prepared operation)', async () => {
+  const adapter = new FakeLoadAdapter();
+  const rt = runtimeFor(env, specs(), { policy, sideEffects: gatewayFor(env, [adapter]) });
+  const a = await rt.execute(request('t.load', { name: 'shared-env' }, ws, { leaseOwner: 'agent_a' }));
+  assert.equal(a.status, 'success', JSON.stringify(a.error));
+  env.deps.clock.advance(1_000);
+  const b = await rt.execute(request('t.load', { name: 'shared-env' }, ws, { leaseOwner: 'agent_b' }));
+  assert.equal(b.status, 'success', `B must not be refused as busy: ${JSON.stringify(b.error)}`);
+  assert.equal(adapter.external.applied, 2);
+  const prepared = await env.db.query<{ n: number }>("SELECT count(*)::int AS n FROM ht_operations WHERE status = 'prepared' AND target->>'resourceKey' = 'loadgen/shared-env'");
+  assert.equal(prepared.rows[0]!.n, 0);
+});
+
+// ------------------------------------------------------------------------------------ conformance-7: record-only effects
+
+test('conformance-7: an external effect without an adapter goes through the Operation Ledger — executed once per invocation, a replay returns the recorded outcome', async () => {
+  const gateway = gatewayFor(env, []);
+  const rt = runtimeFor(env, specs(), { policy, sideEffects: gateway });
+  const req = request('t.poke', { target: 'a' }, ws, { invocationId: 'sess_c7:1:call_poke' });
+  const first = await rt.execute(req);
+  assert.equal(first.status, 'success', JSON.stringify(first.error));
+  assert.deepEqual(first.structured, { poked: 'a', n: 1 });
+  assert.ok(first.operationId, 'the call is an operation');
+  const op = (await env.db.query<{ status: string; adapter_id: string; operation_type: string; tool_invocation_id: string }>('SELECT status, adapter_id, operation_type, tool_invocation_id FROM ht_operations WHERE operation_id = $1', [first.operationId!])).rows[0]!;
+  assert.deepEqual(op, { status: 'verified', adapter_id: 'tool.effect', operation_type: 't.poke', tool_invocation_id: req.invocationId });
+  const [ev] = await env.evidence.getMany(first.evidenceRefs);
+  assert.equal(ev!.operationId, first.operationId, 'the evidence names its operation');
+  // the durable replay of the same invocation: recorded outcome, NOT executed again
+  const replay = await rt.execute({ ...req });
+  assert.equal(replay.status, 'success');
+  assert.deepEqual(replay.structured, first.structured);
+  assert.deepEqual(replay.evidenceRefs, first.evidenceRefs);
+  assert.equal(replay.operationId, first.operationId);
+  assert.equal(count('t.poke:a'), 1, 'exactly one external effect');
+  // a replay through a NEW gateway (a restarted process) returns it as well
+  assert.equal((await runtimeFor(env, specs(), { policy, sideEffects: gatewayFor(env, []) }).execute({ ...req })).status, 'success');
+  assert.equal(count('t.poke:a'), 1);
+  // a new invocation is a new call
+  await rt.execute(request('t.poke', { target: 'a' }, ws));
+  assert.equal(count('t.poke:a'), 2);
+  // a tool failure is a recorded outcome: its replay does not execute again either
+  const failing = request('t.poke', { target: 'f', fail: 'hypertest' }, ws);
+  const f1 = await rt.execute(failing);
+  assert.deepEqual([f1.status, f1.error?.code], ['failed', 'unavailable']);
+  const f2 = await rt.execute({ ...failing });
+  assert.deepEqual([f2.status, f2.error?.code], ['failed', 'unavailable']);
+  assert.equal(count('t.poke:f'), 1);
+  // without a gateway the tool runs directly (no ledger configured)
+  const direct = runtimeFor(env, specs(), { policy });
+  const d = request('t.poke', { target: 'd' }, ws);
+  await direct.execute(d);
+  await direct.execute({ ...d });
+  assert.equal(count('t.poke:d'), 2);
+});
+
+test('conformance-7: a call interrupted between sending and recording is never re-sent by a replay (manual review); a gateway without the record adapters fails closed', async () => {
+  const rt = runtimeFor(env, specs(), { policy, sideEffects: gatewayFor(env, []) });
+  const req = request('t.poke', { target: 'h', hang: true }, ws, { invocationId: 'sess_c7:2:call_hang', timeoutMs: 200 });
+  const interrupted = await rt.execute(req);
+  assert.equal(interrupted.status, 'failed');
+  assert.equal(interrupted.error?.code, 'manual_review');
+  assert.match(interrupted.error!.message, /do not re-send it as a new call/);
+  assert.equal(count('t.poke:h'), 1);
+  const replay = await runtimeFor(env, specs(), { policy, sideEffects: gatewayFor(env, []) }).execute({ ...req, timeoutMs: 5000 });
+  assert.equal(replay.error?.code, 'manual_review');
+  assert.equal(count('t.poke:h'), 1, 'never re-sent');
+  // fail closed: a gateway that cannot record the effect never executes it
+  const { AdapterRegistry, createLeaseService: leases, createOperationLedger, createSideEffectGateway } = await import('@hypertest/operation');
+  const opDeps = { ...env.deps, db: env.db, events: env.events };
+  const bare = createSideEffectGateway({ ...opDeps, ledger: createOperationLedger(opDeps), leases: leases(opDeps), adapters: new AdapterRegistry([]), pollIntervalMs: 5 });
+  const refused = await runtimeFor(env, specs(), { policy, sideEffects: bare }).execute(request('t.poke', { target: 'bare' }, ws));
+  assert.equal(refused.status, 'failed');
+  assert.equal(count('t.poke:bare'), 0);
 });

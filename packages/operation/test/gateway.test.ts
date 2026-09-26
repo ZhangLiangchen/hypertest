@@ -215,7 +215,9 @@ test('resource busy: another live owner ⇒ failed/resource_busy with no dispatc
   const busy = await gateway.run(req);
   assertStatus(busy, 'failed');
   assert.equal(busy.reason, 'resource_busy');
-  assert.equal(busy.operation.status, 'prepared', 'the ledger keeps the intent, not a failure');
+  // durability-3: never dispatched ⇒ recorded not_applied (not an orphaned `prepared`, and never a `failed` operation)
+  assert.equal(busy.operation.status, 'not_applied', 'the ledger records that nothing was dispatched');
+  assert.match(busy.operation.lastError ?? '', /^resource_busy: env\/busy/);
   assert.equal(adapter.calls.dispatch, 0);
   await env.leases.release(other.leaseId);
   const ok = await gateway.run(req);
@@ -226,7 +228,7 @@ test('resource busy: another live owner ⇒ failed/resource_busy with no dispatc
 
 test('the same owner reuses its live lease (renewed, same token) across retries', async () => {
   const adapter = new FakeAdapter();
-  adapter.completeAfterObserves = 1;
+  adapter.completeAfterObserves = 2;
   const { gateway } = gatewayFor(env, [adapter]);
   const req = request('run-reuse', { lease: { resourceKey: 'env/reuse', owner: 'worker-r', ttlMs: 10_000 } });
   const first = await gateway.run(req);
@@ -234,11 +236,126 @@ test('the same owner reuses its live lease (renewed, same token) across retries'
   const token = first.operation.lease?.fencingToken;
   env.clock.advance(5_000);
   const second = await gateway.run(req);
-  assertStatus(second, 'verified');
+  assertStatus(second, 'pending');
   assert.equal(second.operation.lease?.fencingToken, token);
   const live = await env.leases.current('env/reuse');
   assert.equal(live?.fencingToken, token);
   assert.equal(live?.expiresAt, new Date(env.clock.nowMs() + 10_000).toISOString(), 'the reused lease was renewed');
+  env.clock.advance(5_000);
+  const third = await gateway.run(req);
+  assertStatus(third, 'verified');
+  assert.equal(third.operation.lease?.fencingToken, token, 'still the same lease, never a new grant');
+  assert.equal(adapter.calls.dispatch, 1);
+  // durability-3: the settled operation released its lease
+  assert.equal(await env.leases.current('env/reuse'), undefined);
+});
+
+// ------------------------------------------------------------------------------------ durability-3: lease lifecycle
+
+test('durability-3: a settled operation releases its lease at once — another owner is not refused as busy until the TTL', async () => {
+  const adapter = new FakeAdapter();
+  const { gateway } = gatewayFor(env, [adapter]);
+  const a = await gateway.run(request('run-rel', { toolInvocationId: 'rel:a', lease: { resourceKey: 'env/rel', owner: 'agent-a', ttlMs: 60_000 } }));
+  assertStatus(a, 'verified');
+  assert.equal(await env.leases.current('env/rel'), undefined, 'released on verified');
+  env.clock.advance(1_000);
+  const b = await gateway.run(request('run-rel', { toolInvocationId: 'rel:b', lease: { resourceKey: 'env/rel', owner: 'agent-b', ttlMs: 60_000 } }));
+  assertStatus(b, 'verified');
+  assert.equal(b.operation.lease!.fencingToken, a.operation.lease!.fencingToken + 1, 'a fresh grant with a higher fencing token');
+  assert.equal(adapter.calls.dispatch, 2);
+  assert.equal(await env.leases.current('env/rel'), undefined);
+  // not_applied and failed settle (and release) too
+  adapter.dispatchFaults = ['reject'];
+  const c = await gateway.run(request('run-rel', { toolInvocationId: 'rel:c', lease: { resourceKey: 'env/rel', owner: 'agent-c', ttlMs: 60_000 } }));
+  assertStatus(c, 'not_applied');
+  assert.equal(await env.leases.current('env/rel'), undefined, 'released on not_applied');
+  adapter.verifyFailure = 'job crashed';
+  const d = await gateway.run(request('run-rel', { toolInvocationId: 'rel:d', lease: { resourceKey: 'env/rel', owner: 'agent-d', ttlMs: 60_000 } }));
+  assertStatus(d, 'failed');
+  assert.equal(d.operation.status, 'failed');
+  assert.equal(await env.leases.current('env/rel'), undefined, 'released on failed');
+});
+
+test('durability-3: an unsettled operation keeps its lease; observe extends it while the job runs and releases it once verified', async () => {
+  const adapter = new FakeAdapter();
+  adapter.completeAfterObserves = 3;
+  const { gateway } = gatewayFor(env, [adapter]);
+  const started = await gateway.run(request('run-keep', { lease: { resourceKey: 'env/keep', owner: 'agent-k', ttlMs: 10_000 } }));
+  assertStatus(started, 'pending');
+  assert.equal(started.operation.status, 'acknowledged');
+  const lease = await env.leases.current('env/keep');
+  assert.equal(lease?.owner, 'agent-k', 'kept while the job is unsettled');
+  const ctx = eventCtx('run-keep');
+  const signal = new AbortController().signal;
+  // three observations 8 s apart: the 10 s lease would have lapsed after the first one without renewal
+  for (let i = 0; i < 2; i++) {
+    env.clock.advance(8_000);
+    assertStatus(await gateway.observe(started.operation.operationId, ctx, signal), 'pending');
+    const live = await env.leases.current('env/keep');
+    assert.equal(live?.leaseId, lease!.leaseId, `observation ${i + 1}: same lease`);
+    assert.ok(Date.parse(live!.expiresAt) >= env.clock.nowMs() + 10_000 - 1, `observation ${i + 1}: extended`);
+    assert.equal(await env.leases.acquire({ resourceKey: 'env/keep', owner: 'intruder', ttlMs: 1_000 }), undefined, 'exclusivity kept while the job runs');
+  }
+  env.clock.advance(8_000);
+  assertStatus(await gateway.observe(started.operation.operationId, ctx, signal), 'verified');
+  assert.equal(await env.leases.current('env/keep'), undefined, 'the observation that settled the operation released the lease');
+  assert.ok(await env.leases.acquire({ resourceKey: 'env/keep', owner: 'next', ttlMs: 1_000 }));
+});
+
+test('durability-3: an observation never extends the lease of a DISPATCHING operation (a crashed dispatcher stays detectable)', async () => {
+  const adapter = new FakeAdapter();
+  const { gateway } = gatewayFor(env, [adapter]);
+  const lease = await env.leases.acquire({ resourceKey: 'env/crash', owner: 'dead-worker', ttlMs: 5_000 });
+  const op = await env.ledger.prepare({ runId: 'run-crash-lease', workItemId: 'wi', toolInvocationId: 'crash:1', operationType: 'job.create', adapterId: adapter.adapterId, target: { resourceKey: 'env/crash', kind: 'env' }, desiredStateHash: 'h', inputHash: 'i', lease: { leaseId: lease!.leaseId, resourceKey: 'env/crash', fencingToken: lease!.fencingToken } }, eventCtx('run-crash-lease'));
+  await env.ledger.transition(op.operationId, 'dispatching', {}, eventCtx('run-crash-lease'));
+  env.clock.advance(4_000);
+  const o = await gateway.observe(op.operationId, eventCtx('run-crash-lease'), new AbortController().signal);
+  assertStatus(o, 'pending');
+  assert.equal((await env.leases.current('env/crash'))?.expiresAt, lease!.expiresAt, 'not extended by the observer');
+  env.clock.advance(2_000);
+  assert.equal(await env.leases.current('env/crash'), undefined, 'the dead dispatcher lease lapses');
+});
+
+test('durability-3: two in-process drives sharing one lease — the first to settle never releases it under the other', async () => {
+  const adapter = new FakeAdapter();
+  let open!: () => void;
+  const gate = new Promise<void>((r) => (open = r));
+  const { gateway } = gatewayFor(env, [adapter]);
+  const spec = { resourceKey: 'env/shared', owner: 'agent-s', ttlMs: 60_000 };
+  adapter.dispatchGate = gate;
+  const slow = gateway.run(request('run-shared', { toolInvocationId: 'sh:slow', lease: spec }));
+  await new Promise((r) => setTimeout(r, 20));
+  adapter.dispatchGate = undefined;
+  const fast = await gateway.run(request('run-shared', { toolInvocationId: 'sh:fast', lease: spec }));
+  assertStatus(fast, 'verified');
+  assert.ok(await env.leases.current('env/shared'), 'still in use by the slow drive');
+  open();
+  assertStatus(await slow, 'verified');
+  assert.equal(await env.leases.current('env/shared'), undefined, 'released once no drive uses it');
+});
+
+test('durability-3: a lease that still guards another unsettled operation of the owner is kept when a second operation settles', async () => {
+  const running = new FakeAdapter({ adapterId: 'fake-running' });
+  running.completeAfterObserves = 100; // a long job: stays acknowledged
+  const quick = new FakeAdapter({ adapterId: 'fake-quick' });
+  const { gateway } = gatewayFor(env, [running, quick]);
+  const spec = { resourceKey: 'env/guard', owner: 'agent-g', ttlMs: 60_000 };
+  const job = await gateway.run(request('run-guard', { adapterId: 'fake-running', lease: spec }));
+  assertStatus(job, 'pending');
+  const other = await gateway.run(request('run-guard', { adapterId: 'fake-quick', operationType: 'job.quick', lease: spec }));
+  assertStatus(other, 'verified');
+  assert.equal(other.operation.lease?.leaseId, job.operation.lease?.leaseId, 'the owner reused its live lease');
+  assert.equal((await env.leases.current('env/guard'))?.leaseId, job.operation.lease?.leaseId, 'kept: the running job still needs its exclusivity');
+  assert.equal(await env.leases.acquire({ resourceKey: 'env/guard', owner: 'intruder', ttlMs: 1_000 }), undefined);
+});
+
+test('durability-3: a lease obtained for a call whose prepare fails is released (nothing will be dispatched under it)', async () => {
+  const adapter = new FakeAdapter();
+  adapter.prepareFault = new Error('bad input for the target');
+  const { gateway } = gatewayFor(env, [adapter]);
+  await assert.rejects(gateway.run(request('run-prepfail', { lease: { resourceKey: 'env/prepfail', owner: 'agent-p', ttlMs: 60_000 } })));
+  assert.equal(await env.leases.current('env/prepfail'), undefined);
+  assert.equal(adapter.calls.dispatch, 0);
 });
 
 test('I4: absent on reconcile ⇒ not_applied ⇒ exactly one safe re-dispatch per run', async () => {

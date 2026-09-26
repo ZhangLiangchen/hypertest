@@ -4,6 +4,7 @@ import { canonicalJson, isValidSchema, validateJson } from '@hypertest/core';
 import { EVENT_TYPES, type ToolEffect } from '@hypertest/domain';
 import {
   BUILTIN_ROLES,
+  EVIDENCE_PRODUCER_ROLES,
   KNOWN_TOOL_IDS,
   RoleCatalog,
   TERMINAL_TOOLS,
@@ -160,10 +161,26 @@ test('lead: plans and delegates to analysts but never executes tests', () => {
 
 test('reviewer: independent from producers, structured reasoning, evidence tools, no production tools', () => {
   const reviewer = role('reviewer');
-  assert.deepEqual(reviewer.defaultModelPolicy.independentFromRoles, ['executor', 'test_designer', 'rca']);
+  assert.deepEqual(reviewer.defaultModelPolicy.independentFromRoles, ['executor', 'test_designer', 'rca', 'fixer', 'metrics_analyst', 'environment']);
   for (const c of ['structured_output', 'reasoning'] as const) assert.ok(reviewer.defaultModelPolicy.requiredCapabilities?.includes(c), c);
   for (const t of ['evidence.get', 'evidence.query', 'blackboard.post_review', 'oracle.get', 'test.run'] as const) assert.equal(toolPermitted(reviewer.toolPolicy, t), true, t);
   for (const t of ['blackboard.post_finding', 'oracle.propose_change', 'test_artifact.validate', 'shell.exec'] as const) assert.equal(toolPermitted(reviewer.toolPolicy, t), false, t);
+});
+
+test('H10: the reviewer is independent from EVERY role that produces evidence, findings, test artifacts or fixes', () => {
+  // A producing role missing from independentFromRoles lets the reviewer route to that role's provider: the gate then
+  // discards the review as dependent (C6) — or, with a gate counting fewer producers, accepts a self-review.
+  const producing = ['test.run', 'shell.exec', 'mutation.run', 'coverage.collect', 'http.request', 'metrics.query', 'metrics.scrape', 'load.start', 'env.restart', 'env.deploy', 'env.inject_fault',
+    'blackboard.post_finding', 'blackboard.post_hypothesis', 'test_artifact.register', 'fs.write', 'fs.apply_patch', 'git.commit'] as const;
+  const reviewer = role('reviewer');
+  const independent = new Set(reviewer.defaultModelPolicy.independentFromRoles ?? []);
+  assert.deepEqual([...independent].sort(), [...EVIDENCE_PRODUCER_ROLES].sort());
+  for (const r of BUILTIN_ROLES) {
+    if (r.role === 'reviewer') continue;
+    const produces = producing.filter((t) => toolPermitted(r.toolPolicy, t));
+    if (produces.length > 0) assert.ok(independent.has(r.role), `${r.role} produces (${produces.join(', ')}) but the reviewer is not independent from it`);
+  }
+  assert.ok(Object.isFrozen(EVIDENCE_PRODUCER_ROLES));
 });
 
 test('model policies differ meaningfully across roles (native multi-LLM)', () => {

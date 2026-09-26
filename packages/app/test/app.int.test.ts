@@ -10,7 +10,7 @@ import { after, describe, test } from 'node:test';
 import { MemoryLogger } from '@hypertest/core';
 import { openDatabase } from '@hypertest/store';
 import { infraEnv, skipUnless, tempDir } from '@hypertest/testkit';
-import { createHypertest, diagnose, type HypertestConfig, type HypertestInstance } from '../src/index.ts';
+import { createHypertest, diagnose, opaPolicyRevision, type HypertestConfig, type HypertestInstance } from '../src/index.ts';
 import { roleRouter, scriptedConfig, sumRepo, tinyRunBrains } from './helpers.ts';
 
 const infra = infraEnv();
@@ -69,7 +69,9 @@ describe('production wiring (local infrastructure)', { concurrency: false }, () 
       });
       assert.equal(ht.services.bus.kind, 'nats');
       assert.equal(ht.durable.kind, 'local');
-      assert.match(ht.services.policy.revision, new RegExp(`^builtin:[0-9a-f]{16}\\+opa:hypertest/${pkg}$`));
+      // conformance-12: the OPA part of the revision is the digest of the served policy modules of the decision package
+      assert.match(ht.services.policy.revision, new RegExp(`^builtin:[0-9a-f]{16}\\+opa:hypertest/${pkg}@[0-9a-f]{16}$`));
+      assert.equal(ht.services.policy.revision.split('+')[1], await opaPolicyRevision(infra.opaUrl!, `hypertest/${pkg}`));
 
       // a probe consumer on the bus: run events published by the outbox relay are delivered through JetStream
       const delivered: Array<{ runId: string; eventType: string }> = [];
@@ -135,6 +137,90 @@ describe('production wiring (local infrastructure)', { concurrency: false }, () 
       } finally {
         await db.close();
       }
+    },
+  );
+});
+
+describe('H12: workers sharing one PostgreSQL store share environment generations', { concurrency: false }, () => {
+  test(
+    'a generation bump by worker A (a verified env.restart) makes worker B snapshot the new generation — separate data directories, no shared file',
+    skipUnless(!!infra.pgUrl, 'HYPERTEST_TEST_PG_URL not set (run npm run infra:up)'),
+    async () => {
+      const schema = await freshSchema('h12');
+      const secret = randomBytes(24).toString('hex');
+      const environments = [{ environmentId: 'env-shared', environmentClass: 'sandbox', baseUrl: 'http://127.0.0.1:9', generation: 1 }];
+      async function worker(tag: string): Promise<HypertestInstance> {
+        const dir = await tempDir(`ht-app-int-h12-${tag}-`);
+        cleanups.push(dir.cleanup);
+        const env = { HT_INT_PG_URL: infra.pgUrl!, HT_INT_CAPABILITY_SECRET: secret };
+        const config: HypertestConfig = {
+          ...scriptedConfig(dir.path),
+          store: { kind: 'postgres', urlEnv: 'HT_INT_PG_URL', schema },
+          policy: { capabilitySecretEnv: 'HT_INT_CAPABILITY_SECRET' },
+          environments: environments as never,
+        };
+        const ht = await createHypertest(config, { scriptedBrains: { sim: roleRouter(tinyRunBrains()) }, logger: new MemoryLogger(), env, workerId: `worker:h12:${tag}` });
+        cleanups.push(() => ht.close());
+        return ht;
+      }
+      const a = await worker('a');
+      const b = await worker('b');
+      // A's env.restart adapter bumps the generation while verifying its operation (the durable, cross-process path)
+      const bumped = await a.services.environments.bumpGenerationAsync!('env-shared', 'sha256:build-2', 'op_restart_1');
+      assert.equal(bumped.generation, 2);
+      // B never saw the bump in its own process; its freshness/snapshot resolver reads the shared store
+      const run = await b.control.startRun({ goal: 'h12 freshness', target: { environmentId: 'env-shared' } });
+      const snap = await b.control.snapshot(run.runId);
+      const entry = snap.readSet.find((e) => e.resourceType === 'environment' && e.resourceId === 'env-shared');
+      assert.ok(entry, 'the target environment is pinned');
+      assert.equal(entry.observedVersion, '2:sha256:build-2', `snapshot pins generation 2, got ${entry.observedVersion}`);
+      assert.equal((await b.services.environments.load!('env-shared'))!.generation, 2);
+      // the same operation verified again by B does not bump twice
+      assert.equal((await b.services.environments.bumpGenerationAsync!('env-shared', 'sha256:build-2', 'op_restart_1')).generation, 2);
+      await b.cancel(run.runId, 'test done');
+    },
+  );
+});
+
+describe('durability-4: Temporal workers of one deployment share one identity', { concurrency: false }, () => {
+  test(
+    'a tick or an observation that lands on another worker process acts on the run (the run lease and the claims are the deployment\'s, not one process\'s)',
+    skipUnless(!!infra.pgUrl, 'HYPERTEST_TEST_PG_URL not set (run npm run infra:up)'),
+    async () => {
+      const schema = await freshSchema('dur4');
+      const secret = randomBytes(24).toString('hex');
+      const repo = await sumRepo();
+      cleanups.push(repo.cleanup);
+      async function worker(tag: string): Promise<HypertestInstance> {
+        const dir = await tempDir(`ht-app-int-dur4-${tag}-`);
+        cleanups.push(dir.cleanup);
+        const env = { HT_INT_PG_URL: infra.pgUrl!, HT_INT_CAPABILITY_SECRET: secret };
+        const config: HypertestConfig = {
+          ...scriptedConfig(dir.path, { gate: { requireIndependentReview: false } }),
+          store: { kind: 'postgres', urlEnv: 'HT_INT_PG_URL', schema },
+          policy: { capabilitySecretEnv: 'HT_INT_CAPABILITY_SECRET' },
+          // external: nothing connects to Temporal here; the control planes are driven directly, as activities would be
+          durable: { kind: 'temporal', address: '127.0.0.1:1', taskQueue: `dur4-${suffix}`, workerMode: 'external' },
+        };
+        const ht = await createHypertest(config, { scriptedBrains: { sim: roleRouter(tinyRunBrains()) }, logger: new MemoryLogger(), env });
+        cleanups.push(() => ht.close());
+        return ht;
+      }
+      const a = await worker('a');
+      const b = await worker('b');
+      assert.equal(a.services.workerId, b.services.workerId);
+      const run = await a.control.startRun({ goal: 'Is the sum module releasable?', target: { repoPath: repo.path, commit: repo.head } });
+      const first = await a.control.tick(run.runId);
+      assert.equal(first.dispatched.length, 1, 'worker A claimed the lead');
+      // the next tick activity lands on worker B: it is not locked out by A's run lease (it used to be a no-op until the
+      // lease expired — idle, nothing evaluated)
+      const onB = await b.control.tick(run.runId);
+      assert.equal(onB.convergence.state, 'active');
+      assert.equal((onB.convergence as { running: number }).running, 1, 'B evaluated the run (it saw the claimed lead)');
+      // …and B can run the turn A's tick dispatched (the claim belongs to the deployment's identity, fenced by its token)
+      const d = first.dispatched[0]!;
+      assert.notEqual((await b.control.executeTurn(d.workItemId, d.fencingToken)).status, 'lease_lost');
+      await a.control.cancelRun(run.runId, 'test done');
     },
   );
 });

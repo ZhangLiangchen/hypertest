@@ -62,6 +62,12 @@ export interface OutboxRelay {
   stop(): Promise<void>;
   /** Number of outbox rows not yet marked sent (additive; used by convergence checks and tests). */
   pending(): Promise<number>;
+  /**
+   * (additive, durability-11) Deletes rows marked sent more than `sentRetentionMs` ago (the event store keeps every
+   * event; a sent outbox row is only a delivery record). Returns the number deleted. The poll loop of start() prunes
+   * once per `pruneIntervalMs`.
+   */
+  prune?(): Promise<number>;
 }
 
 /** Dependencies of createOutboxRelay (additive named type for the inline contract signature). */
@@ -71,6 +77,10 @@ export interface OutboxRelayDeps extends CollabDeps {
   pollMs?: number;
   /** Rows per SELECT batch; default 100. */
   batchSize?: number;
+  /** (additive, durability-11) How long sent rows are kept before prune() deletes them; default 1 h. */
+  sentRetentionMs?: number;
+  /** (additive, durability-11) How often the poll loop prunes; default 60 s. */
+  pruneIntervalMs?: number;
 }
 
 export interface InProcessBusOptions {

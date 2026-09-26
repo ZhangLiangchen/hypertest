@@ -55,8 +55,12 @@ export type ConvergenceState =
 export interface TickResult {
   runId: string;
   status: TestRun['status'];
-  /** Work items admitted and claimed this tick, ready to execute (leases held by the returned owner). */
-  dispatched: Array<{ workItemId: string; ownerId: string; fencingToken: number }>;
+  /**
+   * Work items admitted and claimed this tick, ready to execute (leases held by the returned owner). `nextTurn`
+   * (additive, durability-9): the turn the item's session runs next — pass it as ExecuteTurnOptions.expectedTurn on the
+   * FIRST executeTurn too, so a retried first call never advances the session twice.
+   */
+  dispatched: Array<{ workItemId: string; ownerId: string; fencingToken: number; nextTurn?: number }>;
   /** Work items waiting on long-running operations to poll. */
   waiting: Array<{ workItemId: string; operationIds: string[] }>;
   replanScheduled: boolean;
@@ -99,8 +103,11 @@ export interface ReportBuilder {
 /** Facade used by the durable runtimes (Temporal activities call exactly these). */
 export interface ControlPlane {
   startRun(input: StartRunInput, ctx?: Partial<EventContext>): Promise<TestRun>;
-  /** One scheduling step: reactors catch-up, plan application, replan triggers, admission, convergence, gate. */
-  tick(runId: string): Promise<TickResult>;
+  /**
+   * One scheduling step: reactors catch-up, plan application, replan triggers, admission, convergence, gate. `options`
+   * is additive (TickOptions): the caller's free executor capacity bounds how many claims are handed out.
+   */
+  tick(runId: string, options?: TickOptions): Promise<TickResult>;
   /**
    * Executes one agent turn for a dispatched work item (idempotent per turn). `options` is additive:
    * `expectedTurn` makes a durable retry return `{status:'continue', turn}` without running when the session
@@ -109,6 +116,13 @@ export interface ControlPlane {
   executeTurn(workItemId: string, fencingToken: number, signal?: AbortSignal, options?: ExecuteTurnOptions): Promise<TurnOutcome>;
   /** Polls long-running operations for a waiting work item; resumes it when all settled. */
   observeWaiting(workItemId: string, signal?: AbortSignal): Promise<TurnOutcome>;
+  /**
+   * (additive, optional; H6) Keeps a held claim alive while its executor has not started (or not resumed) its turn — e.g.
+   * the claim waits for a free turn slot of the durable runtime: renews the work lease, the claim's expiry and the item's
+   * resource claims. `false` when the claim is no longer held with that fencing token (or its resource claims were taken:
+   * the claim is then yielded without consuming an attempt); the caller stops driving it.
+   */
+  renewClaim?(workItemId: string, fencingToken: number): Promise<boolean>;
   /** Startup recovery: reconcile operations, expire stale leases, requeue orphaned work. */
   recover(runId: string, signal?: AbortSignal): Promise<{ reconciled: number; requeued: string[] }>;
   cancelRun(runId: string, reason: string): Promise<void>;
@@ -119,6 +133,16 @@ export interface ControlPlane {
   readonly deps: BaseDeps;
   /** (additive, optional) Releases process resources (e.g. the reactors' bus subscription). */
   close?(): Promise<void>;
+}
+
+/** (additive, H6) Options of ControlPlane.tick. */
+export interface TickOptions {
+  /**
+   * The durable runtime's free executor capacity (turn slots not in use or promised): at most this many work items are
+   * claimed and dispatched by this tick. A claim is never handed out to wait unrenewed behind a full executor (its lease
+   * would lapse and the item would be requeued as if its worker had died). Absent: bounded by the run's concurrency only.
+   */
+  maxDispatch?: number;
 }
 
 /** (additive) Options of ControlPlane.executeTurn. */

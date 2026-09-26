@@ -64,7 +64,8 @@ export interface OperationRecord {
 }
 
 const OP_TRANSITIONS: Record<OperationStatus, readonly OperationStatus[]> = {
-  prepared: ['dispatching', 'failed'],
+  // prepared → not_applied: never dispatched (e.g. refused because another owner holds the resource lease)
+  prepared: ['dispatching', 'not_applied', 'failed'],
   dispatching: ['acknowledged', 'outcome_unknown', 'not_applied', 'failed'],
   acknowledged: ['verified', 'outcome_unknown', 'failed'],
   outcome_unknown: ['reconciling'],

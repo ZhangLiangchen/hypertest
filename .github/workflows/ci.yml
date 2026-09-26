@@ -8,32 +8,105 @@ on:
 permissions:
   contents: read
 
-jobs:
-  verify:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22.19.0
-      - run: npm ci --ignore-scripts
-      - run: npm run ci
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
-  cross-language-conformance:
+# Both jobs run the whole suite (unit + integration + e2e) against a PostgreSQL 16 service container.
+# NATS, Temporal, OPA and S3 are not provided: their integration tests skip with an explicit reason.
+jobs:
+  test:
+    name: check + test (PGlite; PostgreSQL integration tests)
     runs-on: ubuntu-latest
-    needs: verify
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: hypertest_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      HYPERTEST_TEST_PG_URL: postgres://postgres@localhost:5432/hypertest_test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22.19.0
+          cache: npm
+      # the test-runner adapters are exercised with real pytest and go test -json
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.12"
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.23.x"
+          go-version: "1.24.x"
           cache: false
-      - run: python -m pip install pytest coverage
-      - run: npm ci --ignore-scripts
-      - run: npm run test:examples
+      - name: Install pytest
+        run: python -m pip install pytest
+      # the local sandbox runs agent commands in unprivileged user namespaces (unshare + python3);
+      # Ubuntu 24.04 restricts them through AppArmor by default
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: Git identity for fixture repositories
+        run: |
+          git config --global user.name "Hypertest CI"
+          git config --global user.email "ci@hypertest.invalid"
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+      - name: Typecheck and package boundaries
+        run: npm run check
+      - name: Test
+        run: npm test
+
+  test-postgres:
+    name: test (everything on PostgreSQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: hypertest_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      HYPERTEST_TEST_PG_URL: postgres://postgres@localhost:5432/hypertest_test
+      HYPERTEST_TEST_DB: postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: false
+      - name: Install pytest
+        run: python -m pip install pytest
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: Git identity for fixture repositories
+        run: |
+          git config --global user.name "Hypertest CI"
+          git config --global user.email "ci@hypertest.invalid"
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+      - name: Test on PostgreSQL
+        run: npm test

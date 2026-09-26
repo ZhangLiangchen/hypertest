@@ -84,4 +84,13 @@ CREATE TRIGGER ht_approvals_guard_trg BEFORE UPDATE OR DELETE ON ht_approvals
   FOR EACH ROW EXECUTE FUNCTION ht_approvals_guard();
 `,
   },
+  {
+    // conformance-11: human gate waivers are approvals of kind gate_exception ({criterionId, expiresAt?})
+    id: 'policy/003-gate-exception-approvals',
+    sql: `
+ALTER TABLE ht_approvals DROP CONSTRAINT IF EXISTS ht_approvals_kind_check;
+ALTER TABLE ht_approvals ADD CONSTRAINT ht_approvals_kind_check
+  CHECK (kind IN ('action', 'oracle_change', 'test_change', 'budget', 'manual_review', 'gate_exception'));
+`,
+  },
 ];

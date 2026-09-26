@@ -147,6 +147,16 @@ export const EVENT_TYPES = {
   budgetReserved: 'budget.reserved',
   budgetExhausted: 'budget.exhausted',
 
+  /**
+   * (additive, durability-2) Resource admission of a work item (ResourceClaims): `granted` `{ workItemId, claims }` when
+   * the scheduler admits it; `refused` `{ workItemId, conflicts: ["<resourceKey>@<holder>"] }` when a conflicting holder
+   * blocks it (once per distinct conflict set); `lapsed` `{ workItemId, conflicts, phase }` when a held item's claims could
+   * not be renewed (another holder took them) — the item stops (its turn is refused / its claim yielded).
+   */
+  admissionGranted: 'admission.granted',
+  admissionRefused: 'admission.refused',
+  admissionLapsed: 'admission.lapsed',
+
   gateEvaluated: 'gate.evaluated',
   gatePassed: 'gate.passed',
   gateFailed: 'gate.failed',

@@ -190,6 +190,11 @@ is a protocol-only child for the kill/restart helper tests.
   operations, first-child model timeout, large-output check, positive integers); `TrialData.harness.timedOut` covers
   a trial child's own timeout. New exports: `decideTrialResult`, `unexercisedChaos`, `chaosProblems`,
   `childExitProblem`, `hintProblems`, `RELEASE_VERDICTS`.
+- (hardening) `TrialOptions.signal?` / `SuiteOptions.signal?` (H11): an aborted suite starts no further trial and
+  rejects with `cancelled`; an in-flight trial cancels its run (or kills its trial child,
+  `ChildTrialResult.cancelled?`). PoC reviewer brains also review the run itself when control requests it before the
+  gate (H7), so the multi-LLM arm's C6 is satisfied. `PRODUCER_ROLES` of the PoC graders is
+  `EVIDENCE_PRODUCER_ROLES`.
 
 ## Review fixes (adversarial review of the platform)
 

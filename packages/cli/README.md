@@ -25,6 +25,9 @@ Depends on `core`, `domain`, `app`, `eval`, `evidence`, `store` (+ `yaml`), per 
 | `evidence verify <runId>` | Evidence chain, artifact hashes, seals and the signed, root-bound verdict (`verifyEvidence`); exit 1 with the problems listed. |
 | `approvals [--run id] [--status a,b \| --all]` | Approval requests (pending by default). |
 | `approve <approvalId> [--deny] --by <name> --reason "<text>"` | A human decision (`human:<name>` in the audit trail). The requester can never decide its own request. Refused (`permission_denied`) when `$HYPERTEST_SANDBOX` is set. |
+| `oracle establish <file> --by <name>` | Establishes an oracle (the run's correctness criterion) as a named human; runs without an oracle in force are at best `inconclusive` (gate C0). An existing oracle is a `conflict` (it changes only through proposals). Refused when `$HYPERTEST_SANDBOX` is set. |
+| `waive <runId> <criterionId> --by <name> --reason "<text>" [--expires <time>]` | A governed human waiver of one gate criterion (approval kind `gate_exception`), applied at the run's next gate evaluation; never C1; refused for a finished run and when `$HYPERTEST_SANDBOX` is set. |
+| `experience list [--run r] [--status s1,s2 \| --all]` / `experience review <experienceId> --decision review\|approve\|publish\|reject\|quarantine --by <name>` | The learning loop's human surface: only approved/published experience is retrieved into later runs; the creator of a candidate can never review it. `review` is refused when `$HYPERTEST_SANDBOX` is set. |
 | `oracle proposals [...]` / `oracle decide <proposalId> [--reject] --by <name> --reason "<text>"` | Oracle change proposals: list, or decide as a human (I8). `decide` is refused when `$HYPERTEST_SANDBOX` is set. |
 | `cancel <runId> --reason "<text>"` | Cancels a run; a finished run keeps its outcome (`conflict`, exit 1). |
 | `eval run <suite> [--trials n] [--arms a,b] [--work-dir d] [--keep-work-dir] [--timeout-ms n] [--mode in-process\|child-process] [--out f]` | Runs an eval suite (`runSuite`) with per-trial progress on stderr; prints `renderSuiteReport` (or a summary table). `runSuite` takes no cancellation signal: an interrupt returns 130 at once and says that the trials in progress finish in the background (a second Ctrl-C terminates the process). |
@@ -104,10 +107,12 @@ or when requested with `--arms config`.
   runtime starts its embedded worker lazily on the first start/signal, and a short-lived command must never poll the
   task queue (it would take activities of live runs — with inert brains — and abandon them on exit).
 - **Human decisions from agents.** `shell.exec` allows `node` by default, so a command an agent runs can reach this
-  CLI. `approve`/`oracle decide` refuse when `$HYPERTEST_SANDBOX` is set, but the local sandbox of `@hypertest/tools`
-  does not set that marker yet; until it does, the protection is that agents cannot open the store (PGlite: the
-  driving process holds the lock; PostgreSQL: the URL comes from `urlEnv`, which the sandbox scrubs — do not use a
-  passwordless inline `store.url` reachable from the sandbox).
+  CLI. `approve`/`oracle decide`/`oracle establish` refuse when `$HYPERTEST_SANDBOX` is set; both sandboxes of `@hypertest/tools` (local
+  and OCI) set it in every child process, last, so neither the environment allowlist nor a caller can remove or spoof
+  it. It is defence in depth, not a trust boundary: the local sandbox runs as the same OS user (see the tools README),
+  so the other protection remains that agents cannot open the store (PGlite: the driving process holds the lock;
+  PostgreSQL: the URL comes from `urlEnv`, which the sandbox scrubs — do not use a passwordless inline `store.url`
+  reachable from the sandbox).
 - Every worker must use the same configuration as its clients: a run is only driven by a runtime with the manifest it
   is pinned to (I11). `worker` hosts the embedded Temporal worker of that configuration.
 - Read commands (`status`, `report`, `events`, `evidence verify`, `approvals`) compose a full instance (store, outbox
@@ -134,6 +139,11 @@ or when requested with `--arms config`.
   `resume --json` interrupted before starting prints `{ resumed: [], outcomes: [], interrupted: true }`; `approve` /
   `oracle decide` refuse under `$HYPERTEST_SANDBOX`; new exports `clientOnlyConfig`, `SANDBOX_ENV`,
   `MIN_API_TOKEN_LENGTH`, `writeConfigAtomically`.
+- (hardening) `oracle establish <file> --by <name>` (conformance-1: a human establishes an oracle from a YAML/JSON
+  file — one oracle, a list, or `{ oracles: [...] }`; refused under `$HYPERTEST_SANDBOX`; an existing oracle is a
+  `conflict`); the `init` template documents `gate.requireOracle` and a commented `oracles:` example; the template's
+  reviewer lists every evidence-producing role in `independentFromRoles`.
+- (hardening, conformance-13/11) `experience list` / `experience review`, and `waive` (both in `COMMANDS`).
 
 ## How to run
 

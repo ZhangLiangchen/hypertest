@@ -13,7 +13,7 @@
  */
 import type { JsonValue } from '@hypertest/core';
 import { evIds, inputRecord, jsonOf, leadReply, recIds, resultText, str, toolCall, type BrainView, type RoleBrain } from './kit.ts';
-import { reviewerOfFinding } from './poc-a.ts';
+import { pocReviewer, reviewerOfFinding, reviewerOfRun } from './poc-a.ts';
 
 export const BANK_ENV_ID = 'bank';
 export const BANK_ORACLE_ID = 'bank-api';
@@ -251,7 +251,10 @@ function acceptedNegativeTransfer(structured: unknown): boolean {
   }
 }
 
-export const pocBReviewer: RoleBrain = reviewerOfFinding({ evidenceType: 'api-response', supports: acceptedNegativeTransfer, what: 'POST /transfers with a negative amount answered 201' });
+export const pocBReviewer: RoleBrain = pocReviewer(
+  reviewerOfFinding({ evidenceType: 'api-response', supports: acceptedNegativeTransfer, what: 'POST /transfers with a negative amount answered 201' }),
+  reviewerOfRun({ evidenceType: 'api-response', supports: acceptedNegativeTransfer, what: 'POST /transfers with a negative amount answered 201' }),
+);
 
 export const POC_B_ROLES: Record<string, RoleBrain> = {
   lead: pocBLead,

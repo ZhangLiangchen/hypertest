@@ -39,11 +39,15 @@ function validateSuite(suite: EvalSuite, options: SuiteOptions): void {
 export async function runSuite(suite: EvalSuite, options: SuiteOptions): Promise<SuiteResult> {
   validateSuite(suite, options);
   const trials: EvalTrial[] = [];
+  const cancelled = () =>
+    new HypertestError('cancelled', `suite ${suite.suiteId} was cancelled after ${trials.length} trial(s)`, { details: { completedTrials: trials.length, trials: trials.map((x) => ({ taskId: x.taskId, armId: x.armId, trial: x.trial, result: x.result })) } });
   for (const task of suite.tasks) {
     for (let t = 0; t < options.trials; t++) {
       const seed = trialSeed(suite, task.taskId, t);
       for (const arm of seededShuffle(options.arms, seed)) {
+        if (options.signal?.aborted) throw cancelled();
         const o: TrialOptions = { workDir: options.workDir, trial: t, seed };
+        if (options.signal) o.signal = options.signal;
         if (options.baseConfig) o.baseConfig = options.baseConfig;
         if (options.timeoutMs !== undefined) o.timeoutMs = options.timeoutMs;
         if (options.mode) o.mode = options.mode;
@@ -57,6 +61,7 @@ export async function runSuite(suite: EvalSuite, options: SuiteOptions): Promise
       }
     }
   }
+  if (options.signal?.aborted) throw cancelled(); // the last trial was cancelled: never summarize a partial suite
   return summarizeSuite(suite, options.arms.map((a) => a.armId), trials);
 }
 

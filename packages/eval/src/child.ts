@@ -205,6 +205,8 @@ export interface RunChildTrialOptions extends Omit<SpawnTrialChildOptions, 'jobF
   kills?: KillPoint[];
   /** Overall deadline for all children (the child still running at the deadline is killed). */
   timeoutMs: number;
+  /** (additive, H11) Cancels the trial: the running child is SIGKILLed and no resume child starts. */
+  signal?: AbortSignal;
 }
 
 /** The ledger state a kill point waits for (`operation` progress lines carry the state an operation moved `to`). */
@@ -261,7 +263,7 @@ export function dispatchCount(progress: readonly TrialProgressEvent[]): number {
  * applies to the first child. Returns the last child's exit status and every progress line.
  */
 export async function runChildTrial(job: TrialChildJob, options: RunChildTrialOptions): Promise<ChildTrialResult> {
-  const { workDir, killAfterOperationDispatch, kills: killPoints = [], timeoutMs, ...spawnOptions } = options;
+  const { workDir, killAfterOperationDispatch, kills: killPoints = [], timeoutMs, signal, ...spawnOptions } = options;
   if (killAfterOperationDispatch !== undefined && (!Number.isSafeInteger(killAfterOperationDispatch) || killAfterOperationDispatch < 1)) {
     throw new HypertestError('invalid_argument', `killAfterOperationDispatch must be a positive integer, got ${String(killAfterOperationDispatch)}`);
   }
@@ -273,6 +275,7 @@ export async function runChildTrial(job: TrialChildJob, options: RunChildTrialOp
   let kills = 0;
   let killPointsHit = 0;
   let timedOut = false;
+  let cancelled = false;
   let chaosExercised = killAfterOperationDispatch === undefined && killPoints.length === 0;
   const start = async (attempt: number, mode: 'start' | 'resume'): Promise<ChildTrialProcess> => {
     const j: TrialChildJob = { ...job, mode, attempt };
@@ -305,8 +308,19 @@ export async function runChildTrial(job: TrialChildJob, options: RunChildTrialOp
   for (const k of killPoints) points.push({ reached: (p) => killPointCount(p, k) >= (k.nth ?? 1), killPoint: true, delayMs: k.delayMs ?? 0, downtimeMs: k.downtimeMs ?? 0 });
   let attempt = 1;
   let proc = await start(attempt, job.mode);
+  // (H11) a cancelled trial kills its current child at once (the run stays resumable in the trial's stores)
+  const onAbort = () => {
+    cancelled = true;
+    void proc.kill('SIGKILL').catch(() => undefined);
+  };
+  if (signal) {
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  }
+  try {
   let exercised = 0;
   for (const point of points) {
+    if (cancelled) break;
     // counted over the whole trial: the earlier children's lines + this child's
     const hit = await proc.waitFor((_e, progress) => point.reached([...all, ...progress]), { timeoutMs: Math.max(0, deadline - Date.now()) });
     if (!hit) break;
@@ -318,10 +332,16 @@ export async function runChildTrial(job: TrialChildJob, options: RunChildTrialOp
     if (point.killPoint) killPointsHit++;
     // Hypertest stays down for a while: the external world moves on without it
     if (point.downtimeMs > 0) await sleep(Math.min(point.downtimeMs, Math.max(0, deadline - Date.now())));
+    if (cancelled) break;
     proc = await start(++attempt, 'resume');
   }
   if (exercised === points.length) chaosExercised = true;
   const exit = await finish(proc);
   all.push(...proc.progress);
-  return { exit, kills, killPointsHit, chaosExercised, timedOut, progress: all };
+  const result: ChildTrialResult = { exit, kills, killPointsHit, chaosExercised, timedOut, progress: all };
+  if (cancelled) result.cancelled = true;
+  return result;
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
+  }
 }

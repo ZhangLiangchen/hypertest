@@ -85,10 +85,13 @@ class GenerationBumper {
   constructor(envs: EnvironmentRegistry) {
     this.#envs = envs;
   }
-  bump(operationId: string, environmentId: string, buildDigest?: string): EnvironmentDescriptor {
+  /** A registry with a shared durable store (bumpGenerationAsync, e.g. the SQL registry) bumps atomically across processes. */
+  async bump(operationId: string, environmentId: string, buildDigest?: string): Promise<EnvironmentDescriptor> {
     const prior = this.#done.get(operationId);
     if (prior) return prior;
-    const next = this.#envs.bumpGeneration(environmentId, buildDigest, operationId);
+    const next = typeof this.#envs.bumpGenerationAsync === 'function'
+      ? await this.#envs.bumpGenerationAsync(environmentId, buildDigest, operationId)
+      : this.#envs.bumpGeneration(environmentId, buildDigest, operationId);
     this.#done.set(operationId, next);
     return next;
   }
@@ -226,7 +229,7 @@ export class ProcessEnvAdapter implements SideEffectAdapter<EnvInput, ProcessEnv
     if (obs.state === 'running') return { status: 'pending', progress: { state: 'running', restartId: obs.restartId } };
     if (obs.state === 'failed') return { status: 'failed', reason: `supervised ${obs.kind} failed: ${obs.error ?? 'unknown error'}` };
     if (obs.state !== 'completed') return { status: 'failed', reason: `restart in unexpected state ${obs.state}` };
-    const bumped = this.#bumper.bump(op.operation.operationId, environmentId, obs.kind === 'deploy' ? obs.buildRef : undefined);
+    const bumped = await this.#bumper.bump(op.operation.operationId, environmentId, obs.kind === 'deploy' ? obs.buildRef : undefined);
     return {
       status: 'verified',
       result: {
@@ -377,7 +380,7 @@ export class DockerEnvAdapter implements SideEffectAdapter<EnvInput, DockerEnvOb
   async verify(obs: DockerEnvObservation, _hash: string, op: OperationContext): Promise<VerificationResult> {
     if (obs.running) {
       const environmentId = environmentIdOf(op);
-      const bumped = this.#bumper.bump(op.operation.operationId, environmentId);
+      const bumped = await this.#bumper.bump(op.operation.operationId, environmentId);
       return { status: 'verified', result: { environmentId, action: 'restart', container: obs.container, startedAt: obs.startedAt, generation: bumped.generation } };
     }
     if (obs.status === 'restarting' || obs.status === 'created') return { status: 'pending', progress: { status: obs.status } };
@@ -567,7 +570,7 @@ export class KubectlEnvAdapter implements SideEffectAdapter<EnvInput, KubectlEnv
     const environmentId = environmentIdOf(op);
     const deploy = op.operation.operationType === 'env.deploy';
     const buildRef = deploy ? (obs.buildRef ?? obs.images[0]) : undefined;
-    const bumped = this.#bumper.bump(op.operation.operationId, environmentId, buildRef);
+    const bumped = await this.#bumper.bump(op.operation.operationId, environmentId, buildRef);
     return {
       status: 'verified',
       result: { environmentId, action: deploy ? 'deploy' : 'restart', namespace: obs.namespace, deployment: obs.deployment, replicas: obs.replicas, images: obs.images, generation: bumped.generation, ...(bumped.buildDigest !== undefined ? { buildDigest: bumped.buildDigest } : {}) },

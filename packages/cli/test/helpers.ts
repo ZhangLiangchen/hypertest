@@ -60,6 +60,17 @@ export const SIM_ROUTE = {
   maxActionRisk: 'critical',
 };
 
+/**
+ * The sum module's correctness criterion (conformance-1: the gate needs an oracle in force), established by a named
+ * human through the configuration and pinned by every run that names no oracles.
+ */
+export const SUM_ORACLE = {
+  oracleId: 'sum-contract',
+  scope: { components: ['sum'], description: 'the sum module adds numbers' },
+  assertions: [{ assertionId: 'suite-passes', description: 'every case of the sum suite passes', kind: 'requirement', severity: 'P1', check: { type: 'test_outcome', testSelector: '*', expected: 'pass' } }],
+  establishedBy: 'alice',
+};
+
 export interface TestProject {
   dir: string;
   configPath: string;
@@ -98,6 +109,7 @@ export async function writeProject(dir: string, extra: Record<string, unknown> =
     models: { providers: [{ id: 'sim', kind: 'scripted' }], routes: [SIM_ROUTE] },
     gate: { requireIndependentReview: false },
     observability: { logLevel: 'warn' },
+    oracles: [SUM_ORACLE],
     ...extra,
   };
   const configPath = join(dir, 'hypertest.config.yaml');

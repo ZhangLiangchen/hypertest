@@ -24,13 +24,14 @@ renamed export is a compile error, never a silently smaller catalog; duplicate i
 |---|---|
 | Registry | `ToolRegistry` (`register`, `get`, `getByName`, `list`, `definitionsFor`, `revision`), `toolIdToName`, `toolNameToId`, `assertValidToolId` |
 | Runtime | `createToolRuntime(deps)`, `redactSecrets`, `utf8Head`, `utf8Tail`, `DEFAULT_MAX_INLINE_BYTES` (16 KiB), `SECRET_KEY_PATTERN`, `SIDE_EFFECT_SETTLE_MS` |
-| Environments | `createEnvironmentRegistry(initial?)` (in-memory `EnvironmentRegistry` for `ToolRuntimeDeps.environments`) |
+| Environments | `createEnvironmentRegistry(initial?)` (in-memory `EnvironmentRegistry` for `ToolRuntimeDeps.environments`); (H12) `createSqlEnvironmentRegistry({ db, clock?, logger? }, initial?)` — generations shared by every process through the core `SqlDatabase` port — and `toolsMigrations` (`ht_environments`, `ht_environment_bumps`) |
+| Ledgered effects | (conformance-7) `recordEffectAdapters()`, `RECORD_EFFECT_ADAPTER_ID` (`tool.effect`), `RECORD_EFFECT_RESENDABLE_ADAPTER_ID` (`tool.effect.resendable`), `bindRecordEffect` |
 | Workspaces | `createWorkspaceManager(deps)`, `workspaceIdFor`, `confineExisting`, `normalizeRel`, `workspaceResource` |
-| Sandboxes | `createLocalSandbox(options?)`, `createOciSandbox({ image, docker?, user? })`, `buildDockerArgs`, `dockerNetwork`, `dockerCliEnv`, `dockerContainerEnv`, `allowlistedEnv`, `spawnProcess`; trusted git: `SAFE_GIT_CONFIG`, `trustedGitEnv`, `TRUSTED_GIT_ENV_KEYS` |
+| Sandboxes | `createLocalSandbox(options?)`, `createOciSandbox({ image, docker?, user? })`, `buildDockerArgs`, `dockerNetwork`, `dockerCliEnv`, `dockerContainerEnv`, `allowlistedEnv`, `sandboxCwd`, `spawnProcess`, `SANDBOX_MARKER_ENV` (`HYPERTEST_SANDBOX`); argument confinement `argumentPathDenial(ws, cwd, argv)`, `argumentPathTokens`; trusted git: `SAFE_GIT_CONFIG`, `trustedGitEnv`, `TRUSTED_GIT_ENV_KEYS` |
 | Runners | `nodeTestRunner`, `vitestRunner`, `jestRunner`, `pytestRunner`, `goTestRunner`, `commandRunner({ command, allowNoCases? })`, `defaultTestRunners()`; parsers `parseJunitCases`, `parseJestJson`, `parseGoTestJson`, `applyPytestSummary`; `buildResult` |
 | Coverage | `parseCoverageJson` (coverage.py), `parseLcov`, `parseCobertura`, `parseGoCoverProfile`, `parseCoverage`, `detectCoverageFormat` |
 | Mutation | `generateMutants(file, source, language, { operators? })`, `applyMutant`, `selectMutants`, `maskSource`, `runMutationAnalysis(input)`, `classifyMutantRun`, `MUTATION_OPERATORS` |
-| Tools | `builtinTools(options)`, `whiteboxTools(options)`, `DEFAULT_SHELL_ALLOWLIST`, `shellDenial`, `patchPaths`, `parseNumstatPaths`, `assertNotGitMetadata`, `selectRunner`, `extractSymbols` |
+| Tools | `builtinTools(options)`, `whiteboxTools(options)`, `DEFAULT_SHELL_ALLOWLIST`, `shellDenial`, `patchPaths`, `parseNumstatPaths`, `assertNotGitMetadata`, `selectRunner`, `extractSymbols`; (conformance-2) `workspaceDelta(ws, workspaces, selector?)`, `TEST_FILE_PATTERNS`, `isTestFilePath` |
 | XML | `parseXml`, `decodeEntities` (small tolerant parser used for JUnit and Cobertura) |
 
 ### Runtime pipeline (`createToolRuntime(deps).execute(request)`)
@@ -70,7 +71,10 @@ the reason. In order:
    The target's resourceKey must be one of (or beneath) the authorized `resources(input)`, else
    `failed`/`permission_denied` before anything is prepared.
    `verified` ⇒ `success` (structured = result), `pending` ⇒ `pending` + `operationId`, `not_applied` /
-   `failed` / `manual_review` / `stale_fence` ⇒ `failed` with that code. On timeout/abort the gateway's
+   `failed` / `manual_review` / `stale_fence` ⇒ `failed` with that code. The lease owner is
+   `request.leaseOwner ?? agentId` (H4: pass a claim-scoped owner such as `${agentId}#${fencingToken}`, so a stale
+   worker of the same agent never reuses the live claim's resource lease); the gateway releases the lease once the
+   operation settles (durability-3). On timeout/abort the gateway's
    signal is aborted and it gets `SIDE_EFFECT_SETTLE_MS` (5 s) to record the interruption: an interrupted
    dispatch comes back as `pending` with its operation id (`outcome_unknown`), never as a bare timeout that
    would invite a duplicate call; if the gateway does not answer, the timeout/cancel text tells the model not
@@ -79,6 +83,23 @@ the reason. In order:
    signal: timeout ⇒ `timeout`, abort ⇒ `failed`/`cancelled`, `HypertestError` ⇒ `failed` with its code,
    anything else ⇒ `failed`/`internal` (logged). Tools without a side-effect binding get an
    **observe-only** view of the gateway (`run`/`compensate` ⇒ `permission_denied`).
+   **Ledgered external effects (conformance-7, I4).** A tool WITHOUT a side-effect binding whose computed effect is
+   `external` or `destructive` (http.request POST/PUT/PATCH/DELETE, browser.click/fill, mcp.*) runs — when a gateway
+   is configured — through `gateway.run({ adapterId: 'tool.effect', operationType: <toolId>, toolInvocationId,
+   target: <first resource> })`: the record-only adapter's dispatch executes the tool ONCE (the executor is bound to the
+   invocation in this process) and its ToolOutcome is the verified result (the receipt persisted with `acknowledged` —
+   it travels in the L0 event — is compact: status, error code, evidence ids, digest; a crash between acknowledgement
+   and verification recovers status and evidence from it, without a structured result and never re-sending). A replay of the invocation
+   (durable retry, restarted process) returns the recorded outcome and never executes again; evidence of the call names
+   its operation. A call interrupted between sending and recording (timeout, abort, crash) is `outcome_unknown` ⇒
+   `manual_review` (`failed`/`manual_review`, "do not re-send it as a new call") — never a blind resend — unless
+   `spec.resendable(input)` (http.request to an environment declaring `honoursIdempotencyKey`, risk < high): then the
+   `tool.effect.resendable` adapter lets the gateway re-send it once with the same `Idempotency-Key`. A tool failure
+   (or a thrown error, unless interrupted) is a recorded outcome too. Without a gateway such tools run directly; a
+   gateway without the record-only adapters refuses them (fail closed, never executed).
+   `ToolContext.leaseOwner` / `ToolContext.claim` (H4) carry the request's lease owner and work-item claim (a claim on
+   another work item ⇒ `denied`/`claim_work_item_mismatch`), so tools that record effects re-check the claim right
+   before writing.
 9. **Output schema** — a `success` whose `structured` violates `outputSchema` ⇒ `failed`/`schema_violation`.
 10. **Model text (I9)** — `text ?? JSON(structured)`; above `maxInlineBytes` (default 16 KiB) the full text
     goes to the ArtifactStore (`text/plain`) with a `tool-output` evidence record, and the model sees
@@ -146,7 +167,48 @@ rejects with the abort reason; members left in the group when the command exits 
 capped per stream with truncation flags; stdin supported; a missing program ⇒ exit 127 + `spawnError`.
 A workspace whose profile says `kind: 'oci'` is refused (`precondition_failed`) — never silently run as a
 host process. Limitation: a process that calls `setsid` leaves the group (no cgroup isolation locally; use
-OCI), and the local sandbox cannot enforce `network` or read-only roots.
+OCI), and the local sandbox cannot enforce read-only roots.
+
+**Isolation (security-2, H1).** Unless the profile says `network: 'open'`, every local command runs in fresh
+unprivileged Linux namespaces (`netns.ts`, strategy probed once per process). The preferred `userns_jail` strategy
+(`unshare --user --map-root-user --net --mount` + a python3 helper) gives the command: its own network namespace with
+only its own loopback (up: a test's own servers work; nothing else is reachable — not the internet, not the SUT's
+control endpoint, not the store); a PID namespace with a fresh `/proc` (the Hypertest process, its environment with
+API keys and its `/proc/<pid>/root` view are invisible); `LocalSandboxOptions.hiddenPaths` hidden (empty read-only
+tmpfs / `/dev/null`); every workspace of `workspacesDir` but its own root and temp dir hidden; and a nested user
+namespace mapped back to the caller's uid/gid, so it holds no capability over those namespaces and cannot unmount the
+(locked) mounts — not even from a namespace of its own. Allowlisted egress: for `loopback` / `egress_allowlist`
+profiles, `LocalSandboxOptions.egress(ws)` names origins (the app passes the registered environments' base URLs and
+the URL entries of `tools.httpAllowlist`); their loopback endpoints are relayed into the namespace (a listener on the
+same `host:port` inside, a unix socket served from outside), so a black-box regression test reaches the SUT and
+nothing else (`loopbackEndpoints`; other hosts cannot be relayed and stay unreachable). Exit codes and terminating
+signals are reported as before.
+Fallbacks isolate the network only (`jail: false`): `userns_loopback` (helper without PID/mount namespaces),
+`userns` (`--map-current-user`, loopback down) and `userns_root`; they relay no allowlisted endpoint (fail closed).
+`none`, `loopback` and `egress_allowlist` are all enforced this way; `none` never relays anything. A host without user
+namespaces (another OS, `kernel.apparmor_restrict_unprivileged_userns`, a container without them) refuses such
+profiles with `precondition_failed` — never a silent downgrade; use the OCI sandbox or set `network: 'open'`
+explicitly. `networkIsolation()` / `probeNetworkIsolation()` report the strategy (`hypertest doctor` shows it). A
+program that does not exist is reported as before (exit 127 + `spawnError`) without starting anything outside the
+namespaces. Residual: the command still runs as the same uid and sees the rest of the host file system (e.g. the
+user's home) — untrusted execution needs the OCI sandbox.
+
+Every sandboxed process (local and OCI) gets `HYPERTEST_SANDBOX=<kind>` (`SANDBOX_MARKER_ENV`), set last so neither
+the allowlist nor the caller's `env` can drop or spoof it (the CLI refuses human decisions under it — H1).
+
+**The local sandbox is not a security boundary for what a program does with its arguments (security-H1a).** It
+confines the cwd and the environment only; a program resolves its arguments itself. Agent argv (`shell.exec`,
+`test.run` `framework: 'command'`) is therefore confined by `argumentPathDenial` before anything runs: every path-like
+token of every argument (split at whitespace, quotes and flag/list/script punctuation, so paths inside `sed`/`awk`/`-e`
+scripts and `--flag=/path` are seen; `file://` URLs count as their path; network URLs are egress, not paths) is refused
+(`denied`/`permission_denied`) when it climbs out with `..`, names an existing path outside the workspace, a path
+under an existing directory outside it, or leaves the workspace through a symlink. Allowed outside: the workspace's
+private temp dir and `/dev/null|stdin|stdout|stderr`; an absolute token whose top-level directory does not exist on
+the host (a regex `/^#/d`, an API path `/api/v1`) is not a path and passes. This is **defence in depth**: interpreters
+(node, python3, awk, make, npm scripts, git aliases) can compute paths at run time. Untrusted execution needs the OCI
+sandbox (or another OS-level jail), and secret material (capability secret, signing keys) must live outside any
+directory the sandboxed process can reach. (With the OCI sandbox runner the check is skipped: argv names container
+paths there, and the container's mount namespace is the boundary.)
 
 `createOciSandbox({ image })`: `docker run --rm --network none|bridge -v <root>:/workspace[:ro]
 -v <tempDir>:<tempDir> -w … --user uid:gid [--cpus] [--memory] --security-opt no-new-privileges
@@ -169,7 +231,7 @@ plain docker and maps to `none` (fail closed). `available()` probes `docker info
 | `fs.apply_patch` | write_workspace/medium | header paths (hunk bodies skipped by their counts) are confined first; `-p1` only when EVERY header name has an `a/`/`b/` prefix, else `-p0` (a no-prefix git patch at `-p1` would land on another path); `git apply --check`, then `git apply --numstat` must name only declared paths, then apply via stdin; `check: true` validates only |
 | `git.status` / `diff` / `log` / `show` / `blame` | read/low | revisions validated (no leading `-`); non-empty diffs recorded as `git-diff` evidence; in a `scratch` workspace `GIT_CEILING_DIRECTORIES` stops git from discovering an enclosing repository (e.g. a baseDir inside the target repo) |
 | `git.commit` | write_workspace/medium | isolated worktree only, and only while HEAD is the workspace's own `refs/heads/ht/<run>/<wi>` (else `permission_denied`); with `paths` exactly those paths are committed (`commit --only`), other staged changes stay staged; `files` = what the commit contains; author/committer "Hypertest Agent"; `--no-verify`, hooks disabled |
-| `shell.exec` | execute/medium | `command[0]` must be a bare name in the allowlist (default: node npm npx python3 python pytest go git ls cat grep rg sed awk head tail wc diff make — no shells) ∩ permit `allowedCommands`; else `denied`/`permission_denied`; resources always include the workspace root (a program can touch anything, whatever its cwd); stdout/stderr evidence; non-zero exit is a successful call |
+| `shell.exec` | execute/medium | `command[0]` must be a bare name in the allowlist (default: node npm npx python3 python pytest go git ls cat grep rg sed awk head tail wc diff make — no shells) ∩ permit `allowedCommands`; else `denied`/`permission_denied`; arguments may only name paths inside the workspace (`argumentPathDenial`, see Sandboxes); resources always include the workspace root (a program can touch anything, whatever its cwd); stdout/stderr evidence; non-zero exit is a successful call |
 | `test.run` | execute/medium | runner auto-detection: vitest, jest (package.json), node:test (test files / `node --test` script), pytest (ini/pyproject/conftest/test_*.py), go (go.mod); `framework: 'command'` runs an allowlisted command and is never `passed` (there is no agent-controlled `allowNoCases`) |
 | `coverage.collect` | execute/low | parses a report in the workspace ⇒ `coverage` evidence (absolute paths made relative) |
 | `mutation.run` | execute/medium | see Mutation below ⇒ `mutation-result` evidence; resources: root + file (it copies and executes the whole suite) |
@@ -180,6 +242,18 @@ payload), and a `test-result` record whose structured payload is the `TestRunRes
 With several `testArtifactIds` one `test-result` record is written **per artifact** (the QualityGate reads
 the singular `testArtifactId`, so an ineligible artifact can never ride along with an eligible one).
 `coverage: true` adds a `coverage` record (CoverageMap payload, gate-readable `totals.lines/branches`).
+
+**What was tested (conformance-2).** Before the run, test.run derives the workspace's delta against its base commit
+(`WorkspaceManager.changedFiles`: committed on the work branch, staged, unstaged and untracked files; a scratch
+workspace lists every file as added) and records it on the test-result and coverage records (and in the structured
+result) as `workspaceDelta`: `{ status: 'computed', baseCommit, readOnly, treeDigest, changedFiles, testFiles: [{ path,
+change: added|modified|deleted, sha256 }] }` (`testFiles` = changed files matching `TEST_FILE_PATTERNS` — the policy's
+test path patterns plus the runners' default discovery patterns — or the file the selector names; `treeDigest` =
+sha256 of the canonical base + every change and its digest), or `{ status: 'unavailable', readOnly, reason }`. The
+linkage is derived by the tool, never claimed by the caller: the QualityGate counts such evidence only when every
+added/modified test file is covered by a validated TestArtifact with exactly that content digest (see
+`@hypertest/policy`), so a run over an unregistered generated (or edited) test can never satisfy C1/C3/C4. The model
+text says which test files still need registration and validation.
 
 **Fake-green guards** (`TestRunResult.passed`): true only with exit 0, no harness error, ≥ 1 passed case and
 no failed/error/xpass case; skipped and xfail never make a run green on their own. node:test reports a file
@@ -243,6 +317,12 @@ restores. score = killed / (killed + survived), 0 when nothing was decidable. Th
 | Local sandbox never downgrades an OCI profile; docker CLI env | `test/sandbox.test.ts` |
 | I1 input bound at validation; inconsistent workspace handle refused; I4 interrupted side effect ⇒ `pending`/`outcome_unknown` with its operation id, same-invocation retry ⇒ one external effect | `test/runtime.test.ts` › review regressions |
 | Mutation in a monorepo exercises the mutant; a mutant is never written into the original through a symlink | `test/mutation.test.ts` |
+| security-H1a/H1: agent argv cannot read or write outside the workspace (the PoC: `cat <abs>`, `sed 'w ../sibling/x'`; `node -e` with a literal path, `ls ..`, `git -C`, `file://`, PATH lists, symlinks); ordinary scripts/regexes/git ranges/URLs keep working; `HYPERTEST_SANDBOX` is always set and cannot be spoofed | `test/sandbox.test.ts` › H1, H1a; `test/whitebox-tools.test.ts` › security-H1a |
+| H4: side-effect leases are owned by `request.leaseOwner` (a stale worker of the same agent is refused as busy, nothing dispatched); claim + owner reach the ToolContext; a claim on another work item is refused | `test/runtime.test.ts` › H4 |
+| durability-3: after agent A's side effect is verified, agent B acts on the resource at once (no resource_busy, no orphaned `prepared`) | `test/runtime.test.ts` › durability-3 (tools) |
+| conformance-2: test.run records the tool-derived workspace delta (added/modified test files with digests, tree digest); the gate refuses an unregistered generated test and accepts it once a validated artifact has its digest | `test/whitebox-tools.test.ts` › conformance-2 |
+| conformance-7 (I4): external effects without an adapter are executed once per invocation through the ledger; replays (also after a restart) return the recorded outcome; an interrupted call ⇒ manual_review, never re-sent; a gateway without the record adapters fails closed; a POST killed between send and settle is sent exactly once; a kill between receipt and verification recovers the outcome from the compact receipt (L0 event stays small); an `honoursIdempotencyKey` environment gets one resend with the same key (applied once) | `test/runtime.test.ts` › conformance-7, `test/blackbox-http.test.ts` › conformance-7 |
+| H12: the SQL registry never forgets a bump across restarts (descriptors/secrets never stored), one operation bumps once across processes, concurrent bumps never lose an update, `load`/`refresh` read the store, sync members queue durable writes; env adapters bump through `bumpGenerationAsync` | `test/sql-environments.test.ts` (PGlite and PostgreSQL) |
 
 ### Contract changes (additive, backward compatible)
 
@@ -259,6 +339,29 @@ restores. score = killed / (killed + survived), 0 when nothing was decidable. Th
   generation at execution time; unknown ids record none). Black-box evidence (HTTP exchanges, scrapes, load results)
   therefore has a provenance anchor: without it, L5 reported "records neither an environment nor a commit" for every
   black-box number. Test: `test/runtime.test.ts` › evidence records the environment the tool addressed.
+- (hardening) `ToolExecutionRequest.leaseOwner?`, `ToolExecutionRequest.claim?`, `ToolContext.leaseOwner?`,
+  `ToolContext.claim?`, new type `ToolClaim` (H4).
+- (hardening) `ToolSpec.resendable?(input, ctx)`, `EnvironmentDescriptor.honoursIdempotencyKey?` (conformance-7);
+  behaviour: external/destructive tools without a binding are ledgered when a gateway is configured (the gateway must
+  have `recordEffectAdapters()` registered — `builtinSideEffectAdapters` includes them).
+- (hardening) `WorkspaceManager.changedFiles?(ws)` and `WorkspaceChange` (conformance-2); test-result/coverage
+  structured payloads gain `workspaceDelta`.
+- (hardening) `EnvironmentRegistry.load?` / `bumpGenerationAsync?` (optional members), `SqlEnvironmentRegistry`,
+  `SqlEnvironmentRegistryDeps`, `createSqlEnvironmentRegistry`, `toolsMigrations` (H12; the package's first
+  migrations: `tools/001-environments`).
+- (hardening) Behaviour: sandboxed processes get `HYPERTEST_SANDBOX`; agent argv is confined (`argumentPathDenial`).
+  New exports: `SANDBOX_MARKER_ENV`, `sandboxCwd`, `argumentPathDenial`, `argumentPathTokens`, `TEST_FILE_PATTERNS`,
+  `isTestFilePath`, `workspaceDelta`, `recordEffectAdapters`, `RECORD_EFFECT_ADAPTER_ID`,
+  `RECORD_EFFECT_RESENDABLE_ADAPTER_ID`, `bindRecordEffect`.
+- (hardening, security-2/H1) `LocalSandboxOptions.networkIsolation?`, `.hiddenPaths?`, `.workspacesDir?`, `.egress?`;
+  new exports `networkIsolation`, `probeNetworkIsolation`, `resolveProgram`, `loopbackEndpoints`, types
+  `NetworkIsolation`, `NetworkIsolationOptions`, `IsolationSpec`. Behaviour: the local sandbox enforces every network profile but `open` with user + network (and,
+  where available, PID + mount) namespaces and refuses them where it cannot isolate the network.
+- (hardening, security-1) `WorkspaceManager.diff()` / `changedFiles()` no longer trust the worktree's git index or
+  repository configuration: they hash the worktree bytes themselves (`worktree-state.ts`: `worktreeChanges`,
+  `renderWorktreeDiff`) against the base commit's tree, so skip-worktree / assume-unchanged bits, `git replace`
+  refs, clean/diff filters, textconv, `info/exclude` and sparse-checkout cannot hide a change from the drift guard;
+  diffs are rendered by `git diff --no-index` over copies outside the repository (no filters, no external diff).
 
 ### How to test
 
@@ -303,7 +406,7 @@ world beyond a single probe (load jobs, restarts, deploys, faults) is a `SideEff
 
 | Tool | Effect / risk | Resources | Notes |
 |---|---|---|---|
-| `http.request` | read/low for GET/HEAD/OPTIONS, else external/medium | `env/<id>` or `url/<host>` | `url` or `environmentId`+`path` (joined under the baseUrl path prefix; `..`/`%2e%2e` segments are normalized first and may not climb above it or change the origin). Non-2xx is `success` (domain outcome). Redirects are returned, never followed. Non-idempotent methods get `Idempotency-Key: <invocationId>` unless set; they are testing actions on a sandbox SUT, governed by capability + policy, **not** routed through the gateway. `api-response` evidence: artifact = full response body; structured = redacted request (credential headers, secret-named query params and JSON body fields ⇒ `[REDACTED]`) and response (body text truncated at 1 MiB), duration. Timeouts (`timeout`) and connection failures (`failed`/`unavailable`) are recorded too; a body that breaks off after the status line keeps the bytes read and sets `bodyError` (never a silent short body). |
+| `http.request` | read/low for GET/HEAD/OPTIONS, else external/medium | `env/<id>` or `url/<host>` | `url` or `environmentId`+`path` (joined under the baseUrl path prefix; `..`/`%2e%2e` segments are normalized first and may not climb above it or change the origin). Non-2xx is `success` (domain outcome). Redirects are returned, never followed. Non-idempotent methods get `Idempotency-Key: <invocationId>` unless set, and (with a gateway) are recorded in the Operation Ledger through the record-only adapter (conformance-7): a replay returns the recorded response; an interrupted request ⇒ manual_review, or one resend with the same key for an environment declaring `honoursIdempotencyKey`. `api-response` evidence: artifact = full response body; structured = redacted request (credential headers, secret-named query params and JSON body fields ⇒ `[REDACTED]`) and response (body text truncated at 1 MiB), duration. Timeouts (`timeout`) and connection failures (`failed`/`unavailable`) are recorded too; a body that breaks off after the status line keeps the bytes read and sets `bodyError` (never a silent short body). |
 | `metrics.query` | read/low | `env/<id>` or `url/<host>` | PromQL instant (`time`) or range (`range`) against `prometheusUrl` / the environment's; values parsed to numbers (non-finite spelled `NaN`/`+Inf`/`-Inf`); raw JSON as `metric` evidence; Prometheus errors ⇒ `failed` `prometheus_<errorType>`. |
 | `metrics.scrape` | read/low | as above | Text exposition (HELP/TYPE, escaped labels, NaN/±Inf, timestamps, histogram `_bucket/_sum/_count`) ⇒ families, samples, **p50/p95/p99 per histogram family** (Prometheus `histogram_quantile` interpolation over buckets summed across label sets), counter totals; raw text as `metric` evidence with that summary. A body that breaks off mid-stream ⇒ `failed`/`unavailable` (partial metrics would silently drop series). |
 | `load.start` | external/high, adapter `load.http` | `env/<id>`/`url/<host>`, `loadgen/<host>` | Open-loop HTTP load job; returns `pending` + operation id. Egress guard enforced when the runtime derives the target (before any operation is prepared) ⇒ `failed`/`permission_denied`. GET/HEAD with a body, duplicate header names and a caller-set `X-Hypertest-Operation` are refused; header names are lower-cased. |
@@ -388,7 +491,8 @@ context that never navigated sends nothing (fail closed).
   `not_applied` before anything is patched (one image must never overwrite the sidecars). observe =
   annotation match; verify = rollout-status semantics (observedGeneration, updated/available replicas,
   `ProgressDeadlineExceeded` ⇒ failed).
-- After a **verified** restart/deploy the adapter calls `environments.bumpGeneration` (deploy with
+- After a **verified** restart/deploy the adapter calls `environments.bumpGenerationAsync` when the registry has it
+  (the SQL registry: atomic and idempotent per operation across processes), else `environments.bumpGeneration` (deploy with
   buildDigest = buildRef) once per operation, so snapshots that observed the old generation become stale. The
   bump names its operation (`bumpGeneration(id, digest, operationId)`): a registry returns the recorded bump when the
   same operation is verified again — by another adapter instance, e.g. the reconciliation in a process resumed after a

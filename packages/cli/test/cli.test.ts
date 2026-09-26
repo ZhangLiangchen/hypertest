@@ -114,6 +114,17 @@ describe('dispatch, help and usage errors', () => {
       [['oracle'], /^hypertest oracle: missing sub-command/],
       [['oracle', 'nope'], /^hypertest oracle: unknown sub-command oracle nope\n/],
       [['oracle', 'decide'], /^hypertest oracle: missing <proposalId>\n/],
+      [['oracle', 'establish'], /^hypertest oracle: missing <file>\n/],
+      [['oracle', 'establish', 'o.yaml'], /^hypertest oracle: --by is required\n/],
+      [['waive', 'run_1', 'C1', '--by', 'alice', '--reason', 'r'], /^hypertest waive: C1 evidence_integrity is not waivable\n/],
+      [['waive', 'run_1', 'review', '--by', 'alice', '--reason', 'r'], /^hypertest waive: <criterionId> must be a gate criterion id C0\.\.C9 \(got "review"\)\n/],
+      [['waive', 'run_1', 'C6', '--by', 'alice'], /^hypertest waive: --reason is required\n/],
+      [['waive', 'run_1', 'C6', '--by', 'alice', '--reason', 'r', '--expires', 'soon'], /^hypertest waive: --expires must be an ISO-8601 time \(got "soon"\)\n/],
+      [['experience'], /^hypertest experience: missing sub-command \(experience list \| experience review <experienceId>\)\n/],
+      [['experience', 'nope'], /^hypertest experience: unknown sub-command experience nope\n/],
+      [['experience', 'list', '--status', 'bogus'], /^hypertest experience: --status: unknown experience status "bogus"/],
+      [['experience', 'review', 'exp_1', '--by', 'alice'], /^hypertest experience: --decision is required\n/],
+      [['experience', 'review', 'exp_1', '--decision', 'bless', '--by', 'alice'], /^hypertest experience: --decision must be one of review, approve, publish, reject, quarantine \(got "bless"\)\n/],
       [['evidence', 'check', 'r1'], /^hypertest evidence: unknown sub-command evidence check/],
       [['eval'], /^hypertest eval: missing sub-command \(eval run <suite>\)\n/],
       [['eval', 'run', 'x', '--trials', '0'], /^hypertest eval: --trials must be an integer between 1 and 10000 \(got "0"\)\n/],
@@ -231,6 +242,18 @@ describe('processes that execute no agent turn', () => {
       const o = await cli(['oracle', 'decide', 'ocp_1', '--by', 'alice', '--reason', 'fine', '--json'], { cwd: dir.path, env });
       assert.equal(o.code, 1);
       assert.equal(parseJsonError(o.stdout), 'permission_denied');
+      // conformance-11: waiving a gate criterion is a human decision
+      const w = await cli(['waive', 'run_1', 'C6', '--by', 'alice', '--reason', 'no reviewer route today'], { cwd: dir.path, env });
+      assert.equal(w.code, 1);
+      assert.match(w.stderr, /^hypertest waive: waive is a human decision and cannot be taken from inside a Hypertest sandbox .*\[permission_denied\]\n$/);
+      // conformance-13: reviewing what later runs learn from is a human decision too
+      const exp = await cli(['experience', 'review', 'exp_1', '--decision', 'approve', '--by', 'alice'], { cwd: dir.path, env });
+      assert.equal(exp.code, 1);
+      assert.match(exp.stderr, /^hypertest experience: experience review is a human decision and cannot be taken from inside a Hypertest sandbox .*\[permission_denied\]\n$/);
+      // conformance-1: establishing an oracle (the correctness criterion itself) is a human decision too
+      const est = await cli(['oracle', 'establish', 'oracle.yaml', '--by', 'alice'], { cwd: dir.path, env });
+      assert.deepEqual([est.code, est.stdout], [1, '']);
+      assert.match(est.stderr, /^hypertest oracle: oracle establish is a human decision and cannot be taken from inside a Hypertest sandbox .*\[permission_denied\]\n$/);
       // an empty marker is not a sandbox: the command proceeds (and here fails for want of a configuration)
       const unset = await cli(['approve', 'appr_1', '--by', 'alice', '--reason', 'r'], { cwd: dir.path, env: { [SANDBOX_ENV]: '', HYPERTEST_CONFIG: undefined } });
       assert.equal(unset.code, 1);

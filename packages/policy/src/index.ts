@@ -13,7 +13,7 @@ export { assertMayDecide, createOracleGovernance } from './oracle-governance.ts'
 export { agentIndependenceViolation, type IndependenceViolation } from './independence.ts';
 export { DEFAULT_TEST_PATH_PATTERNS, categoryDecision, classifyTestChange } from './classifier.ts';
 export { parseUnifiedDiff, type DiffFile, type DiffHunk, type DiffLine } from './diff.ts';
-export { DEFAULT_GATE_SPEC, GATE_CRITERIA, QualityGate, currentRecords } from './gate.ts';
+export { DEFAULT_GATE_SPEC, GATE_CRITERIA, QualityGate, currentRecords, evaluateOracleCheck, gateOverrides, type OracleCheckOutcome } from './gate.ts';
 export { DEFAULT_PROTOCOL_CONTEXT_BYTES, extractMarkdownSections, prepareProtocolContext, resolveProtocolBinding } from './bugate.ts';
 export { EMBEDDED_PRINCIPLES, EMBEDDED_PROTOCOL_VERSION, PREPARED_PROTOCOL_CONTEXT_SCHEMA } from './bugate-embedded.ts';
 export { policyMigrations } from './migrations.ts';

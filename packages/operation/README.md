@@ -25,8 +25,9 @@ Depends on `@hypertest/core` and `@hypertest/domain` only. The ABI is `src/contr
 1. Find the operation by `(toolInvocationId, operationType)`. Same id with a different input/run/adapter ⇒
    `conflict`. `verified` ⇒ recorded result; `failed` / `manual_review` / compensation states ⇒ recorded outcome.
 2. `request.lease`: reuse (renew) the owner's live lease, else acquire; held by another live owner ⇒
-   `failed` / `resource_busy` (no dispatch). Without `request.lease`, a lease recorded on the operation
-   (e.g. by the scheduler at prepare time) is used as the fence.
+   `failed` / `resource_busy` (no dispatch; a never-dispatched `prepared` operation is recorded `not_applied` with
+   `lastError: resource_busy: …` — never an orphaned `prepared`; a retry re-enters through `not_applied → dispatching`).
+   Without `request.lease`, a lease recorded on the operation (e.g. by the scheduler at prepare time) is used as the fence.
 3. New operation: the id is generated first, `adapter.prepare()` sees it (labels), then `ledger.prepare()`.
 4. Before any dispatch — and before a stale worker may drive reconciliation — `checkFence`; stale ⇒ `stale_fence`, status unchanged.
 5. `prepared`/`not_applied` ⇒ persist `dispatching` (attempt+1) **before** `adapter.dispatch()`.
@@ -72,6 +73,19 @@ Compensation only from `verified` (an unknown outcome must be reconciled first �
 `compensating → compensated | manual_review`; an interrupted compensation is resumed by lookup; a
 compensation still in flight in this process is never run a second time (`pending`).
 
+Lease lifecycle (durability-3): the lease a `run()` drive holds is **released** as soon as the operation settles
+(`verified`, `not_applied`, `failed`, `manual_review`, `compensated`) — the next owner is served at once, not refused as
+`resource_busy` until the TTL — unless another drive in this process still uses the same lease (reference-counted) or
+another unsettled operation of the run is recorded under it (an owner reuses its live lease: a job still running on the
+resource keeps its exclusivity). A lease obtained for a call whose prepare fails (or that lost the prepare race to an
+already settled operation) is released the same way.
+While a drive polls (`verifyWithinMs`) it renews its lease at half its TTL. `observe()` extends (never shortens) the
+live lease of an operation whose effect exists but is unsettled (`acknowledged`/`outcome_unknown`/`reconciling`) to
+`GatewayDeps.leaseRenewTtlMs` (default 60 s), so a long-running job keeps its exclusivity while it is polled, and
+releases it when the observation settles the operation. It never extends the lease of a `dispatching` operation: that
+lease going stale is how a crashed dispatcher is detected. A busy refusal racing the lease holder's dispatch never
+stops it (the holder dispatches from `not_applied` at the same attempt).
+
 Leases: every grant (free, expired per the injected clock, or same-owner re-acquire) issues `previous + 1`
 from `ht_fences.last_token` (never reused, survives release). `acquire` locks the fence row and the current
 lease row, so a renewal in progress is never silently overwritten by a regrant. `renew` of an expired or
@@ -81,7 +95,9 @@ Budgets: scopes form an immutable parent chain (`open` is idempotent, also under
 atomically (rows locked in sorted order); the first violation is reported in caller scope order, then
 `BUDGET_DIMENSIONS` order; missing limit = unlimited; `settle` records actual usage even above the
 reservation/limit; settle-after-settle and release-after-finish are no-ops; `charge` never records an
-exceeding amount.
+exceeding amount. A `charge(…, { idempotencyKey })` is recorded once per key (transaction-scoped advisory lock on the
+key + unique `idempotency_key` column): a replay returns the recorded reservation id without charging again; the same
+key for other scopes/amounts ⇒ `conflict`; a refused charge records nothing (its retry is evaluated afresh).
 
 ## Invariants and where they are proven
 
@@ -104,6 +120,8 @@ exceeding amount.
 | I4 a re-dispatch never inherits the previous attempt's job id (no blind retry of high-risk no-lookup) | `test/gateway-races.test.ts`, `test/ledger.test.ts` |
 | I4 non-cooperative adapters cannot hang `run()`/`reconcile()` after abort; compensation runs once | `test/gateway-races.test.ts` |
 | I4 renewal vs regrant race: no lost renewal | `test/postgres.int.test.ts` |
+| durability-3: a settled operation releases its lease (verified / not_applied / failed); another owner is served at once; observe extends the lease of a running job and releases it when it settles; never extends a dispatching operation's lease; a lease shared by two in-process drives is released only after both settle; a lease still guarding another unsettled operation is kept; a failed prepare releases its lease; a busy refusal records `not_applied` | `test/gateway.test.ts` › durability-3, › resource busy |
+| H5: a keyed charge is recorded once (sequential and 6 concurrent duplicates), the limit still applies, refused charges record nothing, a reused key for other amounts/scopes ⇒ conflict | `test/budget.test.ts` › H5 |
 
 ## Contract changes (additive, backward compatible)
 
@@ -115,6 +133,15 @@ exceeding amount.
 - (eval review) `RunSideEffectRequest.reconcileOnly?` and `SideEffectGateway.find?(toolInvocationId, operationType,
   runId)` (optional member; `createSideEffectGateway` implements it) — see Gateway semantics 8.
 - Documented outcome mapping for `compensated`/`compensating`/`prepared` (no new outcome statuses).
+- (hardening) `BudgetLedger.charge(scopes, amounts, reason, options?: { idempotencyKey? })` (optional 4th argument;
+  migration `operation/005-budget-charge-idempotency` adds `ht_budget_reservations.idempotency_key`).
+- (hardening) `GatewayDeps.leaseRenewTtlMs?`; exported `DEFAULT_LEASE_RENEW_TTL_MS`. Behaviour: leases are released
+  when an operation settles and extended while it is observed (see Lease lifecycle); busy-refused `prepared`
+  operations are recorded `not_applied` (the domain state machine gained `prepared → not_applied`).
+- (hardening, durability-1) `BudgetLedger.releaseOpen?(scope)` (optional member; `createBudgetLedger` implements it):
+  releases every still-open reservation whose scope chain contains `scope` — the control plane's `recover()` calls it
+  for the `work:<id>` of every claim it takes from a dead worker, so a crash between reserve and settle never shrinks
+  the run's headroom for good. A later settle of a released reservation is `precondition_failed`.
 - Documented (no signature change): `transition(→ dispatching)` clears `externalJobId`/`externalReceipt`
   unless the patch supplies them; `prepare` also treats a different `adapterId` as a `conflict`; the
   gateway emits `operation.late_receipt` audit events for receipts the ledger cannot store.

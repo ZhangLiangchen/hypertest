@@ -4,6 +4,7 @@ import { recordEvidence, type RecordEvidenceInput } from '@hypertest/evidence';
 import type { SideEffectGateway, SideEffectOutcome } from '@hypertest/operation';
 import { capabilityAllows, matchesResourcePattern, verifyCapability, type ActionPermit, type ActionRequest } from '@hypertest/policy';
 import type { ToolContext, ToolExecutionRequest, ToolExecutionResult, ToolOutcome, ToolRuntime, ToolRuntimeDeps, ToolSpec, ToolStatus } from '../contracts.ts';
+import { RECORD_EFFECT_ADAPTER_ID, RECORD_EFFECT_RESENDABLE_ADAPTER_ID, bindRecordEffect, type RecordedToolOutcome } from './record-effects.ts';
 
 /** Default model-visible byte budget before a tool output is offloaded to the ArtifactStore (I9). */
 export const DEFAULT_MAX_INLINE_BYTES = 16 * 1024;
@@ -12,6 +13,9 @@ export const SECRET_KEY_PATTERN = /secret|token|password|api[_-]?key|authorizati
 export const REDACTED = '[REDACTED]';
 const MAX_LISTED_EVIDENCE = 20;
 const EFFECTS_WITHOUT_FRESHNESS: ReadonlySet<ToolEffect> = new Set(['read', 'record']);
+/** Effects on the outside world that must go through the Operation Ledger (I4) even without a dedicated adapter. */
+const LEDGERED_EFFECTS: ReadonlySet<ToolEffect> = new Set(['external', 'destructive']);
+const TOOL_STATUSES: ReadonlySet<string> = new Set(['success', 'failed', 'timeout', 'denied', 'pending', 'stale_context']);
 
 /** Deep copy of a JSON-like value with every property whose key matches SECRET_KEY_PATTERN replaced. */
 export function redactSecrets(value: unknown, pattern: RegExp = SECRET_KEY_PATTERN): JsonValue {
@@ -135,6 +139,8 @@ function observeOnly(gateway: SideEffectGateway): SideEffectGateway {
 }
 
 interface Stage {
+  /** A ledgered call's outcome recovered from its receipt only (the structured result was lost in a crash). */
+  recovered?: boolean;
   status: ToolStatus;
   structured?: JsonValue;
   text?: string;
@@ -165,6 +171,13 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
       if (!request || typeof request !== 'object' || typeof request.toolId !== 'string' || typeof request.invocationId !== 'string' || !request.eventContext || !request.workspace || !request.signal) {
         throw new HypertestError('invalid_argument', 'malformed ToolExecutionRequest');
       }
+      if (request.leaseOwner !== undefined && (typeof request.leaseOwner !== 'string' || request.leaseOwner.length === 0)) {
+        throw new HypertestError('invalid_argument', 'malformed ToolExecutionRequest: leaseOwner must be a non-empty string');
+      }
+      if (request.claim !== undefined && (!request.claim || typeof request.claim.workItemId !== 'string' || !Number.isSafeInteger(request.claim.fencingToken) || request.claim.fencingToken <= 0)) {
+        throw new HypertestError('invalid_argument', 'malformed ToolExecutionRequest: claim needs a workItemId and a positive integer fencingToken');
+      }
+      const leaseOwner = request.leaseOwner ?? request.agentId;
       const started = clock.nowMs();
       const evCtx: EventContext = {
         ...request.eventContext,
@@ -242,6 +255,7 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
       if (cap.runId !== request.runId) return deny('denied', 'permission_denied', `capability_run_mismatch: ${cap.runId} != ${request.runId}`);
       if (cap.subjectAgentId !== request.agentId) return deny('denied', 'permission_denied', `capability_subject_mismatch: ${cap.subjectAgentId} != ${request.agentId}`);
       if (cap.workItemId !== request.workItemId) return deny('denied', 'permission_denied', `capability_work_item_mismatch: ${cap.workItemId} != ${request.workItemId}`);
+      if (request.claim && request.claim.workItemId !== request.workItemId) return deny('denied', 'permission_denied', `claim_work_item_mismatch: ${request.claim.workItemId} != ${request.workItemId}`);
 
       // 4 effect / risk / resources / environment ⇒ capability scope
       let effect: ToolEffect;
@@ -316,6 +330,11 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
         if (outside.length > 0) return deny('denied', 'permission_denied', `permit_constraint_violated: resources outside allowedPaths: ${outside.join(', ')}`, permit);
       }
 
+      // conformance-7: an external/destructive effect without a dedicated adapter (http.request POST, browser.click/fill,
+      // mcp.*) still goes through the Operation Ledger — the call is recorded under the invocation id, a replay returns
+      // its recorded outcome, an interrupted call is never blindly re-sent. Without a configured gateway it runs directly.
+      const recordEffect = !spec.sideEffect && deps.sideEffects !== undefined && LEDGERED_EFFECTS.has(effect);
+
       // 6 freshness for mutating effects — fail closed: a configured guard with no snapshot cannot vouch for the action.
       //   Exception: the REPLAY of a side-effect call that was already dispatched (the same invocation: a durable retry of
       //   a committed turn, e.g. after a crash) on a snapshot that is stale by now. Its act happened (or may have) under
@@ -337,9 +356,10 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
           }
           if (!fresh.fresh) staleText = `stale context (snapshot ${request.snapshot.snapshotId}): ${fresh.stale.map((s) => `${s.resourceType}/${s.resourceId}: ${s.reason}`).join('; ')}`;
         }
-        if (staleText !== undefined && spec.sideEffect && deps.sideEffects?.find) {
+        const ledgerType = spec.sideEffect?.operationType ?? (recordEffect ? spec.id : undefined);
+        if (staleText !== undefined && ledgerType !== undefined && deps.sideEffects?.find) {
           try {
-            const prior = await deps.sideEffects.find(request.invocationId, spec.sideEffect.operationType, request.runId);
+            const prior = await deps.sideEffects.find(request.invocationId, ledgerType, request.runId);
             if (prior && prior.status !== 'prepared' && prior.status !== 'not_applied') replayOf = prior.operationId;
           } catch (e) {
             logger.warn('operation lookup failed; the stale call is refused', { invocationId: request.invocationId, error: (e as Error).message });
@@ -421,7 +441,7 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
                 adapterId: binding.adapterId,
                 input,
                 target,
-                lease: { resourceKey: target.resourceKey, ttlMs: binding.leaseTtlMs ?? Math.max(spec.timeoutMs, 60_000), owner: request.agentId },
+                lease: { resourceKey: target.resourceKey, ttlMs: binding.leaseTtlMs ?? Math.max(spec.timeoutMs, 60_000), owner: leaseOwner },
                 ctx: evCtx,
                 signal,
                 // a replay settles its operation; a (re-)dispatch would be a new decision on a snapshot nobody validated
@@ -432,6 +452,39 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
             `tool ${spec.id}`,
           );
           applySideEffectOutcome(stage, outcome);
+        } else if (recordEffect) {
+          const gateway = deps.sideEffects!;
+          let resendable = false;
+          try {
+            resendable = RISK_ORDER[riskClass] < RISK_ORDER.high && spec.resendable?.(input, { environments: deps.environments }) === true;
+          } catch (e) {
+            logger.warn('resendable() failed; treating the effect as not resendable', { error: (e as Error).message });
+          }
+          const unbind = bindRecordEffect(request.runId, request.invocationId, (signal, operationId) => executeRecorded(signal, operationId));
+          try {
+            const outcome = await runSideEffect(
+              (signal) =>
+                gateway.run({
+                  runId: request.runId,
+                  workItemId: request.workItemId,
+                  agentId: request.agentId,
+                  toolInvocationId: request.invocationId,
+                  operationType: spec.id,
+                  adapterId: resendable ? RECORD_EFFECT_RESENDABLE_ADAPTER_ID : RECORD_EFFECT_ADAPTER_ID,
+                  input,
+                  target: { resourceKey: resources[0] ?? `tool/${spec.id}`, kind: 'tool_effect' },
+                  ctx: evCtx,
+                  signal,
+                  ...(replayOf !== undefined ? { reconcileOnly: true } : {}),
+                }),
+              timeoutMs,
+              request.signal,
+              `tool ${spec.id}`,
+            );
+            applyRecordedOutcome(stage, outcome);
+          } finally {
+            unbind();
+          }
         } else {
           const outcome: ToolOutcome = await withTimeout(timeoutMs, (signal) => spec.execute(input, makeCtx(signal)), request.signal, `tool ${spec.id}`);
           if (!outcome || typeof outcome !== 'object' || typeof outcome.status !== 'string') throw new HypertestError('internal', `tool ${spec.id} returned a malformed outcome`);
@@ -449,7 +502,7 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
         if (e instanceof HypertestError) {
           stage.status = e.code === 'timeout' ? 'timeout' : 'failed';
           stage.error = { code: e.code, message: e.message };
-          if (spec.sideEffect && (e.code === 'timeout' || e.code === 'cancelled')) {
+          if ((spec.sideEffect || recordEffect) && (e.code === 'timeout' || e.code === 'cancelled')) {
             stage.error.message += `; the external outcome is unknown: do not re-issue this action as a new call — re-running this same invocation (${request.invocationId}) reconciles it through the Operation Ledger`;
           }
         } else {
@@ -459,8 +512,8 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
         }
       }
 
-      // 9 output schema
-      if (stage.status === 'success' && spec.outputSchema) {
+      // 9 output schema (a recovered ledgered outcome has no structured result: its full response is in its evidence)
+      if (stage.status === 'success' && spec.outputSchema && !stage.recovered) {
         const v = compileSchema(spec.outputSchema)(stage.structured);
         if (!v.valid) {
           stage.status = 'failed';
@@ -513,7 +566,36 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
       }
       return done;
 
-      function makeCtx(signal: AbortSignal): ToolContext {
+      /**
+       * The single execution of a record-effect tool, driven by the gateway's dispatch (record-only adapter): the tool
+       * runs under the gateway's signal (the tool timeout / request abort); its evidence names the operation. A tool that
+       * reports a failure — or throws, unless interrupted — has a definitive recorded outcome; an interrupted call
+       * rethrows, so the gateway records outcome_unknown (never a silent failure that would invite a resend).
+       */
+      async function executeRecorded(signal: AbortSignal, operationId: string): Promise<RecordedToolOutcome> {
+        const before = produced.length;
+        let outcome: ToolOutcome;
+        try {
+          outcome = await spec!.execute(input, makeCtx(signal, operationId));
+          if (!outcome || typeof outcome !== 'object' || typeof outcome.status !== 'string' || !TOOL_STATUSES.has(outcome.status)) throw new HypertestError('internal', `tool ${spec!.id} returned a malformed outcome`);
+        } catch (e) {
+          if (signal.aborted) throw abortReason(signal);
+          if (!(e instanceof HypertestError)) logger.error('tool execution failed unexpectedly', { error: e instanceof Error ? (e.stack ?? e.message) : String(e) });
+          const err = e instanceof HypertestError ? e : new HypertestError('internal', e instanceof Error ? e.message : String(e));
+          outcome = { status: err.code === 'timeout' ? 'timeout' : 'failed', error: { code: err.code, message: err.message } };
+        }
+        const recorded: RecordedToolOutcome = { status: outcome.status };
+        const structured = toJson(outcome.structured, `tool ${spec!.id} structured output`);
+        if (structured !== undefined) recorded['structured'] = structured;
+        if (outcome.text !== undefined) recorded['text'] = String(outcome.text);
+        if (outcome.error) recorded['error'] = { code: String(outcome.error.code), message: String(outcome.error.message) };
+        if (outcome.operationId !== undefined) recorded['operationId'] = outcome.operationId;
+        recorded['artifactRefs'] = toJson(outcome.artifactRefs ?? [], 'artifact refs') ?? [];
+        recorded['evidenceRefs'] = uniq([...(outcome.evidenceRefs ?? []), ...produced.slice(before).map((p) => p.evidenceId)]);
+        return recorded;
+      }
+
+      function makeCtx(signal: AbortSignal, operationId?: string): ToolContext {
         const ctx: ToolContext = {
           runId: request.runId,
           workItemId: request.workItemId,
@@ -522,13 +604,16 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
           invocationId: request.invocationId,
           workspace: request.workspace,
           artifacts: deps.artifacts,
-          recordEvidence: recordEv,
+          // evidence of a ledgered call names its operation (L5: evidence → operation) unless the tool names one
+          recordEvidence: operationId === undefined ? recordEv : (inp) => recordEv(inp.operationId !== undefined ? inp : { ...inp, operationId }),
           eventContext: evCtx,
           permit,
           signal,
           logger,
           environments: deps.environments,
+          leaseOwner,
         };
+        if (request.claim) ctx.claim = { ...request.claim };
         if (request.snapshot) ctx.snapshot = request.snapshot;
         if (deps.sideEffects) ctx.sideEffects = spec!.sideEffect ? deps.sideEffects : observeOnly(deps.sideEffects);
         return ctx;
@@ -560,6 +645,31 @@ function applySideEffectOutcome(stage: Stage, outcome: SideEffectOutcome): void 
       stage.status = 'failed';
       stage.error = { code: outcome.status, message: outcome.reason };
       stage.structured = { operationId: outcome.operation.operationId, operationStatus: outcome.operation.status };
+  }
+}
+
+/** A record-effect call's gateway outcome ⇒ the tool's recorded outcome (verified) or the operation's state. */
+function applyRecordedOutcome(stage: Stage, outcome: SideEffectOutcome): void {
+  const op = outcome.operation;
+  if (outcome.status === 'verified') {
+    const r = (outcome.result ?? {}) as RecordedToolOutcome;
+    stage.status = (TOOL_STATUSES.has(r.status) ? r.status : 'failed') as ToolStatus;
+    if (r['structured'] !== undefined) stage.structured = r['structured'];
+    if (typeof r['text'] === 'string') stage.text = r['text'];
+    const err = r['error'] as { code?: unknown; message?: unknown } | undefined;
+    if (err && typeof err === 'object') stage.error = { code: String(err.code), message: String(err.message) };
+    stage.operationId = typeof r['operationId'] === 'string' ? r['operationId'] : op.operationId;
+    stage.artifactRefs = Array.isArray(r['artifactRefs']) ? (r['artifactRefs'] as unknown as ArtifactRef[]) : [];
+    stage.evidenceRefs = uniq([...(Array.isArray(r['evidenceRefs']) ? (r['evidenceRefs'] as string[]) : []), ...op.evidenceRefs]);
+    if (r['recoveredFromReceipt'] === true) stage.recovered = true;
+    if (stage.status !== 'success' && stage.status !== 'pending' && !stage.error) stage.error = { code: stage.status, message: `tool reported ${stage.status}` };
+    return;
+  }
+  applySideEffectOutcome(stage, outcome);
+  if (stage.error && outcome.status !== 'pending') {
+    stage.error.message += outcome.status === 'manual_review'
+      ? '; the call may or may not have reached the target and its outcome was not recorded: do not re-send it as a new call before checking the target (the operation awaits manual review)'
+      : '';
   }
 }
 

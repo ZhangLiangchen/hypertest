@@ -17,7 +17,7 @@ interface ApprovalRow {
   decided_at: unknown;
 }
 
-const KINDS: ReadonlySet<string> = new Set(['action', 'oracle_change', 'test_change', 'budget', 'manual_review']);
+const KINDS: ReadonlySet<string> = new Set(['action', 'oracle_change', 'test_change', 'budget', 'manual_review', 'gate_exception']);
 /**
  * Kinds an agent may never decide: they are the human-in-the-loop for side effects (`action`, from
  * approval_required permits), spend (`budget`) and explicit manual review. Agents can only request them.

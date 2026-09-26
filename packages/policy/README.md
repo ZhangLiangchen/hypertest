@@ -18,7 +18,7 @@ Depends only on `@hypertest/core`, `@hypertest/domain` and `yaml`. The binding A
 | Audit | `createPolicyDecisionLog(deps)` (`ht_policy_decisions`), `createApprovalService(deps)` (`ht_approvals`), `policyMigrations` |
 | Oracles (I8) | `createOracleGovernance(deps)`, `assertMayDecide`, `agentIndependenceViolation` |
 | Self-heal (I8) | `classifyTestChange(diff, options?)`, `categoryDecision`, `DEFAULT_TEST_PATH_PATTERNS`, `parseUnifiedDiff` |
-| Gate (I7) | `QualityGate#evaluate(input)`, `DEFAULT_GATE_SPEC`, `GATE_CRITERIA`, `currentRecords` |
+| Gate (I7) | `QualityGate#evaluate(input)`, `DEFAULT_GATE_SPEC`, `GATE_CRITERIA`, `currentRecords`, `evaluateOracleCheck` (the C3 check evaluator), `OracleCheckOutcome` |
 | BUGate | `resolveProtocolBinding({ bugatePath? })`, `prepareProtocolContext(protocol, request)`, `EMBEDDED_PRINCIPLES`, `PREPARED_PROTOCOL_CONTEXT_SCHEMA` |
 
 ### Semantics worth knowing
@@ -115,6 +115,8 @@ Depends only on `@hypertest/core`, `@hypertest/domain` and `yaml`. The binding A
 | I1 permit before tool: capability checked first, signature/run/subject/work-item binding, malformed input denied, fail-closed defaults, OPA fail-closed, immutable rules | `test/engine.test.ts`, `test/opa.test.ts`, `test/opa.int.test.ts` |
 | I2 no amplification: attenuation per field, greedy child, tampered parent refused, non-canonical keys, seeded randomized property (400 capabilities × 50 actions) | `test/capabilities.test.ts`, `test/patterns.test.ts` |
 | I7 gate: one test per criterion (satisfied/violated/unknown), precedence, exceptions, determinism, zero (eligible) evidence, LLM-only critical, ineligible generated tests, latest build (unidentified evidence never hides the current build's failure) | `test/gate.test.ts` |
+| I8/conformance-2: evidence carrying a `workspaceDelta` counts only when every test file added/modified since the base commit is covered by the LATEST revision of a TestArtifact with exactly that content digest that proved its sensitivity (draft/quarantined/retired/insensitive/`existing`-claimed artifacts do not cover; one uncovered file taints the record even with an eligible declared artifact); an unavailable delta counts only for a read-only workspace | `test/gate.test.ts` › conformance-2 |
+| H8: `evaluateOracleCheck` is the gate's own C3 evaluator (same outcome and refs as C3) | `test/gate.test.ts` › H8 |
 | I8 oracles: self-approval, same/unknown provider or role, approver kinds, flip needs human (re-checked at decision time), stale proposal, create-only establish, concurrent approvals (in-process and across instances), resumable approval, new revision + reassessment | `test/oracle-governance.test.ts` |
 | I8 self-heal: JS/TS/Python/Go diffs, deletion/skip/swallow/assertion/threshold, evasion attempts (comments, wrappers, exits, modifiers, hooks, selection, malformed hunks) and false-positive guards, real git multi-file diff | `test/classifier.test.ts` |
 | I10 audit: decision log append-only (trigger), event in the same transaction (sink failure rolls back), approvals decided once (conditional UPDATE + trigger), agent deciders, NUL-safe storage, concurrent deciders on PostgreSQL | `test/persistence.test.ts`, `test/persistence.int.test.ts` |
@@ -127,6 +129,29 @@ Depends only on `@hypertest/core`, `@hypertest/domain` and `yaml`. The binding A
 `GateInput.producerProviders?`, `GateInput.revision?`,
 `GateInput.supersedes?`; `ProtocolContextRequest.workspaceDigest?`; the `PolicyRule` doc comment now
 states the evaluate-all / most-restrictive / fail-closed semantics.
+
+(hardening) Exports `evaluateOracleCheck(check, evidence)` and type `OracleCheckOutcome` (H8: the gate's own check
+evaluator, for deterministic consumers such as the oracle-change flip detector — no re-implementation that drifts).
+Gate behaviour (conformance-2): evidence eligibility is also derived from its recorded `workspaceDelta` (written by
+`test.run` from the workspace itself): new or modified test files must be covered by a validated/approved artifact
+with that exact `artifactDigest`; evidence without a delta is judged as before (declared `testArtifactId` only).
+
+(hardening, upper) `GateSpec.requireOracle?` (domain, default `true` in `DEFAULT_GATE_SPEC`) and gate criterion
+**C0 `oracle_in_force`** (conformance-1), evaluated first: satisfied when the run pins an approved oracle revision
+with at least one deterministic P0/P1 assertion (not `llm_rubric` / `llm_semantic`), or when the gate explicitly sets
+`requireOracle: false`; otherwise `unknown` ⇒ the verdict is at best `inconclusive` (never `pass` without a
+correctness criterion decided by a human). H3: an unrecognised `failOnUnresolvedSeverity` / `conditionalOnRiskLevel`
+fails closed (strictest threshold, criterion at least `unknown`).
+
+(hardening) conformance-4: `GateInput.currentOracleRevisions?` — the latest approved revision of each pinned oracle;
+a pinned revision below it (an oracle approved in a new revision during the run) makes C0 `unknown` ("superseded …
+judge the candidate against the new revision in a new run"), whatever `requireOracle` says. conformance-9: every
+`QualityDecision` carries `gateSpecDigest` (sha256 of the canonical effective GateSpec, signed with the decision) and
+`gateOverrides` (`field=value` for each field that differs from `DEFAULT_GATE_SPEC`; new export `gateOverrides`), so a
+weakened run-level override is visible in the decision and the report. conformance-11: approval kind
+`gate_exception` (subject `{ criterionId, expiresAt? }`; migration `policy/003-gate-exception-approvals` widens the
+`ht_approvals.kind` check) — the governed waiver the gate's exception rules (never C1, never agent-approved, never
+expired) apply to.
 
 ## Testing
 

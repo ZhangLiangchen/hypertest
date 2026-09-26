@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { after, before, describe, test } from 'node:test';
 import { tempDir } from '@hypertest/testkit';
 import { MemoryLogger } from '@hypertest/core';
+import { networkIsolation } from '@hypertest/tools';
 import { acquireDirectoryLock, defaultConfig, diagnose, lockFileFor, type DiagnosticReport, type HypertestConfig } from '../src/index.ts';
 import { FULL_ROUTE } from './helpers.ts';
 
@@ -36,16 +37,30 @@ describe('diagnose (hypertest doctor)', () => {
   });
   after(async () => dir.cleanup());
 
-  test('a healthy configuration: every check ok, secrets reported by name only', async () => {
+  test('a healthy configuration: every check ok, secrets reported by name only', async (t) => {
+    const iso = await networkIsolation();
+    if (!iso.available || !iso.jail) {
+      // the default sandbox (network loopback) cannot be (fully) enforced here: doctor must say so (security-2, H1)
+      const r = await diagnose(base(), { env: { HT_DOCTOR_KEY: 'sk-doctor-SECRET' } });
+      assert.deepEqual(r.checks.filter((c) => c.status !== 'ok').map((c) => [c.name, c.status]), [['sandbox', iso.available ? 'warn' : 'error']]);
+      t.skip(`the sandbox jail is unavailable on this host (${iso.available ? iso.strategy : iso.reason}): the default configuration is not fully healthy here`);
+      return;
+    }
     const r = await diagnose(base(), { env: { HT_DOCTOR_KEY: 'sk-doctor-SECRET' } });
     assert.equal(r.ok, true, JSON.stringify(r.checks, null, 2));
     assert.deepEqual(r.checks.filter((c) => c.status !== 'ok'), []);
+    assert.match(of(r, 'sandbox')[0]!.detail, /^local sandbox, network loopback \(enforced: userns_jail, private loopback; keys, store and other workspaces hidden\), env allowlist /);
     assert.deepEqual(of(r, 'secrets'), [{ name: 'secrets', status: 'ok', detail: 'provider local (apiKeyEnv): HT_DOCTOR_KEY is set' }]);
     assert.deepEqual(of(r, 'models'), [{ name: 'models', status: 'ok', detail: '1 route(s); every built-in role can be routed' }]);
     assert.equal(of(r, 'store')[0]!.detail, `PGlite data directory ${join(dir.path, 'data', 'db')} can be created (${dir.path} is writable)`);
     assert.equal(existsSync(join(dir.path, 'data')), false, 'doctor is read-only');
     assert.match(of(r, 'protocol')[0]!.detail, /^BUGate .* \(embedded\), digest [0-9a-f]{16}$/);
     assert.equal(JSON.stringify(r).includes('sk-doctor-SECRET'), false);
+  });
+
+  test('security-2: an open sandbox network is a warning (no egress governance for commands agents run)', async () => {
+    const r = await diagnose(base({ sandbox: { network: 'open' } }), { env: { HT_DOCTOR_KEY: 'k' }, connect: false });
+    assert.deepEqual(of(r, 'sandbox'), [{ name: 'sandbox', status: 'warn', detail: 'local sandbox, network open (commands agents run reach any host: no egress governance), env allowlist PATH, HOME, LANG, LC_ALL, TMPDIR' }]);
   });
 
   test('a missing API key variable is an error (reported by doctor, not at load)', async () => {

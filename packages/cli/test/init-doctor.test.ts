@@ -53,7 +53,10 @@ describe('hypertest init', () => {
     assert.match(text, /^ {4}# - id: local\n {4}# {3}kind: openai-compatible\n {4}# {3}baseUrl: "\$\{LOCAL_LLM_URL:-http:\/\/127\.0\.0\.1:11434\/v1\}"$/m);
     // per-role model policies
     assert.deepEqual(Object.keys(config.roles ?? {}).sort(), ['condenser', 'executor', 'lead', 'rca', 'reviewer', 'test_designer']);
-    assert.deepEqual(config.roles!['reviewer']!.defaultModelPolicy, { preferredRoutes: ['claude-sonnet', 'claude-opus'], independentFromRoles: ['executor', 'test_designer', 'rca'], fallback: 'fail_closed' });
+    // H10: the generated reviewer override keeps EVERY evidence producer (an array replaces the catalog default)
+    assert.deepEqual(config.roles!['reviewer']!.defaultModelPolicy, {
+      preferredRoutes: ['claude-sonnet', 'claude-opus'], independentFromRoles: ['executor', 'test_designer', 'rca', 'fixer', 'metrics_analyst', 'environment'], fallback: 'fail_closed',
+    });
     assert.deepEqual(config.roles!['lead']!.defaultModelPolicy, { preferredRoutes: ['claude-opus', 'deepseek-chat'], minQuality: 0.8 });
     // secrets hygiene: no inline credential field, no key-looking value
     assert.doesNotMatch(text, /^\s*(apiKey|api_key|token|secret|password|accessKeyId|secretAccessKey)\s*:/m);
@@ -79,6 +82,17 @@ describe('hypertest init', () => {
     // the interpolation default applies without the variable
     const fallback = await loadConfig(join(project, 'hypertest.config.yaml'), { env: {} });
     assert.equal(fallback.models.providers.find((p) => p.id === 'local')!.baseUrl, 'http://127.0.0.1:11434/v1');
+  });
+
+  test('conformance-1: the commented oracle example is valid once uncommented and names its human authority', async () => {
+    const project = join(dir.path, 'oracle');
+    await mkdir(project);
+    const text = uncommentBlock(configTemplate('oracle'), '# oracles:');
+    await writeFile(join(project, 'hypertest.config.yaml'), text);
+    const config = await loadConfig(join(project, 'hypertest.config.yaml'), { env: {} });
+    assert.equal(config.oracles?.length, 1);
+    assert.deepEqual([config.oracles![0]!.oracleId, config.oracles![0]!.establishedBy, config.oracles![0]!.assertions[0]!.severity], ['checkout-contract', 'alice', 'P1']);
+    assert.match(configTemplate('x'), /^ {2}# requireOracle: false /m);
   });
 
   test('never overwrites without --force (exit 1, file untouched); --force rewrites it and leaves .gitignore alone', async () => {

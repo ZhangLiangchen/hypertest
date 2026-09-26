@@ -70,6 +70,12 @@ export interface LocalDurableOptions extends DurableHooks {
    * the loop gives up (default 5, as the Temporal activity retry policy). executeTurn retries carry `expectedTurn`.
    */
   maxAttempts?: number;
+  /**
+   * (additive, H6) Interval at which a work loop waiting for a free turn slot keeps its claim alive through
+   * `ControlPlane.renewClaim` (default 10000 ms; keep it well below the control plane's lease TTL). Ticks also hand out
+   * claims only up to the free turn slots (`TickOptions.maxDispatch`).
+   */
+  claimKeepaliveMs?: number;
 }
 
 export interface TemporalDurableOptions extends DurableHooks {
@@ -89,6 +95,12 @@ export interface TemporalDurableOptions extends DurableHooks {
    * while another live worker owns the run (standby) — as `LocalDurableOptions.maxIdleMs` (default 5000).
    */
   maxIdleMs?: number;
+  /**
+   * (additive, durability-5) Start-to-close bound of ONE agent-turn activity attempt (default 24 h: a turn may run tools
+   * for hours — test.run ≤ 1 h, mutation.run ≤ 2 h each). Liveness is the activity heartbeat (1 min timeout), not this
+   * bound; set it below the longest tool timeout and healthy turns can never complete.
+   */
+  turnTimeoutMs?: number;
 }
 
 /** (additive) A bundled `src/temporal/workflows.ts` (code in memory or a file path). */

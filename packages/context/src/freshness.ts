@@ -4,8 +4,12 @@ import type { ContextDeps, FreshnessGuard, FreshnessResult, ProposedAction, Reso
 import { createResolverRegistry } from './resolvers.ts';
 import { environmentVersion, snapshotIdFor } from './snapshots.ts';
 
-/** Types always re-validated before a mutating action (the "world moved under you" set). */
-export const ALWAYS_CHECKED_TYPES: ReadonlySet<string> = new Set(['environment', 'build', 'oracle', 'experiment', 'lease']);
+/**
+ * Types always re-validated before a mutating action (the "world moved under you" set).
+ * (conformance-3) `finding` entries — the heads of the findings a work item acts on, pinned by the control plane — are
+ * re-checked too: a fix or test built on a finding that was rejected or superseded meanwhile is stale.
+ */
+export const ALWAYS_CHECKED_TYPES: ReadonlySet<string> = new Set(['environment', 'build', 'oracle', 'experiment', 'lease', 'finding']);
 
 function idMatches(id: string, resource: string): boolean {
   return resource === id || resource.startsWith(id + '/') || id.startsWith(resource + '/');

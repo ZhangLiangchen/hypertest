@@ -19,7 +19,7 @@ export { FIX_OUTPUT_SCHEMA } from './fixer.ts';
 export { LEAD_OUTPUT_SCHEMA } from './lead.ts';
 export { METRICS_OUTPUT_SCHEMA } from './metrics-analyst.ts';
 export { RCA_OUTPUT_SCHEMA } from './rca.ts';
-export { REVIEW_OUTPUT_SCHEMA } from './reviewer.ts';
+export { EVIDENCE_PRODUCER_ROLES, REVIEW_OUTPUT_SCHEMA } from './reviewer.ts';
 export { TEST_DESIGN_OUTPUT_SCHEMA } from './test-designer.ts';
 
 /**

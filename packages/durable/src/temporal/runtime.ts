@@ -175,6 +175,10 @@ export class TemporalDurableRuntime implements DurableRuntime {
     if (max !== undefined && (!Number.isSafeInteger(max) || max < 1)) throw new HypertestError('invalid_argument', `TemporalDurableRuntime: maxConcurrentActivities must be an integer ≥ 1 (got ${String(max)})`);
     const maxIdleMs = options.maxIdleMs ?? DEFAULT_WORKFLOW_MAX_IDLE_MS;
     if (!Number.isSafeInteger(maxIdleMs) || maxIdleMs < 1) throw new HypertestError('invalid_argument', `TemporalDurableRuntime: maxIdleMs must be an integer ≥ 1 (got ${String(options.maxIdleMs)})`);
+    const turnTimeoutMs = options.turnTimeoutMs;
+    if (turnTimeoutMs !== undefined && (!Number.isSafeInteger(turnTimeoutMs) || turnTimeoutMs < 1000)) {
+      throw new HypertestError('invalid_argument', `TemporalDurableRuntime: turnTimeoutMs must be an integer ≥ 1000 (got ${String(turnTimeoutMs)})`);
+    }
     this.#options = options;
     this.#maxIdleMs = maxIdleMs;
     this.#control = options.control;
@@ -202,6 +206,7 @@ export class TemporalDurableRuntime implements DurableRuntime {
     const state: TestRunWorkflowState = {};
     if (this.#maxIterations !== DEFAULT_MAX_WORKFLOW_ITERATIONS) state.maxIterations = this.#maxIterations;
     if (this.#maxIdleMs !== DEFAULT_WORKFLOW_MAX_IDLE_MS) state.maxIdleMs = this.#maxIdleMs;
+    if (this.#options.turnTimeoutMs !== undefined) state.turnTimeoutMs = this.#options.turnTimeoutMs;
     try {
       await client.workflow.start<typeof testRunWorkflow>('testRunWorkflow', {
         workflowId: runWorkflowId(runId),

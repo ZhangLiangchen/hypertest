@@ -5,7 +5,9 @@ import { existsSync } from 'node:fs';
 import { chmod, mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createGitRepo, testDeps } from '@hypertest/testkit';
-import { BuiltinPolicyEngine, DEFAULT_POLICY_RULES } from '@hypertest/policy';
+import { BuiltinPolicyEngine, DEFAULT_GATE_SPEC, DEFAULT_POLICY_RULES, QualityGate } from '@hypertest/policy';
+import { sha256Hex } from '@hypertest/core';
+import type { EvidenceRecord, TestArtifact } from '@hypertest/domain';
 import { builtinTools, createWorkspaceManager, parseNumstatPaths, patchPaths, whiteboxTools, type BuiltinToolOptions, type SandboxRunner, type ToolExecutionResult, type ToolRuntime, type WorkspaceHandle } from '../src/index.ts';
 import { ALL_EFFECTS_PROFILE, RUN, SANDBOX, SECRET, WORK, capability, openToolEnv, request, runtimeFor, tempDir, type ToolEnv } from './helpers.ts';
 
@@ -366,6 +368,93 @@ test('patchPaths: hunk bodies never count as headers; renames are unstripped; nu
   assert.deepEqual(patchPaths(rename), { paths: ['new.txt', 'old.txt'], strip: 1 });
   assert.deepEqual(patchPaths('--- /dev/null\n+++ src/new.txt\n@@ -0,0 +1 @@\n+x\n'), { paths: ['src/new.txt'], strip: 0 });
   assert.deepEqual(parseNumstatPaths('1\t1\tsrc/a.txt\0-\t-\tbin.dat\x000\t0\t\0old name.txt\0new name.txt\0'), ['bin.dat', 'new name.txt', 'old name.txt', 'src/a.txt']);
+});
+
+test('security-H1a: shell.exec / test.run command arguments cannot read or write outside the workspace (the PoC), ordinary commands still run', async () => {
+  // PoC 1: cat <absolute path outside the root> returned the file
+  const cat = await exec('shell.exec', { command: ['cat', join(outside.path, 'secret.txt')] });
+  assert.equal(cat.status, 'denied');
+  assert.equal(cat.error?.code, 'permission_denied');
+  assert.match(cat.error!.message, /outside the workspace/);
+  assert.doesNotMatch(cat.modelText, /outside secret/);
+  assert.equal(cat.evidenceRefs.length, 0, 'nothing ran');
+  // PoC 2: sed writing into a sibling directory through ..
+  const rel = join('..'.repeat(1), '..', '..', '..', '..', '..', '..', '..', '..', outside.path, 'pwned.txt');
+  for (const script of [`w ${join(outside.path, 'pwned.txt')}`, `w ${rel}`]) {
+    const sed = await exec('shell.exec', { command: ['sed', '-n', script, 'README.md'] });
+    assert.equal(sed.status, 'denied', script);
+    assert.equal(existsSync(join(outside.path, 'pwned.txt')), false);
+  }
+  // interpreters with a literal path, cwd-relative escapes and test.run's command framework are confined the same way
+  for (const command of [['node', '-e', `console.log(require('fs').readFileSync(${JSON.stringify(join(outside.path, 'secret.txt'))}, 'utf8'))`], ['ls', '..'], ['git', '-C', outside.path, 'status']]) {
+    const d = await exec('shell.exec', { command });
+    assert.equal(d.status, 'denied', command.join(' '));
+    assert.doesNotMatch(d.modelText, /outside secret/);
+  }
+  const viaTest = await exec('test.run', { framework: 'command', command: ['cat', join(outside.path, 'secret.txt')] });
+  assert.equal(viaTest.status, 'denied');
+  assert.doesNotMatch(viaTest.modelText, /outside secret/);
+  // ordinary commands are unaffected
+  ok(await exec('shell.exec', { command: ['sed', '-n', '/hello/p', 'README.md'] }));
+  ok(await exec('shell.exec', { command: ['grep', '-rn', 'hello', '.'] }));
+  const inside = ok(await exec('shell.exec', { command: ['cat', join(wt.root, 'README.md')] }));
+  assert.match(inside.modelText, /hello world/);
+  // the marker is visible to the program
+  const marker = ok(await exec('shell.exec', { command: ['node', '-e', 'process.stdout.write(String(process.env.HYPERTEST_SANDBOX))'] }));
+  assert.match(marker.modelText, /--- stdout ---\nlocal\n/);
+});
+
+test('conformance-2: test.run records what was tested relative to the base commit (tool-derived digests); an unregistered new test cannot count for the gate', async () => {
+  const dwt = await env.workspaces.isolatedWorktree({ runId: RUN, workItemId: 'wi_delta', repoPath: repo.path });
+  const run = (input: Record<string, unknown>) => rt.execute(request('test.run', { framework: 'node_test', ...input }, dwt, { workItemId: 'wi_delta', capability: capability({ workItemId: 'wi_delta' }) }));
+  // unchanged tree: nothing to prove
+  const clean = ok(await run({}));
+  const cleanDelta = (clean.structured as { workspaceDelta: Record<string, unknown> }).workspaceDelta;
+  assert.deepEqual({ ...cleanDelta, treeDigest: 'x' }, { status: 'computed', readOnly: false, treeDigest: 'x', changedFiles: 0, testFiles: [], baseCommit: repo.commits[0] });
+  // a generated trivial test, never registered, run without any testArtifactId
+  const GEN = "import { test } from 'node:test';\ntest('cart > total', () => {});\n";
+  await writeFile(join(dwt.root, 'test', 'new_generated.test.mjs'), GEN);
+  await writeFile(join(dwt.root, 'src', 'calc.mjs'), CALC + '// product change (not a test file)\n');
+  const r = ok(await run({}));
+  const delta = (r.structured as { workspaceDelta: { status: string; baseCommit: string; treeDigest: string; changedFiles: number; testFiles: unknown[] } }).workspaceDelta;
+  assert.equal(delta.status, 'computed');
+  assert.equal(delta.baseCommit, repo.commits[0]);
+  assert.match(delta.treeDigest, /^[0-9a-f]{64}$/);
+  assert.notEqual(delta.treeDigest, (cleanDelta as { treeDigest: string }).treeDigest);
+  assert.equal(delta.changedFiles, 2);
+  assert.deepEqual(delta.testFiles, [{ path: 'test/new_generated.test.mjs', change: 'added', sha256: sha256Hex(GEN) }], 'product files are not test files');
+  assert.match(r.modelText, /1 test file\(s\) differ from the base commit \(added test\/new_generated\.test\.mjs\).*registered and validated as a TestArtifact/);
+  // the evidence itself carries the delta (never a caller claim) …
+  const records = await env.evidence.getMany(r.evidenceRefs);
+  const testResult = records.find((e) => e?.evidenceType === 'test-result') as EvidenceRecord;
+  assert.deepEqual((testResult.structured as { workspaceDelta: unknown }).workspaceDelta, delta);
+  // … so the gate refuses it without a validated artifact of exactly that content, and accepts it with one
+  const gateInput = (testArtifacts: TestArtifact[]) => ({
+    run: { runId: RUN, goal: 'g', target: {}, status: 'gating', budget: {}, runtimeManifestId: 'm', policyRevision: 'p', currentPlanRevision: 1, oracleRevisions: {}, experimentIds: [], labels: {}, createdAt: '', updatedAt: '' } as never,
+    // no oracle here: this test is about artifact eligibility, so the gate waives C0 explicitly (conformance-1)
+    gate: { ...DEFAULT_GATE_SPEC, requireIndependentReview: false, requireOracle: false }, objectives: [], oracles: [], experiments: [], findings: [], risks: [], reviews: [], coverageGaps: [], testArtifacts,
+    evidence: [testResult], evidenceRoot: { rootHash: 'r', count: 1 }, workItems: [], claims: [], exceptions: [], runtimeManifestId: 'm', policyRevision: 'p', decisionId: 'd', now: '2026-01-01T00:00:00.000Z',
+  });
+  assert.equal(new QualityGate().evaluate(gateInput([])).verdict, 'inconclusive');
+  const validated: TestArtifact = {
+    artifactId: 'ta_gen', runId: RUN, revision: 1, path: 'test/new_generated.test.mjs', artifactDigest: sha256Hex(GEN), sourceType: 'generated', oracleRefs: [],
+    runner: { framework: 'node_test', selector: 'test/new_generated.test.mjs' }, validations: { knownBad: { status: 'passed', evidenceRefs: ['ev_x'] } }, approvalState: 'validated', createdAt: '',
+  };
+  assert.equal(new QualityGate().evaluate(gateInput([validated])).verdict, 'pass');
+  // modifying an existing test is a change too; a selector naming a non-pattern file includes it
+  await writeFile(join(dwt.root, 'test', 'calc.test.mjs'), GOOD_TEST + '// weakened\n');
+  await writeFile(join(dwt.root, 'checks.mjs'), GEN);
+  const m = ok(await run({ selector: 'checks.mjs' }));
+  const files = (m.structured as { workspaceDelta: { testFiles: Array<{ path: string; change: string }> } }).workspaceDelta.testFiles.map((f) => `${f.change} ${f.path}`);
+  assert.deepEqual(files, ['added checks.mjs', 'modified test/calc.test.mjs', 'added test/new_generated.test.mjs']);
+  // a scratch workspace has no base: everything in it was created in the run
+  const scratch = await env.workspaces.scratch({ runId: RUN, workItemId: 'wi_delta_scratch' });
+  await mkdir(join(scratch.root, 'test'), { recursive: true });
+  await writeFile(join(scratch.root, 'test', 'a.test.mjs'), GEN);
+  await writeFile(join(scratch.root, 'package.json'), '{"type":"module"}\n');
+  const sr = ok(await rt.execute(request('test.run', { framework: 'node_test' }, scratch, { workItemId: 'wi_delta_scratch', capability: capability({ workItemId: 'wi_delta_scratch' }) })));
+  assert.deepEqual((sr.structured as { workspaceDelta: { testFiles: unknown } }).workspaceDelta.testFiles, [{ path: 'test/a.test.mjs', change: 'added', sha256: sha256Hex(GEN) }]);
+  await env.workspaces.dispose(dwt.workspaceId);
 });
 
 test('shell.exec: the capability must cover the whole workspace, not only the cwd', async () => {

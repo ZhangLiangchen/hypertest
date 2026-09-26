@@ -4,6 +4,8 @@ import { json, num } from './sql.ts';
 
 const DEFAULT_POLL_MS = 250;
 const DEFAULT_BATCH = 100;
+const DEFAULT_SENT_RETENTION_MS = 60 * 60 * 1000;
+const DEFAULT_PRUNE_INTERVAL_MS = 60 * 1000;
 
 /**
  * Publishes committed outbox rows to the bus in id order and marks them sent.
@@ -19,6 +21,25 @@ export function createOutboxRelay(deps: OutboxRelayDeps): OutboxRelay {
   const batchSize = deps.batchSize ?? DEFAULT_BATCH;
   if (!Number.isInteger(batchSize) || batchSize < 1) throw new HypertestError('invalid_argument', 'batchSize must be a positive integer');
   if (!(pollMs > 0)) throw new HypertestError('invalid_argument', 'pollMs must be positive');
+  const retentionMs = deps.sentRetentionMs ?? DEFAULT_SENT_RETENTION_MS;
+  const pruneIntervalMs = deps.pruneIntervalMs ?? DEFAULT_PRUNE_INTERVAL_MS;
+  if (!Number.isFinite(retentionMs) || retentionMs < 0) throw new HypertestError('invalid_argument', 'sentRetentionMs must be a non-negative number');
+  if (!(pruneIntervalMs > 0)) throw new HypertestError('invalid_argument', 'pruneIntervalMs must be positive');
+  let lastPrune = 0;
+
+  /** durability-11: sent rows are delivery records only (ht_events keeps every event); unsent rows are never touched. */
+  async function prune(): Promise<number> {
+    const cutoff = new Date(Date.parse(clock.isoNow()) - retentionMs).toISOString();
+    const r = await db.query<{ n: unknown }>('WITH d AS (DELETE FROM ht_outbox WHERE sent_at IS NOT NULL AND sent_at <= $1 RETURNING 1) SELECT count(*) AS n FROM d', [cutoff]);
+    return num(r.rows[0]!.n);
+  }
+
+  async function maybePrune(): Promise<void> {
+    const now = Date.now();
+    if (now - lastPrune < pruneIntervalMs) return;
+    lastPrune = now;
+    await prune().catch((e: unknown) => logger.warn('outbox prune failed; sent rows are kept until the next attempt', { error: (e as Error).message }));
+  }
 
   let inFlight: Promise<number> | undefined;
   let timer: NodeJS.Timeout | undefined;
@@ -62,6 +83,7 @@ export function createOutboxRelay(deps: OutboxRelayDeps): OutboxRelay {
       timer = undefined;
       if (!running || gen !== generation) return;
       flush()
+        .then(() => maybePrune())
         .catch((e: unknown) => {
           const err = toHypertestError(e);
           logger.warn('outbox relay flush failed; rows stay unsent and are retried', { code: err.code, error: err.message });
@@ -86,6 +108,7 @@ export function createOutboxRelay(deps: OutboxRelayDeps): OutboxRelay {
       timer = undefined;
       if (inFlight) await inFlight.catch(() => 0);
     },
+    prune,
     async pending() {
       const r = await db.query<{ n: unknown }>('SELECT count(*) AS n FROM ht_outbox WHERE sent_at IS NULL');
       return num(r.rows[0]!.n);

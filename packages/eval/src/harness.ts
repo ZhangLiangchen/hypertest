@@ -269,8 +269,9 @@ async function waitForPoint(
   watch: { afterSeq: number; lines: TrialProgressEvent[] },
   reached: (lines: readonly TrialProgressEvent[]) => boolean,
   deadline: number,
+  signal?: AbortSignal,
 ): Promise<boolean> {
-  while (Date.now() < deadline) {
+  while (Date.now() < deadline && !signal?.aborted) {
     for (const e of await ht.events(runId, { afterSeq: watch.afterSeq })) {
       watch.afterSeq = e.seq ?? watch.afterSeq;
       const line = operationLine(e);
@@ -311,23 +312,44 @@ interface ExecutionInput {
   timeoutMs: number;
   logger: Logger;
   scope: Scope;
+  signal?: AbortSignal;
 }
 
-/** Waits for the run; on timeout it is cancelled and given a moment to settle (the trial then fails). */
-async function awaitRun(ht: HypertestInstance, runId: string, deadline: number, logger: Logger): Promise<{ outcome?: RunOutcome; error?: string; timedOut: boolean }> {
+/** Rejects with `cancelled` when `signal` aborts (never, without a signal). */
+function aborted(signal: AbortSignal | undefined): { promise: Promise<never>; dispose(): void } {
+  if (!signal) return { promise: new Promise<never>(() => undefined), dispose: () => undefined };
+  let listener: (() => void) | undefined;
+  const promise = new Promise<never>((_, reject) => {
+    listener = () => reject(new HypertestError('cancelled', 'the eval trial was cancelled'));
+    if (signal.aborted) listener();
+    else signal.addEventListener('abort', listener, { once: true });
+  });
+  promise.catch(() => undefined);
+  return { promise, dispose: () => listener && signal.removeEventListener('abort', listener) };
+}
+
+/** Waits for the run; on timeout (or cancellation, H11) it is cancelled and given a moment to settle (the trial then fails). */
+async function awaitRun(ht: HypertestInstance, runId: string, deadline: number, logger: Logger, signal?: AbortSignal): Promise<{ outcome?: RunOutcome; error?: string; timedOut: boolean; cancelled?: boolean }> {
+  const abort = aborted(signal);
   try {
-    return { outcome: await ht.durable.awaitCompletion(runId, { timeoutMs: Math.max(1, deadline - Date.now()) }), timedOut: false };
+    return { outcome: await Promise.race([ht.durable.awaitCompletion(runId, { timeoutMs: Math.max(1, deadline - Date.now()) }), abort.promise]), timedOut: false };
   } catch (e) {
-    if (!isHypertestError(e, 'timeout')) throw e;
-    const error = `the run did not complete in time: ${(e as Error).message}`;
+    const cancelled = isHypertestError(e, 'cancelled') && signal?.aborted === true;
+    if (!isHypertestError(e, 'timeout') && !cancelled) throw e;
+    const error = cancelled ? 'the trial was cancelled (signal)' : `the run did not complete in time: ${(e as Error).message}`;
     try {
-      await ht.cancel(runId, 'eval trial timeout');
+      await ht.cancel(runId, cancelled ? 'eval trial cancelled' : 'eval trial timeout');
       await ht.durable.awaitCompletion(runId, { timeoutMs: CANCEL_SETTLE_MS });
     } catch (c) {
       logger.warn('the timed-out run could not be cancelled cleanly', { runId, error: (c as Error).message });
     }
     const outcome = await outcomeOf(ht, runId);
-    return outcome ? { outcome, error, timedOut: true } : { error, timedOut: true };
+    const out: { outcome?: RunOutcome; error?: string; timedOut: boolean; cancelled?: boolean } = { error, timedOut: !cancelled };
+    if (outcome) out.outcome = outcome;
+    if (cancelled) out.cancelled = true;
+    return out;
+  } finally {
+    abort.dispose();
   }
 }
 
@@ -359,7 +381,7 @@ async function executeInProcess(x: ExecutionInput): Promise<Execution> {
   // runTrial decides from the graders, the timeout and the unexercised chaos (unexercisedChaos / decideTrialResult)
   const watch = { afterSeq: 0, lines: [] as TrialProgressEvent[] };
   for (const point of killPredicates(chaos)) {
-    if (!(await waitForPoint(ht, input.runId, watch, point.reached, deadline))) break;
+    if (!(await waitForPoint(ht, input.runId, watch, point.reached, deadline, x.signal))) break;
     if (point.delayMs > 0) await sleep(Math.min(point.delayMs, Math.max(0, deadline - Date.now())));
     // "kill": the instance goes away mid-run (in-flight turns aborted); a new one resumes from the stores
     await ht.close();
@@ -369,10 +391,11 @@ async function executeInProcess(x: ExecutionInput): Promise<Execution> {
     ht = await compose();
     await ht.resumeIncomplete();
   }
-  const r = await awaitRun(ht, input.runId, deadline, logger);
+  const r = await awaitRun(ht, input.runId, deadline, logger, x.signal);
   const out: Execution = { ht, harness: { restarts, injectedModelTimeouts: counter.injected, duplicateDelivery: chaos.duplicateEventDelivery === true, timedOut: r.timedOut } };
   if (r.outcome) out.outcome = r.outcome;
   if (r.error) out.error = r.error;
+  if (r.cancelled) out.infraError = r.error ?? 'the trial was cancelled';
   return out;
 }
 
@@ -406,6 +429,7 @@ async function executeInChild(x: ExecutionInput): Promise<Execution> {
   const r = await runChildTrial(job, {
     workDir,
     timeoutMs: x.timeoutMs,
+    ...(x.signal ? { signal: x.signal } : {}),
     ...(chaos.killAfterOperationDispatch !== undefined ? { killAfterOperationDispatch: chaos.killAfterOperationDispatch } : {}),
     ...(chaos.kills && chaos.kills.length > 0 ? { kills: chaos.kills } : {}),
   });
@@ -430,7 +454,8 @@ async function executeInChild(x: ExecutionInput): Promise<Execution> {
   if (outcome) out.outcome = outcome;
   const failure = [...r.progress].reverse().find((e) => e.type === 'error');
   const reported = failure?.type === 'error' ? failure.message : undefined;
-  if (r.timedOut) out.error = `the trial child did not finish within ${x.timeoutMs} ms (killed)`;
+  if (r.cancelled) out.infraError = 'the trial was cancelled (signal): its child was killed';
+  else if (r.timedOut) out.error = `the trial child did not finish within ${x.timeoutMs} ms (killed)`;
   else if (code === TRIAL_EXIT_CODES.timeout) out.error = `the run did not complete in time: ${reported ?? 'timeout'}`;
   else {
     const problem = childExitProblem(r.exit, outcome?.decision?.verdict, reported);
@@ -509,6 +534,10 @@ export async function runTrial(task: EvalTask, arm: EvalArm, options: TrialOptio
     if (task.gate) input.gate = { ...task.gate };
     if (task.oracles && task.oracles.length > 0) input.oracleIds = task.oracles.map((o: EvalOracle) => o.oracleId);
     const x: ExecutionInput = { task, arm, fixture, config, input, workDir, timeoutMs: options.timeoutMs ?? DEFAULT_TRIAL_TIMEOUT_MS, logger, scope };
+    if (options.signal) {
+      if (options.signal.aborted) throw new HypertestError('cancelled', 'the trial was cancelled (signal) before its run started');
+      x.signal = options.signal;
+    }
     const exec = options.mode === 'child-process' ? await executeInChild(x) : await executeInProcess(x);
     if (exec.infraError) throw precondition(exec.infraError);
     const probes = await runProbes(fixture, options.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS);

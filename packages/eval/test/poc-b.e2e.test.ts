@@ -32,6 +32,8 @@ test('PoC B: finding.created wakes RCA and the test designer without the lead; d
       verdict: d.decision?.verdict,
       status: d.status,
       violated: d.decision?.violatedCriteria.map((c) => c.criterionId).sort(),
+      satisfied: d.decision?.satisfiedCriteria.map((c) => c.criterionId).sort(),
+      runReviews: d.workItems.filter((w) => w.role === 'reviewer' && w.inputRefs.some((r) => r.kind === 'run')).map((w) => w.state),
       planned: d.workItems.filter((w) => w.origin.kind === 'plan').map((w) => w.role).sort(),
       reactions: reactions.map((w) => `${w.role}←${creators.get(w.workItemId)}${w.causationEventId === created?.eventId ? ' (caused by finding.created)' : ''}:${w.state}`).sort(),
       duplicateDelivery: d.harness.duplicateDelivery,
@@ -82,6 +84,9 @@ test('PoC B: finding.created wakes RCA and the test designer without the lead; d
   assert.ok(a.violated?.includes('C3'), `violated ${a.violated?.join(', ')}`);
   assert.ok(a.reportFindingEvidence.includes('api-response'), a.reportFindingEvidence.join(', '));
   assert.deepEqual(a.findingHttpEnvironments, ['bank@1']);
+  // H7: the run-level review the gate requires was requested before the gate and approved by the independent judge (C6)
+  assert.deepEqual(a.runReviews, ['completed']);
+  assert.ok(a.satisfied?.includes('C6'), `satisfied ${a.satisfied?.join(', ')}`);
   // ground truth: money is conserved (the defect is invisible to the total — only the contract test catches it). The
   // executor opened alice (100) and bob (50); the regression test run opened two more accounts (10 each)
   assert.deepEqual(a.health, { status: 'ok', accounts: 4, total: 170, deposited: 170, balanceConserved: true });

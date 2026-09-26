@@ -135,11 +135,12 @@ export function targetEnvironmentClass(input: { url?: string; environmentId?: st
  * targets of registered process environments are never addressed (restarts/faults only via env.*). Secret-named
  * JSON request fields are redacted in the evidence (like credential headers).
  *
- * Non-idempotent methods (POST/PUT/PATCH/DELETE) are `external` effects but deliberately do NOT go
- * through the SideEffectGateway: black-box probes are testing actions against a sandbox SUT, governed
- * by capability + policy (environment class). To make retries safe on SUTs that honour it, an
- * `Idempotency-Key: <invocationId>` header is added unless the caller sets one; the invocation id is
- * stable across durable retries of the same tool call.
+ * Non-idempotent methods (POST/PUT/PATCH/DELETE) are `external` effects: with a gateway configured the ToolRuntime
+ * records the call in the Operation Ledger (record-only adapter, keyed by the invocation id — conformance-7): a
+ * durable replay returns the recorded response instead of sending again, and a call interrupted between sending and
+ * recording goes to manual review instead of being re-sent. An `Idempotency-Key: <invocationId>` header is added unless
+ * the caller sets one (the invocation id is stable across durable retries); for an environment declaring
+ * `honoursIdempotencyKey` such an interrupted call is re-sent once with the same key (`resendable`).
  */
 export function httpRequestTool(options: { httpAllowlist?: string[] }): ToolSpec<HttpRequestInput> {
   return {
@@ -154,6 +155,8 @@ export function httpRequestTool(options: { httpAllowlist?: string[] }): ToolSpec
     riskClass: (input) => (HTTP_READ_METHODS.includes(input.method) ? 'low' : 'medium'),
     resources: (input) => targetResources(input),
     environmentClass: (input, ctx) => targetEnvironmentClass(input, ctx.environments),
+    // a resend carries the same Idempotency-Key (the invocation id, or the caller's own header — same input)
+    resendable: (input, ctx) => NON_IDEMPOTENT_METHODS.includes(input.method.toUpperCase()) && input.environmentId !== undefined && ctx.environments.get(input.environmentId)?.honoursIdempotencyKey === true,
     timeoutMs: 300_000,
     async execute(input, ctx) {
       return executeHttpRequest(input, ctx, options.httpAllowlist);

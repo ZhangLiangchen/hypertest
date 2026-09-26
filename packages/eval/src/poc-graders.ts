@@ -10,13 +10,14 @@
  */
 import { HypertestError, type JsonValue } from '@hypertest/core';
 import type { BlackboardRecord, DomainEvent, EvidenceRecord, Finding, Hypothesis, Review, TestArtifact, WorkItem } from '@hypertest/domain';
+import { EVIDENCE_PRODUCER_ROLES } from '@hypertest/agents';
 import type { Grader, GraderContext, GraderResult, TrialData } from './contracts.ts';
 import { EXECUTION_EVIDENCE_TYPES, PRODUCT_FINDING_CATEGORIES, RELEASE_VERDICTS, analyzeSideEffects } from './analysis.ts';
 import type { BrainObservation } from './fixtures.ts';
 
 const MAX_ITEMS = 8;
-/** Roles whose model providers produced findings or tests (the reviewer must be independent of them). */
-const PRODUCER_ROLES: ReadonlySet<string> = new Set(['executor', 'test_designer', 'rca', 'fixer']);
+/** Roles whose model providers produced findings, tests, evidence or fixes (the reviewer must be independent of them; H10). */
+const PRODUCER_ROLES: ReadonlySet<string> = new Set(EVIDENCE_PRODUCER_ROLES);
 /** A model request after an offloaded output must stay below this many bytes (bounded digests only, I9). */
 export const MAX_BOUNDED_REQUEST_BYTES = 256 * 1024;
 /** No single message may carry more than this after an offload (head ≤ 8 KiB + marker + tail ≤ 4 KiB, with slack). */
@@ -402,7 +403,7 @@ export const contextIsolationGrader: Grader = (ctx) => {
 
 /**
  * Reviewer independence: at least one approving review exists and every review was produced on a model provider that
- * no producer role (executor, test designer, RCA, fixer) of this run used.
+ * no producer role (executor, test designer, RCA, fixer, metrics analyst, environment) of this run used.
  */
 export const independentReviewGrader: Grader = async (ctx) => {
   const missing = noRun('independentReview', ctx.data);

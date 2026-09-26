@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -13,7 +13,7 @@ import { BuiltinPolicyEngine, DEFAULT_POLICY_RULES, createPolicyDecisionLog, cre
 import { createTestDatabase } from '@hypertest/store';
 import { testDeps } from '@hypertest/testkit';
 import {
-  ToolRegistry, createEnvironmentRegistry, createLocalSandbox, createToolRuntime, createWorkspaceManager,
+  ToolRegistry, createEnvironmentRegistry, createLocalSandbox, createToolRuntime, createWorkspaceManager, recordEffectAdapters,
   type EnvironmentRegistry, type FreshnessPort, type SandboxProfile, type SandboxRunner, type ToolExecutionRequest, type ToolRuntime, type ToolSpec, type WorkspaceHandle, type WorkspaceManager,
 } from '../src/index.ts';
 
@@ -213,7 +213,8 @@ export class FakeLoadAdapter implements SideEffectAdapter<{ name: string }, { jo
 export function gatewayFor(env: ToolEnv, adapters: SideEffectAdapter<any, any>[]): SideEffectGateway {
   const opDeps = { ...env.deps, db: env.db, events: env.events };
   const ledger = createOperationLedger(opDeps);
-  return createSideEffectGateway({ ...opDeps, ledger, leases: createLeaseService(opDeps), adapters: new AdapterRegistry(adapters), pollIntervalMs: 5 });
+  // the record-only adapters are part of every realistic gateway (external effects without an adapter of their own)
+  return createSideEffectGateway({ ...opDeps, ledger, leases: createLeaseService(opDeps), adapters: new AdapterRegistry([...adapters, ...recordEffectAdapters().filter((r) => !adapters.some((a) => a.adapterId === r.adapterId))]), pollIntervalMs: 5 });
 }
 
 /** True when the process exists and is not a zombie (killed orphans may stay unreaped when PID 1 does not reap). */
@@ -229,4 +230,21 @@ export function isProcessAlive(pid: number): boolean {
   } catch {
     return true;
   }
+}
+
+/**
+ * Live (non-zombie) processes of this host whose command line contains `marker` — how a test finds processes a
+ * sandboxed command started: inside the sandbox's PID namespace their pids are namespace-local and mean nothing here.
+ */
+export function liveProcessesWithMarker(marker: string): number[] {
+  const out: number[] = [];
+  for (const entry of readdirSync('/proc')) {
+    if (!/^\d+$/.test(entry)) continue;
+    try {
+      if (readFileSync(`/proc/${entry}/cmdline`, 'utf8').includes(marker) && isProcessAlive(Number(entry))) out.push(Number(entry));
+    } catch {
+      // gone meanwhile
+    }
+  }
+  return out;
 }

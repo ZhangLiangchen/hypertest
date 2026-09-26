@@ -165,6 +165,11 @@ export interface GatewayDeps extends OperationDeps {
   pollIntervalMs?: number;
   /** Default dispatch timeout when the request gives none (additive; default: none, only the abort signal). */
   dispatchTimeoutMs?: number;
+  /**
+   * (additive) TTL an observation extends a lease to while its operation's effect exists but is unsettled
+   * (acknowledged / outcome_unknown / reconciling); default 60 000. Never shortens a lease.
+   */
+  leaseRenewTtlMs?: number;
 }
 
 export interface AdapterRegistryLike {
@@ -203,6 +208,14 @@ export interface RunSideEffectRequest<I = unknown> {
   reconcileOnly?: boolean;
 }
 
+/**
+ * Leases (I4, additive semantics): run() acquires or renews the request's lease; the drive keeps it alive while it
+ * polls; once the operation settles (verified / not_applied / failed / manual_review / compensated) the lease is
+ * RELEASED (never while another in-process drive uses it), so the next owner is not refused as busy until the TTL.
+ * observe() extends the live lease of an operation whose effect exists but is unsettled, and releases it when the
+ * observation settles the operation. A busy refusal of a never-dispatched operation records it `not_applied`
+ * (lastError `resource_busy: …`; the outcome stays `failed`/`resource_busy`).
+ */
 export interface SideEffectGateway {
   run<I>(request: RunSideEffectRequest<I>): Promise<SideEffectOutcome>;
   /**
@@ -265,7 +278,18 @@ export interface BudgetLedger {
   reserve(scopes: string[], amounts: BudgetAmounts, reason: string): Promise<ReserveOutcome>;
   settle(reservationId: string, actual: BudgetAmounts): Promise<void>;
   release(reservationId: string): Promise<void>;
-  /** Record usage without a prior reservation (e.g. observed wall-clock). */
-  charge(scopes: string[], amounts: BudgetAmounts, reason: string): Promise<ReserveOutcome>;
+  /**
+   * Record usage without a prior reservation (e.g. observed wall-clock). (additive) `options.idempotencyKey`: a charge
+   * already recorded under this key is not charged again — its reservation id is returned (`ok: true`), so a replayed
+   * charge (a durable retry of a tool call, a redelivered event) never double counts. Reusing a key for different scopes
+   * or amounts is a `conflict`. A refused (exhausted) charge records nothing, so its retry is evaluated afresh.
+   */
+  charge(scopes: string[], amounts: BudgetAmounts, reason: string, options?: { idempotencyKey?: string }): Promise<ReserveOutcome>;
   usage(scope: string): Promise<BudgetUsage | undefined>;
+  /**
+   * (additive, durability-1) Releases every still-open reservation whose scope chain contains `scope` (e.g. the
+   * `work:<id>` of a claim taken from a dead worker: its in-flight model calls will never settle). Returns the released
+   * reservation ids. A later settle of a released reservation is refused (`precondition_failed`).
+   */
+  releaseOpen?(scope: string): Promise<string[]>;
 }

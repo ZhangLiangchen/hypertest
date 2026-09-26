@@ -8,6 +8,7 @@ import { httpRequestTool } from './http.ts';
 import { HttpLoadAdapter, HttpLoadStopAdapter, loadObserveTool, loadStartTool, loadStopTool } from './load.ts';
 import { McpToolBridge, type McpServerConfig } from './mcp.ts';
 import { metricsQueryTool, metricsScrapeTool } from './metrics.ts';
+import { recordEffectAdapters } from '../whitebox/record-effects.ts';
 
 /** MCP bridges created lazily by blackboxTools() (closed by closeBlackboxResources()). */
 const lazyBridges = new Set<McpToolBridge>();
@@ -71,7 +72,9 @@ export async function closeBlackboxResources(): Promise<void> {
 /**
  * The built-in SideEffectAdapters: `load.http` (load generator), `load.http.stop`, `env.control` (the
  * router the env.* tools bind to) and its backends `env.process`, `env.docker`, `env.kubectl` (also
- * registered on their own for direct use).
+ * registered on their own for direct use), plus the record-only adapters `tool.effect` / `tool.effect.resendable`
+ * through which the runtime ledgers external effects that have no adapter of their own (http.request POST,
+ * browser.click/fill, mcp.*).
  */
 export function builtinSideEffectAdapters(options: { stateDir: string; environments: EnvironmentRegistry; kubectl?: string; docker?: string }): SideEffectAdapter[] {
   const processEnv = new ProcessEnvAdapter({ environments: options.environments });
@@ -84,6 +87,7 @@ export function builtinSideEffectAdapters(options: { stateDir: string; environme
     processEnv,
     docker,
     kubectl,
+    ...recordEffectAdapters(),
   ] as SideEffectAdapter[];
 }
 

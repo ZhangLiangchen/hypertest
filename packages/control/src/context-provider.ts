@@ -1,5 +1,5 @@
-import { estimateTokens, textOf, type ChatMessage, type ContextSnapshot, type EventContext, type TestRun, type WorkItem } from '@hypertest/domain';
-import { PromptAssembler, deterministicSummarizer, type PromptSection, type Summarizer } from '@hypertest/context';
+import { estimateTokens, textOf, type ChatMessage, type ContextSnapshot, type EventContext, type ReadSetEntry, type TestRun, type WorkItem } from '@hypertest/domain';
+import { PromptAssembler, deterministicSummarizer, environmentVersion, type PromptSection, type Summarizer } from '@hypertest/context';
 import { prepareProtocolContext } from '@hypertest/policy';
 import { renderRolePrompt, type RoleDefinition } from '@hypertest/agents';
 import type { RouteRequest } from '@hypertest/model';
@@ -8,6 +8,36 @@ import type { WorkspaceHandle } from '@hypertest/tools';
 import type { ControlDeps, ResolvedControlConfig } from './deps.ts';
 import { runScope } from './work-factory.ts';
 import { clip, event, jsonBlock } from './util.ts';
+
+/** The authoritative view of an environment: the store shared by every worker when the registry has one (H12). */
+export async function authoritativeEnvironment(deps: Pick<ControlDeps, 'environments'>, environmentId: string): Promise<{ environmentId: string; generation: number; buildDigest?: string } | undefined> {
+  const env = deps.environments.load ? await deps.environments.load(environmentId) : deps.environments.get(environmentId);
+  return env ?? undefined;
+}
+
+/** The run's target environment as the snapshot builder's `environment` input (authoritative generation). */
+export async function targetEnvironment(deps: Pick<ControlDeps, 'environments'>, run: TestRun): Promise<{ environmentId: string; generation: number; buildDigest?: string } | undefined> {
+  if (!run.target.environmentId) return undefined;
+  const env = await authoritativeEnvironment(deps, run.target.environmentId);
+  if (!env) return undefined;
+  const e: { environmentId: string; generation: number; buildDigest?: string } = { environmentId: env.environmentId, generation: env.generation };
+  if (env.buildDigest !== undefined) e.buildDigest = env.buildDigest;
+  return e;
+}
+
+/**
+ * (conformance-3) Exact-version read-set entries of every registered environment other than the run's target (which the
+ * snapshot pins as its `environment`): an env.* action on any of them is freshness-checked against what the turn saw.
+ */
+export async function environmentReadSet(deps: Pick<ControlDeps, 'environments'>, run: TestRun, at: string): Promise<ReadSetEntry[]> {
+  const out: ReadSetEntry[] = [];
+  for (const listed of deps.environments.list()) {
+    if (listed.environmentId === run.target.environmentId) continue;
+    const env = await authoritativeEnvironment(deps, listed.environmentId);
+    if (env) out.push({ resourceType: 'environment', resourceId: env.environmentId, observedVersion: environmentVersion(env), observedAt: at, freshness: { kind: 'exact_version' } });
+  }
+  return out;
+}
 
 /** The snapshot fixed by the current turn (the dispatcher executes mutating tools against it). */
 export interface TurnState {
@@ -168,19 +198,41 @@ export function createContextProvider(deps: ControlDeps, config: ResolvedControl
     return out;
   }
 
+  const currentEnvironment = (environmentId: string) => authoritativeEnvironment(deps, environmentId);
+
+  /**
+   * (conformance-3, I1) What the agent works against beyond the run's oracles and target environment, pinned in each
+   * turn's ContextSnapshot so the FreshnessGuard re-validates it before every mutating action of the turn:
+   *  - every registered environment's generation/build (an env.* action on ANY environment — not only the run target —
+   *    is refused when that environment was restarted/redeployed since the turn started);
+   *  - the current head of every finding the item takes as input (a fix or test built on a finding that was rejected or
+   *    superseded meanwhile is refused).
+   * The item's own work claim is NOT pinned here: a turn replayed after a crash runs under a new claim against the
+   * snapshot it was recorded with; the claim is fenced at dispatch and re-checked inside every record write (I4, H4).
+   */
+  async function observedReadSet(): Promise<ReadSetEntry[]> {
+    const at = clock.isoNow();
+    const exact = { kind: 'exact_version' } as const;
+    const out: ReadSetEntry[] = await environmentReadSet(deps, run, at);
+    for (const ref of item.inputRefs) {
+      if (ref.kind !== 'record') continue;
+      const rec = await blackboard.getRecord(ref.id);
+      if (!rec || rec.runId !== run.runId || rec.recordType !== 'finding') continue;
+      const head = (await blackboard.head(rec.lineageId)) ?? rec;
+      out.push({ resourceType: 'finding', resourceId: rec.lineageId, observedVersion: head.recordId, observedAt: at, freshness: exact });
+    }
+    return out;
+  }
+
   return {
     async assemble({ sessionId, turn, transcript, compactions, signal }) {
       const epoch = await epochs.current(sessionId);
       const buildInput: Parameters<typeof snapshotBuilder.build>[0] = { runId: run.runId };
       if (epoch) buildInput.modelEpochId = epoch.epochId;
-      if (run.target.environmentId) {
-        const env = environments.get(run.target.environmentId);
-        if (env) {
-          const e: { environmentId: string; generation: number; buildDigest?: string } = { environmentId: env.environmentId, generation: env.generation };
-          if (env.buildDigest !== undefined) e.buildDigest = env.buildDigest;
-          buildInput.environment = e;
-        }
-      }
+      const target = await targetEnvironment(deps, run);
+      if (target) buildInput.environment = target;
+      const readSet = await observedReadSet();
+      if (readSet.length > 0) buildInput.readSet = readSet;
       const snapshot = await snapshotBuilder.build(buildInput, eventContext);
       turnState.turn = turn;
       turnState.snapshot = snapshot;

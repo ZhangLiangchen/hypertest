@@ -298,14 +298,50 @@ observeWaiting). `test/fixture.ts` is a git repo with a seeded pricing regressio
   report's recovery log renders it; test-change / `request_approval` requesters record `modelProvider`. No change to
   `src/contracts.ts`.
 
+- (hardening) `ControlPlane.tick(runId, options?: TickOptions)` with `TickOptions.maxDispatch?` (H6: dispatch no more
+  claims than the caller has free executor slots); optional `ControlPlane.renewClaim?(workItemId, fencingToken)`
+  (keeps a dispatched claim alive while it waits for an executor slot; `false` once the claim or its admission is
+  lost); `TickResult.dispatched[].nextTurn?` (durability-9: the first `executeTurn` of a claim names its turn). New
+  exports `claimLeaseOwner` (H4: gateway lease owner `<workerId>:<workItemId>:<fencingToken>`), `testOutcomeEventId`
+  (H5), `claimFenced` (H4: non-read domain tools re-check the claim token inside their transaction and answer
+  `lease_lost` to a superseded worker), `assertRunPinned`, `gateSpecProblems`, `runReviewRequestEventId`.
+- (hardening, behaviour) I11: `tick`/`executeTurn`/`observeWaiting`/`recover`/idempotent `startRun` refuse a run pinned
+  to another runtime manifest (`precondition_failed`), and a turn refuses an engine whose version differs from the
+  manifest (H2). `startRun` validates `gate` overrides (`invalid_argument`, H3). Reviewer independence counts every
+  `EVIDENCE_PRODUCER_ROLES` role. H7: before the QualityGate of a run that requires independent review, control
+  emits one `review.requested` for the run (`subjectRef { kind: 'run' }`, deterministic event id per gate attempt);
+  runs without a reviewer subscription are unchanged. H9: capability environment classes are the role profile's ∩
+  the registered environments' classes (∪ `local`). Admission is audited: `admission.granted` / `admission.refused`
+  (once per distinct conflict) / `admission.lapsed` (a lapsed resource claim yields the work claim back to `ready`
+  without consuming an attempt; the turn answers `lease_lost`, durability-2). A paused run yields its claims
+  (H13). Turn snapshots pin every other registered environment and the input findings' lineage heads
+  (conformance-3). `recover()` releases the side-effect leases of superseded claims before reconciling.
+  `plan.propose_revision` replays and validates inside one locked transaction (no duplicate revision). Test outcome
+  events and budget charges are keyed by the invocation id (H5).
+- (hardening, behaviour) durability-7: a waiting item fails (`budget_exhausted`, naming the still unsettled
+  operations, which stay in the ledger for reconciliation) once its `maxWallClockMs` or the run's wall clock passed —
+  an operation that never settles no longer keeps the run from its gate. durability-8: `cancelRun` runs under the
+  tick mutex and changes the run status under the work-creation lock; `WorkFactory.create` refuses work for an ended
+  run (`conflict`); the sweep re-reads and cancels an item another process moved meanwhile. durability-1: `recover()`
+  releases the open budget reservations of the claims it supersedes (`BudgetLedger.releaseOpen`). durability-11: the
+  per-process claim bookkeeping forgets ended claims and ended runs (`ControlPlaneInternals.bookkeeping()` reports its
+  size). conformance-4: the gate input names the current approved revision of every pinned oracle. conformance-5:
+  `load.start` above the run's `maxExternalQps` is denied (`external_qps_exceeded`) before it runs. conformance-9: the
+  report shows the deciding gate (`**Gate:** <gateId> (spec <digest>; overrides …)`). conformance-10:
+  `test_artifact.validate` binds a validation to what ran — a changed copy of the artifact's file in the evidence's
+  `workspaceDelta` must be the registered content, and known-good / known-bad must have run on different code
+  (`TestValidation.codeDigest`, domain, additive). conformance-11: the gate input's `exceptions` are the run's
+  approved `gate_exception` approvals (they were hard-coded empty).
+
 ## Notes for integrators
 
 - Register the domain tools (`createDomainTools(deps)`) before computing the RuntimeManifest's
   `toolCatalogRevision`; `createControlPlane` registers only missing ones.
 - `executeTurn` throws `HypertestError('cancelled')` for a plain abort (the activity was cancelled); the turn replays
   on the next attempt. Explicit interrupts (cancelRun) end the item as `cancelled`.
-- The ToolRuntime builds a side effect's gateway lease owner from the agent id (no hook to pass the work claim's
-  fencing token); control fences every tool call of a reassigned worker before it reaches the runtime instead.
+- The dispatcher passes the work claim to the ToolRuntime (`leaseOwner = claimLeaseOwner(...)`, `claim`), so a
+  side effect's gateway lease is owned by the claim that issued it; a superseded claim's leases are released by
+  `recover()` before its operations are reconciled.
 - The post-execution drift guard costs two `workspaces.diff` calls per execution tool in a writable worktree (one
   `git diff --no-index` per untracked file): keep build outputs git-ignored in target repositories. A command that
   rewrites a TRACKED file (e.g. `npm install` updating a committed lockfile) quarantines the worktree until the file is

@@ -15,7 +15,7 @@ import {
 import { BuiltinPolicyEngine, DEFAULT_POLICY_RULES, createPolicyDecisionLog, createRootCapability, policyMigrations, type ActionPermit, type PolicyDecisionLog, type PolicyEngine } from '@hypertest/policy';
 import { createTestDatabase } from '@hypertest/store';
 import {
-  ToolRegistry, createEnvironmentRegistry, createToolRuntime,
+  ToolRegistry, createEnvironmentRegistry, createToolRuntime, recordEffectAdapters,
   type EnvironmentDescriptor, type EnvironmentRegistry, type ToolContext, type ToolExecutionRequest, type ToolRuntime, type ToolSpec, type WorkspaceHandle,
 } from '../src/index.ts';
 
@@ -98,7 +98,8 @@ export function newGateway(env: BlackboxEnv, adapters: SideEffectAdapter<any, an
   const opDeps = { ...env.deps, db: env.db, events: env.events };
   const ledger = createOperationLedger(opDeps);
   const leases = createLeaseService(opDeps);
-  const gateway = createSideEffectGateway({ ...opDeps, ledger, leases, adapters: new AdapterRegistry(adapters), pollIntervalMs: extra.pollIntervalMs ?? 20 });
+  // the record-only adapters are part of every realistic gateway (external effects without an adapter of their own)
+  const gateway = createSideEffectGateway({ ...opDeps, ledger, leases, adapters: new AdapterRegistry([...adapters, ...recordEffectAdapters().filter((r) => !adapters.some((a) => a.adapterId === r.adapterId))]), pollIntervalMs: extra.pollIntervalMs ?? 20 });
   return { gateway, ledger, leases };
 }
 

@@ -9,6 +9,7 @@ import type { Migration } from '@hypertest/core';
  * - ht_leases: the live write lease per resource (one row per resource; regrant replaces the row).
  * - ht_admission_lock + ht_resource_claims: experiment isolation claims, admitted under one lock row.
  * - ht_budget_scopes + ht_budget_reservations: budget leases (reserve → settle | release).
+ * - 005: ht_budget_reservations.idempotency_key (unique when set): a keyed charge is recorded once.
  */
 export const operationMigrations: Migration[] = [
   {
@@ -104,6 +105,13 @@ CREATE TABLE ht_budget_reservations (
   updated_at timestamptz NOT NULL
 );
 CREATE INDEX ht_budget_reservations_status_idx ON ht_budget_reservations (status);
+`,
+  },
+  {
+    id: 'operation/005-budget-charge-idempotency',
+    sql: `
+ALTER TABLE ht_budget_reservations ADD COLUMN idempotency_key text;
+CREATE UNIQUE INDEX ht_budget_reservations_idempotency_uq ON ht_budget_reservations (idempotency_key) WHERE idempotency_key IS NOT NULL;
 `,
   },
 ];

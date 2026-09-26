@@ -281,6 +281,26 @@ describe('ModelEpochs and the ModelInvoker (I3)', () => {
     assert.deepEqual(budget.settled, []);
   });
 
+  test('durability-10: a paid call whose model.invoked append fails is kept — its usage is SETTLED, never released', async () => {
+    const s = await newSession();
+    const catalog = new ModelCatalog([profile('route_a', 'prov_a', 'model-a', 'cls-a')]);
+    const provA = new ScriptedProvider({ providerId: 'prov_a', brains: { 'model-a': () => ({ text: 'paid', usage: { inputTokens: 700, outputTokens: 50 } }) } });
+    // the audit store refuses every model.invoked append (e.g. a lock timeout on the run counter)
+    const sink = { emit: async (evs: Parameters<typeof deps.events.emit>[0]) => {
+      if (evs.some((e) => e.eventType === 'model.invoked')) throw new Error('lock timeout on ht_run_counters');
+      return deps.events.emit(evs);
+    } };
+    const router = createModelRouter({ ...deps, catalog, providers: new ProviderRegistry([provA]), events: sink, retry: { baseDelayMs: 1, maxDelayMs: 2 } });
+    const budget = new RecordingBudget();
+    const invoker = invokerFor(s, router, { budget }, { preferredRoutes: ['route_a'] });
+    const r = await invoker.invoke({ messages: [{ role: 'user', content: 'x' }], tools: [], signal: new AbortController().signal, turn: 1, snapshotId: 'cs_audit' });
+    assert.equal(r.ok, true, 'the paid response is returned, not discarded');
+    if (r.ok) assert.deepEqual(r.message.content, [{ type: 'text', text: 'paid' }]);
+    assert.equal(provA.callCount, 1);
+    assert.deepEqual(budget.settled, [{ id: 'res_1', actual: { tokens: 750, costUsd: router.estimateCostUsd('route_a', 700, 50) } }]);
+    assert.deepEqual(budget.released, [], 'the reservation is never released for a paid call');
+  });
+
   test('cross-model continuation: opaque reasoning of another class is stripped before the route sees it; same class is kept', async () => {
     const s = await newSession();
     const { router, provA, provB } = stack({});

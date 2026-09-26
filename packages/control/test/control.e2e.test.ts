@@ -106,6 +106,21 @@ const rca: RoleBrain = (v) => {
 
 const testDesigner: RoleBrain = () => call('complete_work', { summary: 'The existing test already covers the defect; no new artifact.', output: { summary: 'covered by existing test', testArtifacts: [] } });
 
+/** (H7) The run-level review the gate requires: judges the recorded test-result itself, never a narrative. */
+const reviewer: RoleBrain = (v) => {
+  if (v.step === 0) return call('evidence.query', { evidenceType: 'test-result' });
+  const ids = evidenceIds(v.toolResults[0]!.content);
+  if (v.step === 1) {
+    return call('blackboard.post_review', {
+      subjectRef: { kind: 'run', id: v.runId }, verdict: 'approve',
+      rationale: 'The recorded test-result shows the discount case failing on the candidate: the run\'s finding and verdict rest on execution evidence.',
+      checkedEvidenceRefs: ids,
+    });
+  }
+  const rec = parsed(v.lastResult!.content)['recordId'] as string;
+  return call('complete_work', { summary: `run review: approve (checked ${ids.join(', ')})`, evidenceRefs: ids, recordRefs: [rec], output: { summary: 'approve', verdict: 'approve', reviews: [rec], checkedEvidenceIds: ids } });
+};
+
 describe('full mini run (e2e): plan v1 → v2 → reactors → v3 → gate fail', () => {
   let h: Harness;
   let repo: Awaited<ReturnType<typeof pricingRepo>>;
@@ -115,7 +130,7 @@ describe('full mini run (e2e): plan v1 → v2 → reactors → v3 → gate fail'
 
   before(async () => {
     repo = await pricingRepo();
-    h = await createHarness({ brains: { lead, code_change_analyst: analyst, historical_bug_analyst: analyst, executor, rca, test_designer: testDesigner } });
+    h = await createHarness({ brains: { lead, code_change_analyst: analyst, historical_bug_analyst: analyst, executor, rca, test_designer: testDesigner, reviewer } });
     await pricingOracle(h);
     const run = await h.control.startRun({
       goal: 'Analyse the discount change and decide whether it is releasable.',
@@ -136,9 +151,13 @@ describe('full mini run (e2e): plan v1 → v2 → reactors → v3 → gate fail'
     assert.ok(result.final, `did not converge: ${result.ticks.map((t) => t.convergence.state).join(',')}`);
     assert.equal(result.final.final, true);
     assert.equal(decision.verdict, 'fail');
-    assert.deepEqual(decision.violatedCriteria.map((c) => c.criterionId), ['C2', 'C3', 'C6', 'C7']);
+    // H7: the independent run review the gate requires was requested before the gate and approved on the recorded
+    // test-result by a reviewer on another provider (gamma): C6 is satisfied; the defect still fails the gate
+    assert.deepEqual(decision.violatedCriteria.map((c) => c.criterionId), ['C2', 'C3', 'C7']);
+    assert.ok(decision.satisfiedCriteria.some((c) => c.criterionId === 'C6'), 'C6 satisfied by the independent run review');
     assert.deepEqual(decision.unknownCriteria, []);
-    assert.equal(decision.requiresHumanReview, true);
+    // the human review flag came from the missing independent review (C6), which the run review now supplies
+    assert.equal(decision.requiresHumanReview, false);
     assert.deepEqual(decision.oracleRevisions, { 'oracle.pricing': 1 });
     const run = (await h.deps.runs.get(runId))!;
     assert.equal(run.status, 'completed');
@@ -170,14 +189,22 @@ describe('full mini run (e2e): plan v1 → v2 → reactors → v3 → gate fail'
       ['reaction', 'test_designer', 'completed'],
       ['reaction', 'rca', 'completed'],
       ['replan', 'lead', 'completed'],
+      ['reaction', 'reviewer', 'completed'],
     ]);
+    // H7: the run-level review was requested by the control plane once the plan was ready for the gate (no lead involved)
+    const requested = await h.deps.events.read(runId, { types: ['review.requested'] });
+    assert.equal(requested.length, 1);
+    assert.deepEqual((requested[0]!.payload as { subjectRef: unknown }).subjectRef, { kind: 'run', id: runId });
+    const review = all.find((w) => w.role === 'reviewer')!;
+    assert.deepEqual(review.origin, { kind: 'reactor', rule: 'reviewer.review_requested', eventId: requested[0]!.eventId });
+    assert.deepEqual(review.inputRefs, [{ kind: 'run', id: runId }]);
     const replans = all.filter((w) => w.kind === 'replan');
     assert.match(replans[0]!.objective, /^Replan #1 \(reason: plan_drained\)/);
     assert.match(replans[0]!.objective, /risk rec_\w+ \[high, open\] code_change_analyst: discount arithmetic changed/);
     assert.match(replans[1]!.objective, /finding rec_\w+ \[P1, product_defect, open\] 10% discount is applied twice \(evidence: ev_/);
     // the reactions were caused by the finding event, not by the lead
     const findingEvent = (await h.deps.events.read(runId, { types: ['finding.created'] }))[0]!;
-    for (const w of all.filter((x) => x.kind === 'reaction')) {
+    for (const w of all.filter((x) => x.kind === 'reaction' && x.role !== 'reviewer')) {
       assert.deepEqual(w.origin, { kind: 'reactor', rule: w.role === 'rca' ? 'rca.investigate_finding' : 'test_designer.regression_for_finding', eventId: findingEvent.eventId });
       assert.equal(w.causationEventId, findingEvent.eventId);
     }
@@ -217,6 +244,7 @@ describe('full mini run (e2e): plan v1 → v2 → reactors → v3 → gate fail'
     const routes = Object.fromEntries(report.models.map((m) => [m.role, m.routeId]));
     assert.deepEqual(routes, {
       code_change_analyst: 'alpha-large', executor: 'beta-exec', historical_bug_analyst: 'alpha-large', lead: 'alpha-large', rca: 'beta-exec', test_designer: 'alpha-large',
+      reviewer: 'gamma-review',
     });
     assert.equal(report.models.find((m) => m.role === 'lead')!.turns, 6);
     assert.equal(report.evidence.sealed, true);

@@ -32,6 +32,7 @@ test('PoC A: the seeded pagination regression is found by a dynamic multi-LLM te
     return {
       verdict: d.decision?.verdict,
       violated: d.decision?.violatedCriteria.map((c) => c.criterionId).sort(),
+      satisfied: d.decision?.satisfiedCriteria.map((c) => c.criterionId).sort(),
       acceptedPlans: d.plans.filter((p) => p.status === 'accepted' || p.status === 'superseded').map((p) => p.revision),
       work: d.workItems.map((w) => `${w.role}/${w.origin.kind}/${w.state}`).sort(),
       parallelAnalysts: maxConcurrent(d.events, new Set(analysts)),
@@ -75,7 +76,13 @@ test('PoC A: the seeded pagination regression is found by a dynamic multi-LLM te
   assert.deepEqual([a.leaks, a.inheritedFirstCalls], [0, 0]);
   // Evidence + Review — the reviewer (another provider) fetched every cited evidence itself and approved on the recorded
   // test-result (pocAWorkflow: the approval rests on test-result evidence the reviewer fetched with evidence.get)
-  assert.deepEqual(a.reviews, [{ verdict: 'approve', provider: 'judge-c', subject: 'record', checked: ['stdout', 'test-result'] }]);
+  assert.deepEqual(a.reviews, [
+    { verdict: 'approve', provider: 'judge-c', subject: 'record', checked: ['stdout', 'test-result'] },
+    // H7: the run-level review the gate requires, requested by the control plane before the gate, judged on test-result
+    { verdict: 'approve', provider: 'judge-c', subject: 'run', checked: ['test-result'] },
+  ]);
+  // …and it is independent of every producer's provider: C6 is satisfied in the multi-LLM arm
+  assert.ok(a.satisfied?.includes('C6'), `satisfied ${a.satisfied?.join(', ')}`);
   assert.deepEqual(a.artifacts, ['tests/paginate-pages.test.js:validated', 'tests/transfer-conservation.test.js:validated']);
   // BUGate — the unresolved defect violates the critical oracle assertion: no release
   assert.equal(a.verdict, 'fail');

@@ -123,6 +123,7 @@ advisory lock (two-int4 key space, disjoint from other packages' locks). Malform
 | Work/run state machines | illegal transitions, terminal patches, expectedFrom races | `test/work-items.test.ts`, `test/runs.test.ts` |
 | One head per lineage | supersede a non-head; 6 concurrent supersedes on PG | `test/blackboard-records.test.ts`, `test/postgres.int.test.ts` |
 | Append-only specs/decisions | stale explicit revision, rewritten proposal/decision, double decision, 5 concurrent writers of one oracle from 5 runs | `test/specs.test.ts`, `test/decisions.test.ts`, `test/postgres.int.test.ts` |
+| Append-only in the DATABASE (I6/I10, conformance-15): `ht_events`, `ht_system_models`, `ht_oracles`, `ht_experiments`, `ht_test_artifacts` reject UPDATE/DELETE/TRUNCATE; `ht_decisions` only takes the one-way reassessment flag (never cleared, reason never rewritten) | direct UPDATE/DELETE/TRUNCATE statements, a verdict change piggy-backing on the flag | `test/append-only.test.ts` |
 | At-least-once relay, ordered | publish failure mid-batch, crash after publish, stop()+start() during an in-flight flush | `test/inbox-outbox.test.ts` |
 | Bus redelivery / dead letter / queue semantics | throwing and hanging handlers, poison messages, delayed ack, close/unsubscribe with running handlers, colliding durable names | `test/inprocess-bus.test.ts`, `test/i5-duplicate-delivery.test.ts`, `test/nats.int.test.ts` |
 
@@ -145,6 +146,12 @@ per run and deletes the stream afterwards.
   form); `delayedAck?`, `random?`, `closeGraceMs?`.
 - `NatsBusOptions.subjectPrefix?` (default `ht`), `prefetch?` (default 16), `logger?`.
 - `DecisionRepository.reassessment(decisionId)` → `{ needsReassessment, reason? } | undefined`.
+- (hardening) migration `collab/005-append-only`: trigger functions `ht_collab_append_only()` and
+  `ht_decisions_reassessment_only()` (SQLSTATE 42501 on a refused statement). No API change: the stores already only
+  inserted into these tables; the triggers make a stray statement (or a bug) fail instead of rewriting history.
+- (hardening, durability-11) `OutboxRelay.prune?()`, `OutboxRelayDeps.sentRetentionMs?` (default 1 h) and
+  `.pruneIntervalMs?` (default 60 s): rows marked sent are delivery records only (`ht_events` keeps every event), so
+  the poll loop deletes those sent longer ago than the retention; unsent rows are never touched.
 
 Event types emitted that are not (yet) in `@hypertest/domain` `EVENT_TYPES`: `run.gating`, `run.updated`,
 `work.blocked`, `work.updated`.

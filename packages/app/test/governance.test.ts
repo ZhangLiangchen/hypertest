@@ -93,3 +93,45 @@ describe('recorded-failure flip detection (I8)', () => {
     assert.equal(testCaseMatches('a.b*', { id: 'axb-1' }), false, 'regex metacharacters are literal');
   });
 });
+
+describe('H8: loosening ANY check type that the recorded evidence violates is a flip (the QualityGate evaluator)', () => {
+  const metric = (id: string, runId: string, structured: Record<string, unknown>, evidenceType = 'metric'): EvidenceRecord =>
+    ({ evidenceId: id, runId, seq: 1, evidenceType, structured, capturedAt: '2026-01-01T00:00:00.000Z', producer: {}, provenance: {} }) as unknown as EvidenceRecord;
+  const latency = (threshold: number): OracleAssertion =>
+    ({ assertionId: 'p99', description: 'p99 latency', kind: 'statistical', severity: 'P1', check: { type: 'metric_threshold', metric: 'latency_ms', comparator: '<', threshold, aggregation: 'p99' } }) as OracleAssertion;
+  const http = (expectStatus: number): OracleAssertion =>
+    ({ assertionId: 'cart', description: 'GET /cart ok', kind: 'deterministic_invariant', severity: 'P1', check: { type: 'http_expectation', method: 'GET', path: '/cart', expectStatus } }) as OracleAssertion;
+  const predicate = (value: number): OracleAssertion =>
+    ({ assertionId: 'no5xx', description: 'no 5xx', kind: 'deterministic_invariant', severity: 'P1', check: { type: 'evidence_predicate', evidenceType: 'api-response', field: 'status', comparator: '<', value } }) as OracleAssertion;
+  const spec = (assertions: OracleAssertion[]): OracleSpec => ({ oracleId: 'oracle.pricing', revision: 1, assertions }) as unknown as OracleSpec;
+  function detect(base: OracleSpec, evidence: EvidenceRecord[]) {
+    return recordedFailureFlipDetector({
+      getOracle: async () => base,
+      findings: async () => [],
+      getEvidence: async () => [],
+      testResults: async () => [],
+      evidence: async (runId) => evidence.filter((e) => e.runId === runId),
+    });
+  }
+
+  test('metric_threshold p99 < 200 → < 2000 with a recorded p99 of 500 (the audit PoC) is a flip; tightening or an unviolated one is not', async () => {
+    const recorded = [metric('ev_m', 'run_1', { metric: 'latency_ms', p99: 500 })];
+    const base = spec([latency(200)]);
+    assert.equal(await detect(base, recorded)(proposal([latency(2000)])), true);
+    assert.equal(await detect(base, recorded)(proposal([latency(1000)])), true);
+    assert.equal(await detect(base, recorded)(proposal([])), true, 'removing a violated assertion is a flip');
+    assert.equal(await detect(base, recorded)(proposal([latency(100)])), false, 'tightening keeps the violation');
+    assert.equal(await detect(spec([latency(1000)]), recorded)(proposal([latency(2000)])), false, 'nothing recorded violates the base');
+    assert.equal(await detect(base, [metric('ev_x', 'run_2', { metric: 'latency_ms', p99: 500 })])(proposal([latency(2000)])), false, 'another run\'s evidence is not this run\'s record');
+    // without the new dependency, the old detector did not see it (the reported gap)
+    const old = recordedFailureFlipDetector({ getOracle: async () => base, findings: async () => [], getEvidence: async () => [], testResults: async () => [] });
+    assert.equal(await old(proposal([latency(2000)])), false);
+  });
+
+  test('http_expectation and evidence_predicate relaxations of a recorded violation are flips too', async () => {
+    const responses = [metric('ev_api', 'run_1', { method: 'GET', path: '/cart', status: 503 }, 'api-response')];
+    assert.equal(await detect(spec([http(200)]), responses)(proposal([http(503)])), true);
+    assert.equal(await detect(spec([predicate(500)]), responses)(proposal([predicate(600)])), true);
+    assert.equal(await detect(spec([predicate(500)]), responses)(proposal([predicate(400)])), false);
+  });
+});

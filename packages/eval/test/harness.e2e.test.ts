@@ -235,3 +235,31 @@ describe('failure paths of the platform', () => {
     assert.equal(t.error, 'chaos plan not exercised: fewer than 1 operation(s) were dispatched before the run finished or timed out');
   });
 });
+
+describe('H11: suites and trials are cancellable (SuiteOptions.signal / TrialOptions.signal)', () => {
+  test('a trial whose signal aborts mid-run ends at once as an infra error (never a pass/fail), its run cancelled; an aborted suite starts no trial', async () => {
+    const ctrl = new AbortController();
+    let calls = 0;
+    // a slow team: every model call takes 1.5 s; the caller cancels after the first one started
+    const slowArm: EvalArm = {
+      armId: 'slow', description: 'slow brains', config: (base) => toyConfig(base),
+      brains: () => Object.fromEntries(Object.entries(defectBrains()).map(([id, brain]) => [id, async (req, info) => {
+        if (++calls === 1) setTimeout(() => ctrl.abort(), 200);
+        await new Promise((r) => setTimeout(r, 1500));
+        return brain(req, info);
+      }])) as ReturnType<NonNullable<EvalArm['brains']>>,
+    };
+    const started = Date.now();
+    const trial = await runTrial(toyDefectTask, slowArm, options(join(root.path, 'h11'), { signal: ctrl.signal, timeoutMs: 120_000 }));
+    assert.equal(trial.result, 'infra_error');
+    assert.match(trial.error ?? '', /cancelled/);
+    assert.ok(Date.now() - started < 60_000, `cancelled promptly (${Date.now() - started} ms), not at the trial timeout`);
+    // a suite whose signal is already aborted runs nothing
+    const seen: string[] = [];
+    await assert.rejects(
+      runSuite({ suiteId: 'toy', revision: 'toy-1', tasks: [toyDefectTask] }, { arms: [faithfulArm], trials: 2, workDir: join(root.path, 'h11-suite'), signal: ctrl.signal, onTrial: (t) => seen.push(t.armId) }),
+      (e: unknown) => (e as { code?: string }).code === 'cancelled',
+    );
+    assert.deepEqual(seen, []);
+  });
+});

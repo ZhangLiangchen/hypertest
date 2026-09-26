@@ -113,6 +113,33 @@ test('I12: charge records usage atomically but still refuses (recording nothing)
   assert.equal(rows.rows[0]!.n, 0);
 });
 
+test('H5: a charge under an idempotency key is recorded once — a replayed charge never double counts', async () => {
+  await budget.open('run:b7k', { toolCalls: 3 });
+  await budget.open('work:b7k', {}, 'run:b7k');
+  const first = reservationId(await budget.charge(['work:b7k'], { toolCalls: 1 }, 'tool:inv_1', { idempotencyKey: 'tool:inv_1' }));
+  // the same tool invocation replayed (durable retry, redelivery): the recorded charge, nothing new
+  assert.equal(reservationId(await budget.charge(['work:b7k'], { toolCalls: 1 }, 'tool:inv_1', { idempotencyKey: 'tool:inv_1' })), first);
+  assert.deepEqual((await budget.usage('run:b7k'))?.used, { toolCalls: 1 });
+  assert.deepEqual((await budget.usage('work:b7k'))?.used, { toolCalls: 1 });
+  // concurrent duplicates of one key charge once
+  const dup = await Promise.all(Array.from({ length: 6 }, () => budget.charge(['work:b7k'], { toolCalls: 1 }, 'tool:inv_2', { idempotencyKey: 'tool:inv_2' })));
+  assert.equal(new Set(dup.map(reservationId)).size, 1);
+  assert.deepEqual((await budget.usage('run:b7k'))?.used, { toolCalls: 2 });
+  // a different key is a different charge; unkeyed charges keep counting every call
+  reservationId(await budget.charge(['work:b7k'], { toolCalls: 1 }, 'tool:inv_3', { idempotencyKey: 'tool:inv_3' }));
+  const over = await budget.charge(['work:b7k'], { toolCalls: 1 }, 'tool:inv_4', { idempotencyKey: 'tool:inv_4' });
+  assert.equal(over.ok, false, 'the limit still applies');
+  // a refused charge recorded nothing: its key is free once budget exists again
+  await budget.open('run:b7k', { toolCalls: 4 });
+  reservationId(await budget.charge(['work:b7k'], { toolCalls: 1 }, 'tool:inv_4', { idempotencyKey: 'tool:inv_4' }));
+  assert.deepEqual((await budget.usage('run:b7k'))?.used, { toolCalls: 4 });
+  // the same key for another charge is a conflict (never silently absorbed)
+  await assert.rejects(budget.charge(['work:b7k'], { toolCalls: 2 }, 'tool:inv_1', { idempotencyKey: 'tool:inv_1' }), (e: unknown) => isHypertestError(e, 'conflict'));
+  await assert.rejects(budget.charge(['run:b7k'], { toolCalls: 1 }, 'tool:inv_1', { idempotencyKey: 'tool:inv_1' }), (e: unknown) => isHypertestError(e, 'conflict'));
+  await assert.rejects(budget.charge(['work:b7k'], { toolCalls: 1 }, 'x', { idempotencyKey: '' }), (e: unknown) => isHypertestError(e, 'invalid_argument'));
+  assert.deepEqual((await budget.usage('run:b7k'))?.used, { toolCalls: 4 });
+});
+
 test('I12: concurrent reservations never exceed the limit', async () => {
   await budget.open('run:b8', { workItems: 5 });
   const results = await Promise.all(Array.from({ length: 12 }, (_, i) => budget.reserve(['run:b8'], { workItems: 1 }, `wi-${i}`)));
@@ -141,4 +168,24 @@ test('amounts are validated (no negative, non-finite or unknown dimensions)', as
   await assert.rejects(budget.reserve([], { tokens: 1 }, 'no scope'), invalid);
   await assert.rejects(budget.open('run:b10b', { tokens: -5 }), invalid);
   assert.deepEqual((await budget.usage('run:b10'))?.reserved, {});
+});
+
+test('durability-1: releaseOpen frees the open reservations of a scope (a dead worker\'s calls); other scopes and settled rows are untouched', async () => {
+  await budget.open('run:leak', { tokens: 1000 });
+  await budget.open('work:leak-a', { tokens: 800 }, 'run:leak');
+  await budget.open('work:leak-b', { tokens: 800 }, 'run:leak');
+  const leaked = reservationId(await budget.reserve(['work:leak-a'], { tokens: 700 }, 'turn 3 (the worker died)'));
+  const settled = reservationId(await budget.reserve(['work:leak-a'], { tokens: 50 }, 'turn 2'));
+  await budget.settle(settled, { tokens: 40 });
+  const other = reservationId(await budget.reserve(['work:leak-b'], { tokens: 100 }, 'another item'));
+  // the leak blocks the retried turn of the requeued item
+  assert.equal((await budget.reserve(['work:leak-a'], { tokens: 700 }, 'turn 3 retried')).ok, false);
+  assert.deepEqual(await budget.releaseOpen!('work:leak-a'), [leaked]);
+  assert.deepEqual((await budget.usage('run:leak'))!.reserved, { tokens: 100 });
+  assert.deepEqual((await budget.usage('work:leak-a'))!, { scope: 'work:leak-a', limits: { tokens: 800 }, used: { tokens: 40 }, reserved: { tokens: 0 } });
+  assert.equal((await budget.reserve(['work:leak-a'], { tokens: 700 }, 'turn 3 retried')).ok, true, 'the retried turn fits again');
+  // a zombie settling its released reservation is refused; releasing again is a no-op
+  await assert.rejects(budget.settle(leaked, { tokens: 10 }), (e: unknown) => isHypertestError(e, 'precondition_failed'));
+  assert.deepEqual(await budget.releaseOpen!('work:leak-b').then((ids) => ids.length), 1);
+  assert.equal(other.length > 0, true);
 });
