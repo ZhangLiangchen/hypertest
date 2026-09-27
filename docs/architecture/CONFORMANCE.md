@@ -8,8 +8,8 @@ How far the code conforms to the design sources: [technology selection](../desig
 
 | Status | Meaning | Rows | Before round 2 | At the audit |
 |---|---|---|---|---|
-| implemented | Done as specified; notes name known limits | 132 | 108 | 87 |
-| partial | Works, but part of the requirement is missing | 29 | 48 | 67 |
+| implemented | Done as specified; notes name known limits | 133 | 108 | 87 |
+| partial | Works, but part of the requirement is missing | 28 | 48 | 67 |
 | missing | Not implemented | 1 | 5 | 7 |
 | deferred | Intentionally postponed, or built but not exercised against live infrastructure | 2 | 3 | 3 |
 | **Total** | | **164** | 164 | 164 |
@@ -19,7 +19,7 @@ Per area:
 | Area | Implemented | Partial | Missing | Deferred |
 |---|---|---|---|---|
 | [Product definition and principles](#product-definition-and-principles) | 3 | 0 | 0 | 0 |
-| [Agent runtime, engines and subagents](#agent-runtime-engines-and-subagents) | 8 | 1 | 0 | 0 |
+| [Agent runtime, engines and subagents](#agent-runtime-engines-and-subagents) | 9 | 0 | 0 | 0 |
 | [Multi-LLM routing and model switching](#multi-llm-routing-and-model-switching) | 13 | 0 | 0 | 0 |
 | [Planning, scheduling and collaboration](#planning-scheduling-and-collaboration) | 13 | 1 | 0 | 0 |
 | [Context engine, freshness and learning](#context-engine-freshness-and-learning) | 12 | 2 | 1 | 0 |
@@ -62,11 +62,12 @@ Per area:
 
 ## Changed by the round-2 completion work
 
-25 rows changed status. Each change was checked against the code and its tests; where a unit's own claim went further than the code, the row stays at the lower status and the note says what is missing.
+26 rows changed status (25 in round 2, plus the role-catalog privacy fix that followed it). Each change was checked against the code and its tests; where a unit's own claim went further than the code, the row stays at the lower status and the note says what is missing.
 
 | Requirement | Before | Now |
 |---|---|---|
 | Subagent runtime: spawn/resume/message/interrupt/collect, continuable, background, nested delegation, depth/count caps | partial | implemented |
+| Role catalog including a heterogeneous reviewer, condenser, vision/GUI and local/private agent (privacy fix after round 2) | partial | implemented |
 | P0 revision 1: own ABI + Runtime Adapter + surgical fork; DSH as the first adapter | deferred | implemented |
 | Risk mitigation: model circuit breaker on rate/price changes | missing | implemented |
 | WorkItem schema (capabilityRequirements, model/tool policy, inputRefs, expectedOutput, evidenceRequirements, dependsOn, budget, priority, state) | partial | implemented |
@@ -96,7 +97,6 @@ Improved but still partial, with the reason:
 
 | Requirement | Why it stays partial |
 |---|---|
-| Role catalog including … vision/GUI and local/private agent | The `local_private` role's evidence is readable by hosted agents through `evidence.get` (only its prompt guards restricted values). |
 | L3 hybrid retrieval | Symbols come from regular expressions (no tree-sitter/LSP/SCIP); the only embedder is feature hashing (no semantic model). |
 | ExperimentSpec | The per-experiment `budget` is not accepted or enforced. |
 | Checklist: every runtime release runs the core eval | CI runs the core eval gate on every push, but `runtime promote` accepts any passing replay suite and deployment manifests are not evaluated. |
@@ -116,7 +116,7 @@ Improved but still partial, with the reason:
 |---|---|---|---|---|
 | Runtime ownership: Hypertest owns the agent, session, context, task, subagent, model routing, permission, evidence and gate semantics | technology-selection §原则 | implemented | `packages/runtime/src/contracts.ts`<br>`scripts/check-boundaries.mjs` | – |
 | Kernel: create/resume/interrupt/dispose agents, session, activation, inbox, cancellation propagation | technology-selection §Agent Runtime Kernel | implemented | `packages/runtime/src/subagents.ts`<br>`packages/runtime/src/sessions.ts`<br>`packages/runtime/src/native-engine.ts` | Inbox via ht_agent_inbox/enqueueInput. |
-| Role catalog including a heterogeneous reviewer, condenser, vision/GUI and local/private agent | technology-selection §Multi-LLM Router | partial | `packages/agents/src/roles/*.ts` (`vision-gui.ts`, `local-private.ts`)<br>`packages/app/src/releases.ts` (condenserPrivacyFloor)<br>`packages/app/src/diagnose.ts` (route coverage)<br>`packages/app/test/specialist-roles.e2e.test.ts` | 14 roles. `vision_gui` needs the vision capability and uses `browser.*` with screenshot evidence (DOM/API first, computer use only as a fallback). `local_private` runs only on restricted routes (privacyClass restricted, fallback fail_closed, egress tools denied, condenser privacy floor); a real run proves the routing (specialist-roles.e2e). Hardening (H10): the reviewer is independent of every evidence-producing role (EVIDENCE_PRODUCER_ROLES, now eight). Still partial: evidence recorded by a `local_private` agent's tools is stored as `internal`, and `evidence.get` returns a preview to any agent of the run, so restricted data can reach hosted models; only the role prompt guards this. |
+| Role catalog including a heterogeneous reviewer, condenser, vision/GUI and local/private agent | technology-selection §Multi-LLM Router | implemented | `packages/agents/src/roles/*.ts` (`vision-gui.ts`, `local-private.ts`)<br>`packages/control/src/clearance.ts`<br>`packages/app/src/releases.ts` (condenserPrivacyFloor)<br>`packages/app/src/diagnose.ts` (route coverage)<br>`packages/app/test/specialist-roles.e2e.test.ts` | 14 roles. `vision_gui` needs the vision capability and uses `browser.*` with screenshot evidence (DOM/API first, computer use only as a fallback). `local_private` runs only on restricted routes (privacyClass restricted, fallback fail_closed, egress tools denied, condenser privacy floor); a real run proves the routing (specialist-roles.e2e). Hardening (H10): the reviewer is independent of every evidence-producing role (EVIDENCE_PRODUCER_ROLES, now eight). Privacy (closed after round 2): evidence recorded by a role's tools is stored at that role's classification (`local_private`: restricted), and agents below that clearance get ids only, never content, through `evidence.get`/`evidence.query`, `blackboard.read`, task inputs and work/delegation result summaries (`packages/control/src/clearance.ts`, `packages/control/test/privacy.test.ts`, tools `runtime.test.ts`). Artifacts in the store and the human-facing report are not filtered per classification. |
 | Subagent runtime: spawn/resume/message/interrupt/collect, continuable, background, nested delegation, depth/count caps | technology-selection §Subagent Runtime | **implemented** (was partial) | `packages/runtime/src/subagents.ts`<br>`packages/control/src/domain-tools/work.ts` (delegate, delegate.status/collect/message/release)<br>`packages/control/src/delegation.ts`<br>`packages/control/src/worker.ts`<br>`packages/control/test/subagents.test.ts` | `delegate` accepts `background` (the parent keeps working; `delegate.status` / `delegate.collect` and an inbox note carry only the child's summary) and `continuable` (the child waits for `delegate.message` after each task; `delegate.release`, or the parent's end, completes it). A background child whose worker died is taken over with a new fencing token as the same agent. Depth and count caps are unchanged (maxDepth, MAX_AGENTS_PER_RUN). |
 | SpawnRequest contract (workItemId, role, model/tool policy, permission profile, contextSnapshotId, outputSchema, maxDepth, budget) | technology-selection §Subagent Runtime | implemented | `packages/runtime/src/contracts.ts`<br>`packages/control/src/worker.ts` (SpawnRequest) | – |
 | P0 revision 1: own ABI + Runtime Adapter + surgical fork; DSH as the first adapter | architecture-improvements §执行摘要 P0 | **implemented** (was deferred) | `packages/runtime` (native)<br>`packages/runtime-pi`<br>`packages/runtime-dsh/src/dsh-engine.ts` (DshEngine)<br>`packages/runtime-dsh/README.md` (fork decision gate record)<br>`packages/app/src/compose.ts` (`engines.default: dsh`) | Three engines pass the shared contract suite. DSH (0.1.0-rc.6 train + cordis 4.0.4 + the range-resolved `@deepseek-ai` libraries it loads, exact pins closed over the train, fail closed on drift) is pin + adapter over its public seams (LlmAdapter route, agent-scoped tools, `agent/pre-step`, `tools/post-execute`); no fork was needed. DSH is registered and pinned by the manifest only when it is the default engine (experimental). |

@@ -448,6 +448,16 @@ test('evidence: ctx.recordEvidence fills producer, provenance (not spoofable) an
   assert.deepEqual((completed.payload as { evidenceRefs: string[] }).evidenceRefs, [id]);
 });
 
+test('evidence is recorded at the calling role\'s data classification (runtime-set); default internal', async () => {
+  const rt = runtimeFor(env, specs(), { policy });
+  const plain = await rt.execute(request('t.evidence', {}, ws));
+  assert.equal((await env.evidence.get((plain.structured as { evidenceId: string }).evidenceId))!.classification, 'internal');
+  const req = { ...request('t.evidence', {}, ws), invocationId: 'inv_private_1', dataClassification: 'restricted' as const };
+  const r = await rt.execute(req);
+  assert.equal(r.status, 'success');
+  assert.equal((await env.evidence.get((r.structured as { evidenceId: string }).evidenceId))!.classification, 'restricted');
+});
+
 test('evidence records the environment the tool addressed (input.environmentId, current generation); an explicit environment wins; an unknown one records none', async () => {
   // black-box evidence without an environment (and without a commit) has no provenance anchor: L5 reports a gap for
   // every HTTP exchange, scrape or load result — "all key numbers have provenance" (PoC C) could never hold

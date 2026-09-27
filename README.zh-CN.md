@@ -242,13 +242,13 @@ HYPERTEST_EVAL_LIVE_MODEL=… HYPERTEST_EVAL_LIVE_API_KEY=…`（openai-compatib
 
 ## 状态与限制
 
-在 164 条设计需求中，132 条已实现、29 条部分实现、1 条缺失、2 条延后；全部十二条不变量均已实现
+在 164 条设计需求中，133 条已实现、28 条部分实现、1 条缺失、2 条延后；全部十二条不变量均已实现
 （[CONFORMANCE.zh-CN.md](docs/architecture/CONFORMANCE.zh-CN.md) 列出每一行）。主要缺口：
 
 | 领域 | 当前限制 |
 |---|---|
 | 沙箱 | 本地沙箱用 Linux 命名空间隔离网络、进程与敏感路径，但命令以同一 OS 用户运行，并能看到主机其余文件系统。不受信任的模型请使用 OCI 沙箱。OCI 沙箱、docker 与 kubectl 适配器在开发中未在真实守护进程或集群上运行过。 |
-| 隐私 | `local_private` 角色只运行在 restricted（本地）路由上，但其工具记录的证据以 `internal` 级别存储，而 `evidence.get` 会向本运行的任何 Agent 显示预览。目前只有该角色的提示词在阻止受限值进入这些证据。 |
+| 隐私 | `local_private` 角色只运行在 restricted（本地）路由上，其工具记录的证据以 `restricted` 级别存储：许可级别更低的 Agent 只能看到 id，看不到内容。制品存储中的文件和面向人的报告不按分级过滤。 |
 | 上下文 | 符号图基于正则表达式（没有 tree-sitter/LSP/SCIP）；向量检索使用特征哈希嵌入，而不是语义模型。`shell.exec` 或 `test.run` 修改的文件不会被观察到，因此 Agent 在下一次写入前必须重新读取。另一个 Agent 取代了该 Agent 观察过的 finding，或重新部署了它观察过的环境之后，在它重新观察该资源之前，其变更类操作都会被拒绝。 |
 | 实验与预算 | 实验没有自己的预算（适用运行与工作项预算），QualityGate 也尚未判断实验效度。限时故障可能比其实验的 claim 存活更久。工具调用之外的 artifact 写入（压缩、报告）不计费。 |
 | 模型 | 熔断器按进程保存状态，app 未配置价格上限。所有路由的熔断器都打开时，工作项以 `model_unavailable` 失败。真实供应商已实现，但 CI 使用脚本化大脑，真实模型评测分组为可选。 |
@@ -274,10 +274,8 @@ npm run sbom                                # CycloneDX SBOM → .hypertest-sbom
 npm run test:scripts                        # 供应链脚本的测试
 ```
 
-集成测试在缺少基础设施时会带明确原因跳过。本轮在开发主机上的结果（PGlite 与 PostgreSQL 上相同）：2210 个测试，
-2202 个通过，5 个跳过（无 pgvector、无 S3 端点、可选的真实 LLM 分组、两个 docker 测试），3 个失败。这 3 个失败是已变更代码之外的测试中
-过时的预期：`packages/control/test/robustness.test.ts` 中的角色列表（早于 `vision_gui` 与 `local_private`），以及
-`packages/eval/test/harness.test.ts` 中“未注册引擎”的示例（`dsh` 现已注册）。规则见
+集成测试在缺少基础设施时会带明确原因跳过。开发主机上的结果（PGlite 与 PostgreSQL 上相同）：2215 个测试，
+2210 个通过，0 个失败，5 个跳过（无 pgvector、无 S3 端点、可选的真实 LLM 分组、两个 docker 测试）。规则见
 [CONTRIBUTING.zh-CN.md](CONTRIBUTING.zh-CN.md)，Agent 指令见 [AGENTS.md](AGENTS.md)。
 
 ## 仓库结构

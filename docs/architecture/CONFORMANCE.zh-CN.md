@@ -8,8 +8,8 @@
 
 | 状态 | 含义 | 行数 | 第二轮之前 | 审计时 |
 |---|---|---|---|---|
-| 已实现 | 已按规格完成；备注列出已知限制 | 132 | 108 | 87 |
-| 部分实现 | 可用，但部分需求尚未满足 | 29 | 48 | 67 |
+| 已实现 | 已按规格完成；备注列出已知限制 | 133 | 108 | 87 |
+| 部分实现 | 可用，但部分需求尚未满足 | 28 | 48 | 67 |
 | 缺失 | 未实现 | 1 | 5 | 7 |
 | 延后 | 有意延后，或已实现但未在真实基础设施上验证 | 2 | 3 | 3 |
 | **合计** | | **164** | 164 | 164 |
@@ -19,7 +19,7 @@
 | 领域 | 已实现 | 部分实现 | 缺失 | 延后 |
 |---|---|---|---|---|
 | [产品定义与原则](#产品定义与原则) | 3 | 0 | 0 | 0 |
-| [Agent 运行时、引擎与子 Agent](#agent-运行时引擎与子-agent) | 8 | 1 | 0 | 0 |
+| [Agent 运行时、引擎与子 Agent](#agent-运行时引擎与子-agent) | 9 | 0 | 0 | 0 |
 | [多模型路由与模型切换](#多模型路由与模型切换) | 13 | 0 | 0 | 0 |
 | [规划、调度与协作](#规划调度与协作) | 13 | 1 | 0 | 0 |
 | [上下文引擎、新鲜度与学习](#上下文引擎新鲜度与学习) | 12 | 2 | 1 | 0 |
@@ -67,6 +67,7 @@
 | 需求 | 之前 | 现在 |
 |---|---|---|
 | 子 Agent 运行时：spawn/resume/message/interrupt/collect、可续跑、后台、嵌套委派、深度/数量上限 | 部分实现 | 已实现 |
+| 角色目录包含异构评审者、压缩器、视觉/GUI 与本地/私有 Agent（第二轮之后的隐私修复） | 部分实现 | 已实现 |
 | P0 修订 1：自有 ABI + Runtime Adapter + 外科式 fork；DSH 作为首个适配器 | 延后 | 已实现 |
 | 风险缓解：针对限流/价格变化的模型熔断器 | 缺失 | 已实现 |
 | WorkItem 模式（capabilityRequirements、模型/工具策略、inputRefs、expectedOutput、evidenceRequirements、dependsOn、预算、优先级、状态） | 部分实现 | 已实现 |
@@ -96,7 +97,6 @@
 
 | 需求 | 仍为部分实现的原因 |
 |---|---|
-| 角色目录包含……视觉/GUI 与本地/私有 Agent | `local_private` 角色的证据可被托管模型上的 Agent 通过 `evidence.get` 读取（只有其提示词在防范受限值）。 |
 | L3 混合检索 | 符号来自正则表达式（没有 tree-sitter/LSP/SCIP）；唯一的嵌入器是特征哈希（没有语义模型）。 |
 | ExperimentSpec | 不接受也不执行按实验的 `budget`。 |
 | 清单：每个运行时发布都跑核心评测 | CI 在每次 push 时运行核心评测门禁，但 `runtime promote` 接受任何通过的回放套件，部署清单也不会被评测。 |
@@ -116,7 +116,7 @@
 |---|---|---|---|---|
 | 运行时所有权：Agent、会话、上下文、任务、子 Agent、模型路由、权限、证据与门禁语义都归 Hypertest 所有 | 技术选型 §原则 | 已实现 | `packages/runtime/src/contracts.ts`<br>`scripts/check-boundaries.mjs` | – |
 | 内核：Agent 的创建/恢复/中断/销毁、会话、激活、收件箱、取消传播 | 技术选型 §Agent Runtime Kernel | 已实现 | `packages/runtime/src/subagents.ts`<br>`packages/runtime/src/sessions.ts`<br>`packages/runtime/src/native-engine.ts` | 收件箱通过 ht_agent_inbox/enqueueInput 实现。 |
-| 角色目录包含异构评审者、压缩器、视觉/GUI 与本地/私有 Agent | 技术选型 §Multi-LLM Router | 部分实现 | `packages/agents/src/roles/*.ts` (`vision-gui.ts`, `local-private.ts`)<br>`packages/app/src/releases.ts` (condenserPrivacyFloor)<br>`packages/app/src/diagnose.ts` (route coverage)<br>`packages/app/test/specialist-roles.e2e.test.ts` | 14 个角色。`vision_gui` 需要 vision 能力，使用 `browser.*` 并以截图作为证据（DOM/API 优先，computer use 仅作回退）。`local_private` 只运行在 restricted 路由上（privacyClass restricted、fallback fail_closed、禁用出站工具、压缩器隐私下限）；真实运行证明了路由行为（specialist-roles.e2e）。加固（H10）：评审者独立于所有产出证据的角色（EVIDENCE_PRODUCER_ROLES，现为八个）。仍为部分实现：`local_private` Agent 的工具记录的证据以 `internal` 级别存储，而 `evidence.get` 会向本运行的任何 Agent 返回预览，因此受限数据可能到达托管模型；目前只有角色提示词在防范这一点。 |
+| 角色目录包含异构评审者、压缩器、视觉/GUI 与本地/私有 Agent | 技术选型 §Multi-LLM Router | **已实现**（原为部分实现） | `packages/agents/src/roles/*.ts` (`vision-gui.ts`, `local-private.ts`)<br>`packages/control/src/clearance.ts`<br>`packages/app/src/releases.ts` (condenserPrivacyFloor)<br>`packages/app/src/diagnose.ts` (route coverage)<br>`packages/app/test/specialist-roles.e2e.test.ts` | 14 个角色。`vision_gui` 需要 vision 能力，使用 `browser.*` 并以截图作为证据（DOM/API 优先，computer use 仅作回退）。`local_private` 只运行在 restricted 路由上（privacyClass restricted、fallback fail_closed、禁用出站工具、压缩器隐私下限）；真实运行证明了路由行为（specialist-roles.e2e）。加固（H10）：评审者独立于所有产出证据的角色（EVIDENCE_PRODUCER_ROLES，现为八个）。隐私（第二轮之后补齐）：角色的工具记录的证据以该角色的分级存储（`local_private`：restricted）；低于该许可级别的 Agent 通过 `evidence.get`/`evidence.query`、`blackboard.read`、任务输入以及工作/委派结果摘要只能看到 id，看不到内容（`packages/control/src/clearance.ts`、`packages/control/test/privacy.test.ts`、tools `runtime.test.ts`）。制品存储中的文件和面向人的报告不按分级过滤。 |
 | 子 Agent 运行时：spawn/resume/message/interrupt/collect、可续跑、后台、嵌套委派、深度/数量上限 | 技术选型 §Subagent Runtime | **已实现**（原为部分实现） | `packages/runtime/src/subagents.ts`<br>`packages/control/src/domain-tools/work.ts` (delegate, delegate.status/collect/message/release)<br>`packages/control/src/delegation.ts`<br>`packages/control/src/worker.ts`<br>`packages/control/test/subagents.test.ts` | `delegate` 支持 `background`（父 Agent 继续工作；`delegate.status` / `delegate.collect` 与收件箱通知只携带子 Agent 的摘要）与 `continuable`（子 Agent 在每个任务后等待 `delegate.message`；`delegate.release` 或父 Agent 结束时完成）。worker 已死亡的后台子 Agent 会以新的 fencing token、作为同一个 Agent 被接管。深度与数量上限不变（maxDepth、MAX_AGENTS_PER_RUN）。 |
 | SpawnRequest 契约（workItemId、角色、模型/工具策略、权限配置、contextSnapshotId、outputSchema、maxDepth、预算） | 技术选型 §Subagent Runtime | 已实现 | `packages/runtime/src/contracts.ts`<br>`packages/control/src/worker.ts` (SpawnRequest) | – |
 | P0 修订 1：自有 ABI + Runtime Adapter + 外科式 fork；DSH 作为首个适配器 | 架构改进 §执行摘要 P0 | **已实现**（原为延后） | `packages/runtime` (native)<br>`packages/runtime-pi`<br>`packages/runtime-dsh/src/dsh-engine.ts` (DshEngine)<br>`packages/runtime-dsh/README.md` (fork decision gate record)<br>`packages/app/src/compose.ts` (`engines.default: dsh`) | 三个引擎均通过共享契约测试套件。DSH（0.1.0-rc.6 版本列车 + cordis 4.0.4 + 该列车以版本范围加载的 `@deepseek-ai` 库，精确钉定且覆盖整条列车的依赖闭包，版本漂移即拒绝运行）通过其公开接缝（LlmAdapter 路由、Agent 作用域工具、`agent/pre-step`、`tools/post-execute`）以 pin + adapter 方式适配，无需 fork。DSH 仅在被配置为默认引擎时注册并被 manifest 钉定（实验性）。 |

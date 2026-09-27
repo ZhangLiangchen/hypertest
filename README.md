@@ -257,13 +257,13 @@ references: [app README](packages/app/README.md) (configuration, composition, RE
 
 ## Status and limitations
 
-Of 164 design requirements, 132 are implemented, 29 partial, 1 missing and 2 deferred; all twelve invariants are
+Of 164 design requirements, 133 are implemented, 28 partial, 1 missing and 2 deferred; all twelve invariants are
 implemented ([CONFORMANCE.md](docs/architecture/CONFORMANCE.md) has every row). The main gaps:
 
 | Area | Current limitation |
 |---|---|
 | Sandbox | The local sandbox isolates network, processes and secret paths with Linux namespaces, but commands run as the same OS user and can see the rest of the host file system. Use the OCI sandbox for untrusted models. The OCI sandbox, docker and kubectl adapters were not exercised against a live daemon or cluster in development. |
-| Privacy | The `local_private` role runs only on restricted (local) routes, but evidence its tools record is stored as `internal`, and `evidence.get` shows a preview to any agent of the run. Only the role's prompt keeps restricted values out of that evidence. |
+| Privacy | The `local_private` role runs only on restricted (local) routes, and its tools' evidence is recorded as `restricted`: lower-clearance agents see ids, not content. Artifacts in the store and the human-facing report are not filtered per classification. |
 | Context | The symbol graph is regex-based (no tree-sitter/LSP/SCIP); the vector leg uses feature-hashing embeddings, not a semantic model. Files changed by `shell.exec` or `test.run` are not observed, so the agent must re-read them before its next write. After another agent supersedes a finding, or an environment is redeployed, that the agent observed, its mutating actions are refused until it observes that resource again. |
 | Experiments and budgets | An experiment has no budget of its own (run and work budgets apply), and the QualityGate does not judge experiment validity yet. A time-boxed fault can outlive the claims of its experiment. Artifact writes outside tool calls (condensation, reports) are not charged. |
 | Models | The circuit breaker keeps its state per process, and the app configures no price ceiling. When every route's breaker is open, the work item fails with `model_unavailable`. Live providers are implemented, but CI uses scripted brains and the live eval arm is opt-in. |
@@ -289,11 +289,9 @@ npm run sbom                                # CycloneDX SBOM → .hypertest-sbom
 npm run test:scripts                        # tests of the supply-chain scripts
 ```
 
-Integration tests skip with an explicit reason when their infrastructure is absent. Result of this round on the
-development host, the same on PGlite and on PostgreSQL: 2210 tests, 2202 pass, 5 skipped (no pgvector, no S3 endpoint,
-opt-in live LLM arm, two docker tests) and 3 fail. The three failures are stale expectations in tests outside the changed code: the role list in
-`packages/control/test/robustness.test.ts` (it predates `vision_gui` and `local_private`) and the unregistered-engine
-example in `packages/eval/test/harness.test.ts` (`dsh` is now registered). See [CONTRIBUTING.md](CONTRIBUTING.md) for
+Integration tests skip with an explicit reason when their infrastructure is absent. Result on the development host,
+the same on PGlite and on PostgreSQL: 2215 tests, 2210 pass, 0 fail, 5 skipped (no pgvector, no S3 endpoint, opt-in
+live LLM arm, two docker tests). See [CONTRIBUTING.md](CONTRIBUTING.md) for
 the rules and [AGENTS.md](AGENTS.md) for agent instructions.
 
 ## Repository layout

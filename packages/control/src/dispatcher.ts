@@ -11,6 +11,7 @@ import { toolNameToId, type ToolExecutionRequest, type WorkspaceHandle } from '@
 import type { BudgetExhaustion } from '@hypertest/operation';
 import type { DispatchResult, TerminalSignal, ToolDispatcher } from '@hypertest/runtime';
 import type { ControlDeps } from './deps.ts';
+import { roleClassification } from './clearance.ts';
 import type { TurnState } from './context-provider.ts';
 import { TERMINAL_TOOL_IDS } from './domain-tools/index.ts';
 import { diffSections, invertSection, sectionPaths, unifiedDiff } from './diff.ts';
@@ -701,6 +702,8 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
         signal: meta.signal,
       };
       if (snapshot) request.snapshot = snapshot;
+      // privacy: evidence of this call is recorded at the calling role's classification (read back only with clearance)
+      request.dataClassification = roleClassification(deps.roles, input.role);
       // conformance-6: the call's evidence and operations name the experiment it runs for (one declared experiment)
       if (experiments.known.length === 1) request.experimentId = experiments.known[0]!;
       else if (covering.length === 1) request.experimentId = covering[0]!;

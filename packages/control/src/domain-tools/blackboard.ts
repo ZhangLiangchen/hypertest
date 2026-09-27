@@ -2,12 +2,13 @@ import { canonicalJson, sha256Hex, type JsonSchema, type JsonValue } from '@hype
 import {
   COVERAGE_GAP_INPUT_SCHEMA, FINDING_INPUT_SCHEMA, HYPOTHESIS_INPUT_SCHEMA, REVIEW_INPUT_SCHEMA, RISK_INPUT_SCHEMA, RISK_ORDER, SEVERITY_ORDER, isUnresolvedFinding, riskLevel,
   type BlackboardRecord, type BlackboardRecordType, type CoverageGap, type Finding, type FindingCategory, type FindingStatus, type Hypothesis,
-  type Ref, type Review, type Risk, type Severity,
+  type DataClassification, type Ref, type Review, type Risk, type Severity,
 } from '@hypertest/domain';
 import type { NewRecordInput } from '@hypertest/collab';
 import type { ToolSpec } from '@hypertest/tools';
 import type { ControlDeps } from '../deps.ts';
 import { Caller, checkEvidence, domainTool, refuse, success } from './common.ts';
+import { cleared, recordClassification, roleClassification, withheldNote } from '../clearance.ts';
 
 const RECORD_TYPES = ['finding', 'hypothesis', 'coverage_gap', 'risk', 'review', 'test_strategy', 'decision', 'note'] as const;
 /** Roles allowed to mark a finding confirmed (evidence-backed reproduction / independent review / planning). */
@@ -221,21 +222,30 @@ export function blackboardTools(deps: ControlDeps): ToolSpec[] {
       effect: 'read',
       area: 'blackboard',
       async execute(input, ctx) {
+        // privacy: records written by a role classified above the reader's clearance keep their ids, not their payload
+        const clearance = roleClassification(deps.roles, ctx.role);
+        const byWriter = new Map<string, DataClassification>();
+        const view = async (r: BlackboardRecord<unknown>): Promise<Record<string, unknown>> => {
+          const cls = await recordClassification(deps.agents, deps.roles, r, byWriter);
+          return cleared(clearance, cls) ? recordView(r) : { ...recordView(r), payload: { withheld: withheldNote(cls) } };
+        };
         if (input.recordId !== undefined) {
           const r = await blackboard.getRecord(input.recordId);
           if (!r || r.runId !== ctx.runId) return refuse('not_found', `record ${input.recordId} does not exist in this run`);
-          return success({ records: [recordView(r)] });
+          return success({ records: [await view(r)] });
         }
         if (input.lineageId !== undefined) {
           const r = await blackboard.head(input.lineageId);
           if (!r || r.runId !== ctx.runId) return refuse('not_found', `lineage ${input.lineageId} does not exist in this run`);
-          return success({ records: [recordView(r)] });
+          return success({ records: [await view(r)] });
         }
         const query: Parameters<typeof blackboard.query>[0] = { runId: ctx.runId, limit: input.limit ?? 50 };
         if (input.recordType !== undefined) query.recordType = input.recordType;
         if (input.status !== undefined) query.status = [input.status];
         const records = await blackboard.query(query);
-        return success({ records: records.map(recordView), count: records.length });
+        const views: Array<Record<string, unknown>> = [];
+        for (const r of records) views.push(await view(r));
+        return success({ records: views, count: records.length });
       },
     }),
 

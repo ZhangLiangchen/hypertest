@@ -1,5 +1,5 @@
 import type { BaseDeps, Clock, JsonSchema, JsonValue, Logger, SqlDatabase } from '@hypertest/core';
-import type { ActionCapability, ArtifactRef, ContextSnapshot, DomainEventSink, EventContext, EvidenceInput, EvidenceRecord, EvidenceType, Provenance, ResourceRef, RiskClass, ToolDefinition, ToolEffect } from '@hypertest/domain';
+import type { ActionCapability, DataClassification, ArtifactRef, ContextSnapshot, DomainEventSink, EventContext, EvidenceInput, EvidenceRecord, EvidenceType, Provenance, ResourceRef, RiskClass, ToolDefinition, ToolEffect } from '@hypertest/domain';
 import type { ArtifactStore, EvidenceLedger } from '@hypertest/evidence';
 import type { SideEffectAdapter, SideEffectGateway } from '@hypertest/operation';
 import type { ActionPermit, PolicyDecisionLog, PolicyEngine } from '@hypertest/policy';
@@ -175,6 +175,11 @@ export interface ToolExecutionRequest {
    * re-granted to another worker — is then a different owner and never reuses the live claim's resource lease.
    */
   leaseOwner?: string;
+  /**
+   * (additive, privacy) Data classification of the calling agent's role: every evidence record the call produces is
+   * stored with it (runtime-set, never the tool's say), so readers below that clearance can be refused its content.
+   */
+  dataClassification?: DataClassification;
   /**
    * (additive) The work-item claim the call is made under; it must be a claim on `workItemId` (else `denied`). Handed to
    * the tool as `ToolContext.claim` so tools that record effects re-check it right before writing.

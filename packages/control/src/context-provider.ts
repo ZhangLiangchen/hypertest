@@ -6,6 +6,7 @@ import type { RouteRequest } from '@hypertest/model';
 import type { ContextProvider, ToolDispatcher } from '@hypertest/runtime';
 import type { WorkspaceHandle } from '@hypertest/tools';
 import type { ControlDeps, ResolvedControlConfig } from './deps.ts';
+import { summaryFor } from './clearance.ts';
 import { claimLeaseOwner } from './dispatcher.ts';
 import { runScope } from './work-factory.ts';
 import { clip, event, jsonBlock } from './util.ts';
@@ -164,7 +165,7 @@ export function createContextProvider(deps: ControlDeps, config: ResolvedControl
       const lines = [plan ? `Plan v${plan.revision} (readyForGate ${plan.readyForGate}): ${clip(plan.rationale, 600)}` : 'No plan revision accepted yet.'];
       for (const o of plan?.objectives ?? []) lines.push(`- objective ${o.objectiveId} [${o.priority}, ${o.status}] ${clip(o.description, 300)}`);
       lines.push('Work items:');
-      for (const w of items.slice(-60)) lines.push(`- ${w.workItemId} ${w.role} [${w.state}] ${clip(w.title, 120)}${w.result ? ` — ${clip(w.result.summary, 200)}` : ''}`);
+      for (const w of items.slice(-60)) lines.push(`- ${w.workItemId} ${w.role} [${w.state}] ${clip(w.title, 120)}${w.result ? ` — ${clip(summaryFor(deps.roles, item.role, w.role, w.result.summary), 200)}` : ''}`);
       out.push({ id: 'plan', title: 'Plan & objectives', content: lines.join('\n'), priority: 1 });
     }
 

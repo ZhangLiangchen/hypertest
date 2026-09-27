@@ -13,6 +13,7 @@ import type { RoleDefinition } from '@hypertest/agents';
 import type { WorkspaceHandle } from '@hypertest/tools';
 import type { ExecuteTurnOptions, TurnOutcome } from './contracts.ts';
 import type { ControlDeps, ResolvedControlConfig } from './deps.ts';
+import { cleared, recordClassification, roleClassification, summaryFor, withheldNote } from './clearance.ts';
 import { createContextProvider, type TurnState } from './context-provider.ts';
 import { createToolDispatcher, offeredRisk } from './dispatcher.ts';
 import { createPhaseGovernor } from './phases.ts';
@@ -185,7 +186,12 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
       for (const ref of item.inputRefs) {
         if (ref.kind === 'record') {
           const rec = await blackboard.getRecord(ref.id);
-          lines.push(rec && rec.runId === run.runId ? `### ${rec.recordType} ${rec.recordId} (v${rec.version})\n${jsonBlock({ payload: rec.payload, evidenceRefs: rec.evidenceRefs }, 4000)}` : `- record ${ref.id} (not found in this run)`);
+          if (rec && rec.runId === run.runId) {
+            // privacy: a record written by a role classified above this item's clearance keeps its id, not its payload
+            const cls = await recordClassification(agents, deps.roles, rec);
+            const payload = cleared(roleClassification(deps.roles, item.role), cls) ? rec.payload : { withheld: withheldNote(cls) };
+            lines.push(`### ${rec.recordType} ${rec.recordId} (v${rec.version})\n${jsonBlock({ payload, evidenceRefs: rec.evidenceRefs }, 4000)}`);
+          } else lines.push(`- record ${ref.id} (not found in this run)`);
         } else lines.push(`- ${ref.kind} ${ref.id}${ref.note ? ` — ${ref.note}` : ''}`);
       }
     }
@@ -195,7 +201,7 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
         const dep = await blackboard.getWorkItem(depId);
         if (!dep) continue;
         const r = dep.result;
-        lines.push(`- ${dep.workItemId} (${dep.role}, ${dep.state}): ${r ? clip(r.summary, 800) : dep.failure ? `${dep.failure.reason}: ${dep.failure.message}` : 'no result'}${r?.evidenceRefs.length ? `; evidence ${r.evidenceRefs.join(', ')}` : ''}${r?.recordRefs.length ? `; records ${r.recordRefs.join(', ')}` : ''}`);
+        lines.push(`- ${dep.workItemId} (${dep.role}, ${dep.state}): ${r ? clip(summaryFor(deps.roles, item.role, dep.role, r.summary), 800) : dep.failure ? `${dep.failure.reason}: ${dep.failure.message}` : 'no result'}${r?.evidenceRefs.length ? `; evidence ${r.evidenceRefs.join(', ')}` : ''}${r?.recordRefs.length ? `; records ${r.recordRefs.join(', ')}` : ''}`);
       }
     }
     const oracles = Object.entries(run.oracleRevisions);
@@ -421,7 +427,7 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
     if (!parent || (parent.status !== 'active' && parent.status !== 'waiting')) return;
     const refs = result && result.evidenceRefs.length > 0 ? `; evidence ${result.evidenceRefs.join(', ')}` : '';
     const records = result && result.recordRefs.length > 0 ? `; records ${result.recordRefs.join(', ')}` : '';
-    const content = `[delegation ${child.workItemId} (${child.role}) ${what}]${result ? ` ${clip(result.summary, 2000)}${refs}${records}` : ''}`;
+    const content = `[delegation ${child.workItemId} (${child.role}) ${what}]${result ? ` ${clip(summaryFor(deps.roles, parent.role, child.role, result.summary), 2000)}${refs}${records}` : ''}`;
     try {
       await subagents.message(parent.agentId, { role: 'user', content });
     } catch (e) {
@@ -849,7 +855,7 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
         const records = r?.recordRefs ?? child.result?.recordRefs ?? [];
         evidenceIds.push(...refs);
         lines.push(
-          `- delegation ${op} (${child.role}) ${isAwaitingInput(child) ? 'completed its task (continuable: it waits for delegate.message or delegate.release)' : child.state}: ${summary ? clip(summary, 2000) : failure ? `${failure.reason}: ${failure.message}` : 'no summary'}${refs.length ? `; evidence ${refs.join(', ')}` : ''}${records.length ? `; records ${records.join(', ')}` : ''}`,
+          `- delegation ${op} (${child.role}) ${isAwaitingInput(child) ? 'completed its task (continuable: it waits for delegate.message or delegate.release)' : child.state}: ${summary ? clip(summaryFor(deps.roles, item.role, child.role, summary), 2000) : failure ? `${failure.reason}: ${failure.message}` : 'no summary'}${refs.length ? `; evidence ${refs.join(', ')}` : ''}${records.length ? `; records ${records.join(', ')}` : ''}`,
         );
       } else {
         const outcome = await gateway.observe(op, ctx, signal ?? new AbortController().signal);

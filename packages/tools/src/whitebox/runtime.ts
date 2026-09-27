@@ -422,6 +422,7 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
           provenance,
         };
         if (inp.structured !== undefined) evInput.structured = inp.structured;
+        if (request.dataClassification !== undefined) evInput.classification = request.dataClassification;
         const environment = inp.environment ?? addressedEnvironment(input, deps.environments);
         if (environment !== undefined) evInput.environment = environment;
         if (inp.operationId !== undefined) evInput.operationId = inp.operationId;

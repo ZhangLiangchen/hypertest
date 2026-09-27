@@ -5,6 +5,7 @@ import type { ToolSpec } from '@hypertest/tools';
 import type { ControlDeps } from '../deps.ts';
 import { ControlStore } from '../store.ts';
 import { clip } from '../util.ts';
+import { cleared, roleClassification } from '../clearance.ts';
 import { domainTool, refuse, success } from './common.ts';
 
 interface ClaimInput {
@@ -51,6 +52,10 @@ export function evidenceTools(deps: ControlDeps): ToolSpec[] {
       async execute(input, ctx) {
         const e = await evidence.get(input.evidenceId);
         if (!e || e.runId !== ctx.runId) return refuse('not_found', `evidence ${input.evidenceId} does not exist in this run`);
+        const clearance = roleClassification(deps.roles, ctx.role);
+        if (!cleared(clearance, e.classification)) {
+          return refuse('permission_denied', `evidence ${input.evidenceId} is classified ${e.classification}, above this agent's clearance (${clearance}); cite its id, but its content is withheld`);
+        }
         let preview: string | undefined;
         if (TEXTUAL.test(e.artifact.mimeType)) {
           try {
@@ -81,8 +86,12 @@ export function evidenceTools(deps: ControlDeps): ToolSpec[] {
         const q: Parameters<typeof evidence.query>[0] = { runId: ctx.runId, limit: input.limit ?? 50 };
         if (input.evidenceType !== undefined) q.evidenceType = input.evidenceType;
         if (input.workItemId !== undefined) q.workItemId = input.workItemId;
-        const records = await evidence.query(q);
-        return success({ evidence: records.map((e) => ({ ...evidenceSummary(e), summary: clip(e.summary, 500) })), count: records.length });
+        const all = await evidence.query(q);
+        const clearance = roleClassification(deps.roles, ctx.role);
+        const records = all.filter((e) => cleared(clearance, e.classification));
+        const out: Record<string, unknown> = { evidence: records.map((e) => ({ ...evidenceSummary(e), summary: clip(e.summary, 500) })), count: records.length };
+        if (records.length < all.length) out['withheld'] = { count: all.length - records.length, reason: `classified above this agent's clearance (${clearance})` };
+        return success(out);
       },
     }),
 
