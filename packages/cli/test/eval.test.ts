@@ -5,7 +5,7 @@
  */
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, rm } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { after, before, describe, test } from 'node:test';
 import { defaultConfig } from '@hypertest/app';
@@ -220,9 +220,112 @@ describe('hypertest eval run', () => {
     assert.equal(existsSync(workDir), false);
   });
 
+  test('--out persists the SuiteResult JSON whatever the display format; --report writes the displayed report', async () => {
+    const stub = stubEval();
+    const r = await cli(['eval', 'run', 'poc-a-whitebox', '--arms', 'scripted', '--out', 'result.json', '--report', 'report.md'], { cwd: dir.path, loadEval: async () => stub.module });
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(r.stdout, '# eval poc-a-whitebox\n\ntrials: 1\n');
+    const persisted = JSON.parse(await readFile(join(dir.path, 'result.json'), 'utf8')) as SuiteResult;
+    assert.deepEqual([persisted.suiteId, persisted.trials.map((t) => t.armId)], ['poc-a-whitebox', ['scripted']]);
+    assert.equal(await readFile(join(dir.path, 'report.md'), 'utf8'), r.stdout);
+    assert.match(r.stderr, new RegExp(`wrote ${join(dir.path, 'result.json').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\n`));
+  });
+
+  test('--judge scripted: every task gets the independent judge (llmRubric, last) and the suite options carry it', async () => {
+    const stub = stubEval();
+    const judge = { identity: 'judge[x]', judge: async () => { throw new Error('unused'); }, calibrate: async () => { throw new Error('unused'); }, calibration: async () => undefined };
+    stub.module.scriptedJudge = () => judge;
+    stub.module.pocAWhiteboxSuite = () => ({ ...suiteOf('poc-a-whitebox'), tasks: [{ ...suiteOf('x').tasks[0]!, graders: ['verdict'] }, { ...suiteOf('x').tasks[0]!, taskId: 't2', graders: ['verdict', 'llmRubric'] }] });
+    const r = await cli(['eval', 'run', 'poc-a-whitebox', '--arms', 'scripted', '--judge', 'scripted'], { cwd: dir.path, loadEval: async () => stub.module });
+    assert.equal(r.code, 0, r.stderr);
+    const { suite, options } = stub.calls[0]!;
+    assert.deepEqual(suite.tasks.map((t) => t.graders), [['verdict', 'llmRubric'], ['verdict', 'llmRubric']]);
+    assert.strictEqual(options.judge, judge);
+    const bad = await cli(['eval', 'run', 'poc-a-whitebox', '--judge', 'gpt'], { cwd: dir.path, loadEval: async () => stub.module });
+    assert.equal(bad.code, 2);
+    assert.match(bad.stderr, /--judge must be scripted \(got "gpt"\)/);
+    const none = stubEval();
+    const missing = await cli(['eval', 'run', 'poc-a-whitebox', '--judge', 'scripted'], { cwd: dir.path, loadEval: async () => none.module });
+    assert.deepEqual([missing.code, missing.stderr], [1, 'hypertest eval: @hypertest/eval does not export scriptedJudge: this build has no LLM judge [unsupported]\n']);
+  });
+
   test('the default loader imports @hypertest/eval', async () => {
     const r = await cli(['eval', 'run', 'no-such-suite'], { cwd: dir.path });
     assert.equal(r.code, 2, r.stderr);
     assert.match(r.stderr, /^hypertest eval: unknown suite "no-such-suite" \((available: [a-z0-9, -]+|@hypertest\/eval provides no suites)\)\n/);
+  });
+});
+
+describe('hypertest eval gate', () => {
+  let dir: Awaited<ReturnType<typeof tempDir>>;
+  before(async () => {
+    dir = await tempDir('ht-cli-eval-gate-');
+  });
+  after(async () => {
+    await dir.cleanup();
+  });
+
+  const METRICS = { criticalFalseRelease: 0, defectRecall: 1, policyViolations: 0, securityViolations: 0, duplicateSideEffects: 0, evidenceCompleteness: 1, evidenceVerified: 1 };
+  function result(metrics: Record<string, number> = {}, extra: Partial<SuiteResult> = {}): SuiteResult {
+    const trials: EvalTrial[] = Array.from({ length: 4 }, (_, i) => ({
+      taskId: `task-${i}`, armId: 'scripted-multi-llm', trial: 0, seed: `s${i}`, result: 'pass', verdict: 'fail', graders: [], outcomeMetrics: { ...METRICS, ...metrics }, trajectoryMetrics: {}, durationMs: 1,
+      graderRevisions: { verdict: '1' },
+    }));
+    return { suiteId: 'core', revision: 'core-1', trials, perArm: {}, comparisons: [], ...extra };
+  }
+  async function files(baseline: SuiteResult, candidate: SuiteResult): Promise<void> {
+    await writeFile(join(dir.path, 'baseline.json'), JSON.stringify(baseline));
+    await writeFile(join(dir.path, 'candidate.json'), JSON.stringify(candidate));
+  }
+  const GATE = ['eval', 'gate', '--baseline', 'baseline.json', '--candidate', 'candidate.json'];
+
+  test('a candidate that passes every check exits 0 with the markdown report (the real @hypertest/eval gate)', async () => {
+    await files(result(), result());
+    const r = await cli([...GATE, '--report', 'gate.md'], { cwd: dir.path });
+    assert.equal(r.code, 0, r.stderr);
+    assert.match(r.stdout, /^# Eval release gate: PASS/);
+    assert.equal(await readFile(join(dir.path, 'gate.md'), 'utf8'), r.stdout);
+    assert.match(r.stderr, /eval gate core: PASS \(every check passed\)\n$/);
+  });
+
+  test('a failing check exits 1; --json prints the report object naming the failed checks', async () => {
+    await files(result(), result({ securityViolations: 1 }));
+    const r = await cli([...GATE, '--json'], { cwd: dir.path });
+    assert.equal(r.code, 1);
+    const report = parseJson<{ pass: boolean; checks: Array<{ checkId: string; pass: boolean }> }>(r);
+    assert.deepEqual([report.pass, report.checks.filter((c) => !c.pass).map((c) => c.checkId)], [false, ['security_violations']]);
+    await files(result(), result({}, { revision: 'core-2' }));
+    const incomparable = await cli(GATE, { cwd: dir.path });
+    assert.equal(incomparable.code, 1);
+    assert.match(incomparable.stdout, /\| the results are comparable .* \| \*\*FAIL\*\* \| suite revision core-1 vs core-2/);
+    assert.match(incomparable.stderr, /FAIL \(comparable\)/);
+  });
+
+  test('usage errors (exit 2): missing flags, unreadable or malformed files, a bad alpha, an unknown arm', async () => {
+    await files(result(), result());
+    const cases: Array<[string[], RegExp]> = [
+      [['eval', 'gate', '--candidate', 'candidate.json'], /--baseline is required/],
+      [['eval', 'gate', '--baseline', 'nope.json', '--candidate', 'candidate.json'], /--baseline nope\.json cannot be read/],
+      [[...GATE, '--alpha', '1.5'], /--alpha must be a number in \(0, 1\)/],
+      [[...GATE, '--baseline-arm', 'ghost'], /the baseline has no arm ghost/],
+      [['eval', 'gate', 'extra', ...GATE.slice(2)], /unexpected argument: extra/],
+    ];
+    for (const [argv, re] of cases) {
+      const r = await cli(argv, { cwd: dir.path });
+      assert.equal(r.code, 2, `${argv.join(' ')}: ${r.stderr}`);
+      assert.match(r.stderr, re, argv.join(' '));
+    }
+    await writeFile(join(dir.path, 'candidate.json'), '{not json');
+    const notJson = await cli(GATE, { cwd: dir.path });
+    assert.deepEqual([notJson.code, /--candidate candidate\.json is not JSON/.test(notJson.stderr)], [2, true]);
+    await writeFile(join(dir.path, 'candidate.json'), JSON.stringify({ suiteId: 'core' }));
+    const notResult = await cli(GATE, { cwd: dir.path });
+    assert.deepEqual([notResult.code, /the candidate is not an eval suite result/.test(notResult.stderr)], [2, true]);
+  });
+
+  test('an eval platform without the gate is a failure (exit 1)', async () => {
+    await files(result(), result());
+    const r = await cli(GATE, { cwd: dir.path, loadEval: async () => ({ runSuite: async () => { throw new Error('unused'); } }) });
+    assert.deepEqual([r.code, r.stderr], [1, 'hypertest eval: @hypertest/eval does not export evaluateReleaseGate: this build has no eval release gate [unsupported]\n']);
   });
 });

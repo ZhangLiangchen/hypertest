@@ -1,5 +1,5 @@
 import type { HypertestConfig, HypertestOverrides } from '@hypertest/app';
-import type { EvalArm, EvalSuite, EvalTask, SuiteOptions, SuiteResult, TrialFixture } from '@hypertest/eval';
+import type { EvalArm, EvalSuite, EvalTask, LlmJudge, ReleaseGateOptions, ReleaseGateReport, SuiteOptions, SuiteResult, TrialFixture } from '@hypertest/eval';
 
 /**
  * @hypertest/cli — `hypertest` command line.
@@ -45,6 +45,13 @@ import type { EvalArm, EvalSuite, EvalTask, SuiteOptions, SuiteResult, TrialFixt
  *   - New exports: `clientOnlyConfig`, `SANDBOX_ENV`, `MIN_API_TOKEN_LENGTH`, `writeConfigAtomically`.
  *
  * (additive, runtime release management)
+ * (additive, eval platform completion)
+ *   - `hypertest eval gate --baseline <suite-result.json> --candidate <suite-result.json> [--baseline-arm a] [--candidate-arm b]
+ *     [--alpha p] [--report f] [--json]`: the eval release gate (exit 0 pass / 1 fail; malformed inputs are usage errors).
+ *   - `eval run --out <file>` persists the SuiteResult JSON (whatever the display format; before: the displayed report);
+ *     `--report <file>` writes the displayed report; `--judge scripted` appends the independent LLM judge to every task.
+ *   - EvalModuleLike: `evaluateReleaseGate?`, `renderReleaseGateReport?`, `scriptedJudge?`. New export `withJudge`.
+ *
  *   - `hypertest runtime list | show | register | record-suite | promote | rollback | migrate` (runtimeCommand): the runtime
  *     release registry of the store; decisions take `--by <name>` (`human:<name>`, or `ci:<pipeline>`) and are refused
  *     (`permission_denied`) under `$HYPERTEST_SANDBOX`. New exports `releaseActor`, `parseAllowances`, `parseCanary`,
@@ -113,6 +120,11 @@ export interface EvalModuleLike {
   builtinArms?: () => EvalArm[] | Record<string, EvalArm>;
   defaultArms?: () => EvalArm[] | Record<string, EvalArm>;
   ARMS?: Record<string, EvalArm> | EvalArm[];
+  /** (additive) `eval gate`: the eval release gate over two SuiteResults (and its markdown report). */
+  evaluateReleaseGate?: (baseline: SuiteResult, candidate: SuiteResult, options?: ReleaseGateOptions) => ReleaseGateReport;
+  renderReleaseGateReport?: (report: ReleaseGateReport) => string;
+  /** (additive) `eval run --judge scripted`: the calibrated scripted LLM judge. */
+  scriptedJudge?: () => LlmJudge;
   [name: string]: unknown;
 }
 

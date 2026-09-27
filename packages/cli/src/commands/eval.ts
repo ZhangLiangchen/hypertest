@@ -1,10 +1,10 @@
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { HypertestError } from '@hypertest/core';
+import { dirname, join, resolve } from 'node:path';
+import { HypertestError, isHypertestError } from '@hypertest/core';
 import { loadConfig, mergeConfig, type HypertestConfig, type HypertestConfigInput } from '@hypertest/app';
-import type { EvalArm, EvalSuite, SuiteOptions, SuiteResult } from '@hypertest/eval';
-import { UsageError, flag, int, list, positionals, str } from '../args.ts';
+import type { EvalArm, EvalSuite, ReleaseGateOptions, ReleaseGateReport, SuiteOptions, SuiteResult } from '@hypertest/eval';
+import { UsageError, flag, int, list, positionals, required, str } from '../args.ts';
 import type { Command } from '../command.ts';
 import { aborted, brainMap, findConfig, isPlainObject, loadBrainsModule, type CommandContext } from '../context.ts';
 import type { EvalModuleLike } from '../contracts.ts';
@@ -97,10 +97,85 @@ function summaryLines(result: SuiteResult): string[] {
   return lines;
 }
 
+/** Writes an output file (its directory is created) and says so on stderr. */
+async function writeOutput(ctx: CommandContext, path: string, text: string): Promise<void> {
+  const file = resolve(ctx.io.cwd, path);
+  await mkdir(dirname(file), { recursive: true });
+  await writeFile(file, text);
+  ctx.err(`wrote ${file}`);
+}
+
+/** Reads a SuiteResult JSON file (`eval run --out`); unreadable or malformed ⇒ usage error naming the file. */
+async function readSuiteResult(ctx: CommandContext, option: string, path: string): Promise<SuiteResult> {
+  const file = resolve(ctx.io.cwd, path);
+  let text: string;
+  try {
+    text = await readFile(file, 'utf8');
+  } catch (e) {
+    throw new UsageError(`--${option} ${path} cannot be read: ${(e as Error).message}`, 'eval');
+  }
+  try {
+    return JSON.parse(text) as SuiteResult;
+  } catch (e) {
+    throw new UsageError(`--${option} ${path} is not JSON: ${(e as Error).message}`, 'eval');
+  }
+}
+
+/** `eval gate`: the eval release gate over two persisted suite results ⇒ exit 0 (pass) / 1 (fail) with a report. */
+async function gate(ctx: CommandContext, values: Parameters<Command['run']>[1], args: string[]): Promise<number> {
+  positionals('eval', args, ['gate']);
+  const baselinePath = required('eval', values, 'baseline');
+  const candidatePath = required('eval', values, 'candidate');
+  const options: ReleaseGateOptions = {};
+  const baselineArm = str(values, 'baseline-arm');
+  const candidateArm = str(values, 'candidate-arm');
+  if (baselineArm !== undefined) options.baselineArm = baselineArm;
+  if (candidateArm !== undefined) options.candidateArm = candidateArm;
+  const alpha = str(values, 'alpha');
+  if (alpha !== undefined) {
+    const a = Number(alpha);
+    if (!(Number.isFinite(a) && a > 0 && a < 1)) throw new UsageError(`--alpha must be a number in (0, 1) (got ${JSON.stringify(alpha)})`, 'eval');
+    options.alpha = a;
+  }
+  const baseline = await readSuiteResult(ctx, 'baseline', baselinePath);
+  const candidate = await readSuiteResult(ctx, 'candidate', candidatePath);
+  let ev: EvalModuleLike;
+  try {
+    ev = await ctx.io.loadEval();
+  } catch (e) {
+    throw new HypertestError('unavailable', `the eval platform (@hypertest/eval) could not be loaded: ${(e as Error).message}`, { cause: e });
+  }
+  if (typeof ev.evaluateReleaseGate !== 'function') throw new HypertestError('unsupported', '@hypertest/eval does not export evaluateReleaseGate: this build has no eval release gate');
+  let report: ReleaseGateReport;
+  try {
+    report = ev.evaluateReleaseGate(baseline, candidate, options);
+  } catch (e) {
+    // malformed inputs (not a suite result, an unknown or ambiguous arm) are the caller's to fix
+    if (isHypertestError(e, 'invalid_argument')) throw new UsageError(e.message, 'eval');
+    throw e;
+  }
+  const text = ctx.global.json
+    ? `${JSON.stringify(report, null, 2)}\n`
+    : `${(typeof ev.renderReleaseGateReport === 'function' ? ev.renderReleaseGateReport(report) : report.checks.map((c) => `${c.pass ? 'pass' : 'FAIL'}  ${c.description}: ${c.detail}`).join('\n')).trimEnd()}\n`;
+  ctx.io.stdout.write(text);
+  const reportFile = str(values, 'report');
+  if (reportFile) await writeOutput(ctx, reportFile, text);
+  if (!ctx.global.json) ctx.err(`eval gate ${report.suiteId}: ${report.pass ? 'PASS' : 'FAIL'} (${report.checks.filter((c) => !c.pass).map((c) => c.checkId).join(', ') || 'every check passed'})`);
+  return report.pass ? EXIT_CODES.ok : EXIT_CODES.failure;
+}
+
+/** The suite with the independent LLM judge appended (last) to every task that does not list it already. */
+export function withJudge(suite: EvalSuite): EvalSuite {
+  return { ...suite, tasks: suite.tasks.map((t) => (t.graders.some((g) => g.split('?')[0] === 'llmRubric') ? t : { ...t, graders: [...t.graders, 'llmRubric'] })) };
+}
+
 export const evalCommand: Command = {
   name: 'eval',
-  summary: 'run an evaluation suite (fresh environment per trial) and compare arms',
-  usage: ['eval run <suite> [--trials n] [--arms a,b] [--work-dir <dir>] [--keep-work-dir] [--timeout-ms n] [--mode in-process|child-process] [--out <file>] [--json]'],
+  summary: 'run an evaluation suite (fresh environment per trial) and compare arms; gate a candidate against a baseline',
+  usage: [
+    'eval run <suite> [--trials n] [--arms a,b] [--work-dir <dir>] [--keep-work-dir] [--timeout-ms n] [--mode in-process|child-process] [--judge scripted] [--out <suite-result.json>] [--report <file>] [--json]',
+    'eval gate --baseline <suite-result.json> --candidate <suite-result.json> [--baseline-arm a] [--candidate-arm b] [--alpha 0.05] [--report <file>] [--json]',
+  ],
   optionHelp: [
     ['--trials <n>', 'trials per task and arm (default 1)'],
     ['--arms <list>', 'arms to compare (default: the arms @hypertest/eval provides, else `config`)'],
@@ -108,21 +183,33 @@ export const evalCommand: Command = {
     ['--keep-work-dir', 'keep the temporary workspace'],
     ['--timeout-ms <n>', 'per-trial timeout'],
     ['--mode <mode>', 'in-process (default) or child-process (arms that support it; chaos kills are real SIGKILLs)'],
-    ['--out <file>', 'also write the report (markdown, or JSON with --json) to a file'],
+    ['--judge scripted', 'add the independent LLM judge (llmRubric, last) to every task; `scripted` = the calibrated CI judge'],
+    ['--out <file>', 'persist the SuiteResult as JSON (the input of `eval gate` and `runtime record-suite --from-eval`)'],
+    ['--report <file>', 'also write the report (markdown, or JSON with --json) to a file'],
+    ['--baseline <file>', 'gate: the SuiteResult JSON of the active runtime/model (eval run --out)'],
+    ['--candidate <file>', 'gate: the SuiteResult JSON of the candidate'],
+    ['--baseline-arm <id>', 'gate: arm of the baseline (default: its only arm, or the arm both share)'],
+    ['--candidate-arm <id>', 'gate: arm of the candidate (default: its only arm, or the baseline arm)'],
+    ['--alpha <p>', 'gate: significance level of "defect recall not significantly lower" (exact McNemar; default 0.05)'],
   ],
   notes: [
-    'Suites: poc-a-whitebox, poc-b-event-driven, poc-c-durable-load, oracle-robustness, recovery-chaos (as provided by @hypertest/eval).',
+    'Suites: poc-a-whitebox, poc-b-event-driven, poc-c-durable-load, oracle-robustness, recovery-chaos, context-freshness, model-switch, security-injection, test-generation, core (as provided by @hypertest/eval).',
     'The `config` arm evaluates the models and role policies of your configuration file (live providers need their key variables; scripted providers need --scripted-brains).',
-    'Exit code 0 when every trial passed, 1 otherwise.',
+    'eval run: exit code 0 when every trial passed, 1 otherwise.',
+    'eval gate: exit code 0 when the candidate passes every check (critical false release not worse, defect recall not significantly lower, security violations = 0, duplicate side effects = 0, evidence completeness 100% for critical decisions, comparable results, full coverage), 1 otherwise.',
   ],
   options: {
     trials: { type: 'string' }, arms: { type: 'string' }, 'work-dir': { type: 'string' }, 'keep-work-dir': { type: 'boolean' }, 'timeout-ms': { type: 'string' }, mode: { type: 'string' },
-    out: { type: 'string' },
+    out: { type: 'string' }, report: { type: 'string' }, judge: { type: 'string' },
+    baseline: { type: 'string' }, candidate: { type: 'string' }, 'baseline-arm': { type: 'string' }, 'candidate-arm': { type: 'string' }, alpha: { type: 'string' },
   },
   longRunning: true,
   async run(ctx, values, args) {
+    if (args[0] === 'gate') return gate(ctx, values, args);
     if (args[0] !== 'run') throw new UsageError(args[0] === undefined ? 'missing sub-command (eval run <suite>)' : `unknown sub-command eval ${args[0]}`, 'eval');
     const [, suiteId] = positionals('eval', args, ['run', 'suite']);
+    const judgeKind = str(values, 'judge');
+    if (judgeKind !== undefined && judgeKind !== 'scripted') throw new UsageError(`--judge must be scripted (got ${JSON.stringify(judgeKind)}); a live judge is configured through @hypertest/eval createLlmJudge`, 'eval');
     const trials = int('eval', values, 'trials', { min: 1, max: 10_000 }) ?? 1;
     const timeoutMs = int('eval', values, 'timeout-ms', { min: 1 });
     const wanted = list(values, 'arms');
@@ -139,8 +226,14 @@ export const evalCommand: Command = {
     const suites = availableSuites(ev);
     const factory = suites.get(suiteId!);
     if (!factory) throw new UsageError(`unknown suite ${JSON.stringify(suiteId)}${suites.size > 0 ? ` (available: ${[...suites.keys()].sort().join(', ')})` : ' (@hypertest/eval provides no suites)'}`, 'eval');
-    const suite = factory();
+    let suite = factory();
     if (!isSuite(suite)) throw new HypertestError('internal', `@hypertest/eval: suite factory for ${suiteId} did not return an EvalSuite`);
+    let judge: SuiteOptions['judge'];
+    if (judgeKind === 'scripted') {
+      if (typeof ev.scriptedJudge !== 'function') throw new HypertestError('unsupported', '@hypertest/eval does not export scriptedJudge: this build has no LLM judge');
+      judge = ev.scriptedJudge();
+      suite = withJudge(suite);
+    }
 
     const registry = availableArms(ev, suite);
     const needConfigArm = wanted.includes('config') || (wanted.length === 0 && registry.size === 0);
@@ -166,6 +259,7 @@ export const evalCommand: Command = {
       arms, trials, workDir, keepWorkDir: keep,
       ...(timeoutMs !== undefined ? { timeoutMs } : {}),
       ...(mode !== undefined ? { mode } : {}),
+      ...(judge !== undefined ? { judge } : {}),
       onTrial: (t) => {
         if (!ctx.global.json) ctx.err(`  ${t.taskId} / ${t.armId} #${t.trial}: ${t.result}${t.verdict ? ` (verdict ${t.verdict})` : ''}${t.error ? ` — ${t.error}` : ''} in ${Math.round(t.durationMs)} ms`);
       },
@@ -195,14 +289,15 @@ export const evalCommand: Command = {
     }
     if (!keep) await rm(workDir, { recursive: true, force: true });
 
-    const text = ctx.global.json ? `${JSON.stringify(result, null, 2)}\n` : `${(typeof ev.renderSuiteReport === 'function' ? ev.renderSuiteReport(result) : summaryLines(result).join('\n')).trimEnd()}\n`;
+    const json = `${JSON.stringify(result, null, 2)}\n`;
+    const text = ctx.global.json ? json : `${(typeof ev.renderSuiteReport === 'function' ? ev.renderSuiteReport(result) : summaryLines(result).join('\n')).trimEnd()}\n`;
     ctx.io.stdout.write(text);
+    // --out persists the SuiteResult itself (JSON, whatever the display format): the input of `eval gate` and
+    // `runtime record-suite --from-eval`
     const out = str(values, 'out');
-    if (out) {
-      const file = resolve(ctx.io.cwd, out);
-      await writeFile(file, text);
-      ctx.err(`wrote ${file}`);
-    }
+    if (out) await writeOutput(ctx, out, json);
+    const reportFile = str(values, 'report');
+    if (reportFile) await writeOutput(ctx, reportFile, text);
     if (keep && !ctx.global.json) ctx.err(`trial workspace: ${workDir}`);
     return result.trials.length > 0 && result.trials.every((t) => t.result === 'pass') ? EXIT_CODES.ok : EXIT_CODES.failure;
   },

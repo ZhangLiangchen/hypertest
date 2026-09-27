@@ -48,3 +48,9 @@ export { LEDGER_ORACLE, POC_A_TASK_ID, pocATask } from './poc-a.ts';
 export { BANK_ORACLE, POC_B_TASK_ID, pocBTask } from './poc-b.ts';
 export { KV_ORACLE, POC_C_INSUFFICIENT_TASK_ID, POC_C_TASK_ID, RECOVERY_CHAOS_TASK_ID, kvFixture, pocCInsufficientTask, pocCTask, recoveryChaosTask } from './poc-c.ts';
 export { ORACLE_ROBUSTNESS_TASK_ID, oracleRobustnessTask } from './robustness.ts';
+// (additive) the core suites (context-freshness, model-switch, security-injection, test-generation, core)
+export {
+  CONTEXT_FRESHNESS_TASK_ID, CORE_SUITE_REVISION, KV_RELEASE_ORACLE, LEDGER_PAGINATION_ORACLE, MODEL_SWITCH_BASELINE_TASK_ID, MODEL_SWITCH_TASK_ID, SECURITY_INJECTION_TASK_ID,
+  TEST_GENERATION_DEFECT_TASK_ID, TEST_GENERATION_INSENSITIVE_TASK_ID, TEST_GENERATION_TASK_ID, contextFreshnessSuite, contextFreshnessTask, coreSuite, modelSwitchBaselineTask,
+  modelSwitchSuite, modelSwitchTask, securityInjectionSuite, securityInjectionTask, testGenerationDefectTask, testGenerationInsensitiveTask, testGenerationSuite, testGenerationTask,
+} from './core.ts';

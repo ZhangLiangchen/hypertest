@@ -186,6 +186,29 @@ describe('failure paths of the platform', () => {
     assert.equal(existsSync(repoPath), false, 'fixture cleaned up');
   });
 
+  test('an ungradable trial still records what happened: outcome metrics, model routes and canonical state (the release gate sees them)', async () => {
+    const task: EvalTask = { ...toyDefectTask, taskId: 'toy-ungradable-metrics', graders: ['verdict', 'noDuplicateSideEffects'] };
+    const t = await runTrial(task, faithfulArm, options(join(root.path, 'noprobe-metrics')));
+    assert.equal(t.result, 'infra_error');
+    assert.match(t.error ?? '', /^grader noDuplicateSideEffects could not grade the trial/);
+    // the run's outcome is data even when a grader cannot grade it: security/duplicate/false-release metrics survive
+    assert.deepEqual([t.outcomeMetrics['policyViolations'], t.outcomeMetrics['securityViolations'], t.outcomeMetrics['criticalFalseRelease'], t.outcomeMetrics['evidenceVerified']], [0, 0, 0, 1]);
+    assert.ok((t.modelRoutes ?? []).some((r) => r.routeId === 'sim-large'), JSON.stringify(t.modelRoutes));
+    assert.match(t.canonical?.digest ?? '', /^[0-9a-f]{64}$/);
+    assert.match(t.trialKey ?? '', /^tk_[0-9a-f]{32}$/);
+  });
+
+  test('a deterministic grader cannot opt out of counting: `counted: false` (or pass/outcome disagreeing) is a schema violation, never a pass', async () => {
+    const optOut: Grader = () => ({ graderId: 'optOut', pass: false, score: 0, detail: 'the defect is still there', outcome: 'fail', counted: false });
+    const t = await runTrial({ ...toyDefectTask, taskId: 'toy-opt-out', graders: ['verdict', 'optOut'] }, faithfulArm, options(join(root.path, 'opt-out'), { graders: { optOut } }));
+    assert.equal(t.result, 'infra_error', 'an uncounted deterministic failure must not let the trial pass');
+    assert.match(t.error ?? '', /grader optOut could not grade the trial: grader optOut: only an LLM-judged grader may be reported uncounted/);
+    const liar: Grader = () => ({ graderId: 'liar', pass: false, score: 0, detail: 'x', outcome: 'pass' });
+    const l = await runTrial({ ...toyDefectTask, taskId: 'toy-liar', graders: ['verdict', 'liar'] }, faithfulArm, options(join(root.path, 'liar'), { graders: { liar } }));
+    assert.equal(l.result, 'infra_error');
+    assert.match(l.error ?? '', /grader liar returned pass false with outcome pass/);
+  });
+
   test('a run that does not finish in time is cancelled and fails (graded on what was recorded)', async () => {
     const stuck: EvalArm = {
       armId: 'stuck',

@@ -113,6 +113,7 @@ export const runtimeCommand: Command = {
     'runtime promote <manifestId>|current --by <name> --reason "<text>" [--canary-percent n] [--canary-label key=value …]',
     'runtime rollback [<manifestId>] --by <name> --reason "<text>"',
     'runtime migrate <runId> --to <manifestId>|current --by <name> --reason "<text>" [--checkpoint-timeout-ms n]',
+    'runtime migrate <runId> --abort --by <name> --reason "<text>"',
   ],
   optionHelp: [
     ['--by <name>', 'the human (or ci:<pipeline>) taking the release decision; recorded in the release history'],
@@ -123,11 +124,12 @@ export const runtimeCommand: Command = {
     ['--canary-percent <n>', 'entering canary: the share of new runs (by run id) the canary serves'],
     ['--canary-label <k=v>', 'entering canary: runs carrying this label are served by the canary'],
     ['--checkpoint-timeout-ms <n>', 'migrate: how long in-flight turns may take to give their claims back (default 90000)'],
+    ['--abort', 'migrate: release the checkpoint of an abandoned migration (run paused migrating): the run continues on its own runtime'],
   ],
   notes: [
     'Releases move candidate → shadow → canary → active one step per `promote`; every step needs the LATEST recorded engine_contract and replay results of that manifest to be passes. New runs are created only under the active release (or a canary that selects them); an installation that never activated a release runs unmanaged (runtime.requireActiveRelease: true refuses instead).',
     '`rollback` without a manifest stops the canary, else rolls the active release back to the previous one; the rolled-back release is retired for good and its live runs are quarantined (paused until migrated or cancelled). Old runs keep running on the manifest they are pinned to.',
-    '`migrate` checkpoints the run (pause), takes a canonical snapshot, reconciles its operations (refused while any is unsettled), checks compatibility with the target (active or canary, same schemas or an allowed migration, the engines the run used), records a runtime epoch (run.migrated) and re-pins it. The target runtime drives it afterwards (`hypertest resume` there).',
+    '`migrate` checkpoints the run (pause), takes a canonical snapshot, reconciles its operations (refused while any is unsettled), checks compatibility with the target (active or canary, same schemas or an allowed migration, the engines the run used), records a runtime epoch (run.migrated) and re-pins it. The target runtime drives it afterwards (`hypertest resume` there). `migrate <runId> --abort` releases the checkpoint of a migration whose process died before the re-pin (the run stays paused migrating otherwise): the run continues on the runtime it is still pinned to.',
     `Every decision is refused (permission_denied) when $${SANDBOX_ENV} is set.`,
   ],
   options: {
@@ -149,6 +151,7 @@ export const runtimeCommand: Command = {
     'canary-label': { type: 'string', multiple: true },
     to: { type: 'string' },
     'checkpoint-timeout-ms': { type: 'string' },
+    abort: { type: 'boolean' },
   },
   async run(ctx, values, args) {
     const sub = args[0];
@@ -320,6 +323,19 @@ export const runtimeCommand: Command = {
     const [, runId] = positionals('runtime', args, ['migrate', 'runId']);
     const by = releaseActor(values);
     const reason = required('runtime', values, 'reason');
+    if (flag(values, 'abort')) {
+      if (str(values, 'to') !== undefined || str(values, 'checkpoint-timeout-ms') !== undefined) throw new UsageError('--abort releases an abandoned checkpoint: do not combine it with --to or --checkpoint-timeout-ms', 'runtime');
+      assertNotSandboxed(ctx.io.env, 'migrate --abort');
+      return withInstance(ctx, { drivesAgents: false }, async ({ ht }) => {
+        const run = await ht.releases.releaseCheckpoint(runId!, { by, reason });
+        if (ctx.global.json) ctx.json(run);
+        else {
+          ctx.out(`run ${runId}: the checkpoint of the abandoned migration is released; status ${run.status}, still pinned to ${run.runtimeManifestId}`);
+          ctx.out(run.runtimeManifestId === ht.manifest.manifestId ? 'resume it with `hypertest resume`' : `the runtime ${run.runtimeManifestId} drives it (\`hypertest resume\` there)`);
+        }
+        return EXIT_CODES.ok;
+      });
+    }
     const to = required('runtime', values, 'to');
     const checkpointTimeoutMs = int('runtime', values, 'checkpoint-timeout-ms', { min: 0 });
     assertNotSandboxed(ctx.io.env, 'migrate');

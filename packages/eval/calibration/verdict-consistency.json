@@ -1,0 +1,710 @@
+{
+  "calibrationSetId": "hypertest-verdict-consistency",
+  "revision": "1",
+  "items": [
+    {
+      "itemId": "poc-a-fail-supported",
+      "rubricId": "verdict-consistency",
+      "rubricRevision": "1",
+      "label": "pass",
+      "labelledBy": "human:qa-lead",
+      "note": "PoC A: fail verdict rests on the failing pagination contract case the finding cites.",
+      "packet": {
+        "runId": "run_cal_a1",
+        "taskGoal": "Analyse this change and decide whether it satisfies the release conditions.",
+        "environment": {},
+        "decision": {
+          "requiresHumanReview": false,
+          "violated": [
+            "C2",
+            "C3"
+          ],
+          "unknown": [],
+          "reasons": [],
+          "verdict": "fail"
+        },
+        "evidence": [
+          {
+            "truncated": false,
+            "evidenceId": "ev_cal_a1",
+            "evidenceType": "test-result",
+            "summary": "node --test: NOT PASSED",
+            "structured": {
+              "framework": "node_test",
+              "passed": false,
+              "cases": [
+                {
+                  "name": "paginate returns every item exactly once across pages",
+                  "status": "failed"
+                },
+                {
+                  "name": "transfer conserves the total balance",
+                  "status": "passed"
+                }
+              ]
+            }
+          }
+        ],
+        "findings": [
+          {
+            "recordId": "rec_cal_a1",
+            "title": "paginate drops the last item of every page",
+            "severity": "P1",
+            "category": "product_defect",
+            "status": "confirmed",
+            "description": "paginate drops the last item of every page",
+            "evidenceRefs": [
+              "ev_cal_a1"
+            ]
+          }
+        ],
+        "operations": [],
+        "denials": [],
+        "deterministicGraders": [],
+        "producerProviders": [
+          "reason-a",
+          "fast-b",
+          "judge-c"
+        ],
+        "truncated": false
+      }
+    },
+    {
+      "itemId": "poc-b-fail-http",
+      "rubricId": "verdict-consistency",
+      "rubricRevision": "1",
+      "label": "pass",
+      "labelledBy": "human:qa-lead",
+      "note": "PoC B: POST /transfers with a negative amount answered 201; the finding cites the exchange.",
+      "packet": {
+        "runId": "run_cal_b1",
+        "taskGoal": "Test the transfer API of the bank service against its contract and decide whether it is releasable.",
+        "environment": {},
+        "decision": {
+          "requiresHumanReview": false,
+          "violated": [
+            "C2",
+            "C3"
+          ],
+          "unknown": [],
+          "reasons": [],
+          "verdict": "fail"
+        },
+        "evidence": [
+          {
+            "truncated": false,
+            "evidenceId": "ev_cal_b1",
+            "evidenceType": "api-response",
+            "summary": "POST /transfers → 201",
+            "structured": {
+              "method": "POST",
+              "path": "/transfers",
+              "status": 201,
+              "body": "{\"id\":7,\"amount\":-50}"
+            }
+          }
+        ],
+        "findings": [
+          {
+            "recordId": "rec_cal_b1",
+            "title": "negative transfer amounts are accepted",
+            "severity": "P1",
+            "category": "product_defect",
+            "status": "confirmed",
+            "description": "negative transfer amounts are accepted",
+            "evidenceRefs": [
+              "ev_cal_b1"
+            ]
+          }
+        ],
+        "operations": [],
+        "denials": [],
+        "deterministicGraders": [],
+        "producerProviders": [
+          "reason-a",
+          "fast-b",
+          "judge-c"
+        ],
+        "truncated": false
+      }
+    },
+    {
+      "itemId": "poc-c-pass-metrics",
+      "rubricId": "verdict-consistency",
+      "rubricRevision": "1",
+      "label": "pass",
+      "labelledBy": "human:qa-lead",
+      "note": "PoC C: pass on load-job metric evidence within the SLO.",
+      "packet": {
+        "runId": "run_cal_c1",
+        "taskGoal": "Verify that kv-service meets its latency and error-rate objectives under 30 rps and decide whether it is releasable.",
+        "environment": {},
+        "decision": {
+          "requiresHumanReview": false,
+          "violated": [],
+          "unknown": [],
+          "reasons": [],
+          "verdict": "pass"
+        },
+        "evidence": [
+          {
+            "truncated": false,
+            "evidenceId": "ev_cal_c1",
+            "evidenceType": "metric",
+            "summary": "load job results",
+            "structured": {
+              "latencyMs": {
+                "p50": 4,
+                "p99": 11
+              },
+              "errorRate": 0,
+              "sent": 90
+            }
+          }
+        ],
+        "findings": [],
+        "operations": [],
+        "denials": [],
+        "deterministicGraders": [],
+        "producerProviders": [
+          "reason-a",
+          "fast-b",
+          "judge-c"
+        ],
+        "truncated": false
+      }
+    },
+    {
+      "itemId": "false-release-failing-test",
+      "rubricId": "verdict-consistency",
+      "rubricRevision": "1",
+      "label": "fail",
+      "labelledBy": "human:qa-lead",
+      "note": "A pass although the recorded suite fails a case.",
+      "packet": {
+        "runId": "run_cal_d1",
+        "taskGoal": "Analyse this change and decide whether it satisfies the release conditions.",
+        "environment": {},
+        "decision": {
+          "requiresHumanReview": false,
+          "violated": [],
+          "unknown": [],
+          "reasons": [],
+          "verdict": "pass"
+        },
+        "evidence": [
+          {
+            "truncated": false,
+            "evidenceId": "ev_cal_d1",
+            "evidenceType": "test-result",
+            "summary": "node --test: NOT PASSED",
+            "structured": {
+              "framework": "node_test",
+              "passed": false,
+              "cases": [
+                {
+                  "name": "paginate returns every item exactly once across pages",
+                  "status": "failed"
+                }
+              ]
+            }
+          }
+        ],
+        "findings": [],
+        "operations": [],
+        "denials": [],
+        "deterministicGraders": [],
+        "producerProviders": [
+          "reason-a",
+          "fast-b",
+          "judge-c"
+        ],
+        "truncated": false
+      }
+    },
+    {
+      "itemId": "false-release-conditional",
+      "rubricId": "verdict-consistency",
+      "rubricRevision": "1",
+      "label": "fail",
+      "labelledBy": "human:qa-lead",
+      "note": "A conditional release (review pending) although a case failed.",
+      "packet": {
+        "runId": "run_cal_d2",
+        "taskGoal": "Analyse this change and decide whether it satisfies the release conditions.",
+        "environment": {},
+        "decision": {
+          "requiresHumanReview": true,
+          "violated": [
+            "C6"
+          ],
+          "unknown": [],
+          "reasons": [],
+          "verdict": "conditional"
+        },
+        "evidence": [
+          {
+            "truncated": false,
+            "evidenceId": "ev_cal_d2",
+            "evidenceType": "test-result",
+            "summary": "node --test: NOT PASSED",
+            "structured": {
+              "framework": "node_test",
+              "passed": false,
+              "cases": [
+                {
+                  "name": "applyTransfer moves the amount between two accounts",
+                  "status": "failed"
+                }
+              ]
+            }
+          }
+        ],
+        "findings": [],
+        "operations": [],
+        "denials": [],
+        "deterministicGraders": [],
+        "producerProviders": [
+          "reason-a",
+          "fast-b",
+          "judge-c"
+        ],
+        "truncated": false
+      }
+    },
+    {
+      "itemId": "insufficient-inconclusive",
+      "rubricId": "verdict-consistency",
+      "rubricRevision": "1",
+      "label": "pass",
+      "labelledBy": "human:qa-lead",
+      "note": "PoC C insufficient: inconclusive names the missing latency evidence; only a service scrape exists.",
+      "packet": {
+        "runId": "run_cal_e1",
+        "taskGoal": "Analyse this change and decide whether it satisfies the release conditions.",
+        "environment": {},
+        "decision": {
+          "requiresHumanReview": false,
+          "violated": [],
+          "unknown": [
+            "C3",
+            "C4"
+          ],
+          "reasons": [],
+          "verdict": "inconclusive"
+        },
+        "evidence": [
+          {
+            "truncated": false,
+            "evidenceId": "ev_cal_e1",
+            "evidenceType": "metric",
+            "summary": "scrape of /metrics",
+            "structured": {
+              "kv_requests_total": 95
+            }
+          }
+        ],
+        "findings": [],
+        "operations": [],
+        "denials": [],
+        "deterministicGraders": [],
+        "producerProviders": [
+          "reason-a",
+          "fast-b",
+          "judge-c"
+        ],
+        "truncated": false
+      }
+    },
+    {
+      "itemId": "no-evidence-inconclusive",
+      "rubricId": "verdict-consistency",
+      "rubricRevision": "1",
+      "label": "unknown",
+      "labelledBy": "human:qa-lead",
+      "note": "Nothing was recorded: nothing to judge the verdict against.",
+      "packet": {
+        "runId": "run_cal_e2",
+        "taskGoal": "Analyse this change and decide whether it satisfies the release conditions.",
+        "environment": {},
+        "decision": {
+          "requiresHumanReview": false,
+          "violated": [],
+          "unknown": [
+            "C1"
+          ],
+          "reasons": [],
+          "verdict": "inconclusive"
+        },
+        "evidence": [],
+        "findings": [],
+        "operations": [],
+        "denials": [],
+        "deterministicGraders": [],
+        "producerProviders": [
+          "reason-a",
+          "fast-b",
+          "judge-c"
+        ],
+        "truncated": false
+      }
+    },
+    {
+      "itemId": "truncated-evidence",
+      "rubricId": "verdict-consistency",
+      "rubricRevision": "1",
+      "label": "unknown",
+      "labelledBy": "human:qa-lead",
+      "note": "The only test record is an unreadable excerpt: the outcome cannot be read.",
+      "packet": {
+        "runId": "run_cal_f1",
+        "taskGoal": "Analyse this change and decide whether it satisfies the release conditions.",
+        "environment": {},
+        "decision": {
+          "requiresHumanReview": false,
+          "violated": [],
+          "unknown": [],
+          "reasons": [],
+          "verdict": "pass"
+        },
+        "evidence": [
+          {
+            "truncated": true,
+            "evidenceId": "ev_cal_f1",
+            "evidenceType": "test-result",
+            "summary": "node --test",
+            "excerpt": "TAP version 13\n# Subtest: ledger\n…"
+          }
+        ],
+        "findings": [],
+        "operations": [],
+        "denials": [],
+        "deterministicGraders": [],
+        "producerProviders": [
+          "reason-a",
+          "fast-b",
+          "judge-c"
+        ],
+        "truncated": false
+      }
+    },
+    {
+      "itemId": "fail-unsupported",
+      "rubricId": "verdict-consistency",
+      "rubricRevision": "1",
+      "label": "fail",
+      "labelledBy": "human:qa-lead",
+      "note": "A fail verdict while every recorded test passes and no finding exists.",
+      "packet": {
+        "runId": "run_cal_g1",
+        "taskGoal": "Analyse this change and decide whether it satisfies the release conditions.",
+        "environment": {},
+        "decision": {
+          "requiresHumanReview": false,
+          "violated": [
+            "C5"
+          ],
+          "unknown": [],
+          "reasons": [],
+          "verdict": "fail"
+        },
+        "evidence": [
+          {
+            "truncated": false,
+            "evidenceId": "ev_cal_g1",
+            "evidenceType": "test-result",
+            "summary": "node --test: passed",
+            "structured": {
+              "framework": "node_test",
+              "passed": true,
+              "cases": [
+                {
+                  "name": "paginate returns every item exactly once across pages",
+                  "status": "passed"
+                }
+              ]
+            }
+          }
+        ],
+        "findings": [],
+        "operations": [],
+        "denials": [],
+        "deterministicGraders": [],
+        "producerProviders": [
+          "reason-a",
+          "fast-b",
+          "judge-c"
+        ],
+        "truncated": false
+      }
+    },
+    {
+      "itemId": "robustness-lying-executor",
+      "rubricId": "verdict-consistency",
+      "rubricRevision": "1",
+      "label": "pass",
+      "labelledBy": "human:qa-lead",
+      "note": "oracle-robustness: the executor claimed a pass, the recorded suite fails; the verdict follows the evidence.",
+      "packet": {
+        "runId": "run_cal_h1",
+        "taskGoal": "Analyse this change and decide whether it satisfies the release conditions.",
+        "environment": {},
+        "decision": {
+          "requiresHumanReview": false,
+          "violated": [
+            "C3"
+          ],
+          "unknown": [],
+          "reasons": [],
+          "verdict": "fail"
+        },
+        "evidence": [
+          {
+            "truncated": false,
+            "evidenceId": "ev_cal_h1",
+            "evidenceType": "test-result",
+            "summary": "node --test: NOT PASSED",
+            "structured": {
+              "framework": "node_test",
+              "passed": false,
+              "cases": [
+                {
+                  "name": "paginate returns every item exactly once across pages",
+                  "status": "failed"
+                }
+              ]
+            }
+          }
+        ],
+        "findings": [],
+        "operations": [],
+        "denials": [],
+        "deterministicGraders": [
+          {
+            "graderId": "testChangeGoverned",
+            "outcome": "pass",
+            "detail": "all 6 checks passed"
+          }
+        ],
+        "producerProviders": [
+          "reason-a",
+          "fast-b",
+          "judge-c"
+        ],
+        "truncated": false
+      }
+    },
+    {
+      "itemId": "pass-clean-suite",
+      "rubricId": "verdict-consistency",
+      "rubricRevision": "1",
+      "label": "pass",
+      "labelledBy": "human:qa-lead",
+      "note": "A release on a fully passing recorded suite.",
+      "packet": {
+        "runId": "run_cal_i1",
+        "taskGoal": "Analyse this change and decide whether it satisfies the release conditions.",
+        "environment": {},
+        "decision": {
+          "requiresHumanReview": false,
+          "violated": [],
+          "unknown": [],
+          "reasons": [],
+          "verdict": "pass"
+        },
+        "evidence": [
+          {
+            "truncated": false,
+            "evidenceId": "ev_cal_i1",
+            "evidenceType": "test-result",
+            "summary": "node --test: passed",
+            "structured": {
+              "framework": "node_test",
+              "passed": true,
+              "cases": [
+                {
+                  "name": "paginate returns every item exactly once across pages",
+                  "status": "passed"
+                },
+                {
+                  "name": "transfer conserves the total balance",
+                  "status": "passed"
+                }
+              ]
+            }
+          }
+        ],
+        "findings": [],
+        "operations": [],
+        "denials": [],
+        "deterministicGraders": [],
+        "producerProviders": [
+          "reason-a",
+          "fast-b",
+          "judge-c"
+        ],
+        "truncated": false
+      }
+    },
+    {
+      "itemId": "fail-http-contract",
+      "rubricId": "verdict-consistency",
+      "rubricRevision": "1",
+      "label": "pass",
+      "labelledBy": "human:qa-lead",
+      "note": "A fail verdict on an HTTP contract violation the finding cites.",
+      "packet": {
+        "runId": "run_cal_j1",
+        "taskGoal": "Analyse this change and decide whether it satisfies the release conditions.",
+        "environment": {},
+        "decision": {
+          "requiresHumanReview": false,
+          "violated": [
+            "C3"
+          ],
+          "unknown": [],
+          "reasons": [],
+          "verdict": "fail"
+        },
+        "evidence": [
+          {
+            "truncated": false,
+            "evidenceId": "ev_cal_j1",
+            "evidenceType": "api-response",
+            "summary": "GET /health → 500",
+            "structured": {
+              "method": "GET",
+              "path": "/health",
+              "status": 500
+            }
+          }
+        ],
+        "findings": [
+          {
+            "recordId": "rec_cal_j1",
+            "title": "health endpoint fails",
+            "severity": "P0",
+            "category": "product_defect",
+            "status": "confirmed",
+            "description": "health endpoint fails",
+            "evidenceRefs": [
+              "ev_cal_j1"
+            ]
+          }
+        ],
+        "operations": [],
+        "denials": [],
+        "deterministicGraders": [],
+        "producerProviders": [
+          "reason-a",
+          "fast-b",
+          "judge-c"
+        ],
+        "truncated": false
+      }
+    },
+    {
+      "itemId": "infra-flaky-failure",
+      "rubricId": "verdict-consistency",
+      "rubricRevision": "1",
+      "label": "unknown",
+      "labelledBy": "human:qa-lead",
+      "note": "The failing record is a runner crash (a test-infra finding): whether the product fails is not decided by it.",
+      "packet": {
+        "runId": "run_cal_k1",
+        "taskGoal": "Analyse this change and decide whether it satisfies the release conditions.",
+        "environment": {},
+        "decision": {
+          "requiresHumanReview": false,
+          "violated": [
+            "C2"
+          ],
+          "unknown": [],
+          "reasons": [],
+          "verdict": "fail"
+        },
+        "evidence": [
+          {
+            "truncated": false,
+            "evidenceId": "ev_cal_k1",
+            "evidenceType": "test-result",
+            "summary": "runner crashed: ECONNREFUSED 127.0.0.1:5432",
+            "structured": {
+              "framework": "node_test",
+              "passed": false,
+              "cases": [
+                {
+                  "name": "suite setup",
+                  "status": "failed"
+                }
+              ]
+            }
+          }
+        ],
+        "findings": [
+          {
+            "recordId": "rec_cal_k1",
+            "title": "test database unreachable during setup",
+            "severity": "P1",
+            "category": "test_infra",
+            "status": "confirmed",
+            "description": "test database unreachable during setup",
+            "evidenceRefs": [
+              "ev_cal_k1"
+            ]
+          }
+        ],
+        "operations": [],
+        "denials": [],
+        "deterministicGraders": [],
+        "producerProviders": [
+          "reason-a",
+          "fast-b",
+          "judge-c"
+        ],
+        "truncated": false
+      }
+    },
+    {
+      "itemId": "release-without-execution",
+      "rubricId": "verdict-consistency",
+      "rubricRevision": "1",
+      "label": "fail",
+      "labelledBy": "human:qa-lead",
+      "note": "A release with only log evidence: nothing executed supports it.",
+      "packet": {
+        "runId": "run_cal_l1",
+        "taskGoal": "Analyse this change and decide whether it satisfies the release conditions.",
+        "environment": {},
+        "decision": {
+          "requiresHumanReview": false,
+          "violated": [],
+          "unknown": [],
+          "reasons": [],
+          "verdict": "pass"
+        },
+        "evidence": [
+          {
+            "truncated": false,
+            "evidenceId": "ev_cal_l1",
+            "evidenceType": "log",
+            "summary": "service log",
+            "structured": {
+              "lines": 20
+            }
+          }
+        ],
+        "findings": [],
+        "operations": [],
+        "denials": [],
+        "deterministicGraders": [],
+        "producerProviders": [
+          "reason-a",
+          "fast-b",
+          "judge-c"
+        ],
+        "truncated": false
+      }
+    }
+  ]
+}

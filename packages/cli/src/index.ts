@@ -7,7 +7,7 @@ export { CONFIG_ENV, CONFIG_FILE_NAMES, LOG_LEVEL_ENV, clientOnlyConfig, findCon
 export { configTemplate, GITIGNORE_ENTRIES, TEMPLATE_KEY_VARIABLES } from './template.ts';
 export { ensureGitignore, projectNameFrom, writeConfigAtomically } from './commands/init.ts';
 export { MIN_NODE_VERSION, nodeVersionCheck } from './commands/doctor.ts';
-export { availableArms, availableSuites, suiteFactoryName, suiteIdOf } from './commands/eval.ts';
+export { availableArms, availableSuites, suiteFactoryName, suiteIdOf, withJudge } from './commands/eval.ts';
 export { DEFAULT_API_PORT, DEFAULT_API_TOKEN_ENV, MIN_API_TOKEN_LENGTH } from './commands/serve.ts';
 export { SANDBOX_ENV } from './commands/decide.ts';
 export { parseAllowances, parseCanary, releaseActor, suiteFromEval } from './commands/runtime.ts';

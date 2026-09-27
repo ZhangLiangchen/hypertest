@@ -170,6 +170,13 @@ export interface RuntimeReleaseRegistry {
   recordEpoch(input: NewRuntimeEpoch, tx?: SqlExecutor): Promise<RuntimeEpoch>;
   /** The run's epochs, oldest first. */
   epochs(runId: string, tx?: SqlExecutor): Promise<RuntimeEpoch[]>;
+  /**
+   * (additive) Takes the registry's mutation lock inside the caller's transaction (held until it ends): every register,
+   * promotion, rollback and retirement waits for it. A caller that acts on a release's state (a migration re-pinning a run
+   * onto a release) re-reads the release after this, so no rollback or promotion can commit between its check and its
+   * commit. Lock order: this lock before any run lock (the rollback's order: pointer move, then the quarantine sweep).
+   */
+  lock(tx: SqlExecutor): Promise<void>;
 }
 
 // ------------------------------------------------------------------------------------------------ schema
@@ -857,6 +864,11 @@ export function createRuntimeReleaseRegistry(deps: RuntimeReleaseRegistryDeps): 
     async epochs(runId, tx) {
       const r = await (tx ?? db).query<{ epoch: unknown }>('SELECT epoch FROM ht_runtime_epochs WHERE run_id = $1 ORDER BY seq', [runId]);
       return r.rows.map((row) => fromJsonColumn<RuntimeEpoch>(row.epoch));
+    },
+
+    async lock(tx) {
+      if (!tx || typeof tx.query !== 'function') throw invalid('lock: a transaction is required (the lock is held until it ends)');
+      await lock(tx);
     },
   };
   return registry;

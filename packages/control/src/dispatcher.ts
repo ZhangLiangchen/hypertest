@@ -8,6 +8,7 @@ import {
 } from '@hypertest/domain';
 import { categoryDecision, classifyTestChange, holdsProductFix, parseUnifiedDiff, type ApprovalRequest, type SelfHealDecision, type TestChangeClassification } from '@hypertest/policy';
 import { toolNameToId, type ToolExecutionRequest, type WorkspaceHandle } from '@hypertest/tools';
+import type { BudgetExhaustion } from '@hypertest/operation';
 import type { DispatchResult, TerminalSignal, ToolDispatcher } from '@hypertest/runtime';
 import type { ControlDeps } from './deps.ts';
 import type { TurnState } from './context-provider.ts';
@@ -19,9 +20,12 @@ import { workScope } from './work-factory.ts';
 import { clip, event, maxRisk } from './util.ts';
 import { POLICY_FLAGGED_EVENT, createPhaseGovernor, flagEventId, type ActionDescription } from './phases.ts';
 import {
-  EXPERIMENT_EXEMPT_TOOLS, EXPERIMENT_GUARDED_EFFECTS, JOB_MAY_RUN, callScopes, declaredExperimentIds, exhaustedScope, experimentClaimsProblem, onToolBudgetExhausted, qpsKey,
-  settleExternalQps,
+  EXPERIMENT_EXEMPT_TOOLS, EXPERIMENT_GUARDED_EFFECTS, JOB_MAY_RUN, QPS_REASON_PREFIX, callScopes, declaredExperimentIds, exhaustedScope, experimentClaimsProblem, experimentResourceProblem,
+  onToolBudgetExhausted, qpsJobMayRun, qpsKey, settleExternalQps,
 } from './isolation.ts';
+
+/** (review B2) Re-reservations of one load.start invocation's rate before the call is refused (fail closed). */
+const MAX_QPS_REKEYS = 16;
 
 /** Tools whose effect on test code is classified BEFORE they execute (I8 self-heal governance). */
 export const GOVERNED_TOOL_IDS: readonly string[] = ['fs.write', 'fs.apply_patch', 'git.commit'];
@@ -474,6 +478,23 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
   }
 
   /**
+   * (conformance-5, review B2) Reserves the request rate of a load.start call under its invocation's key. A keyed reserve
+   * returns an earlier reservation of the same call as is — also one already given back (released after a failed or
+   * refused first dispatch, or when its job was found ended): a replayed call must never run a job on it, so a released
+   * reservation is re-reserved under the next key (`qpsKey(invocationId, n)`). 'unavailable' when that keeps happening.
+   */
+  async function reserveQps(invocationId: string, rate: number): Promise<{ ok: true; reservationId: string } | { ok: false; exhausted: BudgetExhaustion } | 'unavailable'> {
+    const scope = workScope(input.workItemId);
+    for (let attempt = 1; attempt <= MAX_QPS_REKEYS; attempt++) {
+      const r = await budget.reserve([scope], { externalQps: rate }, `${QPS_REASON_PREFIX}${invocationId}`, { idempotencyKey: qpsKey(invocationId, attempt) });
+      if (!r.ok || !budget.openReservations) return r;
+      if ((await budget.openReservations(scope)).some((o) => o.reservationId === r.reservationId)) return r;
+      logger.info('the QPS reservation of a replayed load.start was already given back: reserving its rate again', { invocationId, reservationId: r.reservationId, attempt });
+    }
+    return 'unavailable';
+  }
+
+  /**
    * (conformance-5) After a call: charge what it consumed (sandbox wall time, artifact bytes) to the work item and its
    * run — recorded in full even past a limit — and apply the exhaustion policy; give back the QPS reservation of a
    * load.start whose job does not run, and of jobs load.observe / load.stop found ended. Returns notes for the model.
@@ -565,11 +586,27 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
       // conformance-6: a write/fault call of a work item that runs for experiments needs their admitted claims held —
       // two experiments must never invalidate each other (a lapsed or released claim is never acted on regardless)
       const experiments = await itemExperiments();
-      if (experiments.all.length > 0 && effect !== undefined && EXPERIMENT_GUARDED_EFFECTS.has(effect) && !EXPERIMENT_EXEMPT_TOOLS.includes(toolId)) {
-        const problem = await experimentClaimsProblem(deps, input.runId, experiments.all, toolId);
-        if (problem !== undefined) {
-          return deny(call, toolId, invocationId, 'experiment_claims_missing', `[denied] experiment_claims_missing: ${problem}. ${toolId} was NOT executed; do not work around it (another experiment may be using these resources).`);
+      /** The item's experiments whose claims cover this write/fault call (attribution when it runs for several). */
+      let covering: string[] = [];
+      if (effect !== undefined && EXPERIMENT_GUARDED_EFFECTS.has(effect) && !EXPERIMENT_EXEMPT_TOOLS.includes(toolId)) {
+        if (experiments.all.length > 0) {
+          const problem = await experimentClaimsProblem(deps, input.runId, experiments.all, toolId);
+          if (problem !== undefined) {
+            return deny(call, toolId, invocationId, 'experiment_claims_missing', `[denied] experiment_claims_missing: ${problem}. ${toolId} was NOT executed; do not work around it (another experiment may be using these resources).`);
+          }
         }
+        // review B2: held claims license a write/fault only on the resources they claim, and no work item — running for an
+        // experiment or not — writes to / faults a resource another experiment holds (its recorded contamination rule)
+        const verdict = await experimentResourceProblem(deps, {
+          workItemId: input.workItemId,
+          experimentIds: experiments.all,
+          toolId,
+          resources: () => registry.get(toolId)?.resources(args as never, { workspace: ws, runId: input.runId, environments: deps.environments }) ?? [],
+        });
+        if (!verdict.ok) {
+          return deny(call, toolId, invocationId, verdict.code, `[denied] ${verdict.code}: ${verdict.problem}. ${toolId} was NOT executed; do not work around it (another experiment may be using these resources).`);
+        }
+        covering = verdict.covering.filter((id) => experiments.known.includes(id));
       }
       const guarded = driftGuarded && effect === 'execute';
       if (quarantine && (QUARANTINE_BLOCKED_TOOL_IDS.includes(toolId) || (guarded && toolId !== QUARANTINE_RESTORE_TOOL))) {
@@ -604,7 +641,16 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
           }
           computeCapMs = Math.max(1, Math.floor(left.computeMs));
         }
-        if (left.artifactBytes !== undefined) maxArtifactBytes = left.artifactBytes;
+        if (left.artifactBytes !== undefined) {
+          // review B2: a write/fault call whose evidence cannot be stored any more must not act at all — its side effect would
+          // happen unevidenced and the failed call invite a retry (a second effect); ending an effect (load.stop) stays possible
+          if (left.artifactBytes <= 0 && effect !== undefined && EXPERIMENT_GUARDED_EFFECTS.has(effect) && !EXPERIMENT_EXEMPT_TOOLS.includes(toolId)) {
+            const exhausted = (await exhaustedScope(deps, scopes, 'artifactBytes')) ?? { scope: workScope(input.workItemId), dimension: 'artifactBytes' as const, limit: 0, used: 0, reserved: 0, requested: 0 };
+            await onToolBudgetExhausted(deps, input.eventContext, input.runId, exhausted, { reason: 'artifact_bytes', toolId, invocationId });
+            return deny(call, toolId, invocationId, 'budget_exhausted', `[denied] budget_exhausted: the artifact budget of ${exhausted.scope} is spent (${exhausted.used}/${exhausted.limit} bytes); ${toolId} was NOT executed (its evidence could not be stored) — finish with complete_work or fail_work`);
+          }
+          maxArtifactBytes = left.artifactBytes;
+        }
       }
       // … and the request rate of a load job, reserved across the run's concurrent jobs while it runs
       let qpsReservation: string | undefined;
@@ -612,7 +658,10 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
         const cap = (await deps.runs.get(input.runId))?.budget.maxExternalQps;
         const rate = args['ratePerSecond'];
         if (cap !== undefined && typeof rate === 'number' && Number.isFinite(rate) && rate >= 0) {
-          const reserved = await budget.reserve([workScope(input.workItemId)], { externalQps: rate }, `load:${invocationId}`, { idempotencyKey: qpsKey(invocationId) });
+          const reserved = await reserveQps(invocationId, rate);
+          if (reserved === 'unavailable') {
+            return deny(call, toolId, invocationId, 'budget_unavailable', `[denied] budget_unavailable: the request rate of ${toolId} could not be reserved (the call was replayed ${MAX_QPS_REKEYS} times after its rate was given back); the job was NOT started`);
+          }
           if (!reserved.ok) {
             await onToolBudgetExhausted(deps, input.eventContext, input.runId, reserved.exhausted, { reason: 'external_qps', toolId, invocationId });
             const left = Math.max(0, reserved.exhausted.limit - reserved.exhausted.used - reserved.exhausted.reserved);
@@ -654,6 +703,7 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
       if (snapshot) request.snapshot = snapshot;
       // conformance-6: the call's evidence and operations name the experiment it runs for (one declared experiment)
       if (experiments.known.length === 1) request.experimentId = experiments.known[0]!;
+      else if (covering.length === 1) request.experimentId = covering[0]!;
       if (computeCapMs !== undefined) request.timeoutMs = computeCapMs;
       if (maxArtifactBytes !== undefined) request.limits = { maxArtifactBytes };
       if (input.fencingToken !== undefined) {
@@ -668,7 +718,9 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
       try {
         execution = await toolRuntime.execute(request);
       } catch (e) {
-        if (qpsReservation !== undefined) await budget.release(qpsReservation).catch(() => undefined);
+        // review B2: the call may have dispatched its job before it failed (e.g. an audit write after the launch): the rate
+        // is given back only when no job can run (none prepared, or it ended); a replay reuses (or re-reserves) it
+        if (qpsReservation !== undefined && !(await qpsJobMayRun(deps, input.runId, invocationId))) await budget.release(qpsReservation).catch(() => undefined);
         throw e;
       }
       const budgetNotes = await settleCallBudget(toolId, invocationId, args, execution, { qpsReservation, computeCapMs });

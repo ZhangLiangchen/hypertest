@@ -6,8 +6,8 @@
  * human approvals and oracle decisions through the facade.
  */
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { after, before, describe, test } from 'node:test';
 import { HypertestError, MemoryLogger, canonicalJson } from '@hypertest/core';
@@ -109,8 +109,17 @@ describe('createHypertest: a tiny run end to end', () => {
     assert.match(m.toolCatalogRevision, /^tc_[0-9a-f]{64}$/);
     assert.equal(m.policyBundleRevision, `${ht.services.policy.revision}+roles:${ht.services.roles.revision()}`);
     assert.equal(m.roleCatalogRevision, ht.services.roles.revision());
-    // this checkout is not a git repository and no image digest is set in this test: both stay absent (never invented)
+    // gitSha: HEAD of this installation when it is the top level of a git checkout (never invented otherwise); no image
+    // digest is set in this test, so none is pinned
     assert.equal(m.hypertest.gitSha, hypertestGitSha());
+    let head: string | undefined;
+    try {
+      const [top, sha] = execFileSync('git', ['-C', ROOT, 'rev-parse', '--show-toplevel', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim().split('\n');
+      if (top && realpathSync(top) === realpathSync(ROOT)) head = sha;
+    } catch {
+      head = undefined; // not a checkout (e.g. an unpacked release): nothing to pin
+    }
+    assert.equal(m.hypertest.gitSha, head);
     assert.equal(m.hypertest.imageDigest, undefined);
     assert.deepEqual(m.protocol, { id: 'bugate', version: ht.services.protocol.binding.version, digest: ht.services.protocol.binding.digest });
     assert.equal(m.schemas.event, collabMigrations.map((x) => x.id).sort().at(-1));
@@ -195,12 +204,12 @@ describe('composition failures fail fast and leave nothing open', () => {
   after(async () => dir.cleanup());
 
   test('invalid configuration ⇒ invalid_argument listing every problem', async () => {
-    const bad = { ...scriptedConfig(join(dir.path, 'a')), engines: { default: 'dsh' }, bogus: 1 } as unknown as HypertestConfig;
+    const bad = { ...scriptedConfig(join(dir.path, 'a')), engines: { default: 'openhands' }, bogus: 1 } as unknown as HypertestConfig;
     await assert.rejects(createHypertest(bad, { scriptedBrains: {} }), (e: unknown) => {
       assert.ok(e instanceof HypertestError && e.code === 'invalid_argument');
       assert.deepEqual((e.details as { errors: string[] }).errors, [
         "unknown configuration key 'bogus' (expected one of version, project, store, bus, durable, artifacts, models, roles, budget, gate, policy, bugate, engines, sandbox, environments, tools, signing, memory, observability, oracles, runtime)",
-        'engines.default: "dsh" is not a registered engine (native, pi)',
+        'engines.default: "openhands" is not a registered engine (native, pi, dsh)',
       ]);
       return true;
     });

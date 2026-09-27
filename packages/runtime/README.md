@@ -24,7 +24,7 @@ the real policy engine).
 | `createAgentRunner(deps)` | `step()` = one turn (the durable activity unit); `run()` = loop with the work budget; both recover an outcome the engine committed but a crash left unapplied (`recoveredResult`, `recoveredWaiting`). `validateBudget`. |
 | `buildRuntimeManifest(input, createdAt)` | Frozen RuntimeManifest, `manifestId = 'rm_' + sha256(canonicalJson(content))` (content excludes `createdAt`; engine/adapter lists sorted). `verifyRuntimeManifest`, `manifestContent` (validates the runtime-BOM fields when present: `hypertest.gitSha` non-empty (the app pins a full commit id), `hypertest.imageDigest` `sha256:<64 hex>`, `agentEngines[].adapter {package, version}`, `defaultEngine` one of the pinned engines, `roleCatalogRevision`). |
 | `toolCatalogRevision(tools, adapters?)` | `tc_<sha256>` over every tool's schemas, effect/risk (`dynamic` when computed), `timeoutMs`, `maxInlineBytes`, side-effect binding (adapter, operation type, lease TTL) and the side-effect adapters' capabilities: a changed timeout, binding or adapter is another runtime (I11). Duplicates and non-positive timeouts are refused. |
-| `createRuntimeReleaseRegistry({ db, ids, clock, logger })` | The runtime release registry (below): `register`, `get`, `list`, `activePointer`, `recordSuiteResult`, `suiteResults`, `promotionReadiness`, `promote`, `rollback`, `retire`, `admit`, `history`, `recordEpoch`, `epochs`. Pure helpers `runtimeCompatibility(source, target, { usedEngines })`, `canarySelects`, `canaryBucket`, `canarySelectionProblems`, `describeSelection`; constants `RELEASE_STATES`, `PROMOTION_PATH`, `SUITE_KINDS`, `MANIFEST_SCHEMA_KEYS`, `RELEASE_MIGRATION`. |
+| `createRuntimeReleaseRegistry({ db, ids, clock, logger })` | The runtime release registry (below): `register`, `get`, `list`, `activePointer`, `recordSuiteResult`, `suiteResults`, `promotionReadiness`, `promote`, `rollback`, `retire`, `admit`, `history`, `recordEpoch`, `epochs`, `lock(tx)`. Pure helpers `runtimeCompatibility(source, target, { usedEngines })`, `canarySelects`, `canaryBucket`, `canarySelectionProblems`, `describeSelection`; constants `RELEASE_STATES`, `PROMOTION_PATH`, `SUITE_KINDS`, `MANIFEST_SCHEMA_KEYS`, `RELEASE_MIGRATION`. |
 | `EngineRegistry` | `register` (duplicate kind ⇒ `conflict`), `get` (unknown ⇒ `not_found`), `list`, `has`, `manifestEntries()`, `assertPinned(manifest, kind)` (I11: refuses an engine whose version differs from the pinned manifest). |
 | `engineContractSuite(name, makeEngine, { openDatabase })` | node:test suite every engine must pass (see below). |
 | `FakeModelInvoker`, `FakeDispatcher`, `FakeContextProvider`, `fakeHost`, `fakeSnapshot`, `completeWorkTool`, `failWorkTool` | Deterministic, recording test doubles for engine tests. |
@@ -215,7 +215,7 @@ additive: `src` may not depend on `@hypertest/store`.)
 | I2 capability bound to the new agent, derived from **and covered by** the parent's recorded capability (8 amplification variants); unrecorded parent refused; signatures verified with `capabilitySecret` | `test/subagents.test.ts` |
 | I10 correlated route/epoch/turn/tool events; interrupt status + event atomic; resume of a background continuable child + `agent.resumed` atomic | `test/runner.test.ts`, `test/native-engine.test.ts`, `test/subagents.test.ts` |
 | I11 content-hashed manifest, no engine hot swap, unversioned pins fail closed; the runtime-BOM fields change the id and are validated; tool catalog revision pins timeouts, bindings and adapter capabilities | `test/manifest.test.ts` |
-| I11 runtime releases: promotion only one step at a time and only over the latest passing engine-contract AND replay results; one active / one canary; admission (unmanaged, active, selected canary, refused); rollback moves the pointer back and retires for good; append-only history and immutable manifests (triggers); epoch chain; compatibility verdict | `test/releases.test.ts` (PGlite + PostgreSQL) |
+| I11 runtime releases: promotion only one step at a time and only over the latest passing engine-contract AND replay results; one active / one canary; admission (unmanaged, active, selected canary, refused); rollback moves the pointer back and retires for good; append-only history and immutable manifests (triggers); epoch chain; compatibility verdict; `lock(tx)` holds off a rollback until the holder's transaction ends | `test/releases.test.ts` (PGlite + PostgreSQL) |
 | I12 depth/agent-count caps (incl. concurrent spawns, inherited depth cap), work budgets | `test/subagents.test.ts`, `test/runner.test.ts` |
 
 ## Contract changes (additive, 0.3)
@@ -243,6 +243,11 @@ parent's, a child capability must be covered by the parent's, `routeRequestExtra
   `runtime/005-releases` appended to `runtimeMigrations`. Domain (additive): `RuntimeEpoch`, `RuntimeCompatibilityCheck`,
   `PauseReason` `quarantined` | `migrating`, `EVENT_TYPES.runMigrated` (`run.migrated`) / `runQuarantined`
   (`run.quarantined`), `BuiltinRole` `vision_gui` | `local_private`.
+- (review fix, additive) `RuntimeReleaseRegistry.lock(tx)`: takes the registry's mutation lock inside the caller's
+  transaction (held until it ends; `invalid_argument` without one), so a caller that acts on a release's state (the
+  app's run migration) re-reads it after every register/promotion/rollback/retirement that could change it. Lock order:
+  the registry lock before any run lock. Domain (additive): `EVENT_TYPES.runMigrationReleased`
+  (`run.migration_released`).
 
 ## Testing
 

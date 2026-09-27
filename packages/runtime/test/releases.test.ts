@@ -279,6 +279,31 @@ describe('runtime release registry (SQL)', () => {
     assert.deepEqual(results.map((r) => r.status).sort(), ['fulfilled', 'rejected']);
     assert.equal((await reg.list({ states: ['canary'] })).length, 1);
   });
+
+  test('lock: a transaction holding the registry lock sees no rollback commit before it ends (the migration re-check)', async () => {
+    const m = manifest('a');
+    await reg.register(m, { by: BY });
+    await passSuites(m.manifestId);
+    await reg.promote(m.manifestId, { by: BY, reason: 'r' });
+    await reg.promote(m.manifestId, { by: BY, reason: 'r', canary: { percentage: 10 } });
+    const order: string[] = [];
+    let lockTaken!: () => void;
+    const taken = new Promise<void>((resolve) => (lockTaken = resolve));
+    // registered outside the transaction's async context (a call from inside it would join the transaction): started once
+    // the lock is held, it waits for the transaction (PostgreSQL: the lock row; PGlite: its single connection)
+    const rollback = taken.then(() => reg.rollback({ by: BY, reason: 'bad canary', manifestId: m.manifestId })).then(() => order.push('rollback'));
+    await db.transaction(async (tx) => {
+      await reg.lock(tx);
+      lockTaken();
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.equal((await reg.get(m.manifestId, tx))!.state, 'canary', 'the release is unchanged while the lock is held');
+      order.push('locked transaction');
+    });
+    await rollback;
+    assert.deepEqual(order, ['locked transaction', 'rollback']);
+    assert.deepEqual([(await reg.get(m.manifestId))!.state, (await reg.get(m.manifestId))!.rolledBack], ['retired', true]);
+    await assert.rejects(reg.lock(undefined as never), code('invalid_argument'), 'the lock needs the caller\'s transaction');
+  });
 });
 
 describe('runtimeCompatibility (migration check)', () => {

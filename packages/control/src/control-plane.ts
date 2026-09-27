@@ -12,6 +12,7 @@ import { environmentReadSet, targetEnvironment } from './context-provider.ts';
 import { claimLeaseOwner } from './dispatcher.ts';
 import { createConvergenceMonitor, type ConvergenceMonitor } from './convergence.ts';
 import { createDomainTools } from './domain-tools/index.ts';
+import { releaseStrandedReservations } from './isolation.ts';
 import { createReactorService, REACTOR_CONSUMER, REACTOR_SUBJECTS, type ReactorService } from './reactors.ts';
 import { createReportBuilder } from './report.ts';
 import { createScheduler, workLeaseKey, type Scheduler } from './scheduler.ts';
@@ -251,7 +252,7 @@ export function createControlPlane(deps: ControlDeps): ControlPlaneInternals {
     if (run.status === 'converging' || run.status === 'gating') {
       // a crash between the gate transitions: evaluate again (the decision store keeps every revision)
       const g = await convergence.gate(run);
-      return result(g.run, { convergence: { state: 'drained', reason: 'ready_for_gate' }, decision: g.decision, final: g.final, idleMs: 0 });
+      return result(g.run, { convergence: { state: 'drained', reason: 'ready_for_gate' }, ...(g.decision ? { decision: g.decision } : {}), final: g.final, idleMs: g.abandoned ? nextIdle(runId, false) : 0 });
     }
 
     let progressed = false;
@@ -318,7 +319,7 @@ export function createControlPlane(deps: ControlDeps): ControlPlaneInternals {
       const g = await convergence.gate(run);
       idle.delete(runId);
       if (g.final) await scheduler.releaseRun?.(runId);
-      return result(g.run, { convergence: state, decision: g.decision, final: g.final, idleMs: 0, replanScheduled: replan.scheduled });
+      return result(g.run, { convergence: state, ...(g.decision ? { decision: g.decision } : {}), final: g.final, idleMs: g.abandoned ? nextIdle(runId, false) : 0, replanScheduled: replan.scheduled });
     }
     if (state.state === 'exhausted' && !exhausted) state = { state: 'active', runnable: 0, running: 0, waiting: 0, pendingEvents };
     run = await mustRun(runId);
@@ -618,9 +619,10 @@ export function createControlPlane(deps: ControlDeps): ControlPlaneInternals {
       //   holders, so their still-live leases on unsettled operations are released and those operations reconciled now —
       //   the item's next claim then finds them settled (or re-attaches) instead of refused as busy until the TTL
       // durability-1: the budget reservations of the superseded claims' in-flight model calls will never settle (their
-      //   process is gone): released, so the retried turn is not refused by its own leak
+      //   process is gone): released, so the retried turn is not refused by its own leak — except the QPS reservations
+      //   of load jobs they started (conformance-5): the external job outlives its worker and keeps its rate reserved
       for (const { workItemId } of superseded) {
-        const freed = (await budget.releaseOpen?.(workScope(workItemId))) ?? [];
+        const freed = await releaseStrandedReservations(deps, workScope(workItemId));
         if (freed.length > 0) logger.info('released the budget reservations of a superseded claim', { runId, workItemId, reservations: freed });
       }
       const released = await releaseSupersededEffectLeases(runId, superseded);

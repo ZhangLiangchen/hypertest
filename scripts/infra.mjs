@@ -10,11 +10,12 @@
 // HYPERTEST_TEST_TEMPORAL_ADDRESS. scripts/run-tests.mjs loads it automatically.
 // Every component is optional: missing binaries are reported and that component is skipped.
 import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, chmodSync, openSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { join, resolve, dirname } from 'node:path';
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { createConnection } from 'node:net';
 
-const ROOT = resolve(dirname(new URL(import.meta.url).pathname), '..');
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const INFRA = join(ROOT, '.infra');
 const BIN = join(INFRA, 'bin');
 const NATS_VERSION = '2.11.8';

@@ -8,10 +8,10 @@
  * the lead's private trace leaked into another agent's context), which the PoC probes and graders read.
  */
 import { appendFileSync } from 'node:fs';
-import { HypertestError, type JsonValue } from '@hypertest/core';
+import { HypertestError, sleep, type JsonValue } from '@hypertest/core';
 import type { ModelCallRequest, ScriptedBrain, ScriptedReply } from '@hypertest/model';
 import { toolCall, viewOf, type BrainView, type RoleBrain } from '../brains.ts';
-import type { BrainObservation } from '../fixtures.ts';
+import { readObservations, type BrainObservation } from '../fixtures.ts';
 
 /** Which scripted arm the brains serve (provider ids differ; the policies are the same). */
 export type ArmKind = 'multi' | 'single';
@@ -236,6 +236,47 @@ export function armBrains(args: PocBrainArgs, roles: Record<string, RoleBrain>, 
     out[provider] = providerBrain(provider, roles, options);
   }
   return out;
+}
+
+/** (additive) One tool call of the transcript with its result (paired by tool call id; `result` undefined while unsettled). */
+export interface PairedCall {
+  /** Tool id (`http.request`; wire names are mapped back). */
+  tool: string;
+  args: Record<string, unknown>;
+  result?: { content: string; isError: boolean };
+}
+
+/** Every tool call of the transcript in order, with its result: what the agent did so far and what came back. */
+export function pairedCalls(v: BrainView): PairedCall[] {
+  const results = new Map<string, { content: string; isError: boolean }>();
+  for (const m of v.request.messages) if (m.role === 'tool') results.set(m.toolCallId, { content: m.content, isError: m.isError === true });
+  const out: PairedCall[] = [];
+  for (const m of v.request.messages) {
+    if (m.role !== 'assistant') continue;
+    for (const c of m.toolCalls ?? []) {
+      const args = c.arguments !== null && typeof c.arguments === 'object' && !Array.isArray(c.arguments) ? (c.arguments as Record<string, unknown>) : {};
+      const call: PairedCall = { tool: c.name.split('__').join('.'), args };
+      const r = results.get(c.id);
+      if (r) call.result = r;
+      out.push(call);
+    }
+  }
+  return out;
+}
+
+/**
+ * (additive) Waits until the brains' observation log holds an observation matching `predicate` (another agent reached a
+ * point: e.g. it received the verified result of a restart). Brains stay functions of the request — waiting only delays
+ * the reply, like a slower model. Resolves false after `timeoutMs` (the scenario then may not happen; its graders say so).
+ */
+export async function awaitObservation(file: string | undefined, predicate: (o: BrainObservation) => boolean, timeoutMs = 60_000, pollMs = 25): Promise<boolean> {
+  if (!file) return false;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (readObservations(file).some(predicate)) return true;
+    if (Date.now() >= deadline) return false;
+    await sleep(pollMs);
+  }
 }
 
 /** Refuses malformed brain arguments (they come from JSON). */

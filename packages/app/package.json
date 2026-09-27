@@ -17,6 +17,7 @@
     "@hypertest/tools": "0.3.0-dev",
     "@hypertest/runtime": "0.3.0-dev",
     "@hypertest/runtime-pi": "0.3.0-dev",
+    "@hypertest/runtime-dsh": "0.3.0-dev",
     "@hypertest/agents": "0.3.0-dev",
     "@hypertest/control": "0.3.0-dev",
     "@hypertest/durable": "0.3.0-dev",

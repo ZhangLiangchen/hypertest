@@ -160,6 +160,121 @@ describe('release governance at the control boundary', () => {
     assert.equal(admitted.length, 2);
   });
 
+  test('a newly created run is re-checked after creation: quarantined meanwhile ⇒ the start is refused (existing runs are not re-checked)', async () => {
+    const created: string[] = [];
+    const rechecked: string[] = [];
+    let rolledBack = true;
+    const control = {
+      deps: {} as ControlPlane['deps'],
+      async startRun(input: { runId?: string }) {
+        created.push(input.runId!);
+        return { runId: input.runId, status: 'running', runtimeManifestId: 'rm_this' } as TestRun;
+      },
+    } as unknown as ControlPlane;
+    const governed = releaseGovernedControlPlane(control, {
+      manifestId: 'rm_this',
+      requireActive: false,
+      newRunId: () => `run_new${created.length + 1}`,
+      getRun: async (id) => runs.get(id),
+      registry: { admit: async () => ({ allowed: true, mode: 'active', activeManifestId: 'rm_this' }) },
+      afterCreate: async (runId) => {
+        rechecked.push(runId);
+        return rolledBack;
+      },
+    });
+    await assert.rejects(governed.startRun({ goal: 'g', target: {} }), (e: unknown) => {
+      assert.ok(e instanceof HypertestError && e.code === 'precondition_failed', String(e));
+      assert.match(e.message, /^runtime release: runtime rm_this was rolled back while run run_new1 was being created — the run is quarantined/);
+      assert.deepEqual(e.details, { runId: 'run_new1', runtimeManifestId: 'rm_this', quarantined: true });
+      return true;
+    });
+    rolledBack = false;
+    assert.equal((await governed.startRun({ goal: 'g', target: {} })).runId, 'run_new2');
+    // an existing run (idempotent start by id) was admitted when it was created: no re-check
+    rolledBack = true;
+    await governed.startRun({ goal: 'g', target: {}, runId: 'run_live' });
+    assert.deepEqual([created, rechecked], [['run_new1', 'run_new2', 'run_live'], ['run_new1', 'run_new2']]);
+  });
+
+  test('beforeDrive: every loop start (recover) and every operator resume re-checks the run first; fails closed', async () => {
+    const calls: string[] = [];
+    const local = new Map<string, TestRun>([
+      ['run_escaped', { runId: 'run_escaped', status: 'paused', pauseReason: 'operator', runtimeManifestId: 'rm_this' } as TestRun],
+      ['run_ok', { runId: 'run_ok', status: 'paused', pauseReason: 'operator', runtimeManifestId: 'rm_this' } as TestRun],
+    ]);
+    const control = {
+      deps: {} as ControlPlane['deps'],
+      async recover(runId: string) {
+        calls.push(`recover ${runId}`);
+        return { reconciled: 0, requeued: [] };
+      },
+      async resumeRun(runId: string) {
+        calls.push(`resumeRun ${runId}`);
+      },
+    } as unknown as ControlPlane;
+    const options = { manifestId: 'rm_this', requireActive: false, newRunId: () => 'run_x', getRun: async (id: string) => local.get(id), registry: { admit: async () => ({ allowed: true, mode: 'unmanaged' }) as const } };
+    const governed = releaseGovernedControlPlane(control, {
+      ...options,
+      // run_escaped belongs to a rolled-back release but escaped the rollback's sweep: the re-check quarantines it
+      beforeDrive: async (runId) => {
+        calls.push(`check ${runId}`);
+        if (runId !== 'run_escaped') return false;
+        local.set(runId, { ...local.get(runId)!, pauseReason: 'quarantined' });
+        return true;
+      },
+    });
+    assert.deepEqual(await governed.recover('run_ok'), { reconciled: 0, requeued: [] });
+    assert.deepEqual(calls, ['check run_ok', 'recover run_ok'], 'the re-check precedes the loop\'s recover');
+    calls.length = 0;
+    await assert.rejects(governed.resumeRun('run_escaped'), (e: unknown) => isHypertestError(e, 'precondition_failed') && /is quarantined/.test((e as Error).message));
+    await governed.resumeRun('run_ok');
+    assert.deepEqual(calls, ['check run_escaped', 'check run_ok', 'resumeRun run_ok', 'check run_ok'], 'the escaped run is not resumed; a resumed run is re-checked after the resume');
+    // a re-check that cannot be made fails closed: nothing is recovered or resumed (the durable loop retries `unavailable`)
+    const failing = releaseGovernedControlPlane(control, {
+      ...options,
+      beforeDrive: async () => {
+        throw new HypertestError('unavailable', 'the store is down');
+      },
+    });
+    calls.length = 0;
+    await assert.rejects(failing.recover('run_ok'), (e: unknown) => isHypertestError(e, 'unavailable'));
+    await assert.rejects(failing.resumeRun('run_ok'), (e: unknown) => isHypertestError(e, 'unavailable'));
+    assert.deepEqual(calls, []);
+  });
+
+  test('beforeDrive: a rollback whose sweep quarantined the run between the resume check and the resume is not undone by the resume', async () => {
+    const local = new Map<string, TestRun>([['run_r', { runId: 'run_r', status: 'paused', pauseReason: 'operator', runtimeManifestId: 'rm_this' } as TestRun]]);
+    let rolledBack = false;
+    const calls: string[] = [];
+    const control = {
+      deps: {} as ControlPlane['deps'],
+      // the rollback commits (its sweep quarantines the run) just before the control plane's resume flips it to running
+      async resumeRun(runId: string) {
+        rolledBack = true;
+        calls.push(`resumeRun ${runId}`);
+        local.set(runId, { ...local.get(runId)!, status: 'running', pauseReason: undefined } as unknown as TestRun);
+      },
+    } as unknown as ControlPlane;
+    const governed = releaseGovernedControlPlane(control, {
+      manifestId: 'rm_this', requireActive: false, newRunId: () => 'run_x', getRun: async (id) => local.get(id),
+      registry: { admit: async () => ({ allowed: true, mode: 'unmanaged' }) },
+      beforeDrive: async (runId) => {
+        calls.push(`check ${runId}`);
+        const cur = local.get(runId)!;
+        if (!rolledBack || cur.status !== 'running') return false;
+        local.set(runId, { ...cur, status: 'paused', pauseReason: 'quarantined' });
+        return true;
+      },
+    });
+    await assert.rejects(governed.resumeRun('run_r'), (e: unknown) => {
+      assert.ok(isHypertestError(e, 'precondition_failed'), String(e));
+      assert.match((e as Error).message, /^run run_r is quarantined: the runtime release it is pinned to \(rm_this\) was rolled back/);
+      return true;
+    });
+    assert.deepEqual(calls, ['check run_r', 'resumeRun run_r', 'check run_r']);
+    assert.deepEqual([local.get('run_r')!.status, local.get('run_r')!.pauseReason], ['paused', 'quarantined'], 'quarantined again, not left running');
+  });
+
   test('resumeRun refuses quarantined runs and migration checkpoints; other pauses pass', async () => {
     const { control, calls } = fake();
     const governed = releaseGovernedControlPlane(control, { manifestId: 'rm_this', requireActive: false, newRunId: () => 'run_x', getRun: async (id) => runs.get(id), registry: { admit: async () => ({ allowed: true, mode: 'unmanaged' }) } });
@@ -204,5 +319,10 @@ describe('runtime release notes in the report', () => {
     assert.deepEqual((done.json as { runtimeRelease: { quarantined: boolean; notes: unknown[] } }).runtimeRelease.quarantined, false);
     const untouched = report();
     assert.equal(withRuntimeReleaseNotes(untouched, undefined, []), untouched, 'no notes: the report is returned as is');
+  });
+
+  test('a released migration checkpoint is a note too', () => {
+    const notes = runtimeReleaseNotes([ev('run.migration_released', { runId: 'run_1', manifestId: 'rm_old', by: 'human:alice', reason: 'the migrating process died' }, '2026-01-01T00:00:04.000Z')]);
+    assert.deepEqual(notes, [{ at: '2026-01-01T00:00:04.000Z', detail: 'abandoned runtime migration: its checkpoint was released by human:alice (the migrating process died); the run continued on rm_old' }]);
   });
 });

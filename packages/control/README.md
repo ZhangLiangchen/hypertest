@@ -28,7 +28,7 @@ and `agents` (implemented packages; their real behaviour is relied on). The bind
 | `createToolDispatcher`, `createContextProvider`, `condenserSummarizer`, `agentHeader`/`parseAgentHeader`, `unifiedDiff`, `WorkFactory`, `ControlStore` | Building blocks of the EngineHost and the stores (exported for reuse/tests). |
 | `classifyDrift`, `quarantineLifted`, `diffSections`, `invertSection`, `sectionPaths` | Post-execution test-change governance of execution tools (see ToolDispatcher). |
 | `tightenModelPolicy(role, item)` | The effective model policy of a work item's agent: the role's policy tightened, never weakened, by the item's. |
-| `declaredExperimentIds`, `runExperimentIds`, `heldClaims`, `experimentClaimsProblem`, `syncExperimentClaims`, `releaseRunIsolation`, `settleExternalQps`, `qpsKey`, `onToolBudgetExhausted`, `experimentIsolation`, `defaultStopConditions`, `defaultContaminationRules`, `EXPERIMENT_GUARDED_EFFECTS`, `EXPERIMENT_EXEMPT_TOOLS`, `FAULT_TOOLS`, `QPS_KEY_PREFIX` | Unit B2: experiment isolation (conformance-6) and budget leases (conformance-5) — see "Experiments and budget leases". |
+| `declaredExperimentIds`, `runExperimentIds`, `heldClaims`, `experimentClaimsProblem`, `experimentResourceProblem`, `experimentEffectsRunning`, `resourceAliases`, `syncExperimentClaims`, `releaseRunIsolation`, `releaseStrandedReservations`, `settleExternalQps`, `qpsKey`, `qpsInvocationId`, `qpsJobMayRun`, `onToolBudgetExhausted`, `experimentIsolation`, `defaultStopConditions`, `defaultContaminationRules`, `EXPERIMENT_GUARDED_EFFECTS`, `EXPERIMENT_EXEMPT_TOOLS`, `EXPERIMENT_COVERED_PREFIXES`, `FAULT_TOOLS`, `QPS_KEY_PREFIX`, `QPS_REASON_PREFIX` | Unit B2: experiment isolation (conformance-6) and budget leases (conformance-5) — see "Experiments and budget leases". |
 | constants | `REACTOR_CONSUMER` (`reactors`), `REACTOR_SUBJECTS` (`ht.*.>`), `FEEDBACK_CRITERIA` (C3, C4, C6, C8), `MAX_GATE_ATTEMPTS` (2), `PRODUCER_ROLES`, `GOVERNED_TOOL_IDS`, `QUARANTINE_BLOCKED_TOOL_IDS`, `TERMINAL_TOOL_IDS`, `CONFIRMING_ROLES`, `RESOLVING_FINDING_STATUSES`, `DEFAULT_TURN_LIMITS`. |
 
 `ControlConfig`: `capabilitySecret`, `runtimeManifest`, `workerId`, `defaultEngineKind`, `leaseTtlMs` (60000),
@@ -214,9 +214,22 @@ snapshot per turn (`snapshotBuilder.build` with the model epoch and the target e
 FIRST line is `[hypertest role=<role> work_item=<id> kind=<kind> run=<runId>]` followed by the role prompt with the
 prepared BUGate protocol context; sections Task (required), Plan & objectives (lead, reviewer), Blackboard digest +
 full input records, Relevant code (analysis/design roles, `retrieverFactory(root)`), Approved experience, Evidence
-of this item, Oracles; the L2 view (`maxInlineContextTokens` or route window × 0.6); hard pressure ⇒ LLM condenser
-(role `condenser` through the router; deterministic summarizer on any failure) ⇒ `sessions.addCompaction` ⇒
-`context.compacted`.
+of this item, Oracles; the L2 view (`maxInlineContextTokens` or route window × 0.6). **HARD** pressure ⇒ mandatory
+condensation: LLM condenser (role `condenser` through the router; deterministic summarizer on any failure) ⇒
+`sessions.addCompaction` ⇒ `context.compacted` (with its level). **SOFT** pressure ⇒ deferrable condensation, only when
+`softCondensationDue` (≥ keepRecentTurns + 2 turns since the last cut) and only through the LLM condenser
+(`condenserSummarizer(…, { fallback: false })`) within `SOFT_CONDENSE_TIMEOUT_MS` (60 s): any failure (no route, a failed
+or empty answer, nothing to condense, the deadline) defers it — the turn goes on — and records
+`context.condensation_deferred` `{sessionId, turn, retryTurn, reason}` on L0; the session's next soft attempt waits
+until `retryTurn` = turn + keepRecentTurns + 2 (the back-off is read from L0 because the provider is rebuilt every turn).
+The turn's snapshot **read set** (`observedReadSet` + the agent's observations): every registered environment, the
+lineage head of each input record (`finding` for findings), the live side-effect leases of in-flight operations the
+current claim owns, and — through the app's observing ToolRuntime and the snapshot builder's `observer` — what the agent
+observed through its tool calls (files read or written, blackboard records read or posted, one metric window per
+target, environments it addressed; context README). Findings and environments are always re-checked, so after another
+agent supersedes an observed finding or redeploys an observed environment every mutating action of the agent is
+`stale_context` until it observes that resource again (`blackboard.read {lineageId}` or a list query refreshes a
+finding pin; `{recordId: <lineageId>}` returns the lineage's first version).
 
 **ToolDispatcher** — refuses tools outside the agent's definitions/deny list; refuses every call once the work item
 was reassigned or ended (claim token ≠ the host's, item not claimed/running, or `checkFence` fails ⇒ `tool.denied`
@@ -331,12 +344,16 @@ needs a `fault_exclusive` claim, a workload a write/fault claim, `shared_readonl
 with holder = experimentId (compatible with the defining work item's own claims): a conflict refuses the experiment
 (`resource_conflict`, structured `{ admitted: false, holders, conflicts }`, `admission.refused` aggregate `experiment`)
 — it is NOT created (no spec, no `experiment.defined`, not on the run). Admitted ⇒ `admission.granted` (aggregate
-`experiment`); a save that fails releases the claims. A replayed call returns the recorded experiment.
+`experiment`, a deterministic event id: recorded once); a save that fails releases the claims (unless the experiment
+exists after all: a save that failed after its commit, or cannot be checked — then they are kept). Once the experiment is
+saved it keeps its claims whatever fails afterwards (they follow its owners); a replayed call returns the recorded
+experiment and completes what the failed call left undone (the run's `experimentIds`, `admission.granted`).
 
 **Claims follow their owners** — the owners of an experiment are the work item that defined it and every work item of
 the run that declares it (`inputRefs` kind `experiment`). Every tick (`Scheduler.syncIsolation`, before admission)
-renews the claims (TTL `leaseTtlMs`; compatible with the owners' own claims) while an owner is not terminal, and
-releases them once none is (`admission.released`, reason `owners_ended`) or the run ended (`run_ended`: the gate's
+renews the claims (TTL `leaseTtlMs`; compatible with the owners' own claims) while an owner is not terminal — or an
+operation recorded for the experiment may still act (`experimentEffectsRunning`: e.g. its load job outlives the item
+that started it; an unreadable ledger counts as running) — and releases them once none is (`admission.released`, reason `owners_ended`) or the run ended (`run_ended`: the gate's
 final tick, `cancelRun`, and every later tick of a finished run — idempotent). A renewal refused by another holder is
 recorded once per conflict set (`admission.lapsed`, aggregate `experiment`, phase `experiment_renewal`). A paused run
 is not ticked: its claims lapse after the TTL and are re-admitted (if still free) when it resumes. Work-item
@@ -348,26 +365,43 @@ shares nothing.
 defined by its agent). A call whose effect is `external` or `destructive` (http non-GET, load.start, env.*, browser
 clicks, MCP) is refused `experiment_claims_missing` (a `tool.denied`, never executed) when an experiment is unknown to
 the run, holds no write/fault claim (`env.inject_fault` needs `fault_exclusive`), or its claims are not all held right
-now (lapsed, released, taken). `load.stop` is exempt (it only ends an effect). When the item runs for exactly one
-experiment of its run, every call names it (`ToolExecutionRequest.experimentId`): its evidence carries
-`provenance.experimentId` and its operations `experimentId`, so the gate can judge experiment validity.
+now (lapsed, released, taken). Held claims license a write/fault call only on what they claim: every SUT resource of
+the call (`env/…`, `url/…` keys, `EXPERIMENT_COVERED_PREFIXES`) must be covered by a claim of one of the item's
+experiments (same key or an ancestor; `fault_exclusive` for a fault tool, else `write_exclusive`/`fault_exclusive`),
+else `experiment_claims_missing` — a claim on `service/payment` does not license `env.inject_fault` on `env/svc`. A
+`url/<host>` resource also names every registered environment one of whose URLs has that host (`resourceAliases`):
+covered by a claim on that environment, and conflicting with one (no alias bypass).
+And no work item — one running for an experiment or not — writes to or faults a resource a live claim of ANOTHER
+experiment overlaps (any mode, any run): `experiment_resource_conflict`, naming the holder (the recorded contamination
+rule, enforced; checked against the live claims at call time — `experimentResourceProblem`). `load.stop` is exempt (it
+only ends an effect). When the item runs for exactly one experiment of its run, every call names it
+(`ToolExecutionRequest.experimentId`); an item running for several names, on a write/fault call, the one experiment
+whose claims cover it. Its evidence carries `provenance.experimentId` and its operations `experimentId`, so the gate
+can judge experiment validity.
 
 **Budget leases (conformance-5)** — the run scope carries `computeMs` (`maxComputeMinutes` × 60000), `artifactBytes`
 (`maxArtifactBytes`) and `externalQps` (`maxExternalQps`). Before a non-terminal call the dispatcher reads the headroom
 (`BudgetLedger.remaining`): an `execute` tool with no compute left is refused `budget_exhausted` before it runs (else
-its timeout is capped at the compute left); the call's artifact puts are bounded by `limits.maxArtifactBytes`. After
+its timeout is capped at the compute left); the call's artifact puts are bounded by `limits.maxArtifactBytes`, and
+with no artifact headroom left a write/fault call (effect `external`/`destructive`, except `load.stop`) is refused
+`budget_exhausted` before it acts (its evidence could not be stored: an unevidenced side effect and a retry of it). After
 the call, its metered usage (`ToolExecutionResult.usage`: sandbox wall time, distinct stored bytes) is recorded on
 `work:<id>` and the run (`BudgetLedger.consume`: in full, never refused). An exhaustion — recorded, pre-checked, or a
 refused put — is typed: `budget.exhausted` `{ scope, dimension, limit, used, reserved, requested, reason:
 compute | artifact_bytes | external_qps, toolId, invocationId }` and a note to the model; a RUN-scope exhaustion pauses
 the run under `onBudgetExhausted: 'pause'`, and under `'gate'` the convergence monitor reports `budget` (it now checks
 `computeMs` and `artifactBytes` too): pending work is cancelled, the gate decides — never a silent downgrade.
-`load.start` reserves its `ratePerSecond` as `externalQps` (key `qps:<invocationId>`, idempotent for replays) against
+`load.start` reserves its `ratePerSecond` as `externalQps` (key `qps:<invocationId>`, reason `load:<invocationId>`,
+idempotent for replays — a replay whose reservation was already given back reserves again under `qpsKey(id, n)`, so a
+job never runs on a released rate) against
 the run's `maxExternalQps` across all concurrent jobs: a job that does not fit is refused `external_qps_exhausted`
 (transient: never exhausts the run). The rate is released when the call started no job (not applied, denied, failed
 without an operation), when `load.stop` verified the stop, when `load.observe` or the tick's sweep finds the job's
 operation settled (verified / failed / not_applied / compensated), when its work item ended without a job, and when
-the run ends; an operation in `manual_review` keeps it (the job may run).
+the run ends; an operation in `manual_review` keeps it (the job may run). A call that throws keeps the rate while its
+job may run (`qpsJobMayRun`: an operation recorded and not ended, or the ledger unreadable). `recover()` releases the open reservations of
+a claim taken from a dead worker (durability-1) EXCEPT these QPS reservations (`releaseStrandedReservations`): the
+external job outlives its worker (recovery re-attaches it), so its rate stays reserved until the job ends.
 
 ## Invariants and where they are proven
 
@@ -400,8 +434,9 @@ the run ends; an operation in `manual_review` keeps it (the job may run).
 | Evidence-first domain tools (unevidenced defects, unknown evidence, role-gated confirm, completion evidence requirements) | `test/worker.test.ts` |
 | Plan IR validation (each issue), plan acceptance with mapped dependencies, rejected plans create nothing | `test/plan-validator.test.ts`, `test/worker.test.ts` |
 | Durable idempotency (`expectedTurn`), single run-lease owner under concurrent ticks | `test/context.test.ts`, `test/postgres.int.test.ts` |
-| conformance-6 (chaos: two fault experiments compete): admission rejects the second (not created, holder named, audited); a different service is admitted; recorded environment/fixtures/seed/stop/contamination/default claims; replay admits once; insufficient isolation refused; write/fault tools refused while claims are lapsed/taken/released or the experiment is read-only / unknown / foreign, reads and load.stop still run, calls name the experiment; claims renewed/re-admitted while an owner lives, lapse recorded once, released when owners end or the run ends; same-run items share claims, foreign items do not | `test/isolation-budget.test.ts` |
-| conformance-5: run scope limits; real sandbox metering charged to work + run; compute headroom caps / refuses execute tools, recorded in full, convergence `budget`; artifact headroom passed as limits, exhaustion recorded; pause policy pauses the run; externalQps reserved across concurrent jobs (typed refusal, transient), released on settle / stop / not-applied / observe / run end | `test/isolation-budget.test.ts` |
+| Observed read set through the dispatcher: a file another agent changed after the read ⇒ `stale_context` until re-read; `git.show` of the committed version never refreshes the pin; input findings and owned leases pinned; SOFT condensation through the LLM condenser only, deferred on failure with the L0-recorded back-off, HARD still mandatory | `test/context-readset.test.ts` |
+| conformance-6 (chaos: two fault experiments compete): admission rejects the second (not created, holder named, audited) — also when both are defined concurrently (exactly one holder); a different service is admitted; recorded environment/fixtures/seed/stop/contamination/default claims; replay admits once; insufficient isolation refused; write/fault tools refused while claims are lapsed/taken/released or the experiment is read-only / unknown / foreign, reads and load.stop still run, calls name the experiment; claims renewed/re-admitted while an owner lives, lapse recorded once, released when owners end or the run ends; same-run items share claims, foreign items do not; (review B2) a write/fault call outside the experiment's claims (another environment, a bare URL, an abstract-service claim for an environment fault) is refused and a covered one is attributed to its covering experiment; a write/fault call on a resource another experiment holds is refused for every work item (also one running for no experiment), reads still run; a failure after the experiment was saved keeps its claims and the replay records it on the run; the claims outlive the owners while the experiment's load job runs (a competing experiment stays refused) and are released when it ends | `test/isolation-budget.test.ts` |
+| conformance-5: run scope limits; real sandbox metering charged to work + run; compute headroom caps / refuses execute tools, recorded in full, convergence `budget`; artifact headroom passed as limits, exhaustion recorded; pause policy pauses the run; externalQps reserved across concurrent jobs (typed refusal, transient), released on settle / stop / not-applied / observe / run end; recovery from a dead worker keeps a running job's QPS reservation (a job over the cap stays refused) while releasing its stranded model reservations; (review B2) an execution that throws after its job was dispatched keeps the job's rate, and a replayed load.start whose reservation was already given back reserves again (never a job on a released rate); a spent artifact budget refuses write/fault calls before they act (reads and load.stop still run) | `test/isolation-budget.test.ts` |
 | Full product loop: plan v1 (parallel analysts) → drain replan v2 (executor, real node:test in a git repo) → finding → RCA + TestDesigner via reactors → v3 readyForGate → verdict fail; report | `test/control.e2e.test.ts` |
 
 ## How to run
@@ -495,6 +530,13 @@ observeWaiting). `test/fixture.ts` is a git repo with a seeded pricing regressio
   `addressesEnvironments`, `ENVIRONMENT_FREE_NAMESPACES`, `authorizedGateWeakenings`, `gateReference`,
   `GATE_AUTHORITY_KINDS`, `GateAuthorityJudgement`.
 
+- (context engine completion, additive) `condenserSummarizer(deps, input, options?: { fallback?: boolean })`:
+  `fallback: false` throws instead of falling back to the deterministic summarizer (SOFT condensation defers).
+  `src/context-provider.ts` exports `SOFT_CONDENSE_TIMEOUT_MS` (60 000) and `SOFT_CONDENSATION_DEFERRED`
+  (`context.condensation_deferred`, aggregate `context`/sessionId; a new L0 event string, not in the domain catalog);
+  neither is re-exported from `src/index.ts` yet. **Behaviour:** SOFT pressure now condenses (LLM condenser only,
+  deferrable with a back-off of keepRecentTurns + 2 turns); the ContextProvider's read set also pins the live
+  side-effect leases the claim owns, and the snapshot builder adds the agent's recorded observations (`observer`).
 - (unit B2, conformance-5/6) Optional `Scheduler.syncIsolation?(run, items)` and `Scheduler.releaseRun?(runId)`; new
   module `isolation.ts` (exports in the API table); `experiment.define` input gains `fixtures`, `randomSeeds`,
   `stopConditions`, `contaminationRules` and returns `isolation`, `fixtures`, `randomSeeds`, `stopConditions`,
@@ -503,7 +545,17 @@ observeWaiting). `test/fixture.ts` is a git repo with a seeded pricing regressio
   item running for an experiment are refused `experiment_claims_missing` unless its claims are held; calls name their
   experiment; the run scope gets `computeMs` / `artifactBytes` / `externalQps` limits from the budget envelope and tool
   usage is charged; `load.start` reserves QPS (`external_qps_exhausted`); convergence exhaustion includes `computeMs`
-  and `artifactBytes`; run end releases experiment claims and QPS reservations. New L0 event strings (not in the domain
+  and `artifactBytes`; run end releases experiment claims and QPS reservations; `recover()` keeps the QPS reservations
+  of a dead worker's still-running load jobs (it releases only its other open reservations). (review B2) Write/fault
+  calls are also refused outside the experiment's claims (`experiment_claims_missing`) and, for every work item, on
+  resources another experiment holds (new tool-denial code `experiment_resource_conflict`); a replayed load.start whose
+  QPS reservation was given back re-reserves under `qpsKey(invocationId, n)` (QPS reservations carry the reason
+  `load:<invocationId>`); a throwing load.start keeps its rate while its job may run; `experiment.define` keeps a saved
+  experiment's claims when a later step fails (the replay completes it; `admission.granted` has a deterministic id);
+  with the artifact budget spent, write/fault calls are refused `budget_exhausted` before they act.
+  Experiment claims are kept while an operation of the experiment may still act (a running load job), not only while
+  an owner work item lives. New exports: `experimentResourceProblem`, `experimentEffectsRunning`, `resourceAliases`, `qpsInvocationId`, `qpsJobMayRun`, `EXPERIMENT_COVERED_PREFIXES`,
+  `QPS_REASON_PREFIX`. New L0 event strings (not in the domain
   catalog): `admission.released`; `admission.granted|refused|lapsed` are also emitted with aggregate `experiment`.
   No change to `src/contracts.ts`.
 

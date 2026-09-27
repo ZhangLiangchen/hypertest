@@ -361,3 +361,153 @@ export function timeToFirstEvidenceMs(events: readonly DomainEvent<unknown>[]): 
   if (!created || !first) return undefined;
   return Math.max(0, Date.parse(first.occurredAt) - Date.parse(created.occurredAt));
 }
+
+// ------------------------------------------------------------------------------------------------ (additive) freshness
+
+/** Tool effects that are not validated for freshness (everything else mutates). */
+const NON_MUTATING_EFFECTS: ReadonlySet<string> = new Set(['read', 'record']);
+
+export interface StalenessAnalysis {
+  /** Verified environment generation changes (env.* operations whose result names the new generation), per environment. */
+  bumps: Record<string, Array<{ seq: number; generation: number }>>;
+  /** context.stale_rejected events: the FreshnessGuard refused a mutating action. */
+  rejections: number;
+  /**
+   * Rejections whose stale environment entry is really behind: the environment's generation at the rejection is above the
+   * generation the agent had observed (the world moved between the observation and the action).
+   */
+  movedWorldRejections: Array<{ seq: number; agentId?: string; environmentId: string; observed: number; current: number }>;
+  /**
+   * EXECUTED mutating calls addressing an environment whose generation changed after the calling agent's latest
+   * observation of it (recomputed from L0 and the ledger, independently of the FreshnessGuard): stale mutations.
+   */
+  staleMutations: string[];
+  /** Executed mutating calls on environments that could be checked (an earlier observation by the agent exists). */
+  checkedMutations: number;
+  /** After a moved-world rejection, the same agent re-observed the environment at its current generation (refresh). */
+  refreshed: Array<{ agentId: string; environmentId: string; generation: number }>;
+}
+
+function envOfResources(resources: unknown): string[] {
+  return Array.isArray(resources) ? resources.filter((r): r is string => typeof r === 'string' && r.startsWith('env/')).map((r) => r.slice('env/'.length).split('/')[0]!) : [];
+}
+
+function generationOf(version: unknown): number | undefined {
+  if (typeof version !== 'string') return undefined;
+  const n = Number(version.split(':')[0]);
+  return Number.isSafeInteger(n) ? n : undefined;
+}
+
+/**
+ * Environment staleness of a trial, recomputed from L0 + the operation ledger: the generation timeline of every
+ * environment (verified env.* operations), each agent's latest observation of it (any successful tool call addressing
+ * `env/<id>`, at the generation current then), the mutating calls that executed and whether the agent's view was behind.
+ */
+export function analyzeStaleness(data: Pick<TrialData, 'events' | 'operations'>): StalenessAnalysis {
+  const ops = new Map(data.operations.map((o) => [o.operationId, o]));
+  const bumpsOf = new Map<string, Array<{ seq: number; generation: number }>>();
+  for (const e of data.events) {
+    const p = payload(e);
+    if (!e.eventType.startsWith('operation.') || p['to'] !== 'verified') continue;
+    const op = ops.get(str(p['operationId']) ?? e.aggregateId);
+    const key = op?.target?.resourceKey;
+    const gen = (op?.result as { generation?: unknown } | undefined)?.generation;
+    if (!op || !op.operationType.startsWith('env.') || typeof key !== 'string' || !key.startsWith('env/') || typeof gen !== 'number') continue;
+    const env = key.slice('env/'.length);
+    if (!bumpsOf.has(env)) bumpsOf.set(env, []);
+    bumpsOf.get(env)!.push({ seq: e.seq ?? 0, generation: gen });
+  }
+  /** The generation of `env` right before `seq` (undefined when it never changed during the run). */
+  const genAt = (env: string, seq: number): number | undefined => {
+    const bumps = bumpsOf.get(env);
+    if (!bumps || bumps.length === 0) return undefined;
+    let g = bumps[0]!.generation - 1;
+    for (const b of bumps) if (b.seq < seq) g = Math.max(g, b.generation);
+    return g;
+  };
+  const calls = new Map<string, { agentId: string; envs: string[]; mutating: boolean; staleAt?: boolean }>();
+  const observed = new Map<string, number>(); // agent + env → generation observed
+  const staleMutations: string[] = [];
+  let checkedMutations = 0;
+  const moved: StalenessAnalysis['movedWorldRejections'] = [];
+  const refreshed: StalenessAnalysis['refreshed'] = [];
+  const awaitingRefresh = new Map<string, { agentId: string; environmentId: string; generation: number }>();
+  let rejections = 0;
+  const key = (agentId: string, env: string) => `${agentId}\u0000${env}`;
+  for (const e of data.events) {
+    const p = payload(e);
+    const seq = e.seq ?? 0;
+    if (e.eventType === 'tool.called') {
+      const inv = str(p['invocationId']) ?? e.aggregateId;
+      const agentId = e.agentId ?? '';
+      const envs = envOfResources(p['resources']);
+      const call: { agentId: string; envs: string[]; mutating: boolean; staleAt?: boolean } = { agentId, envs, mutating: !NON_MUTATING_EFFECTS.has(String(p['effect'] ?? 'read')) };
+      if (call.mutating) {
+        // the agent's view of each environment it acts on, against the environment's generation at the call
+        const views = envs.map((env) => ({ obs: observed.get(key(agentId, env)), now: genAt(env, seq) })).filter((v): v is { obs: number; now: number } => v.obs !== undefined && v.now !== undefined);
+        if (views.length > 0) call.staleAt = views.some((v) => v.obs < v.now);
+      }
+      calls.set(inv, call);
+    } else if (e.eventType === 'tool.completed') {
+      const inv = str(p['invocationId']) ?? e.aggregateId;
+      const c = calls.get(inv);
+      if (!c || p['status'] !== 'success') continue;
+      if (c.mutating && c.staleAt !== undefined) {
+        checkedMutations++;
+        if (c.staleAt) staleMutations.push(inv);
+      }
+      for (const env of c.envs) {
+        const g = genAt(env, seq);
+        if (g === undefined) continue;
+        observed.set(key(c.agentId, env), g);
+        const waiting = awaitingRefresh.get(key(c.agentId, env));
+        if (waiting && g >= waiting.generation) {
+          refreshed.push({ agentId: c.agentId, environmentId: env, generation: g });
+          awaitingRefresh.delete(key(c.agentId, env));
+        }
+      }
+    } else if (e.eventType === 'context.stale_rejected') {
+      rejections++;
+      const stale = Array.isArray(p['stale']) ? (p['stale'] as Array<Record<string, unknown>>) : [];
+      for (const s of stale) {
+        const env = s['resourceId'];
+        if (s['resourceType'] !== 'environment' || typeof env !== 'string') continue;
+        const observedGen = generationOf(s['observedVersion']);
+        const current = genAt(env, seq);
+        if (observedGen === undefined || current === undefined || !(observedGen < current)) continue;
+        const r: StalenessAnalysis['movedWorldRejections'][number] = { seq, environmentId: env, observed: observedGen, current };
+        if (e.agentId) {
+          r.agentId = e.agentId;
+          awaitingRefresh.set(key(e.agentId, env), { agentId: e.agentId, environmentId: env, generation: current });
+        }
+        moved.push(r);
+      }
+    }
+  }
+  return { bumps: Object.fromEntries(bumpsOf), rejections, movedWorldRejections: moved, staleMutations, checkedMutations, refreshed };
+}
+
+// ------------------------------------------------------------------------------------------------ (additive) test sensitivity
+
+export interface SensitivityAnalysis {
+  /** mutation-result evidence of the run: killed / total mutants each. */
+  mutationRuns: Array<{ evidenceId: string; killed: number; total: number }>;
+  /** Σ killed / Σ total over the run's mutation results (undefined without any). */
+  mutationScore?: number;
+}
+
+/** Mutation testing of the run's tests (oracle sensitivity: how many seeded mutants the tests detect). */
+export function analyzeSensitivity(data: Pick<TrialData, 'evidence'>): SensitivityAnalysis {
+  const runs = data.evidence
+    .filter((e) => e.evidenceType === 'mutation-result')
+    .map((e) => {
+      const s = (e.structured ?? {}) as { killed?: unknown; total?: unknown; survived?: unknown; mutants?: unknown };
+      const killed = typeof s.killed === 'number' ? s.killed : 0;
+      const total = typeof s.total === 'number' ? s.total : Array.isArray(s.mutants) ? s.mutants.length : killed + (typeof s.survived === 'number' ? s.survived : 0);
+      return { evidenceId: e.evidenceId, killed, total };
+    });
+  const total = runs.reduce((s, r) => s + r.total, 0);
+  const out: SensitivityAnalysis = { mutationRuns: runs };
+  if (total > 0) out.mutationScore = runs.reduce((s, r) => s + r.killed, 0) / total;
+  return out;
+}

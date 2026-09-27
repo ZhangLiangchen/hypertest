@@ -91,10 +91,17 @@ generation registry** (`<dataDir>/state/environments.json`); operation ledger, l
 `OpaPolicyEngine` when `policy.opa` is set, both verifying capability HMACs; decision log; approvals; oracle
 governance over the spec store (no `events`: the store emits `oracle.change_*`) with the recorded-failure flip
 detector (every finding revision + the run's recorded test results); QualityGate; BUGate binding; provider registry, catalog, router; snapshot store/builder, resolvers
-(`environment`, `oracle`, `experiment`, `record`, `lease`; control adds `finding`), freshness guard, experience memory
-(SQL or PowerContext), provenance, working context, per-root retrievers (symbol index + single-line exact search);
-workspace manager (`<dataDir>/workspaces`), local/OCI sandbox, tool registry (built-in tools with `stateDir`, then the
-control domain tools), tool runtime; sessions, agents, epochs, `EngineRegistry` (native + pi), subagents, runner;
+(`environment`, `oracle`, `experiment`, `record`, `lease`, and `file` for the workspaces this process opened; control
+adds `finding`), the observation log (`ht_context_observations`), freshness guard, experience memory (SQL or
+PowerContext), provenance (`services.provenance`), working context, per-root L3 retrievers (symbol graph + single-line
+exact search + a workspace vector retriever, RRF-fused; vector corpora built lazily per root and commit, at most 8 per
+process, stored in pgvector when the store has the extension — probed once — else in memory; `HashEmbedder`
+feature-hashing embeddings, no provider embedding route); workspace manager (`<dataDir>/workspaces`), local/OCI
+sandbox, tool registry (built-in tools with `stateDir`, then the control domain tools), tool runtime wrapped by
+`observeToolRuntime` (every tool result feeds the observation log before it returns; a read — `fs.read`, `git.show`,
+`blackboard.read`, `metrics.query`, `metrics.scrape` — whose observation cannot be recorded is returned
+`failed`/`unavailable` with its output withheld); sessions, agents, epochs, `EngineRegistry` (native + pi; + dsh when
+`engines.default: dsh`), subagents, runner;
 roles; the **RuntimeManifest**; control plane wrapped by `pinnedControlPlane` (I11, below) and
 `releaseGovernedControlPlane` (runtime release admission, below; its router has the condenser privacy floor); the
 runtime release service (`ht.releases`); durable runtime (`LocalDurableRuntime` or `TemporalDurableRuntime`, with
@@ -105,9 +112,11 @@ Runs are **not** resumed automatically — call `resumeIncomplete()` (`hypertest
 (`git rev-parse HEAD` of the installation when it is the top level of a git checkout — never a parent repository's
 commit; absent otherwise) and `imageDigest` (`HYPERTEST_IMAGE_DIGEST` of the composition environment, `sha256:<64 hex>`;
 a malformed value fails the composition before anything is created); `agentEngines` (`native` = @hypertest/runtime
-version, `pi` = pi-agent-core version, each with its `adapter` package/version — `@hypertest/runtime-pi` for pi);
+version, `pi` = pi-agent-core version, `dsh` (only when it is the default engine) = the pinned dsh-agent version, each
+with its `adapter` package/version — `@hypertest/runtime-pi` for pi, `@hypertest/runtime-dsh` for dsh);
 `defaultEngine`; `providerAdapters` (every model provider + `engine:native` @hypertest/runtime, `engine:pi`
-@hypertest/runtime-pi and @earendil-works/pi-agent-core); `modelCatalogRevision`; `schemas` (last migration id of
+@hypertest/runtime-pi and @earendil-works/pi-agent-core, `engine:dsh` @hypertest/runtime-dsh and every pinned
+`@deepseek-ai` package of the DSH train); `modelCatalogRevision`; `schemas` (last migration id of
 collab/context/operation/evidence; `tools/1`); `policyBundleRevision` (`<policy revision>+roles:<role catalog
 revision>`); `roleCatalogRevision`; `toolCatalogRevision` (`toolCatalogRevision(tools, adapters)` of @hypertest/runtime:
 built-in + domain tools with their timeouts and side-effect bindings, and the side-effect adapters' capabilities);
@@ -124,15 +133,36 @@ once no live run is pinned to it (`list` and `promote` retire drained releases).
 back (or stops a canary/shadow/candidate), leaves old runs on their pinned manifest, and — in the same transaction —
 quarantines every live run of the rolled-back release: paused with `pauseReason: quarantined` (converging/gating runs
 through `running`, the only legal path) and `run.quarantined` on L0 with its previous status; `resumeRun` of a
-quarantined (or `migrating`) run is refused. `migrate(runId, { to, by, reason, checkpointTimeoutMs?, drive? })` is the
-only way a live run changes runtime: checkpoint (pause `migrating` a running run and wait until no work item holds a live
-claim), canonical ContextSnapshot, operation reconciliation (refused while any operation of the run is unsettled —
+quarantined (or `migrating`) run is refused. Admission and creation are not one transaction, so the creator re-checks a
+run it just admitted (`afterCreate` → `releases.quarantineIfRolledBack`): a run admitted before a rollback committed but
+created after the rollback's sweep is quarantined with that rollback's actor, reason and transition, and its start fails
+`precondition_failed` (`details.quarantined: true`) — either the sweep sees the run or the re-check sees the rollback.
+A quarantine reads and changes the run under the run's lock, so concurrent quarantines of one run (a sweep racing a
+re-check) pause it once and record one `run.quarantined`. Should the creator die (or its re-check fail) between the
+creation and the re-check, the run is quarantined before anything drives it: the governed control plane re-checks a run
+before `recover` — the first step of every durable loop (a start, a migration's drive, a Temporal workflow) — and before
+an operator's `resumeRun` (`beforeDrive`, failing closed when the re-check cannot be made), and `resumeIncomplete()`
+quarantines such a run instead of resuming it. `resumeRun` re-checks again after the control plane's resume: a rollback
+whose sweep quarantined the run between the check and the resume is not undone by it (quarantined again, refused). `migrate(runId, { to, by, reason, checkpointTimeoutMs?, drive? })` is the
+only way a live run changes runtime: checkpoint (under the run's lock, on the run as it is then: a running run is paused
+`migrating`, a paused one keeps its pause — a quarantine or operator pause committed meanwhile is never overwritten —
+then wait until no work item holds a live claim), canonical ContextSnapshot, operation reconciliation (refused while any operation of the run is unsettled —
 prepared, dispatching, acknowledged, outcome_unknown, reconciling, compensating or manual_review — or a work item waits),
 compatibility (`runtimeCompatibility`: target active/canary, same schemas or an explicit allowed migration, the engines
-the run used, same protocol), then ONE transaction: the target manifest stored in `ht_manifests`, a RuntimeEpoch, the
+the run used, same protocol), then ONE transaction: under the registry's lock (`registry.lock(tx)`, taken before the
+run's locks — the rollback's order) the target is read again and the compatibility checked again, so a rollback or
+promotion of the target can never commit between the check and the re-pin (a rollback committing later finds the
+re-pinned run in its sweep); the run must still be paused by the checkpoint's pause (`migrating`, or the pause it had;
+`quarantined` by a rollback of its source is accepted) — a run resumed and paused again meanwhile moved past the
+snapshot and the migration fails `conflict`; then the target manifest stored in `ht_manifests`, a RuntimeEpoch, the
 re-pin, `run.migrated`, and the resume (`running`, or the run's own earlier pause: an operator/budget/approval pause, or
-the pause a quarantine replaced, is kept). A failed migration releases the checkpoint it took. The report of a run
-carries its quarantine and migration notes (`## Runtime release`, `recovery`, `json.runtimeRelease`). Proven with the
+the pause a quarantine replaced, is kept). A failed migration releases the checkpoint it took, under the run's lock and
+only while the run is still paused `migrating` on its source (a quarantine that replaced it is kept). When the migrating
+process dies between its checkpoint and the re-pin, the run stays paused `migrating` (resume refused):
+`releaseCheckpoint(runId, { by, reason })` (`hypertest runtime migrate <runId> --abort`) puts it back to `running` on
+the manifest it is still pinned to, with `run.migration_released` on L0 (a run whose release was rolled back is
+quarantined instead); a migration still in progress for it then fails (`conflict`) and re-pins nothing. The report of a run
+carries its quarantine, migration and released-checkpoint notes (`## Runtime release`, `recovery`, `json.runtimeRelease`). Proven with the
 local durable runtime; with Temporal the source runtime's run workflow fails on its next tick (the I11 refusal of the
 re-pinned run) and `resume` on the target runtime starts the run's workflow on the target's task queue (not exercised
 against a live Temporal server).
@@ -196,6 +226,7 @@ use.
 | Invariant | Test |
 |---|---|
 | I11 a run is pinned to the manifest built at composition (engines incl. pi-agent-core + adapter versions, providers, catalog/tool/policy+roles revisions, schemas, protocol); same runtime ⇒ same id across restarts | `test/app.e2e.test.ts` (tiny run, restart) |
+| `engines.default: dsh`: the tiny run completes on the DeepSeek Harness adapter with the same governance and verdict; the manifest pins the DSH engine, its adapter and the whole pinned DSH train; an installation that does not select DSH neither registers nor pins it | `test/engine-dsh.e2e.test.ts` |
 | I11 a runtime with another manifest never drives a pinned live run: `resumeIncomplete` skips it, `start({runId})` refuses it, the durable runtime's control boundary refuses tick/recover/executeTurn/observeWaiting; the original runtime completes it | `test/app.e2e.test.ts` (I11 restart with another runtime), `test/compose.test.ts` (pinnedControlPlane) |
 | I7 the verdict is the QualityGate's: signed over its content, bound to the sealed evidence root; evidence verifies with the persisted key; `verifyEvidence` reports an altered, unsigned or re-bound decision and refuses unknown runs | `test/app.e2e.test.ts` |
 | I8 an oracle change flipping a recorded failure needs a human (independent agents refused) — including when the proposer cites nothing (the run's failed test cases matching a changed `test_outcome` selector) and when the citing finding was later superseded as rejected; additions flip nothing; unknown base fails closed | `test/governance.test.ts`, `test/app.e2e.test.ts` (facade operations) |
@@ -210,9 +241,10 @@ use.
 | `close()` releases every handle (a child process that composed, ran and closed exits on its own) | `test/app.e2e.test.ts` + `test/fixtures/exit-probe.ts` |
 | API: validation, media type, body limit, Host guard, bearer token, JSON errors without internals, malformed paths, SSE ordering/resume/end (never before the final events) | `test/api.test.ts`, `test/app.e2e.test.ts` (REST API over a real instance) |
 | Production wiring: PostgreSQL + NATS JetStream (delivery proven by a probe consumer) + OPA composed with the built-in rules; Temporal durable runtime (through the pinned control boundary); doctor is read-only on PostgreSQL | `test/app.int.test.ts` |
-| I11 runtime releases: new runs only under the active release or a selecting canary (refused starts create nothing); promotion over recorded passing suites; rollback moves the pointer back, old runs continue on their pinned manifest, the rolled-back release's runs are quarantined (paused, `run.quarantined`, report note, resume refused); explicit migration (checkpoint, snapshot, reconciliation, compatibility, RuntimeEpoch + `run.migrated` + re-pin + resume) completes the run on the new runtime; migration refusals (checkpoint timeout, unknown ids, non-promoted target, unsettled operation) leave the run as it was; `runtime.requireActiveRelease`; drained releases retire; the image digest is part of the BOM | `test/releases.e2e.test.ts` |
-| Runtime BOM inputs (git commit of the installation only, image digest format), condenser privacy floor (restricted agents condensed on restricted routes only, replayed hosted decisions refused), admission wrapper, pin-cache eviction, report notes | `test/releases.test.ts` |
+| I11 runtime releases: new runs only under the active release or a selecting canary (refused starts create nothing); promotion over recorded passing suites; rollback moves the pointer back, old runs continue on their pinned manifest, the rolled-back release's runs are quarantined (paused, `run.quarantined`, report note, resume refused); explicit migration (checkpoint, snapshot, reconciliation, compatibility, RuntimeEpoch + `run.migrated` + re-pin + resume) completes the run on the new runtime; migration refusals (checkpoint timeout, unknown ids, non-promoted target, unsettled operation) leave the run as it was; a rollback committing between the admission and the creation of a run (the run escapes both sweeps) still quarantines it through its creator's re-check and refuses the start; concurrent quarantines of one run record exactly one (PostgreSQL shows the race); `runtime.requireActiveRelease`; drained releases retire; the image digest is part of the BOM; a rollback of the migration target committing after the migration's last pre-transaction check refuses the re-pin (and one committing after the re-pin quarantines the migrated run); runs whose creator died before its re-check are quarantined by the next loop start (`recover`), by `resumeIncomplete()` and by an operator resume, never driven (nor released from an abandoned migration checkpoint); an abandoned migration checkpoint is released explicitly (`run.migration_released`, report note), and a live migration whose checkpoint is released, or released and paused again, fails `conflict` and re-pins nothing; a quarantine committing after a migration read the run is neither overwritten by its checkpoint nor undone when it fails; a quarantine racing the release of a failed migration's checkpoint is kept | `test/releases.e2e.test.ts` |
+| Runtime BOM inputs (git commit of the installation only, image digest format), condenser privacy floor (restricted agents condensed on restricted routes only, replayed hosted decisions refused), admission wrapper and its post-create re-check, the `beforeDrive` re-check before `recover`/`resumeRun` (fails closed) and after `resumeRun` (a quarantine racing the resume is restored), pin-cache eviction, report notes (incl. a released checkpoint) | `test/releases.test.ts` |
 | Doctor route coverage of the specialist roles (vision + computer-use fallback, restricted data only on local routes) | `test/diagnose.test.ts` |
+| The specialist roles in a real run: every model call of a `local_private` agent reaches only the restricted (local) route and every `vision_gui` call only the vision route (provider calls and `model.epoch_started` agree); without a restricted route the `local_private` item fails with a security-stage refusal (`no_eligible_route`) and the hosted provider never sees it | `test/specialist-roles.e2e.test.ts` |
 
 ## How to run
 
@@ -295,13 +327,26 @@ HYPERTEST_TEST_DB=postgres node scripts/run-tests.mjs --package app  # e2e runs 
   `tools.httpAllowlist`; loopback endpoints only); `diagnose()` reports the
   strategy, a warning when only the network is isolated or for `network: open`, and an error when the host cannot
   enforce the configured network.
+- (context engine completion) `HypertestServices.provenance?: ProvenanceService` (additive, optional). **Behaviour:**
+  the composed tool runtime is observing (`observeToolRuntime` of @hypertest/context): tool results feed the agent's
+  read set, and a read whose observation cannot be recorded is returned `failed`/`unavailable` with its output withheld
+  (effect tools' results are returned unchanged); the `file` resolver is registered for the workspaces this process
+  opens; each workspace root's retriever fuses the symbol graph, exact search and a vector retriever (pgvector when
+  available). Migration `context/003-observations` is part of `ALL_MIGRATIONS`.
 - (runtime release management) `HypertestConfig.runtime?: { requireActiveRelease?: boolean }`; env
   `HYPERTEST_IMAGE_DIGEST`; `HypertestInstance.releases: RuntimeReleaseService` (`Hypertest.releases?`); new types
   `RuntimeReleaseService`, `RuntimeReleaseView`, `MigrateRunInput`, `RunMigrationResult`; `HypertestServices.adapters?`;
   `pinnedControlPlane` returns `ControlPlane & { forgetPin(runId) }`. New exports `providerLocality`, `hypertestGitSha`,
   `imageDigestFrom`, `IMAGE_DIGEST_ENV`, `condenserPrivacyFloor`, `agentClassification`, `releaseGovernedControlPlane`,
   `createReleaseService`, `runtimeReleaseNotes`, `withRuntimeReleaseNotes`, `DEFAULT_CHECKPOINT_TIMEOUT_MS`,
-  `ReleaseServiceDeps`. (behaviour) the manifest's `toolCatalogRevision` is the runtime's `toolCatalogRevision` (tools
+  `ReleaseServiceDeps`; `RuntimeReleaseService.quarantineIfRolledBack(runId)` and the `afterCreate` option of
+  `releaseGovernedControlPlane` (the creator's re-check of a new run against a concurrent rollback).
+  (review fixes) `RuntimeReleaseService.releaseCheckpoint(runId, { by, reason })` (an abandoned migration's checkpoint;
+  `run.migration_released`); the `beforeDrive` option of `releaseGovernedControlPlane` (the re-check before `recover`
+  and `resumeRun`); (behaviour) `resumeIncomplete()` quarantines, instead of resuming, a live run of this runtime whose
+  release was rolled back; `resumeRun` re-checks after resuming; `migrate` takes and releases its checkpoint under the
+  run's lock (a concurrent quarantine is never overwritten or undone), re-checks the target under the registry's lock
+  inside its transaction and fails `conflict` when the run left its checkpoint's pause. (behaviour) the manifest's `toolCatalogRevision` is the runtime's `toolCatalogRevision` (tools
   with timeouts/bindings + adapter capabilities) instead of the tool registry's revision, and the manifest carries
   `gitSha`/`imageDigest`/engine adapters/`defaultEngine`/`roleCatalogRevision`: manifest ids change once with this
   version (runs pinned to an older runtime are driven by that runtime, or migrated); `diagnose` reports the specialist
@@ -312,3 +357,9 @@ HYPERTEST_TEST_DB=postgres node scripts/run-tests.mjs --package app  # e2e runs 
   runtime (I11). conformance-12: an OPA policy engine's revision is `opa:<path>@<digest>` of the policy modules of the
   decision package served by OPA (`GET /v1/policies`; new export `opaPolicyRevision`; `@unverified` when OPA cannot list
   them), so a changed policy changes `policyRevision` and the manifest.
+- (runtime-dsh) `HypertestConfig.engines.default` accepts `dsh` (`ENGINE_KINDS` = `native, pi, dsh`): the DeepSeek
+  Harness adapter (`@hypertest/runtime-dsh`, new dependency; pinned, experimental) is registered — and pinned by the
+  manifest: `agentEngines` `dsh` = the pinned dsh-agent version with its adapter, `providerAdapters` `engine:dsh` = the
+  adapter and every pinned `@deepseek-ai` package — only when it is the configured default engine; `close()` disposes its
+  DSH kernel. A drifted DSH install fails the composition (`precondition_failed`), never a run. Installations that do not
+  select it are unchanged (same manifest).

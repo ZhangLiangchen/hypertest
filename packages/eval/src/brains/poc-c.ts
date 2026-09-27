@@ -100,7 +100,7 @@ export const pocCLead: RoleBrain = (v) => {
 // ------------------------------------------------------------------------------------------------ environment operator
 
 /** How the i-th (pending) side effect settled: `[pending]` results settle in the "Results of pending operations" message. */
-function settled(v: BrainView, i: number, operationType: string): { status: string; operationId?: string } {
+export function settled(v: BrainView, i: number, operationType: string): { status: string; operationId?: string } {
   const text = resultText(v, i);
   const op = opIds(text)[0];
   if (/^\[pending\]/.test(text)) {

@@ -9,10 +9,14 @@ binding ABI; this document explains it.
 
 This blueprint is normative: it states what Hypertest must be, not what is built today. The current state is recorded
 in [CONFORMANCE.md](CONFORMANCE.md) ([简体中文](CONFORMANCE.zh-CN.md)): one row per requirement of the design sources and
-invariants, with status, code location and known gaps. Of 164 requirements, 108 are implemented, 48 partial, 5 missing
-and 3 deferred. Of the invariants, I2 is partial (work-item capability requirements are not intersected); the others
-are implemented, with limits noted there. Parts of this blueprint that are not built yet include the `runtime-dsh`
-adapter and runtime release states; the context package's vector index exists but the app does not wire it.
+invariants, with status, code location and known gaps. Of 164 requirements, 132 are implemented, 29 partial, 1 missing
+(the skill registry of the learning loop) and 2 deferred. All twelve invariants are implemented, with limits noted there.
+Parts of this blueprint that are not complete yet include parser-based symbol retrieval (the symbol graph is
+regex-based and the only embedder is feature hashing), a clearance check on evidence reads (restricted evidence of the
+`local_private` role), a per-experiment budget, experiment validity in the QualityGate, the core eval as a promotion
+requirement, the API/UI, Performance, Evidence and MultiAgent eval suites, `traceId`/OpenTelemetry, and fork patch
+tracking and signature attestation in the supply chain. The `runtime-dsh` adapter exists (pin + adapter, no fork;
+registered when `engines.default: dsh`).
 Deployment and recovery procedures are in [OPERATIONS.md](OPERATIONS.md).
 
 ## 1. What we are building
@@ -125,7 +129,7 @@ Enforced by `scripts/check-boundaries.mjs` (`ALLOWED` map).
 | `tools` | ToolSpec, ToolRuntime pipeline (validate→capability→permit→freshness→operation→execute→offload→evidence→events), WorkspaceManager (shared snapshot, git worktree, OCI sandbox), built-in white-box and black-box tools | core, domain, evidence, operation, policy |
 | `runtime` | **AgentEngine ABI**, NativeEngine (Hypertest agent loop), SessionStore, SubagentRuntime, RuntimeManifest builder, engine contract test-suite | core, domain, model, context, tools, policy |
 | `runtime-pi` | Pi engine adapter (`pi-agent-core`) passing the AgentEngine contract suite | core, domain, model, runtime |
-| `runtime-dsh` | DeepSeek Harness adapter (pinned, experimental; pin + adapter, no fork) | core, domain, model, runtime |
+| `runtime-dsh` | DeepSeek Harness adapter (`@deepseek-ai/dsh-*` 0.1.0-rc.6 pinned exactly, experimental; pin + adapter, no fork) passing the AgentEngine contract suite | core, domain, model, runtime |
 | `agents` | role catalog: prompts, default ModelPolicy, tool allowlists, output schemas, event subscriptions | core, domain |
 | `control` | Plan IR validation, DynamicScheduler (admission, deps, budgets, concurrency, resource claims), reactors (event → work), ConvergenceMonitor, RunDriver + AgentWorker, domain tools (blackboard/plan/oracle/evidence/delegate/complete_work) | core, domain, collab, operation, policy, evidence, model, context, tools, runtime, agents |
 | `durable` | DurableRuntime port, LocalDurableRuntime, Temporal workflows/activities/worker/client | core, domain, control |
@@ -326,10 +330,15 @@ coverage gap, review, oracle change proposal, test artifact registration).
   depth/count caps, capability attenuation, budget reservation; child receives only its task context
   (no parent trace), parent receives a summary.
 - `RuntimeManifest` builder (content-hashed) and `engineContractSuite(factory)` shared by all engines.
+- Runtime release registry: states `candidate → shadow → canary → active → retiring → retired`, an active
+  pointer and one canary, promotion one step at a time over passing `engine_contract` and `replay` suite
+  results, rollback (pointer back, rolled-back release retired for good), RuntimeEpochs of explicitly
+  migrated runs; append-only history.
 
 ### agents
 Role catalog (`lead`, `code_change_analyst`, `architecture_analyst`, `historical_bug_analyst`,
-`test_designer`, `executor`, `rca`, `fixer`, `reviewer`, `metrics_analyst`, `environment`, `condenser`):
+`test_designer`, `executor`, `rca`, `fixer`, `reviewer`, `metrics_analyst`, `environment`, `condenser`,
+`vision_gui`, `local_private`):
 system prompt templates (with BUGate injection slot), default `ModelPolicy`, tool allowlists, output
 schemas, subscriptions (event type + filter + work template), permission profile, max depth.
 
@@ -349,15 +358,18 @@ causal depth), `ConvergenceMonitor` (drain detection, livelock/TTL, max plan rev
 ### app / cli
 `hypertest.config.yaml` (models + providers (keys from env), role model policies, budgets, policy rules,
 store, bus, durable, artifacts, BUGate path, sandbox). `createHypertest(config)`. CLI: `init`, `run`,
-`status`, `resume`, `report`, `evidence verify`, `approve`, `eval run`, `worker`, `serve`.
+`status`, `resume`, `report`, `evidence verify`, `approve`, `eval run`, `eval gate`, `runtime` (release
+register/record-suite/promote/rollback/migrate), `worker`, `serve`.
 
 ### eval
 `EvalTask`, `EvalTrial`, `runSuite(suite, arms, {trials})` with a fresh environment per trial (temp copy,
 fresh database, fixed manifest), graders (environment-state checkers first, then deterministic oracles,
 evidence consistency, LLM rubric last), metrics (critical false release, defect recall, FP rate,
 duplicate side effects, orphan operations, policy violations, stale-context actions, evidence completeness,
-pass^k), stats (exact McNemar, paired bootstrap CI). Suites: `poc-a-whitebox`, `poc-b-event-driven`,
-`poc-c-durable-load`, `oracle-robustness`, `recovery-chaos`.
+pass^k), stats (exact McNemar, paired bootstrap CI), versioned graders (lock file, bridge comparison), an
+independent calibrated LLM judge, and a release gate against a baseline SuiteResult. Suites: `poc-a-whitebox`,
+`poc-b-event-driven`, `poc-c-durable-load`, `oracle-robustness`, `recovery-chaos`, and the `core` suites
+`test-generation`, `context-freshness`, `model-switch`, `security-injection`.
 
 ## 6. PoCs (executable acceptance)
 

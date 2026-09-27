@@ -14,7 +14,7 @@ import type { HypertestConfig, HypertestConfigInput, LoadConfigOptions, OracleCo
  */
 
 export const PROVIDER_KINDS = ['openai-compatible', 'anthropic', 'pi-ai', 'scripted'] as const;
-export const ENGINE_KINDS = ['native', 'pi'] as const;
+export const ENGINE_KINDS = ['native', 'pi', 'dsh'] as const;
 /** Variables passed through to sandboxed processes by default (the sandbox sets PATH/HOME/LANG/TMPDIR itself). */
 export const DEFAULT_ENV_ALLOWLIST: readonly string[] = Object.freeze(['PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR']);
 

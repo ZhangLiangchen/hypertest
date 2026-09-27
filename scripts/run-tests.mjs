@@ -6,13 +6,17 @@
 //                   each test SKIPS with an explicit reason when its infra is unavailable
 //   *.e2e.test.ts   end-to-end tests: full Hypertest runs (scripted models) and PoC suites
 //
+//   scripts/test/*.test.mjs  unit tests of the repository scripts (supply chain: SBOM, license policy);
+//                         run with the unit tests, or alone with --package scripts
+//
 // Usage: node scripts/run-tests.mjs [--unit|--integration|--e2e] [--package <name>] [extra node --test args]
 // Infra connection variables are loaded from .infra/env when present (see scripts/infra.mjs).
 import { readdirSync, statSync, existsSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { join, resolve, dirname, relative } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-const ROOT = resolve(dirname(new URL(import.meta.url).pathname), '..');
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
 const kinds = new Set();
 let onlyPackage;
@@ -27,13 +31,13 @@ for (let i = 0; i < args.length; i++) {
 }
 if (kinds.size === 0) { kinds.add('unit'); kinds.add('integration'); kinds.add('e2e'); }
 
-function walk(dir, out = []) {
+function walk(dir, out = [], suffix = '.test.ts') {
   if (!existsSync(dir)) return out;
   for (const name of readdirSync(dir)) {
     if (name === 'node_modules' || name.startsWith('.')) continue;
     const p = join(dir, name);
-    if (statSync(p).isDirectory()) walk(p, out);
-    else if (name.endsWith('.test.ts')) out.push(p);
+    if (statSync(p).isDirectory()) walk(p, out, suffix);
+    else if (name.endsWith(suffix)) out.push(p);
   }
   return out;
 }
@@ -46,7 +50,8 @@ function kindOf(file) {
 
 const pkgsDir = join(ROOT, 'packages');
 const pkgs = existsSync(pkgsDir) ? readdirSync(pkgsDir).filter((p) => !onlyPackage || p === onlyPackage) : [];
-const files = pkgs.flatMap((p) => walk(join(pkgsDir, p, 'test'))).filter((f) => kinds.has(kindOf(f))).sort();
+const scriptTests = kinds.has('unit') && (!onlyPackage || onlyPackage === 'scripts') ? walk(join(ROOT, 'scripts', 'test'), [], '.test.mjs') : [];
+const files = [...pkgs.flatMap((p) => walk(join(pkgsDir, p, 'test'))).filter((f) => kinds.has(kindOf(f))), ...scriptTests].sort();
 if (files.length === 0) {
   console.log('No test files matched.');
   process.exit(0);

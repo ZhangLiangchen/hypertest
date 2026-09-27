@@ -22,8 +22,9 @@ quality decisions stay governed outside the model.
    agent lifecycle, sessions, turns, subagents, model epochs, context, tools,
    permissions, evidence and gate semantics are Hypertest types. Engines are
    adapters: the native engine is the reference; `pi-agent-core` is adapted
-   (pin + adapter, no fork); DeepSeek Harness is a future adapter behind the
-   same ABI (pin + adapter; surgical fork only for irreducible gaps).
+   (pin + adapter, no fork); DeepSeek Harness is adapted behind the same ABI
+   (`@hypertest/runtime-dsh`: pin + adapter; surgical fork only for
+   irreducible gaps — the fork decision gate found none).
 2. **Native multi-LLM**: `ModelPolicy` is a first-class attribute of every
    role/work item; routing is security → capability → role → quality →
    latency → cost; fallback is fail-closed and re-validated; switches happen

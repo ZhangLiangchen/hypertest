@@ -24,8 +24,11 @@ import type {
   ChaosPlan, ChildExit, EvalArm, EvalOracle, EvalTask, EvalTrial, Grader, GraderResult, RunOutcome, TrialChildJob, TrialContext, TrialData, TrialFixture, TrialOptions,
   TrialProgressEvent,
 } from './contracts.ts';
-import { resolveGrader } from './graders.ts';
+import { graderOrderProblems, resolveGrader, type ResolvedGrader } from './graders.ts';
 import { collectTrialData, DEFAULT_PROBE_TIMEOUT_MS, runProbes } from './collect.ts';
+import { EVAL_HARNESS_REVISION } from './grader-revisions.ts';
+import { VERDICT_CONSISTENCY_RUBRIC } from './judge.ts';
+import { canonicalState, trialKey, trialModelRoutes } from './trial-records.ts';
 import { outcomeMetrics, trajectoryMetrics } from './metrics.ts';
 import { withModelTimeoutInjection, type ModelCallCounter } from './brains.ts';
 import { TRIAL_EXIT_CODES, describeKillPoint, dispatchCount, exitCodeForVerdict, killPointCount, killPointProblems, runChildTrial, verdictForExitCode } from './child.ts';
@@ -176,7 +179,13 @@ export function decideTrialResult(input: { graders: readonly GraderResult[]; tim
   const notes: string[] = [];
   if (input.error !== undefined) notes.push(input.error);
   if (input.unexercised.length > 0) notes.push(`chaos plan not exercised: ${input.unexercised.join('; ')}`);
-  const result: EvalTrial['result'] = input.timedOut || input.graders.some((g) => !g.pass) ? 'fail' : input.unexercised.length > 0 ? 'infra_error' : 'pass';
+  // (additive) a result reported but not counted (an uncalibrated LLM judge) never decides; a counted `unknown` (the judge
+  // could not decide from the evidence) never passes: without a failing grader the trial needs a human audit (infra_error)
+  const counted = input.graders.filter((g) => g.counted !== false);
+  const unknown = counted.filter((g) => g.outcome === 'unknown');
+  const failed = counted.filter((g) => g.outcome !== 'unknown' && !g.pass);
+  if (unknown.length > 0) notes.push(`needs human audit: ${unknown.map((g) => `${g.graderId} could not decide from the evidence`).join('; ')}`);
+  const result: EvalTrial['result'] = input.timedOut || failed.length > 0 ? 'fail' : input.unexercised.length > 0 || unknown.length > 0 ? 'infra_error' : 'pass';
   return notes.length > 0 ? { result, error: notes.join('; ') } : { result };
 }
 
@@ -464,13 +473,85 @@ async function executeInChild(x: ExecutionInput): Promise<Execution> {
   return out;
 }
 
-async function grade(graders: Array<{ id: string; grader: Grader }>, ctx: Parameters<Grader>[0]): Promise<GraderResult[]> {
+/**
+ * (additive) A grader result stamped with its revision and three-valued outcome. `pass` ⇔ outcome `pass` (a result
+ * claiming one without the other is inconsistent). Only an LLM-judged grader (`kind: 'llm'`) may be reported but NOT
+ * counted (`counted: false`: a judge below its calibration threshold) — a deterministic grader that opted out of counting
+ * would turn its own failure into a pass. Inconsistent results are schema violations (⇒ the trial is an infra error),
+ * never silently repaired.
+ */
+export function stampGraderResult(r: GraderResult, grader: { id: string; revision: string; kind?: 'deterministic' | 'llm' }): GraderResult {
+  if (r === null || typeof r !== 'object') throw new HypertestError('schema_violation', `grader ${grader.id} returned no result`);
+  const out: GraderResult = { ...r, revision: grader.revision };
+  if (out.outcome === undefined) out.outcome = r.pass ? 'pass' : 'fail';
+  else if (out.outcome !== 'pass' && out.outcome !== 'fail' && out.outcome !== 'unknown') throw new HypertestError('schema_violation', `grader ${grader.id} returned outcome ${String(out.outcome)}`);
+  // a pass is a pass: a result cannot claim pass with a non-pass outcome, nor a pass outcome without passing
+  if ((out.outcome === 'pass') !== (out.pass === true)) throw new HypertestError('schema_violation', `grader ${grader.id} returned pass ${String(out.pass)} with outcome ${out.outcome}`);
+  if (out.counted !== undefined && typeof out.counted !== 'boolean') throw new HypertestError('schema_violation', `grader ${grader.id} returned counted ${String(out.counted)}`);
+  if (out.counted === false && grader.kind !== 'llm') {
+    throw new HypertestError('schema_violation', `grader ${grader.id}: only an LLM-judged grader may be reported uncounted (counted: false); a deterministic grader always counts`);
+  }
+  return out;
+}
+
+/**
+ * Runs the graders in task order (deterministic first, the LLM judge last — enforced by graderOrderProblems): each sees
+ * the results before it (`prior`) and the harness's judge.
+ */
+async function grade(graders: ReadonlyArray<ResolvedGrader>, ctx: Parameters<Grader>[0], revisions: Readonly<Record<string, string>>): Promise<GraderResult[]> {
   const out: GraderResult[] = [];
-  for (const { id, grader } of graders) {
+  for (const { id, grader, kind } of graders) {
     try {
-      out.push(await grader(ctx));
+      out.push(stampGraderResult(await grader({ ...ctx, prior: [...out] }), { id, revision: revisions[id]!, kind }));
     } catch (e) {
       throw new HypertestError(isHypertestError(e) ? e.code : 'internal', `grader ${id} could not grade the trial: ${(e as Error).message}`, { cause: e });
+    }
+  }
+  return out;
+}
+
+/**
+ * The revision of every grader of a task as recorded on its trials. An LLM-judged grader's revision also names the rubric
+ * and the judge (a different judge model is a different grader).
+ */
+export function graderRevisionsOf(task: Pick<EvalTask, 'rubric'>, graders: ReadonlyArray<ResolvedGrader>, judge?: { identity: string }): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const g of graders) {
+    if (g.kind !== 'llm') out[g.id] = g.revision;
+    else {
+      const rubric = task.rubric ?? VERDICT_CONSISTENCY_RUBRIC;
+      out[g.id] = `${g.revision}/${rubric.rubricId}@${rubric.revision}/${judge?.identity ?? 'no-judge'}`;
+    }
+  }
+  return out;
+}
+
+/** Problems of a task's graders before any environment exists: judge ordering and a judge for LLM-judged graders. */
+export function graderSetupProblems(task: Pick<EvalTask, 'taskId' | 'graders'>, options: Pick<TrialOptions, 'graders' | 'judge' | 'bridge'>): string[] {
+  const out = graderOrderProblems(task.graders, options.graders).map((p) => `task ${task.taskId}: ${p}`);
+  const resolved = task.graders.map((g) => resolveGrader(g, options.graders));
+  if (resolved.some((g) => g.kind === 'llm') && !options.judge) out.push(`task ${task.taskId} lists an LLM-judged grader (${resolved.filter((g) => g.kind === 'llm').map((g) => g.id).join(', ')}) but no independent judge is configured (HarnessOptions.judge)`);
+  for (const [id, b] of Object.entries(options.bridge ?? {})) {
+    if (!b || typeof b.grader !== 'function' || typeof b.revision !== 'string' || b.revision.trim() === '') out.push(`bridge grader ${id} must be {revision, grader}`);
+  }
+  return out;
+}
+
+/**
+ * Bridge graders (HarnessOptions.bridge): candidate revisions of graders the task lists, run on the same trial data after
+ * the task's graders; results are recorded apart (EvalTrial.bridge) and never decide the trial. A candidate that cannot
+ * grade the trial is recorded as a failed result naming the fault (the bridge report shows it), never a trial fault.
+ */
+async function gradeBridge(task: EvalTask, options: TrialOptions, ctx: Parameters<Grader>[0], prior: readonly GraderResult[]): Promise<GraderResult[]> {
+  const out: GraderResult[] = [];
+  const listed = new Set(task.graders.map((g) => g.split('?')[0]!.trim()));
+  for (const [id, candidate] of Object.entries(options.bridge ?? {})) {
+    if (!listed.has(id)) continue;
+    try {
+      const r = await candidate.grader({ ...ctx, prior });
+      out.push(stampGraderResult({ ...r, graderId: id }, { id, revision: candidate.revision, kind: candidate.kind ?? 'deterministic' }));
+    } catch (e) {
+      out.push({ graderId: id, pass: false, score: 0, outcome: 'fail', revision: candidate.revision, detail: `the candidate revision could not grade the trial: ${(e as Error).message}` });
     }
   }
   return out;
@@ -498,17 +579,25 @@ export async function runTrial(task: EvalTask, arm: EvalArm, options: TrialOptio
     return trial;
   };
   // fail fast (no environment yet): options, grader specs, arm capabilities
-  let graders: Array<{ id: string; grader: Grader }>;
+  let graders: ResolvedGrader[];
+  let revisions: Record<string, string>;
   try {
     validateOptions(options);
     if (!Array.isArray(task.graders) || task.graders.length === 0) throw precondition(`task ${task.taskId} lists no graders`);
     const chaos = chaosProblems(task.chaos);
     if (chaos.length > 0) throw new HypertestError('invalid_argument', `task ${task.taskId}: ${chaos.join('; ')}`);
     graders = task.graders.map((g) => resolveGrader(g, options.graders));
+    const setup = graderSetupProblems(task, options);
+    if (setup.length > 0) throw new HypertestError('invalid_argument', setup.join('; '));
+    revisions = graderRevisionsOf(task, graders, options.judge);
     if (options.mode === 'child-process' && !arm.child) throw precondition(`arm ${arm.armId} has no child spec (EvalArm.child) for a child-process trial`);
   } catch (e) {
     return infra(e);
   }
+  trial.harness = `hypertest-eval@${EVAL_HARNESS_REVISION}/${options.mode ?? 'in-process'}`;
+  trial.suiteRevision = task.suiteRevision;
+  if (options.suiteId !== undefined) trial.suiteId = options.suiteId;
+  trial.graderRevisions = { ...revisions };
   const logger = trialLogger(harnessLogger, { taskId: task.taskId, armId: arm.armId, trial: options.trial });
   const scope = new Scope();
   let workDir: string | undefined;
@@ -550,9 +639,23 @@ export async function runTrial(task: EvalTask, arm: EvalArm, options: TrialOptio
     } else if (data.verification) {
       trial.evidenceRootHash = data.verification.rootHash;
     }
-    trial.graders = await grade(graders, { task, armId: arm.armId, trial: ctx, fixture, data, ht: exec.ht });
+    // what happened is recorded BEFORE grading: a trial whose grader cannot grade it (infra_error) still carries its
+    // outcome metrics (security violations, duplicate effects, false releases — the release gate counts them), routes,
+    // canonical state and key
     trial.outcomeMetrics = outcomeMetrics(task, data);
     trial.trajectoryMetrics = trajectoryMetrics(data);
+    trial.modelRoutes = trialModelRoutes(data.events);
+    trial.canonical = canonicalState(data);
+    if (data.run) trial.oracleRevisions = { ...data.run.oracleRevisions };
+    const keyParts: Parameters<typeof trialKey>[0] = { suiteRevision: task.suiteRevision, taskId: task.taskId, graderRevisions: revisions, oracleRevisions: trial.oracleRevisions ?? {} };
+    if (options.suiteId !== undefined) keyParts.suiteId = options.suiteId;
+    if (trial.runtimeManifestId !== undefined) keyParts.runtimeManifestId = trial.runtimeManifestId;
+    trial.trialKey = trialKey(keyParts);
+    const gctx: Parameters<Grader>[0] = { task, armId: arm.armId, trial: ctx, fixture, data, ht: exec.ht };
+    if (options.judge) gctx.judge = options.judge;
+    trial.graders = await grade(graders, gctx, revisions);
+    trial.bridge = await gradeBridge(task, options, gctx, trial.graders);
+    if (trial.bridge.length === 0) delete trial.bridge;
     const unexercised = unexercisedChaos(task.chaos, { restarts: exec.harness.restarts, injectedModelTimeouts: exec.harness.injectedModelTimeouts, evidence: data.evidence });
     const decided = decideTrialResult({ graders: trial.graders, timedOut: exec.harness.timedOut, unexercised, ...(exec.error !== undefined ? { error: exec.error } : {}) });
     trial.result = decided.result;

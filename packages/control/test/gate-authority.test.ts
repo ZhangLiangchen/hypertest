@@ -12,7 +12,7 @@ import type { GateSpec } from '@hypertest/domain';
 import { verifyEd25519 } from '@hypertest/evidence';
 import { DEFAULT_GATE_SPEC } from '@hypertest/policy';
 import { ControlStore, createControlPlane, gateWeakenings } from '../src/index.ts';
-import { call, createHarness, drive, type Harness } from './harness.ts';
+import { call, createHarness, drive, runItem, type Harness } from './harness.ts';
 
 const gate = (g: Partial<GateSpec> = {}): GateSpec => ({ ...DEFAULT_GATE_SPEC, ...g });
 
@@ -204,6 +204,42 @@ describe('startRun: a weakening gate override needs a recorded human/system auth
       } finally {
         await other.close();
       }
+    } finally {
+      await h.dispose();
+    }
+  });
+});
+
+describe('a pause committed while the gate is being evaluated wins (no silent un-pause)', () => {
+  test('the gate outcome is abandoned: the run stays paused and no decision is recorded', async () => {
+    const h = await createHarness({ ...LEAD, config: { defaultGate: { requireIndependentReview: false } } });
+    try {
+      const run = await h.control.startRun({ goal: 'race', target: {} });
+      const ctx = h.ctx(run.runId);
+      const evaluate = h.deps.gate.evaluate.bind(h.deps.gate);
+      let pause: Promise<void> | undefined;
+      // an operator/quarantine pause lands between the gate's evaluation and its transaction (gating → running → paused)
+      h.deps.gate.evaluate = (input) => {
+        pause ??= (async () => {
+          await h.deps.runs.update(run.runId, { status: 'running' }, ctx);
+          await h.deps.runs.update(run.runId, { status: 'paused', pauseReason: 'operator' }, ctx);
+        })();
+        return evaluate(input);
+      };
+      for (let i = 0; i < 20 && !pause; i++) {
+        const t = await h.control.tick(run.runId);
+        for (const d of t.dispatched) await runItem(h.control, d.workItemId, d.fencingToken);
+      }
+      assert.ok(pause, 'the gate was reached');
+      await pause;
+      const after = (await h.deps.runs.get(run.runId))!;
+      assert.equal(after.status, 'paused', 'the pause is not undone by the gate');
+      assert.equal(after.pauseReason, 'operator');
+      assert.equal(after.decisionId, undefined);
+      assert.equal(await h.deps.decisions.latestForRun(run.runId), undefined, 'the abandoned outcome recorded no decision');
+      const t = await h.control.tick(run.runId);
+      assert.equal(t.final, false);
+      assert.equal((await h.deps.runs.get(run.runId))!.status, 'paused', 'further ticks leave the paused run alone');
     } finally {
       await h.dispose();
     }

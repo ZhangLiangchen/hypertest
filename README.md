@@ -15,8 +15,9 @@ of a running system, or a registered environment. You do not give it a workflow.
 1. **Plans.** A lead agent proposes a typed plan (Plan IR, never code). Deterministic code validates it, and the
    scheduler admits its work items within budgets. The plan is revised as findings arrive.
 2. **Delegates.** Role agents (analysts, test designer, executor, RCA, fixer, reviewer, metrics analyst,
-   environment operator, condenser) run on the model routes their policies allow. Roles also react to blackboard
-   events without the lead, for example RCA waking on `finding.created`.
+   environment operator, condenser, a vision/GUI tester and a local/private analyst) run on the model routes their
+   policies allow, with capabilities that only shrink from parent to child. Roles also react to blackboard events
+   without the lead, for example RCA waking on `finding.created`.
 3. **Acts through governed tools.** White-box tools (git, fs, shell, test runners, coverage, mutation) and black-box
    tools (HTTP, metrics, load, environment control, browser, MCP) all run through one pipeline. Every result is
    recorded as evidence.
@@ -47,14 +48,14 @@ copy is used when no checkout is configured). The normative design is the [bluep
 
 ## Architecture
 
-Nineteen npm workspaces under `packages/`, TypeScript run directly by Node (no build step). Each package's
+Twenty npm workspaces under `packages/`, TypeScript run directly by Node (no build step). Each package's
 `src/contracts.ts` is its binding ABI. The dependency DAG is enforced by `npm run check:boundaries`.
 
 ```mermaid
 flowchart TB
   human(["Goal and human decisions"]) --> cli["cli: hypertest command"]
   cli --> app["app: config, createHypertest(), REST API"]
-  eval["eval: harness, graders, PoC suites"] --> app
+  eval["eval: harness, graders, judge,<br/>release gate, suites"] --> app
   app --> durable
   subgraph DUR["Durable execution"]
     durable["durable: Local or Temporal runtime"]
@@ -63,8 +64,9 @@ flowchart TB
     control["control: plan validator, scheduler, reactors,<br/>convergence, agent worker, domain tools, report"]
   end
   subgraph AGT["Agent plane"]
-    runtime["runtime: AgentEngine ABI, native engine,<br/>sessions, subagents, RuntimeManifest"]
+    runtime["runtime: AgentEngine ABI, native engine,<br/>sessions, subagents, RuntimeManifest, releases"]
     pi["runtime-pi: Pi engine adapter"]
+    dsh["runtime-dsh: DeepSeek Harness engine adapter"]
     agents["agents: role catalog"]
     model["model: fail-closed router, providers"]
     context["context: snapshots, freshness, L1-L5"]
@@ -87,6 +89,7 @@ flowchart TB
   control --> policy
   control --> collab
   runtime --> pi
+  runtime --> dsh
   runtime --> model
   runtime --> context
   runtime --> tools
@@ -116,15 +119,15 @@ offload large output → evidence → L0 events**.
 | [evidence](packages/evidence) | content-addressed artifacts (fs, S3), hash-chained Evidence Ledger, Merkle root, Ed25519 seals |
 | [operation](packages/operation) | Operation Ledger, leases with fencing tokens, side-effect gateway, reconciliation, admission, budgets |
 | [policy](packages/policy) | capability attenuation, permits (built-in rules, OPA), oracle governance, test-change classifier, QualityGate |
-| [model](packages/model) | model catalog, fail-closed router, providers (OpenAI-compatible, Anthropic, pi-ai, scripted) |
-| [context](packages/context) | context snapshots, freshness guard, working context, retrieval, experience memory, provenance |
+| [model](packages/model) | model catalog, fail-closed router with per-route circuit breaker, providers (OpenAI-compatible, Anthropic, pi-ai, scripted) |
+| [context](packages/context) | context snapshots, observed read sets, freshness guard, working context (HARD/SOFT condensation), hybrid retrieval, experience memory, provenance |
 | [tools](packages/tools) | tool runtime, workspaces, local and OCI sandboxes, white-box and black-box tools |
-| [runtime](packages/runtime), [runtime-pi](packages/runtime-pi) | AgentEngine ABI, native engine, sessions, subagents, manifest; Pi engine adapter |
-| [agents](packages/agents) | 12 roles: prompts, model policies, tool allowlists, output schemas, subscriptions |
-| [control](packages/control) | plan validation, scheduler, reactors, convergence, agent worker, domain tools, report |
+| [runtime](packages/runtime), [runtime-pi](packages/runtime-pi), [runtime-dsh](packages/runtime-dsh) | AgentEngine ABI, native engine, sessions, subagents, manifest, runtime release registry; Pi engine adapter; DeepSeek Harness engine adapter (pin + adapter, experimental) |
+| [agents](packages/agents) | 14 roles: prompts, model policies, tool allowlists, output schemas, subscriptions |
+| [control](packages/control) | plan validation, scheduler, reactors, convergence, agent worker, BUGate phases, experiment isolation and budget leases, domain tools, report |
 | [durable](packages/durable) | local and Temporal durable runtimes |
-| [app](packages/app) | configuration, composition root, REST API, `doctor` diagnostics |
-| [eval](packages/eval) | eval harness, graders, statistics, PoC suites |
+| [app](packages/app) | configuration, composition root, runtime release service (admission, quarantine, migration), REST API, `doctor` diagnostics |
+| [eval](packages/eval) | eval harness, versioned graders, independent LLM judge, statistics, release gate, PoC and core suites |
 | [cli](packages/cli) | the `hypertest` command |
 
 ## Invariants
@@ -135,8 +138,8 @@ The blueprint's hard invariants and where the code enforces them. The status col
 | # | Invariant | Enforced by | Status |
 |---|---|---|---|
 | I1 | Models propose, deterministic code disposes: no tool runs without a capability check and a policy permit, plus a freshness check when it mutates | tools runtime pipeline, policy engine | implemented |
-| I2 | Child capability = parent ∩ role ∩ work item ∩ environment policy, never amplified | policy `attenuateCapability`, control worker | partial: work-item `capabilityRequirements` are not intersected |
-| I3 | Model switches only at safe turn boundaries (new `ModelEpoch`); fail-closed fallback; routing order security → capability → role → quality → latency → cost | model router, runtime invoker and epochs | implemented |
+| I2 | Child capability = parent ∩ role ∩ work item ∩ environment policy, never amplified | policy `attenuateCapability`, control capability grant and worker | implemented; unmet work-item requirements are reported to the agent |
+| I3 | Model switches only at safe turn boundaries (new `ModelEpoch`); fail-closed fallback; routing order security → capability → role → quality → latency → cost | model router (circuit-breaker `availability` stage after quality), runtime invoker and epochs | implemented |
 | I4 | Every external or destructive call has a stable `operationId`; unknown outcomes are reconciled; stale fencing tokens are refused | operation gateway and leases; record-only adapters for http, browser and mcp | implemented |
 | I5 | At-least-once delivery; every consumer dedupes by `eventId`; duplicates never duplicate work or side effects | collab inbox, reactor fingerprints | implemented |
 | I6 | Evidence is append-only: SHA-256 artifacts, per-run hash chain, Merkle root | evidence ledger, database triggers | implemented; the default fs artifact store is not WORM |
@@ -144,7 +147,7 @@ The blueprint's hard invariants and where the code enforces them. The status col
 | I8 | Agents never weaken an oracle, assertion or threshold, or skip/delete a failing test, to get green | classifier, drift quarantine, oracle governance, flip detector | implemented; the local sandbox still shares the OS user |
 | I9 | Large tool outputs are offloaded; only bounded digests reach the model | tools runtime | implemented |
 | I10 | Routes, tool calls, permits, gate evaluations and transitions emit L0 events with run, work, agent, correlation and causation ids | all emitters | implemented; no `traceId` or OpenTelemetry |
-| I11 | A run is pinned to its `RuntimeManifest`; upgrades never hot-swap a live run | app composition, control `assertRunPinned`, manifest-scoped Temporal queues | implemented |
+| I11 | A run is pinned to its `RuntimeManifest`; upgrades never hot-swap a live run | app composition, control `assertRunPinned`, manifest-scoped Temporal queues, runtime release registry, explicit migration (`RuntimeEpoch`) | implemented |
 | I12 | The scheduler enforces concurrency, depth, agent, token, cost, tool-call and wall-clock budgets and keeps convergence authority | control scheduler and convergence | implemented |
 
 ## Quick start
@@ -179,6 +182,29 @@ hypertest evidence verify <runId>          # hash chain, artifacts, seal and the
   with `approvals`, `oracle proposals`, `experience list`). The deciding commands are refused inside the agent
   sandbox.
 
+### Runtime releases
+
+Each combination of code and configuration is a content-addressed `RuntimeManifest`, and every run is pinned to one.
+Until a release is activated the installation is unmanaged (any runtime may start runs). Once one is active, new runs
+start only under the active release or a canary that selects them:
+
+```bash
+hypertest runtime register --by alice                      # this installation's manifest becomes a candidate
+hypertest runtime record-suite current --kind engine_contract --suite agent-engine-contract --passed --total <n> --by ci:github
+hypertest eval run core --arms scripted-multi-llm --out core.json
+hypertest runtime record-suite current --kind replay --from-eval core.json --by ci:github
+hypertest runtime promote current --by alice --reason "suites green"                    # candidate → shadow
+hypertest runtime promote current --by alice --reason "shadow ok" --canary-percent 10  # shadow → canary
+hypertest runtime promote current --by alice --reason "canary ok"                       # canary → active
+hypertest runtime list                                      # states, active pointer, canary, live runs per release
+hypertest runtime rollback --by alice --reason "canary regressed"   # stop the canary, or roll the active release back
+hypertest runtime migrate <runId> --to current --by alice --reason "…"   # move one live run explicitly
+```
+
+`rollback` quarantines the live runs of the rolled-back release (paused until migrated or cancelled). Runs of other
+releases keep running on their own manifest. The full runbook is in
+[OPERATIONS.md §5](docs/architecture/OPERATIONS.md#5-upgrades-runtime-releases-and-manifest-pinning).
+
 ## PoCs and evaluation
 
 The PoC suites run the whole stack with deterministic scripted brains, so they need no API key. Each trial gets a
@@ -189,9 +215,16 @@ fresh directory and database.
 | `hypertest eval run poc-a-whitebox --arms scripted-multi-llm` | PoC A: white-box regression; dynamic plan, parallel analysts, 3 routes, seeded defect ⇒ `fail` | ~15 s |
 | `hypertest eval run poc-c-durable-load --arms scripted-multi-llm --mode child-process` | PoC C: load and fault recovery with a real SIGKILL of the Hypertest process | ~30 s |
 | `hypertest eval run poc-all --arms scripted-multi-llm,scripted-single` | every PoC task (A, B, C, C-insufficient, oracle-robustness, recovery-chaos); paired McNemar comparison of the arms | ~2–3 min |
+| `hypertest eval run core --arms scripted-multi-llm --out core.json` | the core suites: test generation (known-good and known-bad checks), context freshness, mid-run model switch, security injection; `--out` saves the SuiteResult | ~70 s |
+| `hypertest eval gate --baseline packages/eval/baselines/core-scripted-multi-llm.json --candidate core.json` | the release gate: comparable results; critical false release not worse; defect recall not significantly lower; security violations and duplicate side effects = 0; evidence complete (exit 0 pass, 1 fail) | ~2 s |
+| `npm run eval:gate` | both of the above, as CI runs them (outputs in `.hypertest-eval/`) | ~75 s |
 | `node scripts/run-tests.mjs --package eval` | the eval platform's unit and e2e tests, PoCs included | ~4 min |
 
 \* measured on the development host.
+
+`--judge scripted` adds the independent LLM judge (last, after every deterministic grader) with the calibrated
+scripted judge that CI uses. The baseline must be regenerated when a suite, grader or eval-harness revision changes;
+otherwise the gate reports the results as not comparable.
 
 `poc-all` exits 1: the single-model arm is expected to fail the tasks that need an independent reviewer, and that
 difference is what the comparison measures. The opt-in live arm uses a real provider:
@@ -219,44 +252,49 @@ references: [app README](packages/app/README.md) (configuration, composition, RE
 | `policy` | built-in rules | extra rules, `opa: { url, path }`, `capabilitySecretEnv` |
 | `sandbox` | `local`, `network: loopback` | or `oci` (docker); `envAllowlist` |
 | `environments`, `tools` | none | black-box targets (`control.tokenEnv`), `httpAllowlist`, `enableBrowser` |
-| `bugate`, `engines`, `memory`, `signing`, `observability` | embedded, `native`, `sql`, generated key, `info` | protocol checkout, agent engine (`native` or `pi`), PowerContext memory, signing key file, log level |
+| `runtime` | unmanaged until a release is active | `requireActiveRelease: true` refuses new runs while no runtime release is active |
+| `bugate`, `engines`, `memory`, `signing`, `observability` | embedded, `native`, `sql`, generated key, `info` | protocol checkout, agent engine (`native`, `pi`, or the experimental `dsh`), PowerContext memory, signing key file, log level |
 
 ## Status and limitations
 
-Of 164 design requirements, 108 are implemented, 48 partial, 5 missing and 3 deferred
-([CONFORMANCE.md](docs/architecture/CONFORMANCE.md) has every row). The main gaps:
+Of 164 design requirements, 132 are implemented, 29 partial, 1 missing and 2 deferred; all twelve invariants are
+implemented ([CONFORMANCE.md](docs/architecture/CONFORMANCE.md) has every row). The main gaps:
 
 | Area | Current limitation |
 |---|---|
 | Sandbox | The local sandbox isolates network, processes and secret paths with Linux namespaces, but commands run as the same OS user and can see the rest of the host file system. Use the OCI sandbox for untrusted models. The OCI sandbox, docker and kubectl adapters were not exercised against a live daemon or cluster in development. |
-| Experiments | `ExperimentSpec` fixtures, seeds, stop conditions and contamination rules stay empty; experiments are not bound to admitted resource claims (conformance-6). |
-| Budgets | Compute minutes and artifact bytes are declared but not charged; QPS is checked per `load.start` only (conformance-5). |
-| Capabilities (I2) | Work-item `capabilityRequirements` are stored but not intersected into agent capabilities. |
-| Context | Retrieval wires exact and regex-symbol search only (no vector index, no LSP/tree-sitter); only hard context pressure triggers condensation; the ReadSet records environments and input findings only. |
-| Subagents | Children always run foreground and non-continuable. |
-| Models and roles | No vision/GUI or local-private role; no model circuit breaker. Live providers are implemented, but CI uses scripted brains and the live eval arm is opt-in. |
-| Release management | Manifest pinning works, but there are no release states (candidate → … → retired), no active pointer, no migration of long-running runs, and no `gitSha`/image digest in the manifest. |
-| Governance | The policy engine runs before actions only; weakening gate overrides need no recorded authority (conformance-9); no skill registry for the learning loop. |
+| Privacy | The `local_private` role runs only on restricted (local) routes, but evidence its tools record is stored as `internal`, and `evidence.get` shows a preview to any agent of the run. Only the role's prompt keeps restricted values out of that evidence. |
+| Context | The symbol graph is regex-based (no tree-sitter/LSP/SCIP); the vector leg uses feature-hashing embeddings, not a semantic model. Files changed by `shell.exec` or `test.run` are not observed, so the agent must re-read them before its next write. After another agent supersedes a finding, or an environment is redeployed, that the agent observed, its mutating actions are refused until it observes that resource again. |
+| Experiments and budgets | An experiment has no budget of its own (run and work budgets apply), and the QualityGate does not judge experiment validity yet. A time-boxed fault can outlive the claims of its experiment. Artifact writes outside tool calls (condensation, reports) are not charged. |
+| Models | The circuit breaker keeps its state per process, and the app configures no price ceiling. When every route's breaker is open, the work item fails with `model_unavailable`. Live providers are implemented, but CI uses scripted brains and the live eval arm is opt-in. |
+| Release management | Suite results are attested by CI or a human (`record-suite`). `promote` accepts any passing replay suite, not the core eval in particular. An installation that never activated a release is ungated unless `runtime.requireActiveRelease: true`. Migration was not exercised against a live Temporal server. |
+| Governance | A phase permit of `approval_required` is treated as a refusal. A per-run gate weakening needs a recorded human authority, which the REST API does not accept yet, so weakening a gate over HTTP is refused. There is no dedicated environment-validity gate criterion and no skill registry for the learning loop. |
 | Evidence and audit | No per-record signatures (a signed seal instead), no WORM by default, no `traceId`/OpenTelemetry. |
-| Eval | No LLM judge, no TestGeneration/ContextFreshness/ModelSwitch/Security suites, unversioned graders, no release gate. |
-| Supply chain | Lockfile only: no SBOM, license or vulnerability scanning. |
-| Engines | The DeepSeek Harness (DSH) adapter is future work. |
+| Eval | The API/UI, Performance, Evidence and MultiAgent suites are missing. The 14 judge calibration labels still need confirmation by a human QA lead. Trials do not record an environment image digest. |
+| Supply chain | SBOM, license policy and an informational `npm audit` run in CI. Fork patch tracking and package signature/provenance attestation are missing. |
+| Engines | The DeepSeek Harness (DSH) adapter is experimental: it is pinned to one Developer Preview train (0.1.0-rc.6) and registered only when `engines.default: dsh`. Every DSH turn rebuilds its seed from the whole transcript, so turn cost grows with the transcript. |
 
 ## Development
 
 ```bash
 npm ci
 npm run check                               # typecheck + package boundaries
-npm test                                    # unit + integration + e2e
+npm test                                    # unit + integration + e2e (+ the scripts' own tests)
 npm run infra:fetch && npm run infra:up     # optional local PostgreSQL, NATS, Temporal, OPA (writes .infra/env)
 HYPERTEST_TEST_DB=postgres npm test         # the whole suite on PostgreSQL (needs HYPERTEST_TEST_PG_URL)
 node scripts/run-tests.mjs --package tools  # one package; also --unit | --integration | --e2e
+npm run eval:gate                           # core eval suites gated against the committed baseline
+npm run license:check                       # license policy over package-lock.json (exit 1 on a violation)
+npm run sbom                                # CycloneDX SBOM → .hypertest-sbom.json (--out <file> to choose)
+npm run test:scripts                        # tests of the supply-chain scripts
 ```
 
-Integration tests skip with an explicit reason when their infrastructure is absent. Current result on the
-development host: 1865 tests, 1860 pass, 5 skipped (no pgvector, no S3 endpoint, opt-in live LLM arm, two docker
-tests), both on PGlite and on PostgreSQL. See [CONTRIBUTING.md](CONTRIBUTING.md) for the rules and
-[AGENTS.md](AGENTS.md) for agent instructions.
+Integration tests skip with an explicit reason when their infrastructure is absent. Result of this round on the
+development host, the same on PGlite and on PostgreSQL: 2210 tests, 2202 pass, 5 skipped (no pgvector, no S3 endpoint,
+opt-in live LLM arm, two docker tests) and 3 fail. The three failures are stale expectations in tests outside the changed code: the role list in
+`packages/control/test/robustness.test.ts` (it predates `vision_gui` and `local_private`) and the unregistered-engine
+example in `packages/eval/test/harness.test.ts` (`dsh` is now registered). See [CONTRIBUTING.md](CONTRIBUTING.md) for
+the rules and [AGENTS.md](AGENTS.md) for agent instructions.
 
 ## Repository layout
 
@@ -264,9 +302,9 @@ tests), both on PGlite and on PostgreSQL. See [CONTRIBUTING.md](CONTRIBUTING.md)
 |---|---|
 | `packages/<name>/` | `src/contracts.ts` (ABI), `src/index.ts`, `test/*.test.ts` (unit), `*.int.test.ts` (integration), `*.e2e.test.ts` (end-to-end), `README.md` |
 | `bin/hypertest.js` | CLI entry point |
-| `scripts/` | `run-tests.mjs`, `check-boundaries.mjs`, `infra.mjs` |
+| `scripts/` | `run-tests.mjs`, `check-boundaries.mjs`, `infra.mjs`; supply chain: `sbom.mjs`, `license-check.mjs`, `license-exceptions.json` (reviewed exceptions), `test/` |
 | `docs/architecture/` | [BLUEPRINT](docs/architecture/BLUEPRINT.md), [CONFORMANCE](docs/architecture/CONFORMANCE.md), [OPERATIONS](docs/architecture/OPERATIONS.md) |
 | `docs/adr/` | [ADR-0008](docs/adr/0008-autonomous-testing-agent-rebuild.md): the rebuild decision |
 | `docs/design/` | design sources (Chinese): technology selection, architecture improvements |
 | `docs/archive/v0.2/` | the previous generation, kept for history |
-| `.github/workflows/ci.yml` | CI: checks and the full suite on PGlite and on PostgreSQL |
+| `.github/workflows/ci.yml` | CI: checks, the full suite on PGlite and on PostgreSQL, the core eval gate, and the supply-chain job (license policy, SBOM, informational `npm audit`) |

@@ -337,7 +337,7 @@ export function specTools(deps: ControlDeps): ToolSpec[] {
       id: 'experiment.define',
       title: 'Define an experiment',
       description:
-        'Define an ExperimentSpec (hypothesis, environment, workload, fault plan, isolation with resource claims, fixtures, random seeds, stop conditions, contamination rules, evidence requirements, oracle refs) before any load, fault or performance run. Subjects, environment generation and build digest come from the run and its registered environment. The isolation claims are ADMITTED atomically for the experiment (default: env/<environmentId> — fault_exclusive for a fault plan, write_exclusive for a workload, else read_shared): if another experiment or work item holds conflicting claims the experiment is NOT created and the conflicting holders are returned. Work items that declare the experiment (inputRefs kind experiment) may run write/fault tools only while its claims are held.',
+        'Define an ExperimentSpec (hypothesis, environment, workload, fault plan, isolation with resource claims, fixtures, random seeds, stop conditions, contamination rules, evidence requirements, oracle refs) before any load, fault or performance run. Subjects, environment generation and build digest come from the run and its registered environment. The isolation claims are ADMITTED atomically for the experiment (default: env/<environmentId> — fault_exclusive for a fault plan, write_exclusive for a workload, else read_shared): if another experiment or work item holds conflicting claims the experiment is NOT created and the conflicting holders are returned. Work items that declare the experiment (inputRefs kind experiment) may run write/fault tools only while its claims are held, and only on environments/URLs the claims cover (env/<environmentId> or url/<host>, fault tools need fault_exclusive); no other work item may write to or fault a resource the experiment holds.',
       inputSchema: {
         type: 'object',
         additionalProperties: false,
@@ -402,8 +402,21 @@ export function specTools(deps: ControlDeps): ToolSpec[] {
         if (run.target.commit !== undefined) subject.commit = run.target.commit;
         // retry-stable id: a replayed call returns the experiment it already defined
         const experimentId = retryStableId('exp', ctx.runId, ctx.invocationId);
+        /** `admission.granted` of the experiment, once: a deterministic event id makes the append idempotent (replays). */
+        const grantedEvent = async (id: string, granted: ResourceClaim[]): Promise<void> => {
+          const eventId = `evt_admgr_${sha256Hex(`admission.granted\u0000${id}`).slice(0, 32)}`;
+          await events.append([{ ...event(ctx.eventContext, EVENT_TYPES.admissionGranted, 'experiment', id, { experimentId: id, claims: granted, holderId: id, workItemId: ctx.workItemId }), eventId }]);
+        };
         const known = await specs.getExperiment(experimentId);
-        if (known) return success(experimentSummary(known));
+        if (known) {
+          // review B2: a replay after a call that failed once the experiment was saved completes what it left undone
+          // (the run's record of it, the admission audit); its claims were kept (they follow its owners)
+          if (!run.experimentIds.includes(known.experimentId)) {
+            await runs.update(run.runId, { experimentIds: [...new Set([...run.experimentIds, known.experimentId])] }, ctx.eventContext);
+          }
+          await grantedEvent(known.experimentId, known.isolation.resourceClaims);
+          return success(experimentSummary(known));
+        }
         const iso = experimentIsolation(input, environment);
         if (!iso.ok) return refuse('isolation_insufficient', `experiment not created: ${iso.problem}`);
         const isolation = iso.isolation;
@@ -444,13 +457,17 @@ export function specTools(deps: ControlDeps): ToolSpec[] {
         let saved: ExperimentSpec;
         try {
           saved = await specs.saveExperiment(spec, ctx.eventContext);
-          await runs.update(run.runId, { experimentIds: [...new Set([...run.experimentIds, saved.experimentId])] }, ctx.eventContext);
         } catch (e) {
-          // not created: its claims must not outlive it
-          await admission.release(experimentId).catch(() => undefined);
+          // not created: its claims must not outlive it — released only when the experiment is known NOT to exist (a save
+          // that failed after its commit leaves an existing experiment, whose claims stay; unknown ⇒ kept until the TTL)
+          const exists = await specs.getExperiment(experimentId).then((x) => x !== undefined, () => true);
+          if (!exists) await admission.release(experimentId).catch(() => undefined);
           throw e;
         }
-        await events.append([event(ctx.eventContext, EVENT_TYPES.admissionGranted, 'experiment', experimentId, { experimentId, claims, holderId: experimentId, workItemId: ctx.workItemId })]);
+        // review B2: once saved, the experiment exists and keeps its claims (they follow its owners); a failure from here on
+        // is completed by the replay (retry-stable id), never by releasing the claims of an existing experiment
+        await runs.update(run.runId, { experimentIds: [...new Set([...run.experimentIds, saved.experimentId])] }, ctx.eventContext);
+        await grantedEvent(experimentId, claims);
         return success(experimentSummary(saved));
       },
     }),

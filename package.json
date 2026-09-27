@@ -25,7 +25,11 @@
     "infra:fetch": "node scripts/infra.mjs fetch",
     "infra:up": "node scripts/infra.mjs up",
     "infra:down": "node scripts/infra.mjs down",
-    "infra:status": "node scripts/infra.mjs status"
+    "infra:status": "node scripts/infra.mjs status",
+    "sbom": "node scripts/sbom.mjs",
+    "license:check": "node scripts/license-check.mjs",
+    "test:scripts": "node scripts/run-tests.mjs --package scripts",
+    "eval:gate": "node bin/hypertest.js eval run core --arms scripted-multi-llm --out .hypertest-eval/core-candidate.json && node bin/hypertest.js eval gate --baseline packages/eval/baselines/core-scripted-multi-llm.json --candidate .hypertest-eval/core-candidate.json --report .hypertest-eval/core-gate.md"
   },
   "devDependencies": {
     "@types/node": "24.12.4",

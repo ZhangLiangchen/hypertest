@@ -107,10 +107,10 @@ describe('runTrial: fail fast and infra errors', () => {
 
   test('an invalid arm configuration fails at composition (nothing created) and is an infra error', async () => {
     const { t, calls } = tracked();
-    const bogus = arm((c) => ({ ...c, engines: { default: 'dsh' } }), { brains: () => ({}) });
+    const bogus = arm((c) => ({ ...c, engines: { default: 'openhands' } }), { brains: () => ({}) });
     const r = await runTrial(t, bogus, { workDir: dir.path, trial: 0, seed: 's' });
     assert.equal(r.result, 'infra_error');
-    assert.match(r.error!, /^invalid configuration:\n {2}- engines.default: "dsh" is not a registered engine/);
+    assert.match(r.error!, /^invalid configuration:\n {2}- engines.default: "openhands" is not a registered engine/);
     assert.equal(calls.cleanup, 1);
     assert.equal(existsSync(calls.ctx!.workDir), false);
   });
@@ -126,7 +126,7 @@ describe('runTrial: fail fast and infra errors', () => {
     const warnings: string[] = [];
     const logger = { debug() {}, info() {}, warn: (m: string) => warnings.push(m), error() {}, child() { return logger; } };
     const t = task({ setup: async () => ({ target: {}, cleanup: async () => Promise.reject(new Error('port still bound')) }) });
-    const r = await runTrial(t, arm((c) => ({ ...c, engines: { default: 'dsh' } })), { workDir: dir.path, trial: 0, seed: 's', logger });
+    const r = await runTrial(t, arm((c) => ({ ...c, engines: { default: 'openhands' } })), { workDir: dir.path, trial: 0, seed: 's', logger });
     assert.equal(r.result, 'infra_error');
     assert.ok(warnings.includes('fixture cleanup failed'), warnings.join());
   });

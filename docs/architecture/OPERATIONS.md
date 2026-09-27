@@ -2,7 +2,7 @@
 
 English | [简体中文](OPERATIONS.zh-CN.md)
 
-How to deploy, secure, recover and upgrade Hypertest. The configuration reference is the
+How to deploy, secure, recover, release and upgrade Hypertest. The configuration reference is the
 [app README](../../packages/app/README.md); every command is described in the [CLI README](../../packages/cli/README.md).
 The profiles below were run end to end on the development host (PostgreSQL 16, NATS JetStream, Temporal dev server and
 OPA from `npm run infra:up`) with scripted models, except where a row says otherwise.
@@ -61,7 +61,8 @@ Rules for more than one process:
 
 - **Same code and same configuration everywhere.** They yield the same `RuntimeManifest`. Workers poll the task queue
   `<taskQueue>@<first 16 hex digits of the manifest>`, so a worker with another manifest never receives the run's
-  activities (section 5).
+  activities (section 5). During a canary, or while a retiring release still has live runs, two manifests run side by
+  side: keep workers of each of them.
 - **Shared secrets.** `policy.capabilitySecretEnv` (capability tokens are checked by other workers) and
   `signing.keyFile` (seals are verified by other processes). `hypertest doctor` warns when a PostgreSQL store has no
   shared capability secret; it does not check the signing key.
@@ -114,7 +115,7 @@ enabled). Without it, and with the default `fs` store, evidence is tamper-eviden
 | Secrets | none in the file | `*Env` fields name environment variables; inline keys, tokens, passwords and credential headers are configuration errors. Sandboxed commands get only `sandbox.envAllowlist` (default PATH, HOME, LANG, LC_ALL, TMPDIR). `doctor` prints variable names, never values. |
 | Data directory | `.hypertest/` (0700) | Holds the database, artifacts, `keys/` (0600) and workspaces. Keep it out of git (`init` adds it to `.gitignore`). |
 | REST API | `127.0.0.1`, no token | Always set a token of at least 16 characters in `HYPERTEST_API_TOKEN` (or name another variable with `--token-env`). A non-loopback `--host` requires a token. Human decisions over the API always require it, because agents can reach loopback services. Put TLS in front for remote use. |
-| Human decisions | CLI or API | `approve`, `oracle establish`, `oracle decide`, `waive` and `experience review` need `--by <name>` (plus `--reason` where the command asks for it) and are recorded as `human:<name>`. A requester never decides its own request. All of them are refused when `HYPERTEST_SANDBOX` is set, which both sandboxes set in every command. |
+| Human decisions | CLI or API | `approve`, `oracle establish`, `oracle decide`, `waive`, `experience review` and the runtime release decisions (`runtime register`, `record-suite`, `promote`, `rollback`, `migrate`) need `--by <name>` (plus `--reason` where the command asks for it) and are recorded as `human:<name>` (`--by ci:<pipeline>` for release steps taken by CI). A requester never decides its own request. All of them are refused when `HYPERTEST_SANDBOX` is set, which both sandboxes set in every command, so an agent can never promote the runtime it is judged by. |
 | Permits | built-in rules | Reads and records are allowed; writes and execution only inside the workspace. External effects are allowed on `local`/`sandbox` environments and need approval on `staging`. Destructive effects need approval on `staging`, at high risk on `sandbox` and at critical risk anywhere. Anything above read on `production` is denied, and agents can never decide approvals or oracle changes. Add `policy.rules` or OPA to tighten. |
 | Environments | none | Register black-box targets in `environments:` with an `environmentClass`. Control-plane tokens come from `control.tokenEnv`, never the file. |
 
@@ -133,7 +134,11 @@ command (Ctrl-C; the run stays resumable), run `hypertest approve …`, then `hy
 | An oracle change that flips a recorded failure was approved | Decisions that relied on the old revision are flagged; history is not rewritten | `hypertest status <runId>` shows the reassessment flag; start a new run, which pins the new revision |
 | A pinned oracle was superseded during a run | Gate criterion C0 is `unknown`, so the verdict is `inconclusive` | Start a new run |
 | The run budget ran out | The run goes to the gate with the evidence it has (never a silent downgrade); gaps make it `inconclusive` | Raise `budget` in the configuration (or in `POST /runs`) and start a new run |
-| A live run is pinned to another runtime manifest | It is not resumed; the control plane refuses to drive it | Finish it with its own runtime (section 5) or `hypertest cancel <runId> --reason "…"` |
+| A live run is pinned to another runtime manifest | It is not resumed; the control plane refuses to drive it | Finish it with its own runtime, migrate it (`hypertest runtime migrate`, section 5.3) or `hypertest cancel <runId> --reason "…"` |
+| `hypertest run` fails with `runtime release: … new runs are created only under the active release …` (`precondition_failed`) | This runtime is not the active release (or an unselected canary, a rolled-back release, or no release is active while `runtime.requireActiveRelease` is set); no run was created | Run it where the active release is deployed, or release this runtime (section 5.2) |
+| A runtime release misbehaves (canary or active) | – | `hypertest runtime rollback [<manifestId>] --by <name> --reason "…"` (section 5.3); then re-run the suites against the active release |
+| A run is paused `quarantined` | Its release was rolled back; the run is never driven or resumed on it | `hypertest runtime migrate <runId> --to <active manifest> --by <name> --reason "…"`, then `hypertest resume` on that runtime; or `hypertest cancel` |
+| A run is paused `migrating` and no migration is running | The migrating process died between checkpoint and re-pin; resume is refused | `hypertest runtime migrate <runId> --abort --by <name> --reason "…"`: the run continues on the runtime it is pinned to |
 | A gate criterion should not block this run | – | `hypertest waive <runId> <criterionId> --by <name> --reason "…" [--expires <time>]`: applied at the next gate evaluation, recorded in the decision; C1 evidence integrity can never be waived |
 
 ## 4. Evidence verification
@@ -156,21 +161,93 @@ rotate `signing.keyFile`. `hypertest report <runId>` shows the root, the seal an
 with a local key (the evidence package's `Signer` interface is the KMS/HSM port, but no KMS signer is wired). Records
 carry no `traceId`, and WORM storage needs S3 Object Lock.
 
-## 5. Upgrading and manifest pinning
+## 5. Upgrades, runtime releases and manifest pinning
 
 Every run is pinned to the `RuntimeManifest` of the runtime that started it (invariant I11). The manifest id is a
 content hash of:
 
-- the Hypertest version and a source digest (every file under `packages/*/src`);
-- the agent engines, provider adapters and model catalog (routes);
-- the schema versions;
-- the policy bundle (built-in rules, OPA module digest, role catalog);
-- the tool catalog and the BUGate protocol.
+- the Hypertest version, a source digest (every file under `packages/*/src`), the git commit of the installation (only
+  when it is the top level of a git checkout) and the image digest from `HYPERTEST_IMAGE_DIGEST` (set it in container
+  builds, as `sha256:<64 hex>`; a malformed value fails start-up);
+- the agent engines with their adapter packages and the default engine, the provider adapters and the model catalog
+  (routes);
+- the schema versions (the last migration of each store);
+- the policy bundle (built-in rules, OPA module digest) and the role catalog revision;
+- the tool catalog revision (tools with their timeouts and side-effect bindings, side-effect adapter capabilities) and
+  the BUGate protocol.
 
-Oracles, budgets and gate settings are run inputs, not part of the manifest. `GET /health` and `hypertest worker`
-print the current manifest; `hypertest status <runId>` prints the run's.
+Oracles, budgets and gate settings are run inputs, not part of the manifest. `GET /health`, `hypertest worker` and
+`hypertest runtime show current` print the current manifest; `hypertest status <runId>` prints the run's. Changing
+code, routes, roles, policy or the protocol is an upgrade and yields a new manifest.
 
-Changing code, routes, roles, policy or the protocol is an upgrade:
+### 5.1 Unmanaged and managed installations
+
+Until a first release is activated, an installation is **unmanaged**: any runtime except a rolled-back one may start
+runs, and an upgrade is a redeployment (section 5.4). Once a release is **active**, new runs start only under the active
+release, or under the canary when its selection picks the run. `hypertest run` on any other runtime fails
+(`precondition_failed`, exit 1) and creates no run. Set `runtime: { requireActiveRelease: true }` to refuse new runs
+while no release is active.
+
+Releases live in the store, so every installation on the same PostgreSQL store (or data directory) sees the same
+registry. A `<manifestId>` argument is a full id, a unique prefix or `current` (the runtime of the installation that
+runs the command). Every decision takes `--by <name>` (a human) or `--by ci:<pipeline>` and a `--reason` where asked;
+it is recorded in the append-only release history and refused inside the agent sandbox.
+
+### 5.2 Releasing a new runtime
+
+Deploy the new code or configuration next to the active one on the same store (with PGlite, one process at a time owns
+the data directory), then from the new installation:
+
+| Step | Command | Notes |
+|---|---|---|
+| 1. Register | `hypertest runtime register --by <name> [--allow-migration <schema>:<from>=><to> …]` | The manifest becomes a `candidate`. `--allow-migration` names the schema changes that runs of older releases may take when they are migrated onto this one; it is fixed at registration. To register another installation's manifest, export it there with `hypertest runtime show current --json > manifest.json`, then run `register --manifest manifest.json`. |
+| 2. Engine contract | Run the AgentEngine contract suites of the engines you use (`node scripts/run-tests.mjs --package runtime`, `--package runtime-pi`, `--package runtime-dsh`), then `hypertest runtime record-suite current --kind engine_contract --suite agent-engine-contract --passed --total <n> --by ci:<pipeline>` | Record a failure with `--failed --failures <n>`. A pass claimed over failed cases or over zero cases is refused. |
+| 3. Replay | `hypertest eval run core --arms scripted-multi-llm --out core.json`, then `hypertest runtime record-suite current --kind replay --from-eval core.json --by ci:<pipeline>` | `--from-eval` takes the suite id, revision and result from the SuiteResult (every trial must pass) and binds the record to the file's sha256. `--arms config` evaluates the configuration's own models (their key variables must be set). `hypertest eval gate --baseline <file> --candidate core.json` compares the result with a baseline first. |
+| 4. Shadow | `hypertest runtime promote current --by <name> --reason "…"` | candidate → shadow. Each promotion needs the latest `engine_contract` and `replay` results of the manifest to be passes; a later failing result blocks the next step. A shadow release starts no runs in the store (eval trials use their own fresh stores). |
+| 5. Canary | `hypertest runtime promote current --by <name> --reason "…" --canary-percent 10 [--canary-label key=value …]` | shadow → canary. Entering canary needs a selection: a share of new run ids and/or labels (`hypertest run --label key=value`). There is at most one canary. |
+| 6. Activate | `hypertest runtime promote current --by <name> --reason "…"` | canary → active. The active pointer moves; the previous active release becomes `retiring` (its live runs continue on it) and is retired once no live run is pinned to it (`runtime list` and `promote` retire drained releases). |
+
+`hypertest runtime list` shows every release with its state, the active pointer, the canary share and its live runs;
+`hypertest runtime show <manifestId>` shows a manifest and its recorded suite results. With Temporal, keep the workers
+of every release that still has live runs: each manifest polls its own task queue.
+
+### 5.3 Rolling back and migrating runs
+
+`hypertest runtime rollback [<manifestId>] --by <name> --reason "…"` rolls back the given release; without an id it
+stops the canary, or else rolls the active release back to the previous active one (which must still be registered and
+not rolled back). The rolled-back release is retired for good and is never promoted again. Its live runs are
+**quarantined**: paused with `pauseReason: quarantined`, recorded as `run.quarantined`, noted in the report, and
+refused by `resume`. Runs of every other release continue on their pinned manifests without any migration. The command
+prints the quarantined runs and asks you to re-run the compatibility and replay suites against the active release
+(`record-suite`). Then deploy the active release's code and configuration where the rolled-back one ran.
+
+A quarantined run, or any live run that should move to another release, is migrated explicitly:
+
+```bash
+hypertest runtime migrate <runId> --to <manifestId>|current --by <name> --reason "…" [--checkpoint-timeout-ms n]
+hypertest resume            # on the target runtime: the migration itself never drives the run
+```
+
+The migration checkpoints the run (in-flight turns give their claims back; default wait 90 s), takes a canonical
+snapshot and reconciles its operations (refused while an operation is unsettled or a work item is waiting). It then
+checks compatibility: the target is active or canary, the schemas are equal or covered by an allowed migration, the
+engines the run used are pinned, and the protocol is the same. One transaction records a RuntimeEpoch and
+`run.migrated`, re-pins the run and resumes it. A refused migration leaves the run as it was. Alternatively cancel the
+run with `hypertest cancel <runId> --reason "…"`.
+
+If the migrating process dies between the checkpoint and the re-pin, the run stays paused `migrating` and cannot be
+resumed. `hypertest runtime migrate <runId> --abort --by <name> --reason "…"` releases the checkpoint
+(`run.migration_released`), and the run continues on the runtime it is still pinned to (a run of a rolled-back release
+is quarantined instead).
+
+Limits: suite results are attested by whoever records them, and `promote` accepts any passing replay suite, so make your
+release pipeline record the core suite. Migration was exercised with the local durable runtime, not against a live
+Temporal server (with Temporal the source workflow fails at its next tick, and `resume` on the target starts the run's
+workflow on the target's task queue).
+
+### 5.4 Unmanaged upgrades and database migrations
+
+Without an active release:
 
 1. Let live runs finish, or cancel them. With Temporal you can instead keep the old workers running: they keep
    polling their own queue until their runs are done.
@@ -180,9 +257,9 @@ Changing code, routes, roles, policy or the protocol is an upgrade:
    left alone.
 
 Rolling back means redeploying the old code and configuration; the same content gives the same manifest id, so the
-old runtime can drive its runs again. Migrations are forward-only (there are no down-migrations): try a rollback
-against a copy of the database first. Release states, an active-runtime pointer and migration of in-flight runs to a
-new runtime are not implemented ([CONFORMANCE.md](CONFORMANCE.md), runtime manifest and release).
+old runtime can drive its runs again. In both modes database migrations are forward-only (there are no
+down-migrations) and must stay compatible with the release that is still running (expand, then contract): try a
+rollback against a copy of the database first.
 
 ## 6. Observability
 
@@ -190,3 +267,31 @@ new runtime are not implemented ([CONFORMANCE.md](CONFORMANCE.md), runtime manif
 - `hypertest events <runId> [--follow] [--types a,b]` and `GET /runs/:id/events` (SSE) stream the L0 events: model
   routes, tool calls, permits, operations, admissions and gate evaluations, with correlation and causation ids.
 - There is no OpenTelemetry export and events carry no `traceId`.
+
+## 7. Supply-chain checks
+
+CI runs these on every push and pull request (technology-selection §许可证策略):
+
+| Check | Command | CI |
+|---|---|---|
+| License policy | `npm run license:check` (`--json`, `--omit dev`, `--allow ID,…`) | blocking |
+| SBOM | `npm run sbom` writes a CycloneDX document to `.hypertest-sbom.json` (`--out <file>`, `--omit dev`) | uploaded as the `sbom` artifact |
+| Vulnerabilities | `npm audit --omit=dev --audit-level=high` | informational (advisories change without a code change) |
+| Script tests | `npm run test:scripts` | blocking |
+| Eval release gate | `npm run eval:gate` (the core suites against `packages/eval/baselines/core-scripted-multi-llm.json`; report in `.hypertest-eval/`) | blocking |
+
+- **License policy.** Every installed package's `license` (an SPDX expression) must be satisfiable from the allowlist:
+  MIT, ISC, BSD-2-Clause, BSD-3-Clause, Apache-2.0, 0BSD, BlueOak-1.0.0, CC0-1.0, Unlicense, Python-2.0 and CC-BY-4.0.
+  Unknown licenses (missing, unparseable, `UNLICENSED`, "SEE LICENSE IN …") and copyleft or other licenses fail unless
+  `scripts/license-exceptions.json` has a reviewed exception. An exception names the package, the exact license
+  expression it was reviewed for (and optionally the version) and a rationale, so a later relicensing is reviewed
+  again. Ambiguous spellings such as "BSD" or "Public Domain" are never mapped onto an allowed license, and stale
+  exceptions are reported as warnings. Exit codes: 0 ok, 1 violation, 2 usage or unreadable input. The current lockfile
+  (400 packages) passes with one exception (`unionfs`, which declares no license field and ships the Unlicense).
+- **SBOM.** Taken from `npm sbom` (npm ≥ 10.1); otherwise built from `package-lock.json` as CycloneDX 1.5 with purl,
+  version, license, the lockfile's SHA-512 integrity and the resolved URL of every package. The source is recorded in
+  `metadata.properties` (`hypertest:sbom:source`). The lockfile is the dependency provenance record either way.
+- **Audit.** At the time of writing `npm audit --omit=dev` reports one moderate advisory (`ajv`, ReDoS with the `$data`
+  option). The CI step does not block on it.
+- **Not covered yet:** fork patch tracking and package signature/provenance attestation (`npm audit signatures`).
+- The generated `.hypertest-sbom.json` and `.hypertest-eval/` are build outputs; do not commit them.

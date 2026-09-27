@@ -15,7 +15,7 @@ import { after, before, describe, test } from 'node:test';
 import type { JsonValue } from '@hypertest/core';
 import type { ActionCapability, ExperimentSpec, TestRun, WorkItem } from '@hypertest/domain';
 import type { ToolExecutionRequest, ToolExecutionResult } from '@hypertest/tools';
-import { WorkFactory, createToolDispatcher, runScope, workScope } from '../src/index.ts';
+import { WorkFactory, createControlPlane, createToolDispatcher, runScope, workScope } from '../src/index.ts';
 import { call, createHarness, parsed, type Harness, type RoleBrain } from './harness.ts';
 
 const LEAD_OUT: { [k: string]: JsonValue } = { summary: 'lead done', planProposed: false, readyForGate: false, objectives: [] };
@@ -125,6 +125,26 @@ describe('conformance-6: experiments are bound to admitted claims', () => {
     const granted = await eventsOf(h, b.run.runId, 'admission.granted');
     assert.equal(granted.length, 1);
     assert.deepEqual(granted[0]!.payload['claims'], [{ resourceKey: 'service/orders', mode: 'fault_exclusive' }]);
+  });
+
+  test('chaos (concurrent): two fault experiments defined at the same time on the same service ⇒ exactly one is admitted and created', async () => {
+    const a = await lead(h, 'concurrent fault A');
+    const b = await lead(h, 'concurrent fault B');
+    const isolation = { mode: 'exclusive_write', resourceClaims: [{ resourceKey: 'service/inventory', mode: 'fault_exclusive' }] };
+    const [ra, rb] = await Promise.all([
+      a.dispatch('experiment.define', { hypothesis: 'inventory tolerates latency', environmentId: 'svc', faultPlan: [{ kind: 'latency', target: 'inventory' }], isolation }),
+      b.dispatch('experiment.define', { hypothesis: 'inventory tolerates a kill', environmentId: 'svc', faultPlan: [{ kind: 'process_kill', target: 'inventory' }], isolation }),
+    ]);
+    const outcomes = [ra, rb].map((r) => (r.message.isError ? 'refused' : 'admitted')).sort();
+    assert.deepEqual(outcomes, ['admitted', 'refused'], `${String(ra.message.content)}\n${String(rb.message.content)}`);
+    const [winner, loser] = ra.message.isError ? [b, a] : [a, b];
+    const loserResult = ra.message.isError ? ra : rb;
+    assert.match(String(loserResult.message.content), /resource_conflict: experiment not created/);
+    const created = await h.deps.specs.listExperiments(winner.run.runId);
+    assert.equal(created.length, 1);
+    assert.deepEqual(await h.deps.specs.listExperiments(loser.run.runId), []);
+    const holders = (await h.deps.admission.active()).filter((c) => c.claim.resourceKey === 'service/inventory').map((c) => c.holderId);
+    assert.deepEqual(holders, [created[0]!.experimentId], 'one holder of the fault claim, never two');
   });
 
   test('records environment generation/build digest, fixtures, a generated (retry-stable) seed, workload, derived stop conditions, contamination rules and default claims', async () => {
@@ -582,6 +602,467 @@ describe('conformance-5: external QPS is reserved across concurrent load jobs an
       assert.equal(await reserved(), 20);
       await h.control.cancelRun(l.run.runId, 'test');
       assert.equal(await reserved(), 0);
+    } finally {
+      restore();
+    }
+  });
+});
+
+describe('conformance-5 × durability-1: recovery keeps the QPS reservation of a load job that outlives its worker', () => {
+  let h: Harness;
+  before(async () => {
+    h = await createHarness({ brains: readingLead(), environments: ENVIRONMENTS });
+  });
+  after(async () => h.dispose());
+
+  test('recover releases the dead turn\'s model reservations but not the rate of its still-running job; a job over the cap stays refused until the job ends', async () => {
+    const l = await lead(h, 'qps across a crash', { maxExternalQps: 100 });
+    const ops: string[] = [];
+    const restore = intercept(h, async (req) => {
+      if (req.toolId !== 'load.start') return undefined;
+      const op = await h.deps.ledger.prepare({
+        runId: req.runId, workItemId: req.workItemId, toolInvocationId: req.invocationId, operationType: 'load.start', adapterId: 'load.http',
+        target: { resourceKey: 'loadgen/127.0.0.1:9', kind: 'load_job' }, desiredStateHash: `d-${req.invocationId}`, inputHash: `i-${req.invocationId}`,
+      }, req.eventContext);
+      ops.push(op.operationId);
+      await h.deps.ledger.transition(op.operationId, 'dispatching', {}, req.eventContext);
+      await h.deps.ledger.transition(op.operationId, 'acknowledged', { externalJobId: op.operationId }, req.eventContext);
+      return result(req, { status: 'pending', operationId: op.operationId, structured: { operationId: op.operationId, operationStatus: 'acknowledged' } });
+    });
+    const reserved = async () => (await h.deps.budget.usage(runScope(l.run.runId)))?.reserved ?? {};
+    const load = (rate: number) => ({ method: 'GET', environmentId: 'svc', path: '/', ratePerSecond: rate, durationMs: 600_000 });
+    try {
+      const d = await dispatcherFor(h, l.run, l.item, l.agent.agentId, l.agent.sessionId, l.spec.capability, ['load.start']);
+      const started = await d('load.start', load(60));
+      assert.equal(started.message.isError, undefined, String(started.message.content));
+      // worker-1 then reserved its next model call and died with both open
+      const turn = await h.deps.budget.reserve([workScope(l.item.workItemId)], { tokens: 1000 }, 'model call of a turn that never returned');
+      assert.equal(turn.ok, true);
+      assert.deepEqual([(await reserved()).externalQps, (await reserved()).tokens], [60, 1000]);
+
+      const worker2 = createControlPlane({ ...h.deps, config: { ...h.deps.config, workerId: 'worker-2' } });
+      h.clock.advance(60_001);
+      const report = await worker2.recover(l.run.runId);
+      assert.ok(report.requeued.includes(l.item.workItemId), 'the dead worker\'s claim was taken');
+      assert.equal((await reserved()).tokens ?? 0, 0, 'the stranded model reservation is released (durability-1)');
+      assert.equal((await reserved()).externalQps, 60, 'the job still runs: its rate stays reserved');
+      // the job still holds its rate: a second concurrent job above the cap is refused
+      const d2 = await dispatcherFor(h, l.run, l.item, 'agent-w2', 'sess-w2', l.spec.capability, ['load.start']);
+      const over = await d2('load.start', load(50));
+      assert.equal(over.message.isError, true);
+      assert.match(String(over.message.content), /\[denied\] external_qps_exhausted: running load jobs of this run already hold 60 of its maxExternalQps 100/);
+      assert.equal(ops.length, 1, 'the refused job never started');
+      // the recovered job ends ⇒ the next tick gives its rate back
+      await worker2.tick(l.run.runId);
+      assert.equal((await reserved()).externalQps, 60);
+      await h.deps.ledger.transition(ops[0]!, 'verified', { result: { state: 'completed' } }, h.ctx(l.run.runId));
+      await worker2.tick(l.run.runId);
+      assert.equal((await reserved()).externalQps ?? 0, 0);
+    } finally {
+      restore();
+    }
+  });
+});
+
+// ======================================================================================== adversarial review (B2)
+
+/** A dispatcher whose calls carry an explicit invocation id (a replay re-dispatches the SAME invocation). */
+async function replayableDispatcherFor(h: Harness, run: TestRun, item: WorkItem, agentId: string, sessionId: string, capability: ActionCapability, extraTools: string[]) {
+  const d = createToolDispatcher(h.deps, {
+    runId: run.runId, workItemId: item.workItemId, agentId, role: item.role, sessionId,
+    capability: { ...capability, tools: [...capability.tools, ...extraTools], allowedEffects: ['read', 'record', 'write_workspace', 'execute', 'external', 'destructive'] },
+    allow: ['blackboard.read', 'experiment.define', ...extraTools], deny: [],
+    workspace: await h.deps.workspaces.scratch({ runId: run.runId, workItemId: item.workItemId }),
+    eventContext: { runId: run.runId, correlationId: item.workItemId, actorId: agentId, workItemId: item.workItemId, agentId },
+    turnState: {},
+  });
+  return (name: string, args: JsonValue, invocationId: string) =>
+    d.dispatch({ id: invocationId.split(':').at(-1)!, name: name.replaceAll('.', '__'), arguments: args }, { sessionId, turn: 900, invocationId, signal: new AbortController().signal });
+}
+
+async function executorFor(h: Harness, runId: string, expIds: string[], fp: string): Promise<WorkItem> {
+  const c = await new WorkFactory(h.deps).create({
+    runId, kind: 'task', origin: { kind: 'system', reason: 'test' }, title: `for ${expIds.join(',')}`, objective: `run ${fp}`, role: 'executor', objectiveIds: [], capabilityRequirements: [],
+    inputRefs: expIds.map((id) => ({ kind: 'experiment' as const, id })), evidenceRequirements: [], dependsOn: [], budget: { maxTurns: 5, maxTokens: 10_000, maxToolCalls: 50, maxWallClockMs: 6_000_000 },
+    priority: 10, depth: 0, fingerprint: fp, resourceClaims: [], state: 'blocked',
+  }, h.ctx(runId));
+  const w = c.status === 'created' ? c.workItem : assert.fail('not created');
+  await h.deps.budget.open(workScope(w.workItemId), {}, runScope(runId));
+  return w;
+}
+
+function expIdOf(r: { execution?: ToolExecutionResult }): string {
+  return String((r.execution!.structured as Record<string, unknown>)['experimentId']);
+}
+
+describe('review B2 — external QPS is never run on a released reservation', () => {
+  let h: Harness;
+  before(async () => {
+    h = await createHarness({ brains: readingLead(), environments: ENVIRONMENTS });
+  });
+  after(async () => h.dispose());
+
+  const load = (rate: number) => ({ method: 'GET', environmentId: 'svc', path: '/', ratePerSecond: rate, durationMs: 600_000 });
+
+  test('an execution that throws AFTER its job was dispatched keeps the job\'s rate reserved (a second job over the cap stays refused)', async () => {
+    const l = await lead(h, 'qps: throw after dispatch', { maxExternalQps: 100 });
+    const ops: string[] = [];
+    const restore = intercept(h, async (req) => {
+      if (req.toolId !== 'load.start') return undefined;
+      const op = await h.deps.ledger.prepare({
+        runId: req.runId, workItemId: req.workItemId, toolInvocationId: req.invocationId, operationType: 'load.start', adapterId: 'load.http',
+        target: { resourceKey: 'loadgen/127.0.0.1:9', kind: 'load_job' }, desiredStateHash: `d-${req.invocationId}`, inputHash: `i-${req.invocationId}`,
+      }, req.eventContext);
+      ops.push(op.operationId);
+      await h.deps.ledger.transition(op.operationId, 'dispatching', {}, req.eventContext);
+      await h.deps.ledger.transition(op.operationId, 'acknowledged', { externalJobId: op.operationId }, req.eventContext);
+      if (ops.length === 1) throw new Error('event store unavailable after the job was launched');
+      return result(req, { status: 'pending', operationId: op.operationId, structured: { operationId: op.operationId, operationStatus: 'acknowledged' } });
+    });
+    const reserved = async () => (await h.deps.budget.usage(runScope(l.run.runId)))?.reserved.externalQps ?? 0;
+    try {
+      const call = await replayableDispatcherFor(h, l.run, l.item, l.agent.agentId, l.agent.sessionId, l.spec.capability, ['load.start']);
+      await assert.rejects(call('load.start', load(60), `${l.agent.sessionId}:900:qa`), /event store unavailable/);
+      assert.equal(await reserved(), 60, 'the job runs: its rate stays reserved');
+      const over = await call('load.start', load(50), `${l.agent.sessionId}:900:qb`);
+      assert.equal(over.message.isError, true);
+      assert.match(String(over.message.content), /external_qps_exhausted/);
+      assert.equal(ops.length, 1, 'the second job never started');
+      // the job ends ⇒ the tick gives the rate back
+      await h.deps.ledger.transition(ops[0]!, 'verified', { result: { state: 'completed' } }, h.ctx(l.run.runId));
+      await h.control.tick(l.run.runId);
+      assert.equal(await reserved(), 0);
+    } finally {
+      restore();
+    }
+  });
+
+  test('a replayed load.start whose reservation was already given back reserves its rate again before the job runs', async () => {
+    const l = await lead(h, 'qps: replay after release', { maxExternalQps: 100 });
+    const ops: string[] = [];
+    let attempt = 0;
+    const restore = intercept(h, async (req) => {
+      if (req.toolId !== 'load.start') return undefined;
+      if (req.invocationId.endsWith(':ra') && ++attempt === 1) throw new Error('policy store unavailable (nothing dispatched)');
+      const op = await h.deps.ledger.prepare({
+        runId: req.runId, workItemId: req.workItemId, toolInvocationId: req.invocationId, operationType: 'load.start', adapterId: 'load.http',
+        target: { resourceKey: 'loadgen/127.0.0.1:9', kind: 'load_job' }, desiredStateHash: `d-${req.invocationId}`, inputHash: `i-${req.invocationId}`,
+      }, req.eventContext);
+      ops.push(op.operationId);
+      await h.deps.ledger.transition(op.operationId, 'dispatching', {}, req.eventContext);
+      await h.deps.ledger.transition(op.operationId, 'acknowledged', { externalJobId: op.operationId }, req.eventContext);
+      return result(req, { status: 'pending', operationId: op.operationId, structured: { operationId: op.operationId, operationStatus: 'acknowledged' } });
+    });
+    const reserved = async () => (await h.deps.budget.usage(runScope(l.run.runId)))?.reserved.externalQps ?? 0;
+    try {
+      const call = await replayableDispatcherFor(h, l.run, l.item, l.agent.agentId, l.agent.sessionId, l.spec.capability, ['load.start']);
+      const inv = `${l.agent.sessionId}:900:ra`;
+      await assert.rejects(call('load.start', load(60), inv), /policy store unavailable/);
+      assert.equal(await reserved(), 0, 'no job was dispatched: nothing stays reserved');
+      // the engine replays the pending call with the SAME invocation id: the job now starts
+      const replay = await call('load.start', load(60), inv);
+      assert.equal(replay.message.isError, undefined, String(replay.message.content));
+      assert.equal(ops.length, 1);
+      assert.equal(await reserved(), 60, 'the replayed job holds a live reservation of its rate');
+      const over = await call('load.start', load(50), `${l.agent.sessionId}:900:rb`);
+      assert.match(String(over.message.content), /external_qps_exhausted: running load jobs of this run already hold 60 of its maxExternalQps 100/);
+      assert.equal(ops.length, 1);
+      // the re-keyed reservation is still tied to its job: the tick releases it once the job ended
+      await h.control.tick(l.run.runId);
+      assert.equal(await reserved(), 60);
+      await h.deps.ledger.transition(ops[0]!, 'verified', { result: { state: 'completed' } }, h.ctx(l.run.runId));
+      await h.control.tick(l.run.runId);
+      assert.equal(await reserved(), 0);
+    } finally {
+      restore();
+    }
+  });
+});
+
+describe('review B2 — a write/fault call acts only on resources its experiment claims', () => {
+  let h: Harness;
+  before(async () => {
+    h = await createHarness({ brains: readingLead(), environments: ENVIRONMENTS });
+  });
+  after(async () => h.dispose());
+
+  test('resources outside the experiment\'s claims are refused (experiment_claims_missing), never executed; covered ones run and name the covering experiment', async () => {
+    const l = await lead(h, 'coverage');
+    const wr = expIdOf(await l.dispatch('experiment.define', { hypothesis: 'svc holds 5 rps', environmentId: 'svc', workload: { kind: 'http_load', ratePerSecond: 5 } }));
+    const payment = expIdOf(await l.dispatch('experiment.define', {
+      hypothesis: 'payment tolerates latency', environmentId: 'other', faultPlan: [{ kind: 'latency', target: 'payment' }],
+      isolation: { mode: 'exclusive_write', resourceClaims: [{ resourceKey: 'service/payment', mode: 'fault_exclusive' }] },
+    }));
+    const seen: ToolExecutionRequest[] = [];
+    const restore = intercept(h, async (req) => {
+      if (req.workItemId === l.item.workItemId) return undefined;
+      seen.push(req);
+      return result(req);
+    });
+    try {
+      const w = await executorFor(h, l.run.runId, [wr], 'fp-cover-wr');
+      const d = await dispatcherFor(h, l.run, w, 'agent-cov', 'sess-cov', l.spec.capability, ['http.request', 'load.start', 'env.restart']);
+      const ok = await d('http.request', { method: 'POST', environmentId: 'svc', path: '/orders', body: '{}' });
+      assert.equal(ok.message.isError, undefined, String(ok.message.content));
+      assert.equal(seen.length, 1);
+      const cases: Array<[string, JsonValue, RegExp]> = [
+        ['http.request', { method: 'POST', environmentId: 'other', path: '/orders', body: '{}' }, /env\/other is outside the claims of experiment/],
+        ['env.restart', { environmentId: 'other', reason: 'x' }, /env\/other is outside the claims of experiment/],
+        ['load.start', { method: 'GET', targetUrl: 'http://127.0.0.1:11/', ratePerSecond: 1, durationMs: 1000 }, /url\/127\.0\.0\.1:11 is outside the claims of experiment/],
+        // the URL of ANOTHER registered environment is that environment: not covered
+        ['http.request', { method: 'POST', url: 'http://127.0.0.1:10/orders', body: '{}' }, /url\/127\.0\.0\.1:10 is outside the claims of experiment/],
+      ];
+      for (const [name, args, re] of cases) {
+        const denied = await d(name, args);
+        assert.equal(denied.message.isError, true, `${name} ${JSON.stringify(args)}`);
+        assert.match(String(denied.message.content), /\[denied\] experiment_claims_missing: /);
+        assert.match(String(denied.message.content), re);
+      }
+      assert.equal(seen.length, 1, 'nothing outside the claims was executed');
+      // the claimed environment addressed by its URL is covered (the same system under test)
+      const byUrl = await d('http.request', { method: 'POST', url: 'http://127.0.0.1:9/orders', body: '{}' });
+      assert.equal(byUrl.message.isError, undefined, String(byUrl.message.content));
+      assert.equal(seen.length, 2);
+      // a fault experiment whose claims name an abstract service does not cover the environment the fault tool acts on
+      const wf = await executorFor(h, l.run.runId, [payment], 'fp-cover-fault');
+      const df = await dispatcherFor(h, l.run, wf, 'agent-covf', 'sess-covf', l.spec.capability, ['env.inject_fault']);
+      const fault = await df('env.inject_fault', { environmentId: 'other', fault: 'latency' });
+      assert.match(String(fault.message.content), /experiment_claims_missing: .*env\/other is outside the claims of experiment/);
+      assert.equal(seen.length, 2);
+      // an item running for two experiments: a covered write is attributed to the experiment whose claims cover it
+      const both = await executorFor(h, l.run.runId, [wr, payment], 'fp-cover-both');
+      const db2 = await dispatcherFor(h, l.run, both, 'agent-both', 'sess-both', l.spec.capability, ['http.request']);
+      const covered = await db2('http.request', { method: 'POST', environmentId: 'svc', path: '/orders', body: '{}' });
+      assert.equal(covered.message.isError, undefined, String(covered.message.content));
+      assert.equal(seen.at(-1)!.experimentId, wr);
+    } finally {
+      restore();
+    }
+  });
+
+});
+
+describe('review B2 — no work item writes to or faults a resource another experiment holds', () => {
+  let h: Harness;
+  before(async () => {
+    h = await createHarness({ brains: readingLead(), environments: ENVIRONMENTS });
+  });
+  after(async () => h.dispose());
+
+  test('a write/fault call on a resource another experiment holds is refused — also for items that run for no experiment (the contamination rule is enforced)', async () => {
+    const a = await lead(h, 'holder run');
+    const fault = expIdOf(await a.dispatch('experiment.define', { hypothesis: 'other tolerates latency', environmentId: 'other', faultPlan: [{ kind: 'latency', target: 'other' }] }));
+    const loadgen = expIdOf(await a.dispatch('experiment.define', {
+      hypothesis: 'the load generator is exclusive', environmentId: 'svc', workload: { kind: 'http_load', ratePerSecond: 1 },
+      isolation: { mode: 'exclusive_write', resourceClaims: [{ resourceKey: 'loadgen/127.0.0.1:9', mode: 'write_exclusive' }] },
+    }));
+    const spec = (await h.deps.specs.getExperiment(fault))!;
+    assert.match(spec.contaminationRules[0]!.description, /no other experiment or work item may use env\/other/);
+    const b = await lead(h, 'intruding run');
+    const seen: ToolExecutionRequest[] = [];
+    const restore = intercept(h, async (req) => {
+      if (req.workItemId !== b.item.workItemId || req.toolId === 'blackboard.read') return undefined;
+      seen.push(req);
+      return result(req);
+    });
+    try {
+      const d = await dispatcherFor(h, b.run, b.item, b.agent.agentId, b.agent.sessionId, b.spec.capability, ['env.inject_fault', 'http.request', 'load.start']);
+      for (const [name, args, holder] of [
+        ['env.inject_fault', { environmentId: 'other', fault: 'latency' }, fault],
+        ['http.request', { method: 'POST', environmentId: 'other', path: '/x', body: '{}' }, fault],
+        // the held environment addressed by its URL (no alias bypass)
+        ['http.request', { method: 'POST', url: 'http://127.0.0.1:10/x', body: '{}' }, fault],
+        ['load.start', { method: 'GET', environmentId: 'svc', path: '/', ratePerSecond: 1, durationMs: 1000 }, loadgen],
+      ] as const) {
+        const denied = await d(name, args as unknown as JsonValue);
+        assert.equal(denied.message.isError, true, name);
+        assert.match(String(denied.message.content), /\[denied\] experiment_resource_conflict: /);
+        assert.ok(String(denied.message.content).includes(holder), `${name}: the holding experiment is named`);
+      }
+      assert.equal(seen.length, 0, 'nothing was executed');
+      const events = (await h.deps.events.read(b.run.runId, { types: ['tool.denied'] })).filter((e) => (e.payload as Record<string, unknown>)['errorCode'] === 'experiment_resource_conflict');
+      assert.equal(events.length, 4);
+      // reads of the held resource and writes elsewhere still run
+      assert.equal((await d('http.request', { method: 'GET', environmentId: 'other', path: '/health' })).message.isError, undefined);
+      assert.equal((await d('http.request', { method: 'POST', environmentId: 'svc', path: '/x', body: '{}' })).message.isError, undefined);
+      assert.deepEqual(seen.map((r) => r.toolId), ['http.request', 'http.request']);
+      // once the holder's claims are released, the intruder may act
+      await h.deps.admission.release(fault);
+      assert.equal((await d('env.inject_fault', { environmentId: 'other', fault: 'latency' })).message.isError, undefined);
+    } finally {
+      restore();
+    }
+  });
+});
+
+describe('review B2 — experiment.define keeps a saved experiment admitted across a failed call', () => {
+  let h: Harness;
+  before(async () => {
+    h = await createHarness({ brains: readingLead(), environments: ENVIRONMENTS });
+  });
+  after(async () => h.dispose());
+
+  test('a failure after the experiment was saved does not release its claims; the replay records it on the run', async () => {
+    const l = await lead(h, 'partial define');
+    const spec = h.deps.registry.get('experiment.define')!;
+    const ctx = {
+      runId: l.run.runId, workItemId: l.item.workItemId, agentId: l.agent.agentId, role: 'lead', invocationId: `${l.agent.sessionId}:78:pd`,
+      eventContext: { runId: l.run.runId, correlationId: l.item.workItemId, actorId: l.agent.agentId, workItemId: l.item.workItemId, agentId: l.agent.agentId },
+      signal: new AbortController().signal, logger: h.logger, environments: h.deps.environments, artifacts: h.deps.artifacts,
+    };
+    const input = { hypothesis: 'partial', environmentId: 'svc', faultPlan: [{ kind: 'restart', target: 'svc' }] };
+    const runs = h.deps.runs;
+    const original = runs.update;
+    let failed = false;
+    runs.update = async (...args: Parameters<typeof original>) => {
+      if (!failed && (args[1] as Partial<TestRun>).experimentIds !== undefined) {
+        failed = true;
+        throw new Error('run store unavailable');
+      }
+      return original.apply(runs, args);
+    };
+    try {
+      await assert.rejects(spec.execute(input, ctx as never), /run store unavailable/);
+    } finally {
+      runs.update = original;
+    }
+    const saved = await h.deps.specs.listExperiments(l.run.runId);
+    assert.equal(saved.length, 1, 'the experiment was saved before the failure');
+    const expId = saved[0]!.experimentId;
+    assert.deepEqual((await h.deps.admission.held!(expId)).map((c) => c.claim.mode), ['fault_exclusive'], 'a saved experiment keeps its admitted claims');
+    // a competing definition is still refused
+    const other = await lead(h, 'competitor');
+    const competing = await other.dispatch('experiment.define', { hypothesis: 'competing', environmentId: 'svc', faultPlan: [{ kind: 'latency', target: 'svc' }] });
+    assert.match(String(competing.message.content), /resource_conflict/);
+    // the replay returns the experiment and records it on the run
+    const replay = await spec.execute(input, ctx as never);
+    assert.equal(replay.status, 'success');
+    assert.equal((replay.structured as Record<string, unknown>)['experimentId'], expId);
+    assert.deepEqual((await h.deps.runs.get(l.run.runId))!.experimentIds, [expId]);
+  });
+});
+
+describe('review B2 — experiment.define: a failed save releases the claims only of an experiment that does not exist', () => {
+  let h: Harness;
+  before(async () => {
+    h = await createHarness({ brains: readingLead(), environments: ENVIRONMENTS });
+  });
+  after(async () => h.dispose());
+
+  test('save refused before anything was stored ⇒ claims released; save committed then the call failed ⇒ the existing experiment keeps its claims', async () => {
+    const l = await lead(h, 'failing saves');
+    const spec = h.deps.registry.get('experiment.define')!;
+    const ctxFor = (inv: string) => ({
+      runId: l.run.runId, workItemId: l.item.workItemId, agentId: l.agent.agentId, role: 'lead', invocationId: `${l.agent.sessionId}:79:${inv}`,
+      eventContext: { runId: l.run.runId, correlationId: l.item.workItemId, actorId: l.agent.agentId, workItemId: l.item.workItemId, agentId: l.agent.agentId },
+      signal: new AbortController().signal, logger: h.logger, environments: h.deps.environments, artifacts: h.deps.artifacts,
+    });
+    const store = h.deps.specs;
+    const original = store.saveExperiment;
+    try {
+      store.saveExperiment = async () => {
+        throw new Error('spec store unavailable');
+      };
+      await assert.rejects(spec.execute({ hypothesis: 'never saved', environmentId: 'svc', faultPlan: [{ kind: 'restart', target: 'svc' }] }, ctxFor('a') as never), /spec store unavailable/);
+      assert.deepEqual((await h.deps.admission.active(l.run.runId)).filter((c) => c.holderId.startsWith('exp_')), [], 'not created: no claims');
+      store.saveExperiment = async (...args: Parameters<typeof original>) => {
+        await original.apply(store, args);
+        throw new Error('connection reset after commit');
+      };
+      await assert.rejects(spec.execute({ hypothesis: 'saved', environmentId: 'svc', faultPlan: [{ kind: 'restart', target: 'svc' }] }, ctxFor('b') as never), /connection reset after commit/);
+    } finally {
+      store.saveExperiment = original;
+    }
+    const saved = await h.deps.specs.listExperiments(l.run.runId);
+    assert.equal(saved.length, 1);
+    assert.deepEqual((await h.deps.admission.held!(saved[0]!.experimentId)).map((c) => c.claim.resourceKey), ['env/svc'], 'an existing experiment keeps its claims');
+    const replay = await spec.execute({ hypothesis: 'saved', environmentId: 'svc', faultPlan: [{ kind: 'restart', target: 'svc' }] }, ctxFor('b') as never);
+    assert.equal((replay.structured as Record<string, unknown>)['experimentId'], saved[0]!.experimentId);
+    assert.deepEqual((await h.deps.runs.get(l.run.runId))!.experimentIds, [saved[0]!.experimentId]);
+  });
+});
+
+describe('review B2 — no side effect runs once its evidence can no longer be stored', () => {
+  let h: Harness;
+  before(async () => {
+    h = await createHarness({ brains: readingLead(), environments: ENVIRONMENTS });
+  });
+  after(async () => h.dispose());
+
+  test('a spent artifact budget refuses write/fault calls BEFORE they act (typed budget_exhausted); reads still run', async () => {
+    const l = await lead(h, 'artifact budget vs side effects', { maxArtifactBytes: 1000 });
+    const seen: ToolExecutionRequest[] = [];
+    const restore = intercept(h, async (req) => {
+      if (req.workItemId !== l.item.workItemId || req.toolId === 'blackboard.read') return undefined;
+      seen.push(req);
+      return req.toolId === 'fs.search' ? result(req, { usage: { computeMs: 0, artifactBytes: 1500 } }) : result(req);
+    });
+    try {
+      const d = await dispatcherFor(h, l.run, l.item, l.agent.agentId, l.agent.sessionId, l.spec.capability, ['fs.search', 'http.request', 'env.restart', 'load.stop']);
+      await d('fs.search', { pattern: 'x' });
+      assert.equal((await h.deps.budget.remaining!([workScope(l.item.workItemId)])).artifactBytes, 0);
+      for (const [name, args] of [['http.request', { method: 'POST', environmentId: 'svc', path: '/orders', body: '{}' }], ['env.restart', { environmentId: 'svc', reason: 'x' }]] as const) {
+        const denied = await d(name, args as unknown as JsonValue);
+        assert.equal(denied.message.isError, true, name);
+        assert.match(String(denied.message.content), /\[denied\] budget_exhausted: the artifact budget of run:\S+ is spent \(1500\/1000 bytes\)/);
+      }
+      assert.deepEqual(seen.map((r) => r.toolId), ['fs.search'], 'no side effect ran');
+      const ev = (await eventsOf(h, l.run.runId, 'budget.exhausted')).filter((e) => e.payload['reason'] === 'artifact_bytes');
+      assert.ok(ev.length >= 3, 'each refusal is a typed exhaustion on L0');
+      // a read still runs (it acts on nothing), and a running load job can still be stopped (it only ends an effect)
+      await d('http.request', { method: 'GET', environmentId: 'svc', path: '/health' });
+      await d('load.stop', { operationId: 'op_01J00000000000000000000000' });
+      assert.deepEqual(seen.map((r) => r.toolId), ['fs.search', 'http.request', 'load.stop']);
+    } finally {
+      restore();
+    }
+  });
+});
+
+describe('review B2 — experiment claims outlive their owners while the experiment\'s load job still runs', () => {
+  let h: Harness;
+  before(async () => {
+    h = await createHarness({ brains: readingLead(), environments: ENVIRONMENTS });
+  });
+  after(async () => h.dispose());
+
+  test('owners ended but a job of the experiment runs ⇒ claims kept (a competing experiment stays refused); the job ends ⇒ released', async () => {
+    const l = await lead(h, 'job outlives owners');
+    const expId = expIdOf(await l.dispatch('experiment.define', { hypothesis: 'svc holds 20 rps', environmentId: 'svc', workload: { kind: 'http_load', ratePerSecond: 20 } }));
+    const w = await executorFor(h, l.run.runId, [expId], 'fp-job-outlives');
+    const ops: string[] = [];
+    const restore = intercept(h, async (req) => {
+      if (req.toolId !== 'load.start') return undefined;
+      const op = await h.deps.ledger.prepare({
+        runId: req.runId, workItemId: req.workItemId, toolInvocationId: req.invocationId, operationType: 'load.start', adapterId: 'load.http',
+        target: { resourceKey: 'loadgen/127.0.0.1:9', kind: 'load_job' }, desiredStateHash: `d-${req.invocationId}`, inputHash: `i-${req.invocationId}`,
+        ...(req.experimentId !== undefined ? { experimentId: req.experimentId } : {}),
+      }, req.eventContext);
+      ops.push(op.operationId);
+      await h.deps.ledger.transition(op.operationId, 'dispatching', {}, req.eventContext);
+      await h.deps.ledger.transition(op.operationId, 'acknowledged', { externalJobId: op.operationId }, req.eventContext);
+      return result(req, { status: 'pending', operationId: op.operationId, structured: { operationId: op.operationId, operationStatus: 'acknowledged' } });
+    });
+    try {
+      const d = await dispatcherFor(h, l.run, w, 'agent-job', 'sess-job', l.spec.capability, ['load.start']);
+      const started = await d('load.start', { method: 'GET', environmentId: 'svc', path: '/', ratePerSecond: 20, durationMs: 600_000 });
+      assert.equal(started.message.isError, undefined, String(started.message.content));
+      // both owners end while the job runs
+      await h.deps.blackboard.transitionWorkItem(l.item.workItemId, 'cancelled', { failure: { reason: 'cancelled', message: 'test' } }, h.ctx(l.run.runId), { expectedFencingToken: l.token });
+      await h.deps.blackboard.transitionWorkItem(w.workItemId, 'cancelled', { failure: { reason: 'cancelled', message: 'test' } }, h.ctx(l.run.runId), { expectedFrom: ['blocked'] });
+      await h.control.tick(l.run.runId);
+      assert.deepEqual((await h.deps.admission.held!(expId)).map((c) => c.claim.resourceKey), ['env/svc'], 'the running job keeps its experiment isolated');
+      h.clock.advance(70_000); // past the TTL: renewed by the tick, not lapsed
+      await h.control.tick(l.run.runId);
+      assert.equal((await h.deps.admission.held!(expId)).length, 1);
+      const other = await lead(h, 'competing fault');
+      const refused = await other.dispatch('experiment.define', { hypothesis: 'svc tolerates a restart', environmentId: 'svc', faultPlan: [{ kind: 'restart', target: 'svc' }] });
+      assert.match(String(refused.message.content), new RegExp(`resource_conflict: .*${expId}`));
+      // the job ends ⇒ the next tick releases the claims
+      await h.deps.ledger.transition(ops[0]!, 'verified', { result: { state: 'completed' } }, h.ctx(l.run.runId));
+      await h.control.tick(l.run.runId);
+      assert.deepEqual(await h.deps.admission.held!(expId), []);
+      assert.deepEqual((await eventsOf(h, l.run.runId, 'admission.released')).map((e) => [e.payload['experimentId'], e.payload['reason']]), [[expId, 'owners_ended']]);
     } finally {
       restore();
     }

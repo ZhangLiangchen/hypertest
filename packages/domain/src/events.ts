@@ -69,6 +69,11 @@ export const EVENT_TYPES = {
    * previousPauseReason?, by, reason }`.
    */
   runQuarantined: 'run.quarantined',
+  /**
+   * (additive) The checkpoint of an abandoned runtime migration was released: the run (paused `migrating`) continues on
+   * the manifest it is still pinned to: payload `{ runId, manifestId, by, reason }`.
+   */
+  runMigrationReleased: 'run.migration_released',
   runConverging: 'run.converging',
   runGating: 'run.gating',
   runUpdated: 'run.updated',
@@ -100,17 +105,23 @@ export const EVENT_TYPES = {
   agentDisposed: 'agent.disposed',
   agentSettled: 'agent.settled',
   agentResumed: 'agent.resumed',
+  delegationMessageQueued: 'delegation.message_queued',
+  delegationReleased: 'delegation.released',
 
   modelRouted: 'model.routed',
   modelEpochStarted: 'model.epoch_started',
   modelInvoked: 'model.invoked',
   modelFallback: 'model.fallback',
+  modelCircuitOpened: 'model.circuit_opened',
+  modelCircuitClosed: 'model.circuit_closed',
 
   toolCalled: 'tool.called',
   toolCompleted: 'tool.completed',
   toolDenied: 'tool.denied',
 
   policyDecided: 'policy.decided',
+  policyFlagged: 'policy.flagged',
+  capabilityRequirementsUnmet: 'capability.requirements_unmet',
   approvalRequested: 'approval.requested',
   approvalGranted: 'approval.granted',
   approvalDenied: 'approval.denied',
@@ -154,6 +165,7 @@ export const EVENT_TYPES = {
 
   contextSnapshotCreated: 'context.snapshot_created',
   contextCompacted: 'context.compacted',
+  contextCondensationDeferred: 'context.condensation_deferred',
   contextStaleRejected: 'context.stale_rejected',
 
   budgetReserved: 'budget.reserved',
@@ -168,8 +180,10 @@ export const EVENT_TYPES = {
   admissionGranted: 'admission.granted',
   admissionRefused: 'admission.refused',
   admissionLapsed: 'admission.lapsed',
+  admissionReleased: 'admission.released',
 
   gateEvaluated: 'gate.evaluated',
+  gateOverrideAuthorized: 'gate.override_authorized',
   gatePassed: 'gate.passed',
   gateFailed: 'gate.failed',
   decisionRecorded: 'decision.recorded',

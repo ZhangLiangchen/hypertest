@@ -64,7 +64,8 @@ export interface HypertestConfig {
   gate?: Partial<GateSpec>;
   policy?: { rules?: PolicyRule[]; opa?: { url: string; path?: string; timeoutMs?: number }; capabilitySecretEnv?: string };
   bugate?: { path?: string };
-  engines?: { default: 'native' | 'pi' | (string & {}) };
+  /** The default AgentEngine. `dsh` (the pinned DeepSeek Harness adapter, experimental) is registered only when selected here. */
+  engines?: { default: 'native' | 'pi' | 'dsh' | (string & {}) };
   sandbox?: Partial<SandboxProfile>;
   /** (additive: `control.tokenEnv`) Environments registered at startup; see EnvironmentConfig. */
   environments?: EnvironmentConfig[];
@@ -279,7 +280,22 @@ export interface RuntimeReleaseService {
   recordSuite(input: RecordSuiteInput): Promise<CompatibilitySuiteResult>;
   promote(manifestId: string, input: { by: string; reason: string; canary?: CanarySelection }): Promise<PromotionResult & { retired: string[] }>;
   rollback(input: { by: string; reason: string; manifestId?: string }): Promise<RollbackResult & { quarantined: string[] }>;
+  /**
+   * Quarantines a live run whose release is rolled back (with that rollback's actor, reason and transition) — the
+   * creator's re-check of a run admitted before the rollback committed but created after its sweep. True when it was
+   * quarantined now; false when there is nothing to do (finished, already quarantined, release not rolled back).
+   */
+  quarantineIfRolledBack(runId: string): Promise<boolean>;
   migrate(runId: string, input: MigrateRunInput): Promise<RunMigrationResult>;
+  /**
+   * (additive) Releases the checkpoint of an abandoned migration (the migrating process died between its checkpoint and
+   * its re-pin): a run paused `migrating` goes back to `running` on the manifest it is still pinned to, with
+   * `run.migration_released` (actor, reason) on L0 — its own runtime drives it again (`hypertest resume` there). Anything
+   * else is `precondition_failed`; a run whose release was rolled back is quarantined instead (never released onto that
+   * runtime). A migration still in progress for the run then fails (it finds the run left its checkpoint) and re-pins
+   * nothing.
+   */
+  releaseCheckpoint(runId: string, input: { by: string; reason: string }): Promise<TestRun>;
   epochs(runId: string): Promise<RuntimeEpoch[]>;
 }
 

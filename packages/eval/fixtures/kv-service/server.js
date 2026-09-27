@@ -9,9 +9,14 @@
 //
 // Every /kv request takes a small random latency (1..KV_MAX_LATENCY_MS ms, default 6). KV_WARMUP_MS (default 0) delays
 // the listen after a (re)start, so a restart stays in flight long enough for a chaos kill to land in it.
+// KV_WRITE_LOG (optional, an absolute path): every PUT is appended as a JSON line {key, value, idempotencyKey, pid,
+// startedAt, at} — the environment's own record of the writes it served (eval ground truth; the store is in memory, so a
+// restart loses it).
+import { appendFileSync } from 'node:fs';
 import http from 'node:http';
 
 const MAX_LATENCY_MS = Math.max(1, Number(process.env.KV_MAX_LATENCY_MS ?? 6));
+const WRITE_LOG = process.env.KV_WRITE_LOG;
 const WARMUP_MS = Math.max(0, Number(process.env.KV_WARMUP_MS ?? 0));
 const BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1];
 const started = Date.now();
@@ -73,6 +78,10 @@ const server = http.createServer((req, res) => {
         store.set(m[1], value);
         status = 200;
         body = { key: m[1], value };
+        if (WRITE_LOG) {
+          const idempotencyKey = req.headers['idempotency-key'] ?? null;
+          appendFileSync(WRITE_LOG, `${JSON.stringify({ key: m[1], value, idempotencyKey, pid: process.pid, startedAt: started, at: Date.now() })}\n`);
+        }
       } else {
         status = 405;
         body = { error: 'method_not_allowed' };

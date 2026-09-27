@@ -266,7 +266,7 @@ test('role prompts state their key operational rules', () => {
     environment: ['never issue it again', 'request_approval', 'Never touch production', 'environmentReady is false while any action is pending or outcome_unknown'],
     condenser: ['verbatim', 'Never add facts', 'fail_work'],
     vision_gui: ['DOM first, API second, pixels last', 'Never guess coordinates', 'computer-use tool', 'weaker evidence', 'not_run'],
-    local_private: ['never by value', 'Never copy secrets', 'local model', 'withheld', 'no network tools'],
+    local_private: ['never by value', 'Never copy secrets', 'local model', 'withheld', 'no network tools', 'readable by every other agent of this run, including agents on hosted models', 'never a test, script or command that echoes a secret'],
   };
   for (const [name, needles] of Object.entries(expectations)) for (const n of needles) assert.ok(role(name).systemPrompt.includes(n), `${name}: ${n}`);
 });

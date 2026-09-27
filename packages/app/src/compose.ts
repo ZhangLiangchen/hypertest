@@ -42,6 +42,7 @@ import {
   createSessionStore, createSubagentRuntime, runtimeMigrations, toolCatalogRevision, type AgentEngine,
 } from '@hypertest/runtime';
 import { PI_AGENT_CORE_VERSION, PiEngine, RUNTIME_PI_PACKAGE_VERSION } from '@hypertest/runtime-pi';
+import { DSH_PINS, DshEngine, RUNTIME_DSH_PACKAGE_VERSION } from '@hypertest/runtime-dsh';
 import { BUILTIN_ROLES, RoleCatalog, type RoleCatalogLike } from '@hypertest/agents';
 import { ControlStore, controlMigrations, createControlPlane, createDomainTools, type ControlConfig, type ControlDeps, type ControlPlane, type StartRunInput } from '@hypertest/control';
 import {
@@ -59,7 +60,7 @@ import { acquireDirectoryLock, lockFileFor } from './lock.ts';
 import {
   agentClassification, condenserPrivacyFloor, createReleaseService, hypertestGitSha, imageDigestFrom, releaseGovernedControlPlane, runtimeReleaseNotes, withRuntimeReleaseNotes,
 } from './releases.ts';
-import type { HypertestConfig, HypertestInstance, HypertestOverrides, HypertestServices, ProviderConfig } from './contracts.ts';
+import type { HypertestConfig, HypertestInstance, HypertestOverrides, HypertestServices, ProviderConfig, RuntimeReleaseService } from './contracts.ts';
 
 /** Every migration of the stateful packages, in dependency order (applied idempotently at startup). */
 export const ALL_MIGRATIONS: readonly Migration[] = Object.freeze([
@@ -538,7 +539,8 @@ export async function decisionProblems(
  * bus + one outbox relay, artifacts, the persisted evidence signer, the evidence ledger, the operation services and
  * side-effect adapters, the policy engine (+ OPA), decision log, approvals, oracle governance, QualityGate and the
  * BUGate binding, the model providers/catalog/router, the context services and freshness resolvers, the tool
- * registry/runtime/workspaces/sandbox, the runtime (sessions, agents, epochs, native + pi engines, subagents, runner),
+ * registry/runtime/workspaces/sandbox, the runtime (sessions, agents, epochs, native + pi engines (+ the DSH engine when it
+ * is the configured default), subagents, runner),
  * the role catalog, the RuntimeManifest (I11, the runtime BOM), the control plane (pinned to the manifest, governed by the
  * runtime release registry) and the durable runtime, and the runtime release service. Anything opened before a
  * failure is closed again. Runs are NOT resumed automatically: call `resumeIncomplete()` (e.g. `hypertest resume`).
@@ -762,6 +764,13 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
       if (config.engines?.default === 'pi') throw e;
       logger.warn('the pi engine is unavailable; only the native engine is registered', { error: (e as Error).message });
     }
+    // The DeepSeek Harness adapter (pinned, experimental) is registered — and pinned by the manifest — when it is the
+    // configured default engine; a drifted DSH install fails composition (precondition_failed), never a run.
+    if (config.engines?.default === 'dsh') {
+      const dsh = new DshEngine({ ...base, sessions, events });
+      engineList.push(dsh);
+      pending.push({ name: 'engine:dsh', close: () => dsh.close() });
+    }
     const engines = new EngineRegistry(engineList);
     const defaultEngineKind = config.engines?.default ?? 'native';
     if (!engines.has(defaultEngineKind)) throw invalid(`engines.default: engine '${defaultEngineKind}' is not registered`);
@@ -798,6 +807,11 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
       engineAdapters.push({ provider: 'engine:pi', package: '@hypertest/runtime-pi', version: RUNTIME_PI_PACKAGE_VERSION });
       engineAdapters.push({ provider: 'engine:pi', package: '@earendil-works/pi-agent-core', version: PI_AGENT_CORE_VERSION });
     }
+    if (engines.has('dsh')) {
+      // the adapter and the whole pinned DSH train (the engine refuses to exist over any other installed version)
+      engineAdapters.push({ provider: 'engine:dsh', package: '@hypertest/runtime-dsh', version: RUNTIME_DSH_PACKAGE_VERSION });
+      for (const [pkg, version] of Object.entries(DSH_PINS)) engineAdapters.push({ provider: 'engine:dsh', package: pkg, version });
+    }
     // runtime BOM: the installation (version, source digest, git commit, image digest) and each engine with its adapter
     const hypertestBom: RuntimeManifest['hypertest'] = { version: HYPERTEST_VERSION, sourceDigest: hypertestSourceDigest() };
     const gitSha = hypertestGitSha();
@@ -806,6 +820,7 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
     const engineAdapter: Record<string, { package: string; version: string }> = {
       native: { package: '@hypertest/runtime', version: RUNTIME_PACKAGE_VERSION },
       pi: { package: '@hypertest/runtime-pi', version: RUNTIME_PI_PACKAGE_VERSION },
+      dsh: { package: '@hypertest/runtime-dsh', version: RUNTIME_DSH_PACKAGE_VERSION },
     };
     const manifest = buildRuntimeManifest(
       {
@@ -841,12 +856,18 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
     });
     // runtime releases: new runs only under the active release (or a canary selecting them); quarantined runs stay paused
     const releaseRegistry = createRuntimeReleaseRegistry({ ...base, db });
+    // the release service needs the durable runtime, which needs this control plane: bound once it exists (below)
+    let releaseService: RuntimeReleaseService | undefined;
     const control = releaseGovernedControlPlane(pinned, {
       manifestId: manifest.manifestId,
       registry: releaseRegistry,
       requireActive: config.runtime?.requireActiveRelease === true,
       newRunId: () => ids.next('run'),
       getRun: (id) => runs.get(id),
+      // a run admitted just before its release's rollback committed is quarantined by its creator
+      afterCreate: (runId) => (releaseService ? releaseService.quarantineIfRolledBack(runId) : Promise.resolve(false)),
+      // … and, should its creator have died before that re-check, by the first loop (or operator resume) that would drive it
+      beforeDrive: (runId) => (releaseService ? releaseService.quarantineIfRolledBack(runId) : Promise.resolve(false)),
     });
     relay.start();
     pending.push({ name: 'relay', close: () => relay.stop() });
@@ -873,6 +894,7 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
       db, registry: releaseRegistry, manifest, runs, events, blackboard, leases, ledger, reconciler, agents, control: plane, durable,
       forgetPin: (runId) => pinned.forgetPin(runId), clock, logger: logger.child({ component: 'releases' }),
     });
+    releaseService = releases;
     const ctx = (runId: string, actorId: string, correlationId = runId): EventContext => ({ runId, correlationId, actorId });
 
     /** Fail fast when the lead cannot be routed at all (a run would only fail its first work item). */
@@ -952,15 +974,23 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
         const resumable = await runs.list({ status: [...RESUMABLE_RUN_STATUSES] });
         const resumed: string[] = [];
         const foreign: Array<{ runId: string; runtimeManifestId: string }> = [];
+        const quarantined: string[] = [];
         for (const run of resumable) {
           if (run.runtimeManifestId !== manifest.manifestId) {
             foreign.push({ runId: run.runId, runtimeManifestId: run.runtimeManifestId });
+            continue;
+          }
+          // a live run of this runtime's rolled-back release that escaped the rollback's sweep (its creator died before
+          // re-checking it) is quarantined, not resumed
+          if (await releases.quarantineIfRolledBack(run.runId)) {
+            quarantined.push(run.runId);
             continue;
           }
           await durable.startRun(run.runId);
           resumed.push(run.runId);
         }
         if (foreign.length > 0) logger.warn('incomplete runs pinned to another runtime manifest are not resumed by this runtime (I11)', { manifestId: manifest.manifestId, runs: foreign });
+        if (quarantined.length > 0) logger.warn('incomplete runs of this rolled-back runtime release are quarantined, not resumed', { manifestId: manifest.manifestId, runs: quarantined });
         if (resumed.length > 0) logger.info('resumed incomplete runs', { runs: resumed });
         return resumed;
       },
@@ -968,7 +998,7 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
       async report(runId) {
         // the control plane's report + the run's runtime-release notes (quarantine, migrations)
         const report = await control.report(runId);
-        const notes = runtimeReleaseNotes(await events.read(runId, { types: ['run.quarantined', 'run.migrated'] }));
+        const notes = runtimeReleaseNotes(await events.read(runId, { types: ['run.quarantined', 'run.migrated', 'run.migration_released'] }));
         return withRuntimeReleaseNotes(report, await runs.get(runId), notes);
       },
       async verifyEvidence(runId) {

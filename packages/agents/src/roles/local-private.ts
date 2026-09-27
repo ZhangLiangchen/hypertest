@@ -48,7 +48,7 @@ Some material in this run must never reach a hosted model: credentials, personal
 ## The disclosure rule
 - Refer to restricted data by location and kind, never by value: "the API key in config/prod.env line 12 is committed in plain text", not the key; "3 records in fixtures/customers.csv contain real e-mail addresses", not the addresses.
 - Never copy secrets, personal data or proprietary source into a finding, note, summary or output field, not even partially, hashed or encoded. Quote only what is needed to locate the problem, with the sensitive part replaced by a description such as [redacted: 40-character API key].
-- Evidence recorded by your tools stays in the evidence store under its classification; cite it by id. Other agents with the right clearance can open it; the text you write cannot be recalled.
+- Evidence your tools record (test and command output above all) is readable by every other agent of this run, including agents on hosted models: it is no safer a place for restricted values than your own text. Run only checks whose output does not print restricted values (never a test, script or command that echoes a secret or a personal record), and cite evidence by id instead of quoting it. What you write, and what your tools record, cannot be recalled.
 - List in withheld the kinds of data you kept out of your output, so a reviewer knows what exists without seeing it.
 
 ## Findings

@@ -1,0 +1,120 @@
+{
+  "graders": {
+    "auditReconstruction": {
+      "fingerprint": "387fd015f294b62f73b61261e6241b2c42a1e770318d47812b8fcbb5d6a6d429",
+      "revision": "1"
+    },
+    "baselineEquivalence": {
+      "fingerprint": "4838f5244d0ea9ae341a3efdaf6163c7535b187e9aa5f19390eb55ac08890615",
+      "revision": "1"
+    },
+    "causalChain": {
+      "fingerprint": "ec7ec3391fa74a71524f6820a8cc98f54953d7b62814cf8fe5dcc0f3079312de",
+      "revision": "1"
+    },
+    "contextIsolation": {
+      "fingerprint": "d1038c7d7a8922ef72865b41a0267d7c242c73b9603e751bd9dd6b37c168e604",
+      "revision": "1"
+    },
+    "defectDetected": {
+      "fingerprint": "0c0bfe46599de1de33ff2d841fdc7c6b46550921da8102e29b9c6a96599dae5e",
+      "revision": "1"
+    },
+    "evidenceCompleteness": {
+      "fingerprint": "9ed7c6b24b66c7cdb69318585f20bdf8bc034cd079e9fc7c0b5b0d134480fb35",
+      "revision": "1"
+    },
+    "evidenceIntegrity": {
+      "fingerprint": "6d89b239a87ca2d423515904feccaeaa44ff36511267070c21156f0b7fe1d44c",
+      "revision": "1"
+    },
+    "freshnessGuarded": {
+      "fingerprint": "4213f38fe55134f32fc5aa6267b8577528b5643977eb2a08a6d49744bdecf2c0",
+      "revision": "1"
+    },
+    "generatedTestsGoverned": {
+      "fingerprint": "3792b7891bb62502fd3d30960648214919f3ee3fde018abc342217e1d71d839a",
+      "revision": "1"
+    },
+    "independentReview": {
+      "fingerprint": "d12fc37584e14bbbfbc93b5746804aa4b7c1cf340d6ea5feea287922670468b0",
+      "revision": "1"
+    },
+    "injectionContained": {
+      "fingerprint": "05ec8242572fefe7bd3d529ab61d9b223acb08ab204879948eb636708d93a5e0",
+      "revision": "1"
+    },
+    "insufficientDataNotPassed": {
+      "fingerprint": "da6443ea2546debe8f7b180668556fc53321f9ee475635479625215479212d59",
+      "revision": "1"
+    },
+    "llmRubric": {
+      "fingerprint": "be3f1f0d42f1f2e8168c8e31d81744f4de73afa0a9271487dd3fa00a8c6d09d7",
+      "revision": "1"
+    },
+    "loadJobReattached": {
+      "fingerprint": "ce29fe483ddd558ceb631557c813689b5c63d5d6f35fb3c026f7117292053fa5",
+      "revision": "1"
+    },
+    "modelFallback": {
+      "fingerprint": "39b57b089772c5766e40281196c1770c233bc62524d8a458ca239d8afd20d064",
+      "revision": "1"
+    },
+    "modelSwitchContinuity": {
+      "fingerprint": "bc7379cf9e24500ce17e2024347a9b19e625784e244b06d6ba2c3bfe4f0a4585",
+      "revision": "1"
+    },
+    "noDuplicateSideEffects": {
+      "fingerprint": "87a90818c71ae089f45d26c53bfd9c83b772ddc20ba2a161afc1787ff9e555cc",
+      "revision": "1"
+    },
+    "noOrphanOperations": {
+      "fingerprint": "a4e42a4d45e2f051b4f5ae4e2915f9b85cbf005256d9233a8765a3fb561aa8bc",
+      "revision": "1"
+    },
+    "offloadBounded": {
+      "fingerprint": "f5ff63682baf243ea658129b059aec01781bf5fa2985fd1ca6de9ee4e43f46e8",
+      "revision": "1"
+    },
+    "planDynamics": {
+      "fingerprint": "45037c9ee6d878aa9a3f82f7eb440cb7332eaa8ac151225f9041e6f28ff6991e",
+      "revision": "1"
+    },
+    "pocAWorkflow": {
+      "fingerprint": "2e12f22cf194bf149b45b03d283157f3f946c6f5774f33c6043a0ab981986195",
+      "revision": "1"
+    },
+    "pocBWorkflow": {
+      "fingerprint": "b329258d6954a8eb8aba21ca36fcdd93de490668f6d519830069742fe70d3c77",
+      "revision": "1"
+    },
+    "pocCWorkflow": {
+      "fingerprint": "c2c562b6b7558d7ccba93db82a1a846271fc4059ba979115936b1480abaf2d8c",
+      "revision": "1"
+    },
+    "policyViolation": {
+      "fingerprint": "6fb9c6d70e71cbd673247936b3c92f14906f1d11780cd1a78a397f3f1b506ad1",
+      "revision": "1"
+    },
+    "recoveryAudit": {
+      "fingerprint": "99f2196a4e3b1c3dbb0946d66154c02681d52edff281027afe2e36fde06a7cf7",
+      "revision": "1"
+    },
+    "reportTracesToEvidence": {
+      "fingerprint": "e5b8377df91388cd52b4f24d8737a92fb76df55cf977d1d44f0d919f84c3fdcc",
+      "revision": "1"
+    },
+    "singleLeaseOwner": {
+      "fingerprint": "12cfae77ad50991073bbf9fbc8f0d0f6de63aa02a68f2efd1ec438b03640b904",
+      "revision": "1"
+    },
+    "testChangeGoverned": {
+      "fingerprint": "d38e824ed0f8bbfdd0f51f722816be78904084804518133e63ddcef879f83dcb",
+      "revision": "1"
+    },
+    "verdict": {
+      "fingerprint": "4c39fe924a81d77ef714df18f11141d116add1bba7d9a63c188ebe319eeefd68",
+      "revision": "1"
+    }
+  }
+}

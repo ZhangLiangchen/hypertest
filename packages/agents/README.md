@@ -95,6 +95,12 @@ observations: [{statement, evidenceIds ≥ 1}], findings, withheld}`), `GUI_CHEC
 them. Domain (additive): `BuiltinRole` gains `vision_gui` | `local_private`. Tests: `test/roles.test.ts` (vision_gui /
 local_private sections, prompts, least privilege, reviewer independence), `test/catalog.test.ts`.
 
+**Known limit (`local_private`).** The role keeps restricted data off hosted models only for what it writes itself.
+Evidence its tools record (for example `test.run` output) is stored with the default classification `internal`, and
+`evidence.get` returns a preview of it to any agent of the run, including agents on hosted routes. Until evidence is
+recorded with the agent's classification and evidence reads check the reader's clearance (tools and control), the
+role's prompt tells it to run only checks whose output prints no restricted value and to cite evidence by id.
+
 ## Testing
 
 ```bash

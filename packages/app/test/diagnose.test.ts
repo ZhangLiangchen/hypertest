@@ -137,8 +137,8 @@ describe('diagnose (hypertest doctor)', () => {
   });
 
   test('invalid configurations stop at validation with every problem', async () => {
-    const r = await diagnose({ ...base(), engines: { default: 'dsh' } } as HypertestConfig, { connect: false });
-    assert.deepEqual(r, { ok: false, checks: [{ name: 'config', status: 'error', detail: 'engines.default: "dsh" is not a registered engine (native, pi)' }] });
+    const r = await diagnose({ ...base(), engines: { default: 'openhands' } } as HypertestConfig, { connect: false });
+    assert.deepEqual(r, { ok: false, checks: [{ name: 'config', status: 'error', detail: 'engines.default: "openhands" is not a registered engine (native, pi, dsh)' }] });
   });
 
   test('infrastructure probes: unreachable NATS / Temporal / OPA are errors; connect:false skips them', async () => {

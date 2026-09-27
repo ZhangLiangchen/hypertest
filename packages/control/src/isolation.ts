@@ -1,9 +1,10 @@
 import { isHypertestError } from '@hypertest/core';
 import {
   EVENT_TYPES, isTerminalWorkState,
-  type EventContext, type ExperimentSpec, type ResourceClaim, type TestRun, type ToolEffect, type WorkItem,
+  type EventContext, type ExperimentSpec, type OperationStatus, type ResourceClaim, type TestRun, type ToolEffect, type WorkItem,
 } from '@hypertest/domain';
 import type { BudgetExhaustion, OpenReservation } from '@hypertest/operation';
+import type { EnvironmentRegistry } from '@hypertest/tools';
 import type { ControlDeps, ResolvedControlConfig } from './deps.ts';
 import { runScope, workScope } from './work-factory.ts';
 import { event, isTerminalRunStatus, runCtx } from './util.ts';
@@ -15,11 +16,15 @@ import { event, isTerminalRunStatus, runCtx } from './util.ts';
  * experiment as holder (holder = experimentId). While an OWNER of the experiment is live — the work item that defined it
  * or any work item that declares it (`inputRefs` kind `experiment`) — the scheduler renews the claims every tick; once no
  * owner is live, or the run ended, they are released. A write/fault tool call (effect `external` / `destructive`) of a
- * work item that runs for experiments needs those claims held (dispatcher; `experiment_claims_missing`).
+ * work item that runs for experiments needs those claims held (dispatcher; `experiment_claims_missing`) and may act only
+ * on the environments/URLs they cover; no work item's write/fault call may touch a resource another experiment holds
+ * (`experiment_resource_conflict`; `experimentResourceProblem`).
  *
- * External QPS: `load.start` reserves its request rate (`externalQps`, key `qps:<invocationId>`) against the run's
- * `maxExternalQps` while the job runs; the reservation is released when the job's operation settles (completed, failed,
- * stopped, never applied), when `load.stop` stopped it, when its work item ended without a job, or when the run ended.
+ * External QPS: `load.start` reserves its request rate (`externalQps`, key `qps:<invocationId>`, reason
+ * `load:<invocationId>`) against the run's `maxExternalQps` while the job runs; the reservation is released when the
+ * job's operation settles (completed, failed, stopped, never applied), when `load.stop` stopped it, when its work item
+ * ended without a job, or when the run ended. A replayed call whose reservation was already given back reserves again
+ * under `qpsKey(invocationId, n)`; a call that throws keeps the rate while its job may run (`qpsJobMayRun`).
  */
 
 /** Effects that act on the outside world: inside an experiment they need its claims held. */
@@ -78,6 +83,127 @@ export async function experimentClaimsProblem(deps: Pick<ControlDeps, 'admission
   return undefined;
 }
 
+/**
+ * Resource-key namespaces that address the system under test (environments, bare URLs). A write/fault call of a work item
+ * running for experiments may act on such a resource only when one of its experiments claims it (the claim key equals
+ * the resource key or is an ancestor of it): admission can only keep two experiments apart on resources they claim.
+ */
+export const EXPERIMENT_COVERED_PREFIXES: readonly string[] = ['env/', 'url/'];
+
+function keyCovers(claimKey: string, resourceKey: string): boolean {
+  return resourceKey === claimKey || resourceKey.startsWith(`${claimKey}/`);
+}
+
+function keysOverlap(a: string, b: string): boolean {
+  return keyCovers(a, b) || keyCovers(b, a);
+}
+
+/**
+ * The environment keys a `url/<host>` resource also addresses: `env/<id>` of every registered environment one of whose
+ * URLs (base, metrics, prometheus) has that host — the same system under test named by URL instead of id. Other
+ * resources have no alias.
+ */
+export function resourceAliases(resource: string, environments: Pick<EnvironmentRegistry, 'list'> | undefined): string[] {
+  if (!resource.startsWith('url/') || !environments) return [];
+  const host = resource.slice('url/'.length).toLowerCase();
+  const out: string[] = [];
+  for (const env of environments.list()) {
+    const hosts = [env.baseUrl, env.metricsUrl, env.prometheusUrl].flatMap((u) => {
+      if (!u) return [];
+      try {
+        return [new URL(u).host.toLowerCase()];
+      } catch {
+        return [];
+      }
+    });
+    if (hosts.includes(host)) out.push(`env/${env.environmentId}`);
+  }
+  return out;
+}
+
+export type ExperimentResourceVerdict =
+  | { ok: true; covering: string[] }
+  | { ok: false; code: 'experiment_claims_missing' | 'experiment_resource_conflict'; problem: string };
+
+/**
+ * (conformance-6, review B2) What the resources of a write/fault call (effect `external`/`destructive`) say about experiment
+ * isolation — checked on top of `experimentClaimsProblem`:
+ *
+ *  - coverage: a work item running for experiments acts only on SUT resources (EXPERIMENT_COVERED_PREFIXES) that one of
+ *    its experiments claims — with `fault_exclusive` for a fault tool, `write_exclusive`/`fault_exclusive` otherwise.
+ *    Otherwise `experiment_claims_missing` (held claims on OTHER resources never license a write/fault here).
+ *  - contamination: no resource of the call may overlap (equal, ancestor or descendant key) a live claim of an experiment
+ *    the item does not run for — whatever its mode (a write disturbs an observation too) and whichever run it belongs
+ *    to. This enforces the recorded contamination rules ("no other experiment or work item may …") for every work
+ *    item, also one that runs for no experiment: `experiment_resource_conflict`, naming the holding experiment.
+ *
+ * `covering`: the item's experiments whose claims cover the call's SUT resources (for attribution). The check reads the
+ * live claims at call time (a claim admitted a moment later is not seen: claims are TTL leases renewed by the tick).
+ */
+export async function experimentResourceProblem(
+  deps: Pick<ControlDeps, 'admission' | 'specs'> & { environments?: Pick<EnvironmentRegistry, 'list'> },
+  call: { workItemId: string; experimentIds: readonly string[]; toolId: string; resources: () => string[] },
+): Promise<ExperimentResourceVerdict> {
+  const own = new Set<string>([call.workItemId, ...call.experimentIds]);
+  const foreign: Array<{ holderId: string; runId: string; claim: ResourceClaim }> = [];
+  const isExperiment = new Map<string, boolean>();
+  for (const a of await deps.admission.active()) {
+    if (own.has(a.holderId)) continue;
+    let known = isExperiment.get(a.holderId);
+    if (known === undefined) {
+      known = (await deps.specs.getExperiment(a.holderId)) !== undefined;
+      isExperiment.set(a.holderId, known);
+    }
+    if (known) foreign.push(a);
+  }
+  if (call.experimentIds.length === 0 && foreign.length === 0) return { ok: true, covering: [] };
+  let resources: string[];
+  try {
+    resources = call.resources();
+    if (!Array.isArray(resources) || resources.some((r) => typeof r !== 'string' || r.length === 0)) throw new Error('malformed resources');
+  } catch (e) {
+    // fail closed: what the call acts on is unknown, so it cannot be shown to stay inside (or away from) the claims
+    return { ok: false, code: call.experimentIds.length > 0 ? 'experiment_claims_missing' : 'experiment_resource_conflict', problem: `the resources of ${call.toolId} cannot be determined (${(e as Error).message})` };
+  }
+  const covering = new Set<string>();
+  if (call.experimentIds.length > 0) {
+    const fault = FAULT_TOOLS.includes(call.toolId);
+    const specs: ExperimentSpec[] = [];
+    for (const id of call.experimentIds) {
+      const spec = await deps.specs.getExperiment(id);
+      if (spec) specs.push(spec);
+    }
+    for (const r of resources) {
+      if (!EXPERIMENT_COVERED_PREFIXES.some((p) => r.startsWith(p))) continue;
+      // a URL of a registered environment is covered by a claim on that environment too
+      const names = [r, ...resourceAliases(r, deps.environments)];
+      const by = specs.filter((s) => s.isolation.resourceClaims.some((c) => (fault ? c.mode === 'fault_exclusive' : c.mode !== 'read_shared') && names.some((n) => keyCovers(c.resourceKey, n))));
+      if (by.length === 0) {
+        const claims = specs.flatMap((s) => s.isolation.resourceClaims.map((c) => `${c.mode}(${c.resourceKey})`));
+        return {
+          ok: false,
+          code: 'experiment_claims_missing',
+          problem: `resource ${r} is outside the claims of experiment ${call.experimentIds.join(', ')} (${claims.join(', ') || 'no claims'}); ${call.toolId} needs a ${fault ? 'fault_exclusive' : 'write_exclusive or fault_exclusive'} claim on ${r} (or an ancestor key) — define an experiment that claims it`,
+        };
+      }
+      for (const s of by) covering.add(s.experimentId);
+    }
+  }
+  for (const r of resources) {
+    // an environment addressed by URL is the environment: its claims apply (no alias bypass)
+    const names = [r, ...resourceAliases(r, deps.environments)];
+    const hit = foreign.find((a) => names.some((n) => keysOverlap(a.claim.resourceKey, n)));
+    if (hit) {
+      return {
+        ok: false,
+        code: 'experiment_resource_conflict',
+        problem: `resource ${r} is claimed by experiment ${hit.holderId} of run ${hit.runId} (${hit.claim.mode}(${hit.claim.resourceKey})): a write/fault call there would invalidate that experiment`,
+      };
+    }
+  }
+  return { ok: true, covering: [...covering].sort() };
+}
+
 /** The work item that defined an experiment (its creator agent's work item), when known. */
 async function definingWorkItem(deps: Pick<ControlDeps, 'agents'>, spec: ExperimentSpec): Promise<string | undefined> {
   const agent = await deps.agents.get(spec.createdBy);
@@ -91,9 +217,23 @@ export interface ExperimentSync {
 }
 
 /**
+ * (review B2) Whether an operation recorded for the experiment (`ht_operations.experiment_id`) may still act: not settled
+ * (a running load job stays `acknowledged` until it ended). Fails closed: an unreadable ledger counts as running.
+ */
+export async function experimentEffectsRunning(deps: Pick<ControlDeps, 'ledger' | 'logger'>, runId: string, experimentId: string): Promise<boolean> {
+  try {
+    return (await deps.ledger.list({ runId, experimentId, status: [...JOB_MAY_RUN] as OperationStatus[] })).length > 0;
+  } catch (e) {
+    deps.logger.warn('experiment operations unreadable: its claims are kept', { runId, experimentId, error: (e as Error).message });
+    return true;
+  }
+}
+
+/**
  * (conformance-6) Keeps the claims of the run's experiments in step with their owners: renewed (TTL extended, or
- * re-admitted) while the defining work item or a work item declaring the experiment is not terminal; released once none
- * is (`admission.released`, reason `owners_ended`) or the run ended. A renewal refused by another holder is recorded
+ * re-admitted) while the defining work item or a work item declaring the experiment is not terminal — or an operation
+ * recorded for the experiment may still act (review B2: e.g. its load job outlives the item that started it); released
+ * once none is (`admission.released`, reason `owners_ended`) or the run ended. A renewal refused by another holder is recorded
  * once per conflict set (`admission.lapsed`, aggregate `experiment`): write/fault tools of the experiment are refused
  * from then on (the dispatcher finds its claims not held).
  */
@@ -114,10 +254,13 @@ export async function syncExperimentClaims(
     const owners = items.filter((w) => declaredExperimentIds(w).includes(id)).map((w) => w.workItemId);
     const definer = await definingWorkItem(deps, spec);
     if (definer !== undefined) owners.push(definer);
-    const live = !isTerminalRunStatus(run.status) && owners.some((o) => {
+    const ownerLive = owners.some((o) => {
       const w = byId.get(o);
       return w !== undefined && !isTerminalWorkState(w.state);
     });
+    // review B2: an effect of the experiment that may still act (a load job outliving the item that started it) keeps the
+    // experiment isolated — releasing its claims then would admit a competing experiment onto a resource under load
+    const live = !isTerminalRunStatus(run.status) && (ownerLive || (await experimentEffectsRunning(deps, run.runId, id)));
     if (!live) {
       if ((await heldClaims(deps, id, run.runId)).length === 0) continue;
       await deps.admission.release(id);
@@ -149,9 +292,22 @@ export async function syncExperimentClaims(
 // ---------------------------------------------------------------------------------------------------- external QPS
 
 export const QPS_KEY_PREFIX = 'qps:';
+/** Reason of a QPS reservation: `load:<invocationId>` (the reservation's link to its load.start call). */
+export const QPS_REASON_PREFIX = 'load:';
 
-export function qpsKey(invocationId: string): string {
-  return `${QPS_KEY_PREFIX}${invocationId}`;
+/**
+ * The idempotency key of a load.start call's QPS reservation. `attempt` > 1 (review B2): a replay of a call whose first
+ * reservation was already given back reserves the rate again under a fresh key (a keyed reserve returns the old,
+ * released reservation as is — a job must never run on it).
+ */
+export function qpsKey(invocationId: string, attempt = 1): string {
+  return attempt <= 1 ? `${QPS_KEY_PREFIX}${invocationId}` : `${QPS_KEY_PREFIX}${invocationId}#${attempt}`;
+}
+
+/** The load.start invocation a QPS reservation belongs to (from its reason; the key of a re-reservation has a suffix). */
+export function qpsInvocationId(r: Pick<OpenReservation, 'reason' | 'idempotencyKey'>): string {
+  if (r.reason.startsWith(QPS_REASON_PREFIX)) return r.reason.slice(QPS_REASON_PREFIX.length);
+  return (r.idempotencyKey ?? '').slice(QPS_KEY_PREFIX.length);
 }
 
 /** Load-operation states in which the job is certainly not running any more (its rate can be given back). */
@@ -178,7 +334,7 @@ export async function settleExternalQps(deps: Pick<ControlDeps, 'budget' | 'ledg
   const only = options.operationIds ? new Set([...options.operationIds, ...stopped]) : undefined;
   const released: string[] = [];
   for (const r of open) {
-    const invocationId = r.idempotencyKey!.slice(QPS_KEY_PREFIX.length);
+    const invocationId = qpsInvocationId(r);
     const op = await deps.ledger.findByToolInvocation(invocationId, 'load.start');
     const mine = op && op.runId === runId ? op : undefined;
     if (only && (!mine || !only.has(mine.operationId))) continue;
@@ -193,6 +349,40 @@ export async function settleExternalQps(deps: Pick<ControlDeps, 'budget' | 'ledg
     await deps.budget.release(r.reservationId);
     released.push(r.reservationId);
     deps.logger.info('external QPS reservation released: the load job ended', { runId, reservationId: r.reservationId, operationId: mine?.operationId, status: mine?.status });
+  }
+  return released;
+}
+
+/**
+ * (review B2) Whether the load job of a load.start invocation may be running: its operation is recorded and not settled
+ * as ended — or the ledger cannot be read (fail closed: the rate stays reserved; the tick, the item's end or the run's
+ * end gives it back). false only when no operation was ever prepared for the call (nothing was dispatched) or it ended.
+ */
+export async function qpsJobMayRun(deps: Pick<ControlDeps, 'ledger' | 'logger'>, runId: string, invocationId: string): Promise<boolean> {
+  try {
+    const op = await deps.ledger.findByToolInvocation(invocationId, 'load.start');
+    if (!op || op.runId !== runId) return false;
+    return !JOB_ENDED.has(op.status);
+  } catch (e) {
+    deps.logger.warn('load job state unknown: its QPS reservation is kept', { runId, invocationId, error: (e as Error).message });
+    return true;
+  }
+}
+
+/**
+ * (durability-1 × conformance-5) The open reservations of a work claim taken from a dead worker: its in-flight model
+ * calls will never settle, so they are released — but NOT the QPS reservation of a load job it started: the external
+ * job survives its worker (recovery re-attaches it) and keeps sending requests, so its rate stays reserved until the job
+ * ended (`settleExternalQps`) or the run ended (`releaseRunIsolation`). Returns the released reservation ids.
+ */
+export async function releaseStrandedReservations(deps: Pick<ControlDeps, 'budget'>, scope: string): Promise<string[]> {
+  // a ledger that cannot list its open reservations cannot tell a QPS lease apart: the old behaviour (release all)
+  if (!deps.budget.openReservations) return (await deps.budget.releaseOpen?.(scope)) ?? [];
+  const released: string[] = [];
+  for (const r of await deps.budget.openReservations(scope)) {
+    if (r.idempotencyKey?.startsWith(QPS_KEY_PREFIX)) continue;
+    await deps.budget.release(r.reservationId);
+    released.push(r.reservationId);
   }
   return released;
 }

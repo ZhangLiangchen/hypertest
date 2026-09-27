@@ -24,8 +24,9 @@ export { createReportBuilder } from './report.ts';
 export { diffSections, invertSection, sectionPaths, unifiedDiff } from './diff.ts';
 export { WorkFactory, runScope, workScope, type CreateWorkOutcome } from './work-factory.ts';
 export {
-  EXPERIMENT_EXEMPT_TOOLS, EXPERIMENT_GUARDED_EFFECTS, FAULT_TOOLS, QPS_KEY_PREFIX, declaredExperimentIds, experimentClaimsProblem, heldClaims, onToolBudgetExhausted, qpsKey,
-  releaseRunIsolation, runExperimentIds, settleExternalQps, syncExperimentClaims, type ExperimentSync,
+  EXPERIMENT_COVERED_PREFIXES, EXPERIMENT_EXEMPT_TOOLS, EXPERIMENT_GUARDED_EFFECTS, FAULT_TOOLS, QPS_KEY_PREFIX, QPS_REASON_PREFIX, declaredExperimentIds, experimentClaimsProblem,
+  experimentEffectsRunning, experimentResourceProblem, heldClaims, onToolBudgetExhausted, qpsInvocationId, qpsJobMayRun, qpsKey, releaseRunIsolation, releaseStrandedReservations, resourceAliases, runExperimentIds,
+  settleExternalQps, syncExperimentClaims, type ExperimentResourceVerdict, type ExperimentSync,
 } from './isolation.ts';
 export { defaultContaminationRules, defaultStopConditions, experimentIsolation } from './domain-tools/specs.ts';
 export {

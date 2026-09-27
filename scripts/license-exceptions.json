@@ -1,0 +1,11 @@
+{
+  "exceptions": [
+    {
+      "package": "unionfs",
+      "version": "4.6.0",
+      "license": "UNKNOWN",
+      "rationale": "The lockfile entry carries no license field because the published package.json declares none; the package ships a LICENSE file with the Unlicense public-domain dedication (permissive). Transitive runtime dependency of @temporalio/worker (durable package only).",
+      "approvedBy": "hypertest-maintainers"
+    }
+  ]
+}

@@ -10,11 +10,14 @@
  * testChangeGoverned, recoveryAudit, insufficientDataNotPassed). The export names (`verdictGrader`, …) are
  * accepted as aliases. Parameters use a query string: `planDynamics?minPlanRevisions=3&minParallel=2&minDistinctRoutes=3`.
  */
-import { HypertestError } from '@hypertest/core';
+import { HypertestError, sha256Hex } from '@hypertest/core';
 import type { DomainEvent } from '@hypertest/domain';
 import { verifyRuntimeManifest } from '@hypertest/runtime';
-import type { Grader, GraderContext, GraderResult, PlanDynamicsOptions } from './contracts.ts';
+import type { Grader, GraderContext, GraderResult, PlanDynamicsOptions, VersionedGrader } from './contracts.ts';
 import { POC_GRADERS } from './poc-graders.ts';
+import { CORE_SUITE_GRADERS } from './core-graders.ts';
+import { llmRubricGrader } from './judge.ts';
+import { GRADER_REVISIONS, LLM_GRADER_IDS, normalizedSource } from './grader-revisions.ts';
 import {
   SIDE_EFFECT_PROBE, acceptedPlans, analyzeCompleteness, analyzeDefects, analyzePolicy, analyzeSideEffects, analyzeVerdict, distinctRoleRoutes, hintProblems, maxParallelWork,
   routesByRole,
@@ -299,6 +302,9 @@ export const GRADERS: Readonly<Record<string, Grader>> = Object.freeze({
   planDynamics: planDynamicsGrader,
   // (additive) the PoC acceptance graders (src/poc-graders.ts)
   ...POC_GRADERS,
+  // (additive) the core-suite graders (src/core-graders.ts) and the independent LLM judge, always LAST (src/judge.ts)
+  ...CORE_SUITE_GRADERS,
+  llmRubric: llmRubricGrader,
 });
 
 /** Graders that accept parameters: id → factory from the query-string parameters. */
@@ -313,21 +319,59 @@ const PARAMETERIZED: Readonly<Record<string, (params: Record<string, number>) =>
   },
 };
 
+export { normalizedSource };
+
+/** The revision of a custom grader given as a plain function: `custom-<sha256 of its normalized source>` (12 hex). */
+export function customGraderRevision(fn: Grader): string {
+  return `custom-${sha256Hex(normalizedSource(fn)).slice(0, 12)}`;
+}
+
+function isVersioned(v: unknown): v is VersionedGrader {
+  return v !== null && typeof v === 'object' && typeof (v as VersionedGrader).grader === 'function';
+}
+
+/** A registry value (a Grader or a VersionedGrader) as a VersionedGrader; malformed values are `invalid_argument`. */
+function versioned(id: string, value: Grader | VersionedGrader, builtin: boolean): VersionedGrader {
+  if (typeof value === 'function') {
+    const revision = builtin ? GRADER_REVISIONS[id] : undefined;
+    return { revision: revision ?? customGraderRevision(value), grader: value, kind: LLM_GRADER_IDS.has(id) ? 'llm' : 'deterministic' };
+  }
+  if (!isVersioned(value)) throw new HypertestError('invalid_argument', `grader '${id}' must be a function or {revision, grader}`);
+  if (typeof value.revision !== 'string' || value.revision.trim() === '') throw new HypertestError('invalid_argument', `grader '${id}': revision must be a non-empty string`);
+  if (value.kind !== undefined && value.kind !== 'deterministic' && value.kind !== 'llm') throw new HypertestError('invalid_argument', `grader '${id}': kind must be deterministic or llm`);
+  // an override of an LLM-judged grader id stays LLM-judged unless it says otherwise (ordering: last)
+  return { ...value, kind: value.kind ?? (LLM_GRADER_IDS.has(id) ? 'llm' : 'deterministic') };
+}
+
+/** A resolved grader spec (resolveGrader). */
+export interface ResolvedGrader {
+  /** Canonical id (the spec without parameters). */
+  id: string;
+  grader: Grader;
+  /** (additive) The grader revision; a parameterized spec appends its normalized parameters (`1+minParallel=3`). */
+  revision: string;
+  /** (additive) `llm` graders are judged by a model and must come after every deterministic grader. */
+  kind: 'deterministic' | 'llm';
+}
+
 /**
  * Resolves a grader spec (`id`, `idGrader`, or `id?param=n&…`) against `extra` (wins) and the built-ins. The
  * returned grader stamps the canonical id (the spec without parameters) on its result. Unknown ids and bad
- * parameters are `invalid_argument`.
+ * parameters are `invalid_argument`. (additive) `extra` values may be VersionedGraders; the result names the grader's
+ * revision (GRADER_REVISIONS for built-ins, `custom-<digest>` for plain custom functions) and kind.
  */
-export function resolveGrader(spec: string, extra: Readonly<Record<string, Grader>> = {}): { id: string; grader: Grader } {
+export function resolveGrader(spec: string, extra: Readonly<Record<string, Grader | VersionedGrader>> = {}): ResolvedGrader {
   if (typeof spec !== 'string' || spec.trim() === '') throw new HypertestError('invalid_argument', 'grader spec must be a non-empty string');
   const trimmed = spec.trim();
   const q = trimmed.indexOf('?');
   const rawId = q < 0 ? trimmed : trimmed.slice(0, q);
   const query = q < 0 ? undefined : trimmed.slice(q + 1);
-  const registry: Record<string, Grader> = { ...GRADERS, ...extra };
+  const registry: Record<string, Grader | VersionedGrader> = { ...GRADERS, ...extra };
   const id = Object.hasOwn(registry, rawId) ? rawId : rawId.endsWith('Grader') && Object.hasOwn(registry, rawId.slice(0, -'Grader'.length)) ? rawId.slice(0, -'Grader'.length) : undefined;
   if (id === undefined) throw new HypertestError('invalid_argument', `unknown grader '${rawId}' (known: ${Object.keys(registry).sort().join(', ')})`);
-  let grader = registry[id]!;
+  const entry = versioned(id, registry[id]!, !Object.hasOwn(extra, id));
+  let grader = entry.grader;
+  let revision = entry.revision;
   if (query !== undefined && query !== '') {
     const factory = Object.hasOwn(extra, id) ? undefined : PARAMETERIZED[id];
     if (!factory) throw new HypertestError('invalid_argument', `grader '${id}' takes no parameters`);
@@ -345,7 +389,21 @@ export function resolveGrader(spec: string, extra: Readonly<Record<string, Grade
       params[k] = n;
     }
     grader = factory(params);
+    // parameters change what the grader checks: they are part of its revision
+    revision = `${revision}+${Object.keys(params).sort().map((k) => `${k}=${params[k]}`).join('&')}`;
   }
   const bound: Grader = async (ctx) => ({ ...(await grader(ctx)), graderId: id });
-  return { id, grader: bound };
+  return { id, grader: bound, revision, kind: entry.kind ?? 'deterministic' };
+}
+
+/**
+ * Problems of a task's grader list: an LLM-judged grader must come AFTER every deterministic grader (outcome graders
+ * first, LLM rubric last — the judge sees their results, never the other way round). Unknown specs throw (resolveGrader).
+ */
+export function graderOrderProblems(specs: readonly string[], extra: Readonly<Record<string, Grader | VersionedGrader>> = {}): string[] {
+  const resolved = specs.map((s) => resolveGrader(s, extra));
+  const firstLlm = resolved.findIndex((r) => r.kind === 'llm');
+  if (firstLlm < 0) return [];
+  const late = resolved.slice(firstLlm + 1).filter((r) => r.kind !== 'llm').map((r) => r.id);
+  return late.length > 0 ? [`the LLM-judged grader ${resolved[firstLlm]!.id} must come after every deterministic grader (listed before: ${late.join(', ')})`] : [];
 }

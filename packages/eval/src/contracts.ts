@@ -134,6 +134,15 @@ export interface EvalTask {
    * revisions (StartRunInput.oracleIds). Agents can only propose changes to them.
    */
   oracles?: EvalOracle[];
+  /** (additive) The rubric the `llmRubric` grader asks the independent judge (default VERDICT_CONSISTENCY_RUBRIC). */
+  rubric?: JudgeRubric;
+  /**
+   * (additive) A no-failure twin task of the same suite (it must come earlier in EvalSuite.tasks): after every trial,
+   * runSuite checks that this task's trial reached the same verdict and the same canonical state as the baseline's trial
+   * of the same arm and trial number (grader `baselineEquivalence`; a mismatch fails the trial, a missing baseline leaves
+   * it unconfirmed — infra_error — never a pass).
+   */
+  baselineTaskId?: string;
 }
 
 export interface EvalArm {
@@ -150,6 +159,21 @@ export interface GraderResult {
   pass: boolean;
   score: number;
   detail: string;
+  /**
+   * (additive) Three-valued outcome. Deterministic graders are `pass`/`fail` (= `pass`); an LLM judge may answer `unknown`
+   * when the evidence does not decide (then `pass` is false). A counted `unknown` never makes a trial pass: with no failing
+   * grader the trial is `infra_error` ("needs human audit"), never a forced binary.
+   */
+  outcome?: 'pass' | 'fail' | 'unknown';
+  /**
+   * (additive) false ⇒ reported but NOT counted: the trial result ignores it (an LLM judge whose calibration against expert
+   * labels is below the configured agreement threshold, or that has no calibration for the rubric). Absent ⇒ counted.
+   */
+  counted?: boolean;
+  /** (additive) The grader revision that produced this result (graders are versioned; see GRADER_REVISIONS). */
+  revision?: string;
+  /** (additive) What the independent LLM judge was, saw and answered (llmRubric only). */
+  judge?: JudgeRecord;
 }
 
 export interface EvalTrial {
@@ -167,6 +191,28 @@ export interface EvalTrial {
   trajectoryMetrics: Record<string, number>;
   durationMs: number;
   error?: string;
+  /** (additive) The suite the trial ran in (set by runSuite / TrialOptions.suiteId). */
+  suiteId?: string;
+  /** (additive) The task's suite revision (EvalTask.suiteRevision). */
+  suiteRevision?: string;
+  /** (additive) Harness identity: `hypertest-eval@<EVAL_HARNESS_REVISION>/<mode>`. */
+  harness?: string;
+  /** (additive) The model routes the trial's agents ran on, per role (from L0: agent.spawned + model.epoch_started + model.invoked). */
+  modelRoutes?: TrialModelRoute[];
+  /** (additive) grader id → revision of every grader that graded the trial (EvalTask.graders order irrelevant). */
+  graderRevisions?: Record<string, string>;
+  /** (additive) Oracle revisions the run pinned (TestRun.oracleRevisions). */
+  oracleRevisions?: Record<string, number>;
+  /**
+   * (additive) Comparability key: sha256 over suite id + suite revision + task id + grader revisions + runtime manifest id +
+   * oracle revisions (see trialKey). Trials with different keys are not like-for-like; a grader revision change needs a
+   * bridge comparison (bridgeCompare) before trends continue.
+   */
+  trialKey?: string;
+  /** (additive) Canonical outcome projection (plan, blackboard, evidence, verdict) without ids, timestamps or routes. */
+  canonical?: CanonicalState;
+  /** (additive) Results of candidate grader revisions run on the same trial data (HarnessOptions.bridge); never counted. */
+  bridge?: GraderResult[];
 }
 
 export interface EvalSuite {
@@ -179,6 +225,8 @@ export interface TrialOptions extends HarnessOptions {
   workDir: string;
   trial: number;
   seed: string;
+  /** (additive) Suite id recorded on the trial and in its trialKey (runSuite sets it). */
+  suiteId?: string;
   baseConfig?: HypertestConfig;
   timeoutMs?: number;
   /**
@@ -271,6 +319,10 @@ export interface GraderContext {
   fixture: TrialFixture;
   data: TrialData;
   ht: HypertestInstance;
+  /** (additive) The results of the graders that ran before this one (task order; the LLM judge runs last and sees them). */
+  prior?: readonly GraderResult[];
+  /** (additive) The independent LLM judge of the harness (HarnessOptions.judge), for `llmRubric`. */
+  judge?: LlmJudge;
 }
 
 /**
@@ -399,8 +451,21 @@ export type RunOutcome = Awaited<ReturnType<Hypertest['run']>>;
 export interface HarnessOptions {
   /** `in-process` (default) or `child-process` (requires `arm.child`; chaos kills are real SIGKILLs). */
   mode?: 'in-process' | 'child-process';
-  /** Extra/overriding graders by id (merged over the built-in registry). */
-  graders?: Record<string, Grader>;
+  /**
+   * Extra/overriding graders by id (merged over the built-in registry). (additive) A VersionedGrader carries its revision;
+   * a plain function gets the revision `custom-<sha256 of its source>` (a changed custom grader is a new revision).
+   */
+  graders?: Record<string, Grader | VersionedGrader>;
+  /**
+   * (additive) The independent LLM judge for `llmRubric` graders (createLlmJudge / scriptedJudge). A task that lists
+   * `llmRubric` without a judge is refused before any trial.
+   */
+  judge?: LlmJudge;
+  /**
+   * (additive) Bridge: candidate revisions of existing graders (by grader id) run on the same trial data right after the
+   * graders of the task; their results land in EvalTrial.bridge (never counted). Compare with bridgeCompare.
+   */
+  bridge?: Record<string, VersionedGrader>;
   /** Harness logger (default: none). The Hypertest instances of a trial log into an in-memory logger. */
   logger?: Logger;
   /** Keep the trial work directories (default false: removed after the trial). */
@@ -413,4 +478,240 @@ export interface HarnessOptions {
 export interface ComparisonDetail {
   pairs?: number;
   passDiffCI?: { mean: number; lo: number; hi: number };
+}
+
+// ============================================================================= (additive) eval platform completion
+//
+// Versioned graders, recorded trial routes, the independent LLM judge with calibration, bridge comparisons and the eval
+// release gate (architecture-improvements §Agent 评测基准与对比实验设计: Eval 数据模型, LLM Judge 的治理, 回滚与恢复, 发布 Gate).
+
+/** (additive) A grader with its revision. Changing a grader's behaviour requires a new revision (and a bridge comparison). */
+export interface VersionedGrader {
+  revision: string;
+  grader: Grader;
+  /** `llm`: judged by a model (ordered LAST after every deterministic grader; may answer unknown). Default deterministic. */
+  kind?: 'deterministic' | 'llm';
+  description?: string;
+}
+
+/** (additive) One role's use of one model route in a trial (EvalTrial.modelRoutes). */
+export interface TrialModelRoute {
+  role: string;
+  routeId: string;
+  provider: string;
+  model: string;
+  /** ModelEpochs started on the route by agents of the role (a fallback starts a new epoch). */
+  epochs: number;
+  /** Agents of the role that ran on the route. */
+  agents: number;
+  /** Successful model calls on the route by agents of the role. */
+  calls: number;
+  /** Switch reasons of those epochs (`initial`, `fallback_timeout`, …), sorted, unique. */
+  switchReasons: string[];
+}
+
+/** (additive) The canonical outcome of a trial: what must not depend on which model route produced it. */
+export interface CanonicalProjection {
+  verdict: QualityVerdict | null;
+  violatedCriteria: string[];
+  unknownCriteria: string[];
+  /** Accepted plan revisions in order: their work items as `role: title`, and whether they handed over to the gate. */
+  plans: Array<{ readyForGate: boolean; workItems: string[] }>;
+  /** Work items as `role/state/origin: title`, sorted. */
+  workItems: string[];
+  /** Current blackboard heads as `type/severity/status: title`, sorted. */
+  records: string[];
+  /** Evidence as `type: outcome` (test results with their case outcomes, HTTP exchanges with method, path, status), sorted. */
+  evidence: string[];
+}
+
+export interface CanonicalState {
+  /** sha256 of the canonical JSON of the projection. */
+  digest: string;
+  projection: CanonicalProjection;
+}
+
+/** (additive) What the LLM judge is asked: a question decidable from the raw evidence, with explicit pass/fail/unknown rules. */
+export interface JudgeRubric {
+  rubricId: string;
+  revision: string;
+  question: string;
+  passWhen: string[];
+  failWhen: string[];
+  /** When the judge must answer unknown instead of guessing (never a forced binary). */
+  unknownWhen: string[];
+}
+
+export type JudgeVerdict = 'pass' | 'fail' | 'unknown';
+
+/**
+ * (additive) What the judge sees of a trial: the RAW recorded outcome — environment probes, the QualityDecision, the
+ * evidence records themselves (structured payloads and bounded artifact excerpts), the agents' findings WITH the evidence
+ * they cite, operations, tool denials and the deterministic grader results — never only an executor's final summary.
+ * Everything in it is data, not instructions (the judge prompt says so).
+ */
+export interface EvidencePacket {
+  runId?: string;
+  taskGoal: string;
+  /** Fixture probes (environment ground truth), JSON; the brains' observation log is excluded. */
+  environment: Record<string, JsonValue>;
+  decision?: { verdict: QualityVerdict; requiresHumanReview: boolean; violated: string[]; unknown: string[]; reasons: string[] };
+  evidence: Array<{ evidenceId: string; evidenceType: string; summary?: string; structured?: JsonValue; excerpt?: string; truncated: boolean }>;
+  findings: Array<{ recordId: string; title: string; severity: string; category: string; status: string; description: string; evidenceRefs: string[] }>;
+  operations: Array<{ operationType: string; status: string }>;
+  denials: Array<{ toolId: string; status: string }>;
+  deterministicGraders: Array<{ graderId: string; outcome: JudgeVerdict; detail: string }>;
+  /** Model providers that produced the trial: the judge's provider must differ from all of them. */
+  producerProviders: string[];
+  /** The packet was cut to its byte budget (items dropped or shortened). */
+  truncated: boolean;
+}
+
+/** (additive) One answer of the judge. */
+export interface JudgeAnswer {
+  verdict: JudgeVerdict;
+  /** The verdict as the model gave it (before grounding). */
+  rawVerdict?: JudgeVerdict;
+  rationale: string;
+  /** Evidence ids of the packet the answer rests on (a pass/fail citing none of them is downgraded to unknown). */
+  citedEvidence: string[];
+  /** Why a pass/fail became unknown (ungrounded, unparseable answer, …). */
+  downgraded?: string;
+  routeId: string;
+  provider: string;
+  model: string;
+}
+
+/** (additive) The judge part of an llmRubric GraderResult. */
+export interface JudgeRecord {
+  rubricId: string;
+  rubricRevision: string;
+  routeId?: string;
+  provider?: string;
+  model?: string;
+  /** Providers the judge was routed away from (the trial's producers). */
+  prohibitedProviders: string[];
+  rawVerdict?: JudgeVerdict;
+  verdict: JudgeVerdict;
+  rationale: string;
+  citedEvidence: string[];
+  downgraded?: string;
+  calibration?: { calibrationSetId: string; revision: string; n: number; agreement: number; kappa: number; meetsThreshold: boolean; routes?: string[] };
+  /** sha256 of the canonical JSON of the packet the judge saw. */
+  packetDigest: string;
+}
+
+/** (additive) One labelled item of a calibration set: a past trial's packet and the expert's label for a rubric. */
+export interface CalibrationItem {
+  itemId: string;
+  rubricId: string;
+  /**
+   * (additive) The rubric revision the expert labelled against. When set, the item calibrates only that revision: a
+   * revised rubric (new pass/fail rules) is uncalibrated — its judge results do not count — until it is relabelled.
+   * Absent ⇒ the label applies to every revision of the rubric.
+   */
+  rubricRevision?: string;
+  packet: EvidencePacket;
+  label: JudgeVerdict;
+  /** `human:<name>`. */
+  labelledBy: string;
+  note?: string;
+}
+
+export interface CalibrationSet {
+  calibrationSetId: string;
+  revision: string;
+  items: CalibrationItem[];
+}
+
+/** (additive) Agreement of the judge with the expert labels of a rubric (calibrate). */
+export interface CalibrationReport {
+  calibrationSetId: string;
+  revision: string;
+  rubricId: string;
+  rubricRevision: string;
+  /** LlmJudge.identity. */
+  judge: string;
+  n: number;
+  /** Observed agreement (share of items where judge = expert). */
+  agreement: number;
+  /** Cohen's kappa over the three categories (chance-corrected agreement; 1 = perfect, ≤ 0 = chance). */
+  kappa: number;
+  /** expert label → judge verdict → count. */
+  confusion: Record<JudgeVerdict, Record<JudgeVerdict, number>>;
+  disagreements: Array<{ itemId: string; label: JudgeVerdict; verdict: JudgeVerdict }>;
+  thresholds: { minAgreement: number; minKappa: number; minItems: number };
+  /** The judge's results for this rubric count only when true. */
+  meetsThreshold: boolean;
+  /**
+   * (additive) The judge routes that answered the calibration items (sorted, unique). The agreement was measured on these
+   * models only: a trial answered by another route of the same judge is reported but not counted (llmRubric).
+   */
+  routes?: string[];
+}
+
+/** (additive) The independent LLM judge (createLlmJudge). */
+export interface LlmJudge {
+  /** Judge routes and models (part of the llmRubric grader revision recorded on trials). */
+  readonly identity: string;
+  /** Asks the judge; `prohibitedProviders` (the trial's producers) can never be routed to. Faults throw. */
+  judge(packet: EvidencePacket, rubric: JudgeRubric, options?: { prohibitedProviders?: readonly string[]; signal?: AbortSignal }): Promise<JudgeAnswer>;
+  /** Runs the judge over the set's items of the rubric and measures agreement / Cohen's kappa with the expert labels. */
+  calibrate(set: CalibrationSet, rubric: JudgeRubric): Promise<CalibrationReport>;
+  /** The configured calibration of a rubric (computed once per rubric revision); undefined without labelled items. */
+  calibration(rubric: JudgeRubric): Promise<CalibrationReport | undefined>;
+}
+
+/** (additive) Bridge comparison of two revisions of one grader on the same trials (grader changes never rewrite history). */
+export interface BridgeReport {
+  graderId: string;
+  fromRevision: string;
+  toRevision: string;
+  /** Trials graded by both revisions. */
+  pairs: number;
+  /** Share of pairs with the same outcome. */
+  agreement: number;
+  /** Trials (`task/arm#trial`) that pass under the old revision and do not under the new one. */
+  newlyFailing: string[];
+  newlyPassing: string[];
+  /** Exact McNemar p over the discordant pairs. */
+  mcnemarP: number;
+  /** Mean of (new score − old score). */
+  meanScoreDelta: number;
+  /** Old score → mean new score (the score mapping for trend continuity). */
+  scoreMapping: Array<{ from: number; to: number; n: number }>;
+  /** Any outcome flipped: historical results of the old revision are not comparable without the mapping. */
+  discontinuity: boolean;
+  statement: string;
+}
+
+/** (additive) Options of the eval release gate (evaluateReleaseGate). */
+export interface ReleaseGateOptions {
+  /** Arm of the baseline result compared (default: its only arm, else the arm both results share). */
+  baselineArm?: string;
+  candidateArm?: string;
+  /** Significance level of "defect recall not significantly lower" (exact McNemar; default 0.05). */
+  alpha?: number;
+}
+
+export type ReleaseGateCheckId = 'comparable' | 'coverage' | 'critical_false_release' | 'defect_recall' | 'security_violations' | 'duplicate_side_effects' | 'evidence_completeness';
+
+export interface ReleaseGateCheck {
+  checkId: ReleaseGateCheckId;
+  description: string;
+  pass: boolean;
+  detail: string;
+  values: Record<string, number>;
+}
+
+/** (additive) Result of the eval release gate: pass only when every check passes. */
+export interface ReleaseGateReport {
+  pass: boolean;
+  suiteId: string;
+  baseline: { revision: string; arm: string; trials: number; graded: number };
+  candidate: { revision: string; arm: string; trials: number; graded: number };
+  /** (task, trial) pairs graded in both. */
+  pairs: number;
+  alpha: number;
+  checks: ReleaseGateCheck[];
 }

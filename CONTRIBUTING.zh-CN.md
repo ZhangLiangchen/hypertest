@@ -44,9 +44,17 @@
 | `node scripts/run-tests.mjs --package <name>` | 一个包的全部测试 |
 | `HYPERTEST_TEST_DB=postgres npm test` | 所有存储都使用全新的 PostgreSQL schema（需要 `HYPERTEST_TEST_PG_URL`） |
 | `npm run infra:fetch` / `infra:up` / `infra:status` / `infra:down` | 本地 PostgreSQL、NATS JetStream、Temporal 开发服务器与 OPA；`up` 会写入 `.infra/env`，测试运行器会自动加载 |
+| `npm run eval:gate` | 使用脚本化多模型分组运行核心评测套件，并与 `packages/eval/baselines/core-scripted-multi-llm.json` 比较（报告位于 `.hypertest-eval/`） |
+| `npm run license:check` / `npm run sbom` / `npm run test:scripts` | 基于 lockfile 的许可证策略、CycloneDX SBOM（`.hypertest-sbom.json`）、这些脚本的测试 |
 
-CI（`.github/workflows/ci.yml`）在 PostgreSQL 16 服务容器上运行 `npm run check` 与 `npm test`，第二个任务用
-`HYPERTEST_TEST_DB=postgres` 运行整个套件。
+CI（`.github/workflows/ci.yml`）在 PostgreSQL 16 服务容器上运行 `npm run check`、`npm test` 与 `npm run eval:gate`；
+第二个任务用 `HYPERTEST_TEST_DB=postgres` 运行整个套件；供应链任务运行脚本测试、许可证策略与 SBOM，并运行仅供参考的
+`npm audit`。
+
+- 新依赖必须通过 `npm run license:check`。允许列表之外的许可证需要在 `scripts/license-exceptions.json` 中有已评审的
+  条目，写明包名、确切的许可证表达式与理由。
+- 修改评测评分器需要新的修订号并重新固定 `packages/eval/graders.lock.json`（否则 `test/grader-versions.test.ts`
+  会失败）；新的套件、评分器或评测 harness 修订需要重新生成基线（见 eval README 的 “Versioned graders”）。
 
 ## 测试
 

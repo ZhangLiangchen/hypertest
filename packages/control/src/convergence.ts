@@ -38,9 +38,21 @@ export interface ReplanOutcome {
 }
 
 export interface GateOutcome {
-  decision: QualityDecision;
+  /** Absent when the outcome was abandoned (the run left `gating` while the gate was evaluated). */
+  decision?: QualityDecision;
   final: boolean;
   run: TestRun;
+  /** Why the gate's outcome was not applied (e.g. the run was paused or quarantined during evaluation). */
+  abandoned?: string;
+}
+
+/** Thrown inside the gate transaction to roll it back when the run is no longer `gating`. */
+class GateAbandoned extends Error {
+  readonly run: TestRun;
+  constructor(run: TestRun) {
+    super(`run ${run.runId} left gating during gate evaluation (now ${run.status}${run.pauseReason ? `/${run.pauseReason}` : ''})`);
+    this.run = run;
+  }
 }
 
 export interface ConvergenceMonitor {
@@ -439,7 +451,13 @@ export function createConvergenceMonitor(deps: ControlDeps, config: ResolvedCont
     // Experience candidates BEFORE the final commit: a crash between the two cannot lose them (a re-gate after a crash
     // proposes nothing twice: candidates are deduplicated by content).
     if (!loop) await proposeExperience(run, ctx);
-    const saved = await db.transaction(async (tx) => {
+    let saved: { decision: QualityDecision; run: TestRun };
+    try {
+      saved = await db.transaction(async (tx) => {
+      // Lock the run and re-check it: a pause/quarantine/cancel committed while the gate was being evaluated must win —
+      // applying this outcome would silently undo it (e.g. the feedback loop's paused → running).
+      const current = await runs.update(run.runId, {}, ctx, tx);
+      if (current.status !== 'gating') throw new GateAbandoned(current);
       const d = await decisions.save(decision, ctx, tx);
       const payload = {
         decisionId: d.decisionId,
@@ -468,7 +486,12 @@ export function createConvergenceMonitor(deps: ControlDeps, config: ResolvedCont
         ? await runs.update(run.runId, { status: 'running' }, ctx, tx)
         : await runs.update(run.runId, { status: 'completed', decisionId: d.decisionId }, ctx, tx);
       return { decision: d, run: next };
-    });
+      });
+    } catch (e) {
+      if (!(e instanceof GateAbandoned)) throw e;
+      logger.warn('quality gate outcome abandoned: the run left gating during evaluation', { runId: run.runId, status: e.run.status, pauseReason: e.run.pauseReason });
+      return { final: false, run: e.run, abandoned: e.message };
+    }
     logger.info('quality gate evaluated', { runId: run.runId, decisionId: saved.decision.decisionId, verdict: saved.decision.verdict, attempt: attempts, final: !loop });
     return { decision: saved.decision, final: !loop, run: saved.run };
   }

@@ -12,7 +12,7 @@ import { MemoryLogger } from '@hypertest/core';
 import { createHypertest, loadConfig } from '@hypertest/app';
 import type { RuntimeManifest, TestRun } from '@hypertest/domain';
 import { tempDir } from '@hypertest/testkit';
-import { GOAL, cli, parseJson, sumRepo, writeProject, type TestProject } from './helpers.ts';
+import { BRAINS, GOAL, cli, parseJson, sumRepo, writeProject, type TestProject } from './helpers.ts';
 
 describe('hypertest runtime', () => {
   let dir: Awaited<ReturnType<typeof tempDir>>;
@@ -172,6 +172,127 @@ describe('hypertest runtime', () => {
     r = await run(['runtime', 'migrate', foreignRun.runId, '--to', 'current', '--by', 'alice', '--reason', 'again']);
     assert.equal(r.code, 1);
     assert.match(r.stderr, /source_differs: the run is already pinned to the target manifest/);
+
+    // --abort releases only the checkpoint of an abandoned migration
+    r = await run(['runtime', 'migrate', foreignRun.runId, '--abort', '--to', 'current', '--by', 'alice', '--reason', 'r']);
+    assert.equal(r.code, 2, r.stderr);
+    assert.match(r.stderr, /--abort releases an abandoned checkpoint: do not combine it with --to/);
+    r = await run(['runtime', 'migrate', foreignRun.runId, '--abort', '--by', 'alice', '--reason', 'r']);
+    assert.equal(r.code, 1, 'an operator pause is not a migration checkpoint');
+    assert.match(r.stderr, /is paused \(operator\): only a run held at a migration checkpoint \(paused migrating\) is released/);
+    r = await run(['runtime', 'migrate', foreignRun.runId, '--abort', '--by', 'alice', '--reason', 'r'], { HYPERTEST_SANDBOX: '1' });
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /cannot be taken from inside a Hypertest sandbox/);
+    // the state a migration leaves when its process dies after the checkpoint: paused migrating
+    {
+      const cfg = await loadConfig(project.configPath, { env: { ...process.env, ...env } });
+      const ht = await createHypertest(cfg, { env: { ...process.env, ...env }, logger: new MemoryLogger(), scriptedBrains: { sim: async () => ({ text: 'noted' }) } });
+      try {
+        const ctx = { runId: foreignRun.runId, correlationId: 'test', actorId: 'system:test' };
+        await ht.services.db.transaction(async (tx) => {
+          await ht.services.runs.update(foreignRun.runId, { status: 'running' }, ctx, tx);
+          await ht.services.runs.update(foreignRun.runId, { status: 'paused', pauseReason: 'migrating' }, ctx, tx);
+        });
+      } finally {
+        await ht.close();
+      }
+    }
+    r = await run(['runtime', 'migrate', foreignRun.runId, '--abort', '--by', 'alice', '--reason', 'the migrating process died']);
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(r.stdout, `run ${foreignRun.runId}: the checkpoint of the abandoned migration is released; status running, still pinned to ${current}\nresume it with \`hypertest resume\`\n`);
+    r = await run(['events', foreignRun.runId, '--types', 'run.migration_released', '--json']);
+    const releasedEvent = JSON.parse(r.stdout.trim().split('\n')[0]!) as { actorId: string; payload: { by: string; reason: string } };
+    assert.deepEqual([releasedEvent.actorId, releasedEvent.payload.by, releasedEvent.payload.reason], ['human:alice', 'human:alice', 'the migrating process died']);
     await run(['cancel', foreignRun.runId, '--reason', 'test done']);
+  });
+});
+
+describe('hypertest runtime rollback', () => {
+  let dir: Awaited<ReturnType<typeof tempDir>>;
+  let repo: Awaited<ReturnType<typeof sumRepo>>;
+  let project: TestProject;
+  let env: Record<string, string>;
+  let previousFile: string;
+  let previous: string;
+
+  before(async () => {
+    dir = await tempDir('ht-cli-rollback-');
+    repo = await sumRepo(true);
+    project = await writeProject(dir.path);
+    env = { ...project.env };
+    // the manifest of an earlier runtime of this installation (one more policy rule), exported as `runtime show --json` would
+    const base = await loadConfig(project.configPath, { env: { ...process.env, ...env } });
+    const other = { ...base, policy: { rules: [{ id: 'site.allow-reads', description: 'site rule', match: { effects: ['read' as const] }, decision: 'allow' as const }] } };
+    const ht = await createHypertest(other, { env: { ...process.env, ...env }, logger: new MemoryLogger(), scriptedBrains: { sim: async () => ({ text: 'noted' }) } });
+    try {
+      previous = ht.manifest.manifestId;
+      previousFile = join(dir.path, 'previous-manifest.json');
+      await writeFile(previousFile, JSON.stringify(ht.manifest));
+    } finally {
+      await ht.close();
+    }
+  });
+  after(async () => {
+    await project?.dispose();
+    await repo?.cleanup();
+    await dir?.cleanup();
+  });
+
+  test('rollback of the active release: the pointer returns to the previous release, live runs are quarantined, the rolled-back runtime starts no run', async () => {
+    const run = (argv: string[]) => cli(argv, { cwd: dir.path, env });
+    const activate = async (ref: string, extra: string[] = []) => {
+      let r = await run(['runtime', 'register', ...extra, '--by', 'alice']);
+      assert.equal(r.code, 0, r.stderr);
+      for (const kind of ['engine_contract', 'replay']) {
+        r = await run(['runtime', 'record-suite', ref, '--kind', kind, '--suite', `${kind}-suite`, '--passed', '--total', '3', '--failures', '0', '--by', 'ci:github']);
+        assert.equal(r.code, 0, r.stderr);
+      }
+      for (const step of [[], ['--canary-percent', '100'], []]) {
+        r = await run(['runtime', 'promote', ref, '--by', 'alice', '--reason', 'suites green', ...step]);
+        assert.equal(r.code, 0, r.stderr);
+      }
+    };
+    // the earlier runtime was active; this runtime replaced it
+    await activate(previous, ['--manifest', previousFile]);
+    await activate('current');
+    let r = await run(['runtime', 'list', '--json']);
+    const current = parseJson<{ current: string }>(r).current;
+    assert.notEqual(current, previous);
+
+    // a live run of this runtime (its lead's first turn never answers; the instance goes away with the run still running)
+    const cfg = await loadConfig(project.configPath, { env: { ...process.env, ...env } });
+    let entered!: () => void;
+    const inLead = new Promise<void>((resolve) => (entered = resolve));
+    const ht = await createHypertest(cfg, { env: { ...process.env, ...env }, logger: new MemoryLogger(), scriptedBrains: { sim: () => (entered(), new Promise(() => undefined)) } });
+    let live: TestRun;
+    try {
+      live = await ht.start({ goal: GOAL, target: { repoPath: repo.path, commit: repo.head } });
+      assert.equal(live.runtimeManifestId, current);
+      await inLead;
+    } finally {
+      await ht.close();
+    }
+
+    r = await run(['runtime', 'rollback', '--by', 'alice', '--reason', 'replay regression in production']);
+    assert.equal(r.code, 0, r.stderr);
+    assert.match(r.stdout, new RegExp(`^runtime ${current} rolled back \\(active → retired\\)\\nactive release is ${previous} again\\nquarantined runs: ${live.runId} \\(migrate them`));
+    r = await run(['status', live.runId, '--json']);
+    const status = parseJson<{ run: TestRun }>(r).run;
+    assert.deepEqual([status.status, status.pauseReason, status.runtimeManifestId], ['paused', 'quarantined', current], 'the run keeps its pin');
+    r = await run(['report', live.runId]);
+    assert.equal(r.code, 0, r.stderr);
+    assert.match(r.stdout, /## Runtime release\n\*\*This run is QUARANTINED\*\*/);
+    assert.match(r.stdout, new RegExp(`QUARANTINED: runtime release ${current} was rolled back by human:alice \\(replay regression in production\\); the active release is ${previous} again`));
+    r = await run(['runtime', 'list', '--json']);
+    const views = parseJson<{ releases: Array<{ manifestId: string; state: string; rolledBack: boolean; active: boolean }> }>(r).releases;
+    assert.deepEqual(views.map((v) => [v.manifestId, v.state, v.rolledBack, v.active]).sort(), [[current, 'retired', true, false], [previous, 'active', false, true]].sort());
+
+    // the rolled-back runtime (this installation's current one) creates no new run; nothing was created
+    r = await run(['run', GOAL, '--repo', repo.path, '--commit', 'HEAD', '--scripted-brains', BRAINS]);
+    assert.equal(r.code, 1, r.stderr);
+    assert.match(r.stderr, /runtime release: runtime rm_\w+… is a retired \(rolled back\) release: new runs are created only under the active release/);
+    r = await run(['status', '--json']);
+    assert.deepEqual(parseJson<Array<{ runId: string }>>(r).map((x) => x.runId), [live.runId], 'the refused start created no run');
+    await run(['cancel', live.runId, '--reason', 'test done']);
   });
 });

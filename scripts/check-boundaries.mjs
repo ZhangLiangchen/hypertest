@@ -8,10 +8,11 @@
 //   4. Selected third-party SDKs are confined to the package that adapts them (CONTAINED).
 //   5. Every @hypertest import used in src/ must be declared in that package's package.json dependencies.
 //   6. Tests may additionally import @hypertest/store and @hypertest/testkit and any declared devDependency.
-import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync, existsSync, realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { join, relative, resolve, dirname, sep } from 'node:path';
 
-const ROOT = resolve(dirname(new URL(import.meta.url).pathname), '..');
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const PACKAGES_DIR = join(ROOT, 'packages');
 
 export const ALLOWED = {
@@ -122,7 +123,18 @@ export function checkBoundaries() {
   return errors;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+/** True when this module is the process entry point (robust to symlinked checkouts and paths with spaces). */
+function isMainModule() {
+  const argv1 = process.argv[1];
+  if (typeof argv1 !== 'string' || argv1 === '') return false;
+  try {
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(resolve(argv1));
+  } catch {
+    return false;
+  }
+}
+
+if (isMainModule()) {
   const errors = checkBoundaries();
   if (errors.length) {
     console.error(`Boundary check failed (${errors.length}):`);

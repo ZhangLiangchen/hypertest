@@ -64,6 +64,18 @@ jobs:
         run: npm run check
       - name: Test
         run: npm test
+      # the core eval suites (context-freshness, model-switch, security-injection, test-generation) with the scripted
+      # multi-LLM arm, gated against the committed baseline SuiteResult: critical false release not worse, defect recall
+      # not significantly lower, security violations = 0, duplicate side effects = 0, evidence completeness 100 %
+      - name: Eval release gate (core suites vs the committed baseline)
+        run: npm run eval:gate
+      - name: Upload the eval gate report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-gate
+          path: .hypertest-eval/
+          if-no-files-found: ignore
 
   test-postgres:
     name: test (everything on PostgreSQL)
@@ -110,3 +122,33 @@ jobs:
         run: npm ci --ignore-scripts
       - name: Test on PostgreSQL
         run: npm test
+
+  # Supply chain (technology-selection §许可证策略): license policy over the lockfile (fails on unknown/copyleft licenses
+  # without a reviewed exception in scripts/license-exceptions.json), a CycloneDX SBOM as a build artifact, and the npm
+  # vulnerability audit (informational: reported, never blocking — advisories change without a code change).
+  supply-chain:
+    name: supply chain (license policy, SBOM, audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: npm
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+      - name: Supply-chain script tests
+        run: npm run test:scripts
+      - name: License policy
+        run: npm run license:check
+      - name: SBOM (CycloneDX)
+        run: npm run sbom
+      - name: Upload the SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: .hypertest-sbom.json
+      - name: Vulnerability audit (informational)
+        continue-on-error: true
+        run: npm audit --omit=dev --audit-level=high

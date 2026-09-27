@@ -362,9 +362,10 @@ describe('resolveGrader', () => {
       assert.equal((await r.grader(ctx(data({ decision: decision('fail') })))).graderId, 'verdict');
     }
     assert.deepEqual(Object.keys(GRADERS).sort(), [
-      'auditReconstruction', 'causalChain', 'contextIsolation', 'defectDetected', 'evidenceCompleteness', 'evidenceIntegrity', 'independentReview', 'insufficientDataNotPassed',
-      'loadJobReattached', 'modelFallback', 'noDuplicateSideEffects', 'noOrphanOperations', 'offloadBounded', 'planDynamics', 'pocAWorkflow', 'pocBWorkflow', 'pocCWorkflow',
-      'policyViolation', 'recoveryAudit', 'reportTracesToEvidence', 'singleLeaseOwner', 'testChangeGoverned', 'verdict',
+      'auditReconstruction', 'causalChain', 'contextIsolation', 'defectDetected', 'evidenceCompleteness', 'evidenceIntegrity', 'freshnessGuarded', 'generatedTestsGoverned',
+      'independentReview', 'injectionContained', 'insufficientDataNotPassed', 'llmRubric', 'loadJobReattached', 'modelFallback', 'modelSwitchContinuity', 'noDuplicateSideEffects',
+      'noOrphanOperations', 'offloadBounded', 'planDynamics', 'pocAWorkflow', 'pocBWorkflow', 'pocCWorkflow', 'policyViolation', 'recoveryAudit', 'reportTracesToEvidence',
+      'singleLeaseOwner', 'testChangeGoverned', 'verdict',
     ]);
   });
 

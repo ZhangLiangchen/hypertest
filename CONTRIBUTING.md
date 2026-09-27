@@ -46,9 +46,18 @@ English | [简体中文](CONTRIBUTING.zh-CN.md)
 | `node scripts/run-tests.mjs --package <name>` | every test of one package |
 | `HYPERTEST_TEST_DB=postgres npm test` | every store on a fresh PostgreSQL schema (needs `HYPERTEST_TEST_PG_URL`) |
 | `npm run infra:fetch` / `infra:up` / `infra:status` / `infra:down` | local PostgreSQL, NATS JetStream, Temporal dev server and OPA; `up` writes `.infra/env`, which the test runner loads |
+| `npm run eval:gate` | the core eval suites with the scripted multi-LLM arm, gated against `packages/eval/baselines/core-scripted-multi-llm.json` (report in `.hypertest-eval/`) |
+| `npm run license:check` / `npm run sbom` / `npm run test:scripts` | license policy over the lockfile, CycloneDX SBOM (`.hypertest-sbom.json`), tests of those scripts |
 
-CI (`.github/workflows/ci.yml`) runs `npm run check` and `npm test` with a PostgreSQL 16 service, and a second job
-runs the whole suite with `HYPERTEST_TEST_DB=postgres`.
+CI (`.github/workflows/ci.yml`) runs `npm run check`, `npm test` and `npm run eval:gate` with a PostgreSQL 16 service; a
+second job runs the whole suite with `HYPERTEST_TEST_DB=postgres`; a supply-chain job runs the script tests, the
+license policy and the SBOM, plus `npm audit` (informational).
+
+- A new dependency must pass `npm run license:check`. A license outside the allowlist needs a reviewed entry in
+  `scripts/license-exceptions.json` that names the package, the exact license expression and a rationale.
+- A changed eval grader needs a new revision and a re-pinned `packages/eval/graders.lock.json`
+  (`test/grader-versions.test.ts` fails otherwise); a new suite, grader or eval-harness revision needs a regenerated
+  baseline (eval README, "Versioned graders").
 
 ## Tests
 

@@ -5,8 +5,11 @@
  */
 import { HypertestError } from '@hypertest/core';
 import type { EvalSuite, EvalTrial, SuiteOptions, SuiteResult, TrialOptions } from './contracts.ts';
-import { chaosProblems, runTrial } from './harness.ts';
+import { chaosProblems, graderSetupProblems, runTrial } from './harness.ts';
 import { resolveGrader } from './graders.ts';
+import { baselineEquivalence } from './core-graders.ts';
+import { GRADER_REVISIONS } from './grader-revisions.ts';
+import { trialKey } from './trial-records.ts';
 import { mcnemarExact, pairedBootstrapCI, passHatK, seededShuffle } from './stats.ts';
 
 /** The paired seed of a task/trial (identical for every arm). */
@@ -23,11 +26,17 @@ function validateSuite(suite: EvalSuite, options: SuiteOptions): void {
   const taskIds = suite.tasks.map((t) => t.taskId);
   if (new Set(taskIds).size !== taskIds.length) throw new HypertestError('invalid_argument', `task ids must be unique in suite ${suite.suiteId}`);
   // a malformed suite is refused before its first trial (runTrial would record the same fault once per trial)
-  for (const task of suite.tasks) {
+  for (const [i, task] of suite.tasks.entries()) {
     if (!Array.isArray(task.graders) || task.graders.length === 0) throw new HypertestError('invalid_argument', `task ${task.taskId} lists no graders`);
     for (const spec of task.graders) resolveGrader(spec, options.graders);
+    const setup = graderSetupProblems(task, options);
+    if (setup.length > 0) throw new HypertestError('invalid_argument', setup.join('; '));
     const chaos = chaosProblems(task.chaos);
     if (chaos.length > 0) throw new HypertestError('invalid_argument', `task ${task.taskId}: ${chaos.join('; ')}`);
+    if (task.baselineTaskId !== undefined) {
+      const b = suite.tasks.findIndex((t) => t.taskId === task.baselineTaskId);
+      if (b < 0 || b >= i) throw new HypertestError('invalid_argument', `task ${task.taskId}: its baseline task ${task.baselineTaskId} must be an earlier task of suite ${suite.suiteId}`);
+    }
   }
   if (options.mode === 'child-process') {
     const missing = options.arms.filter((a) => !a.child).map((a) => a.armId);
@@ -46,8 +55,10 @@ export async function runSuite(suite: EvalSuite, options: SuiteOptions): Promise
       const seed = trialSeed(suite, task.taskId, t);
       for (const arm of seededShuffle(options.arms, seed)) {
         if (options.signal?.aborted) throw cancelled();
-        const o: TrialOptions = { workDir: options.workDir, trial: t, seed };
+        const o: TrialOptions = { workDir: options.workDir, trial: t, seed, suiteId: suite.suiteId };
         if (options.signal) o.signal = options.signal;
+        if (options.judge) o.judge = options.judge;
+        if (options.bridge) o.bridge = options.bridge;
         if (options.baseConfig) o.baseConfig = options.baseConfig;
         if (options.timeoutMs !== undefined) o.timeoutMs = options.timeoutMs;
         if (options.mode) o.mode = options.mode;
@@ -56,6 +67,7 @@ export async function runSuite(suite: EvalSuite, options: SuiteOptions): Promise
         if (options.keepWorkDir !== undefined) o.keepWorkDir = options.keepWorkDir;
         if (options.probeTimeoutMs !== undefined) o.probeTimeoutMs = options.probeTimeoutMs;
         const trial = await runTrial(task, arm, o);
+        if (task.baselineTaskId !== undefined) applyBaseline(trial, trials.find((x) => x.taskId === task.baselineTaskId && x.armId === arm.armId && x.trial === t));
         trials.push(trial);
         options.onTrial?.(trial);
       }
@@ -63,6 +75,38 @@ export async function runSuite(suite: EvalSuite, options: SuiteOptions): Promise
   }
   if (options.signal?.aborted) throw cancelled(); // the last trial was cancelled: never summarize a partial suite
   return summarizeSuite(suite, options.arms.map((a) => a.armId), trials);
+}
+
+/**
+ * Suite-level grader (EvalTask.baselineTaskId): appends `baselineEquivalence` — same verdict and canonical state as the
+ * baseline trial of the same arm and trial number — and re-decides the result. A comparison that cannot be made (baseline
+ * missing or ungraded) leaves a passing trial unconfirmed (infra_error), never a pass; a failing trial stays a fail.
+ */
+export function applyBaseline(trial: EvalTrial, baseline: EvalTrial | undefined): void {
+  if (trial.result === 'infra_error' && trial.graders.length === 0) return; // never graded: nothing to add
+  const r = baselineEquivalence(trial, baseline);
+  const revision = GRADER_REVISIONS['baselineEquivalence']!;
+  if (r) {
+    trial.graders.push({ ...r, revision, outcome: r.pass ? 'pass' : 'fail' });
+    if (trial.graderRevisions) {
+      trial.graderRevisions['baselineEquivalence'] = revision;
+      // the suite-level grader is one of the trial's graders: its revision is part of the trial key
+      const parts: Parameters<typeof trialKey>[0] = { suiteRevision: trial.suiteRevision ?? '', taskId: trial.taskId, graderRevisions: trial.graderRevisions, oracleRevisions: trial.oracleRevisions ?? {} };
+      if (trial.suiteId !== undefined) parts.suiteId = trial.suiteId;
+      if (trial.runtimeManifestId !== undefined) parts.runtimeManifestId = trial.runtimeManifestId;
+      trial.trialKey = trialKey(parts);
+    }
+    if (!r.pass && trial.result !== 'fail') {
+      trial.result = 'fail';
+      trial.error = [trial.error, `baselineEquivalence: ${r.detail}`].filter(Boolean).join('; ');
+    }
+    return;
+  }
+  const why = baseline ? `baseline trial ${baseline.taskId}/${baseline.armId}#${baseline.trial} is ${baseline.result}${baseline.canonical ? '' : ' without a canonical state'}` : 'no baseline trial';
+  if (trial.result === 'pass') {
+    trial.result = 'infra_error';
+    trial.error = [trial.error, `unconfirmed: the baseline comparison could not be made (${why})`].filter(Boolean).join('; ');
+  }
 }
 
 function mean(xs: readonly number[]): number {
@@ -136,7 +180,11 @@ function cell(s: string): string {
 }
 
 /** Outcome metrics shown per arm (in this order) when any trial reports them. */
-const HEADLINE = ['criticalFalseRelease', 'defectRecall', 'falseFail', 'duplicateSideEffects', 'orphanOperations', 'policyViolations', 'staleContextActions', 'evidenceCompleteness'];
+const HEADLINE = [
+  'criticalFalseRelease', 'defectRecall', 'falseFail', 'duplicateSideEffects', 'orphanOperations', 'policyViolations', 'staleContextActions', 'evidenceCompleteness',
+  // (additive) appended: the core-suite metrics
+  'securityViolations', 'staleMutations', 'mutationScore',
+];
 
 /** Markdown report of a suite result (deterministic: no timestamps). Trajectory metrics are labelled explanatory. */
 export function renderSuiteReport(result: SuiteResult): string {
@@ -167,7 +215,10 @@ export function renderSuiteReport(result: SuiteResult): string {
   lines.push('| task | arm | trial | result | verdict | failed graders | note |');
   lines.push('|---|---|---|---|---|---|---|');
   for (const t of result.trials) {
-    const failed = t.graders.filter((g) => !g.pass).map((g) => `${g.graderId}: ${g.detail}`);
+    // counted failures; a counted `unknown` (needs human audit) and uncounted (uncalibrated judge) results are labelled
+    const failed = t.graders
+      .filter((g) => !g.pass)
+      .map((g) => (g.counted === false ? `[not counted] ${g.graderId} ${g.outcome ?? 'fail'}: ${g.detail}` : g.outcome === 'unknown' ? `[unknown] ${g.graderId}: ${g.detail}` : `${g.graderId}: ${g.detail}`));
     lines.push(`| ${cell(t.taskId)} | ${cell(t.armId)} | ${t.trial} | ${t.result} | ${t.verdict ?? '–'} | ${cell(failed.join('; ') || '–')} | ${cell(t.error ?? '')} |`);
   }
   lines.push('');

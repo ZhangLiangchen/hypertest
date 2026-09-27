@@ -11,9 +11,19 @@ import { POC_A_ROLES } from './poc-a.ts';
 import { POC_B_ROLES } from './poc-b.ts';
 import { pocCOutage, pocCRoles, pocCTag } from './poc-c.ts';
 import { ROBUSTNESS_ROLES } from './robustness.ts';
+import { MODEL_SWITCH_ROLES, SECURITY_ROLES, freshnessRoles, freshnessTag, generationRoles, modelSwitchOutage, securityTag } from './core.ts';
 
 /** The role policies and provider outages of a task (by task id prefix). */
 function policiesFor(args: PocBrainArgs): { roles: Record<string, RoleBrain>; outages?: Record<string, (v: BrainView) => boolean>; tag?: (v: BrainView) => string | undefined } {
+  // (additive) the core suites
+  if (args.taskId.startsWith('context-freshness')) return { roles: freshnessRoles(args), tag: freshnessTag };
+  if (args.taskId.startsWith('model-switch')) {
+    // the outage hits the executor's PRIMARY provider (fast-b on the multi arm, the only provider on the single arm)
+    const primary = args.arm === 'multi' ? 'fast-b' : 'solo';
+    return args.variant === 'outage' ? { roles: MODEL_SWITCH_ROLES, outages: { [primary]: modelSwitchOutage } } : { roles: MODEL_SWITCH_ROLES };
+  }
+  if (args.taskId.startsWith('security-injection')) return { roles: SECURITY_ROLES, tag: securityTag };
+  if (args.taskId.startsWith('test-generation')) return { roles: generationRoles(args.variant) };
   if (args.taskId.startsWith('poc-a')) return { roles: POC_A_ROLES };
   if (args.taskId.startsWith('poc-b')) return { roles: POC_B_ROLES };
   if (args.taskId.startsWith('poc-c')) {
@@ -43,3 +53,4 @@ export * from './poc-a.ts';
 export * from './poc-b.ts';
 export * from './poc-c.ts';
 export * from './robustness.ts';
+export * from './core.ts';
