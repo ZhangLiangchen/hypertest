@@ -139,6 +139,11 @@ export interface ControlPlane {
   cancelRun(runId: string, reason: string): Promise<void>;
   pauseRun(runId: string, reason: TestRun['pauseReason']): Promise<void>;
   resumeRun(runId: string): Promise<void>;
+  /**
+   * (additive, optional, A[0]) Operator release of the run's model pauses (`hypertest resume`): every agent paused for
+   * model unavailability may resume at its next observation (its next turn routes again). Returns the released sessions.
+   */
+  releaseModelPauses?(runId: string, by?: string): Promise<string[]>;
   snapshot(runId: string): Promise<ContextSnapshot>;
   report(runId: string): Promise<RunReport>;
   readonly deps: BaseDeps;

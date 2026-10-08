@@ -1,5 +1,5 @@
 import { HypertestError, type JsonValue, type SqlExecutor } from '@hypertest/core';
-import type { EvidenceInput, EvidenceRecord, ReportClaim } from '@hypertest/domain';
+import { evaluateClaim, type EvidenceInput, type EvidenceRecord, type ReportClaim } from '@hypertest/domain';
 import type { ArtifactStore, ClaimResolution, EvidenceEventOptions, EvidenceLedger, RecordEvidenceInput, ResolveClaimOptions } from './contracts.ts';
 import { computeMetadataHash, computeRecordHash } from './records.ts';
 
@@ -38,12 +38,25 @@ function hasPath(value: JsonValue | undefined, path: string): boolean {
   return cur !== undefined;
 }
 
+/** Parsed JSON artifact of a record, when the artifact is JSON and readable (undefined otherwise). */
+async function artifactJson(artifacts: ResolveClaimOptions['artifacts'], e: EvidenceRecord): Promise<JsonValue | undefined> {
+  if (!artifacts || !/^application\/(json|x-ndjson)/.test(e.artifact.mimeType)) return undefined;
+  try {
+    return JSON.parse(new TextDecoder().decode(await artifacts.get(e.artifact))) as JsonValue;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * A claim is supported iff it references at least one evidence record, every reference exists and
  * its stored hashes recompute (metadata + record hash), all references belong to one run
- * (`options.runId` when given), and each record matches the claim's evidenceQuery: `evidenceType`
- * and `workItemId` when set, and — when `field` is set — the record's structured payload contains
- * that dot path. Problems are listed; nothing is inferred.
+ * (`options.runId` when given), each record matches the claim's evidenceQuery (`evidenceType` and
+ * `workItemId` when set; `field` — in the structured payload, or in the record's JSON artifact when
+ * `options.artifacts` is given) and — (area-C-0) — the claim EVALUATES true: domain `evaluateClaim`
+ * runs the evidenceQuery aggregation over the referenced values and compares it with `claim.value`
+ * (a number the model invented and backed with a real evidence id is a `mismatch`, never supported).
+ * Problems are listed; nothing is inferred.
  */
 export async function resolveClaim(ledger: EvidenceLedger, claim: ReportClaim, options: ResolveClaimOptions = {}): Promise<ClaimResolution> {
   if (!claim || typeof claim !== 'object' || !Array.isArray(claim.evidenceRefs)) {
@@ -64,6 +77,7 @@ export async function resolveClaim(ledger: EvidenceLedger, claim: ReportClaim, o
   }
 
   const q = claim.evidenceQuery ?? {};
+  const data = new Map<string, JsonValue>();
   for (const e of evidence) {
     // A claim must not be supported by a record whose stored hashes no longer recompute (it was
     // rewritten behind the ledger). Chain links and artifact bytes are checked by verify().
@@ -80,8 +94,14 @@ export async function resolveClaim(ledger: EvidenceLedger, claim: ReportClaim, o
       problems.push(`evidence ${e.evidenceId} belongs to work item ${e.workItemId ?? '<none>'}, claim requires ${q.workItemId}`);
     }
     if (q.field !== undefined && !hasPath(e.structured, q.field)) {
-      problems.push(`evidence ${e.evidenceId} has no structured field ${q.field}`);
+      const fromArtifact = await artifactJson(options.artifacts, e);
+      if (fromArtifact !== undefined && hasPath(fromArtifact, q.field)) data.set(e.evidenceId, fromArtifact);
+      else problems.push(`evidence ${e.evidenceId} has no structured field ${q.field}`);
     }
   }
-  return { claim, supported: problems.length === 0, evidence, problems };
+  if (problems.length > 0) return { claim, supported: false, evidence, problems };
+  const evaluation = evaluateClaim(claim, evidence, data);
+  if (evaluation.status === 'mismatch') problems.push(`claim value contradicts its evidence: ${evaluation.detail}`);
+  else if (evaluation.status === 'unevaluable') problems.push(`claim cannot be evaluated against its evidence: ${evaluation.detail}`);
+  return { claim, supported: problems.length === 0, evidence, problems, evaluation };
 }

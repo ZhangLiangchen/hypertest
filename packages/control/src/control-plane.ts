@@ -236,6 +236,22 @@ export function createControlPlane(deps: ControlDeps): ControlPlaneInternals {
     return out;
   }
 
+  /**
+   * (A[0]) Releases the run's model pauses now (operator resume): each paused agent resumes at its next observation and
+   * its next turn routes again (L0 `model.pauses_released`). Returns the released sessions.
+   */
+  async function releaseModelPauses(runId: string, by: string): Promise<string[]> {
+    await mustRun(runId);
+    if (!deps.epochs.releaseModelPauses) return [];
+    const released = await deps.epochs.releaseModelPauses(runId, clock.isoNow());
+    if (released.length > 0) {
+      await events.append([event(runCtx(runId, config.workerId), EVENT_TYPES.modelPausesReleased, 'run', runId, { sessions: released, by })]);
+      idle.delete(runId);
+      logger.info('model pauses released', { runId, sessions: released.length, by });
+    }
+    return released;
+  }
+
   async function doTick(runId: string, options: TickOptions = {}): Promise<TickResult> {
     await ensureSubscribed();
     let run = await mustRun(runId);
@@ -659,9 +675,15 @@ export function createControlPlane(deps: ControlDeps): ControlPlaneInternals {
 
     async resumeRun(runId) {
       const run = await mustRun(runId);
+      // an operator resume also lets agents paused for model unavailability try their routes again (A[0])
+      await releaseModelPauses(runId, 'operator:resume');
       if (run.status !== 'paused') return;
       await runs.update(runId, { status: 'running' }, runCtx(runId, config.workerId));
       idle.delete(runId);
+    },
+
+    releaseModelPauses(runId, by) {
+      return releaseModelPauses(runId, by ?? 'operator');
     },
 
     async snapshot(runId) {

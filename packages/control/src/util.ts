@@ -35,6 +35,7 @@ export function gateSpecProblems(gate: GateSpec): string[] {
     if (typeof g[k] !== 'boolean') out.push(`gate.${k} must be a boolean (got ${JSON.stringify(g[k])})`);
   }
   if (g['requireOracle'] !== undefined && typeof g['requireOracle'] !== 'boolean') out.push(`gate.requireOracle must be a boolean (got ${JSON.stringify(g['requireOracle'])})`);
+  if (g['requireContracts'] !== undefined && typeof g['requireContracts'] !== 'boolean') out.push(`gate.requireContracts must be a boolean (got ${JSON.stringify(g['requireContracts'])})`);
   const required = g['requiredEvidence'];
   if (!Array.isArray(required)) out.push('gate.requiredEvidence must be a list');
   else {
@@ -78,7 +79,7 @@ function coverageRatio(v: number | undefined): number | undefined {
  * (conformance-9) The fields in which `effective` is WEAKER than `base` (DEFAULT_GATE_SPEC ⊕ configuration), each as
  * `field: base → effective`. Weaker means the effective gate would pass something the base would not:
  *  - failOnUnresolvedSeverity lowered (P1 → P0: fewer unresolved findings fail), conditionalOnRiskLevel raised;
- *  - requireDeterministicForCritical / requireIndependentReview disabled, requireOracle set to false;
+ *  - requireDeterministicForCritical / requireIndependentReview disabled, requireOracle or requireContracts set to false;
  *  - a minCoverage threshold lowered or removed;
  *  - required evidence removed: every base requirement must be matched by a distinct effective requirement with at least
  *    its minCount and the same type (or both deterministic execution evidence types: EXECUTION_EVIDENCE_TYPES).
@@ -97,6 +98,7 @@ export function gateWeakenings(base: GateSpec, effective: GateSpec): string[] {
     if (base[k] === true && effective[k] !== true) out.push(`${k}: true → ${j(effective[k])}`);
   }
   if (base.requireOracle !== false && effective.requireOracle === false) out.push(`requireOracle: ${j(base.requireOracle ?? true)} → false`);
+  if (base.requireContracts !== false && effective.requireContracts === false) out.push(`requireContracts: ${j(base.requireContracts ?? true)} → false`);
   for (const k of ['lines', 'branches'] as const) {
     const b = coverageRatio(base.minCoverage?.[k]);
     const e = coverageRatio(effective.minCoverage?.[k]);

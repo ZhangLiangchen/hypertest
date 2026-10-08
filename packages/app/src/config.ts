@@ -18,22 +18,40 @@ export const ENGINE_KINDS = ['native', 'pi', 'dsh'] as const;
 /** Variables passed through to sandboxed processes by default (the sandbox sets PATH/HOME/LANG/TMPDIR itself). */
 export const DEFAULT_ENV_ALLOWLIST: readonly string[] = Object.freeze(['PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR']);
 
-/** Defaults applied to every `models.routes` entry (a route names at least routeId, provider and model). */
+/**
+ * Defaults applied to the absent fields of a `models.routes` entry (A[2]: an explicit CapabilityProfile per route). A
+ * route must declare `capabilities` (validation error otherwise — nothing is assumed about what a model can do); the
+ * security fields default CONSERVATIVELY (`maxDataClassification: internal`, `maxActionRisk: low`); `structuredOutput`
+ * defaults to `prompted` when the route declares the structured_output capability, else `none`; an undeclared price is
+ * UNKNOWN (never $0): a run or work item with a USD cost budget is never routed to it. `hypertest doctor` lists every
+ * defaulted field.
+ */
 export const ROUTE_DEFAULTS = Object.freeze({
-  capabilities: ['tool_use', 'structured_output'],
-  structuredOutput: 'native',
   reasoning: 'none',
   contextWindow: 128_000,
   maxOutputTokens: 4096,
-  maxDataClassification: 'confidential',
+  maxDataClassification: 'internal',
   quality: { default: 0.7 },
   toolReliability: 0.8,
-  costPerMillionInputUsd: 0,
-  costPerMillionOutputUsd: 0,
   typicalLatencyMs: 2000,
-  maxActionRisk: 'high',
+  maxActionRisk: 'low',
   enabled: true,
-}) as Readonly<Omit<ModelCapabilityProfile, 'routeId' | 'provider' | 'model' | 'continuationCompatibilityClass'>>;
+}) as Readonly<
+  Omit<ModelCapabilityProfile, 'routeId' | 'provider' | 'model' | 'continuationCompatibilityClass' | 'capabilities' | 'structuredOutput' | 'costPerMillionInputUsd' | 'costPerMillionOutputUsd'>
+>;
+
+/** Route fields that are defaulted when absent (structuredOutput is derived from the declared capabilities). */
+const DEFAULTABLE_ROUTE_FIELDS = [...Object.keys(ROUTE_DEFAULTS), 'structuredOutput'] as const;
+
+/**
+ * (A[2]) What a configured route leaves to defaults: the defaulted fields (ROUTE_DEFAULTS, derived structuredOutput) and
+ * whether its price is unknown — reported by `hypertest doctor`.
+ */
+export function defaultedRouteFields(route: Partial<ModelCapabilityProfile>): { defaulted: string[]; costUnknown: boolean } {
+  const defaulted = DEFAULTABLE_ROUTE_FIELDS.filter((f) => (route as Record<string, unknown>)[f] === undefined);
+  const costUnknown = route.costPerMillionInputUsd === undefined || route.costPerMillionOutputUsd === undefined;
+  return { defaulted: [...defaulted], costUnknown };
+}
 
 const TOP_LEVEL_KEYS = new Set([
   'version', 'project', 'store', 'bus', 'durable', 'artifacts', 'models', 'roles', 'budget', 'gate', 'policy', 'bugate', 'engines', 'sandbox',
@@ -272,9 +290,16 @@ export function providerCompatibilityClass(provider: ProviderConfig, model: stri
   }
 }
 
-/** A complete ModelCapabilityProfile from a configured route (ROUTE_DEFAULTS for every absent field). */
+/**
+ * A complete ModelCapabilityProfile from a configured route: ROUTE_DEFAULTS for the absent defaultable fields,
+ * `structuredOutput` derived from the declared capabilities (`prompted` with structured_output, else `none`), no
+ * capability that is not declared (an undeclared list is empty — validation refuses it), and an undeclared price left
+ * unknown (A[2]).
+ */
 export function completeRoute(route: RouteConfig, continuationCompatibilityClass: string): ModelCapabilityProfile {
   const profile = { ...(jsonClone(ROUTE_DEFAULTS) as object), ...(jsonClone(route) as object) } as ModelCapabilityProfile;
+  if (!Array.isArray(profile.capabilities)) profile.capabilities = [];
+  if (profile.structuredOutput === undefined) profile.structuredOutput = profile.capabilities.includes('structured_output') ? 'prompted' : 'none';
   profile.continuationCompatibilityClass = route.continuationCompatibilityClass ?? continuationCompatibilityClass;
   return profile;
 }
@@ -427,6 +452,11 @@ function validateRoutes(errors: Errors, routes: unknown, providers: Map<string, 
       ids.add(r['routeId']);
     }
     str(errors, `${label}.model`, r['model'], true);
+    // A[2]: an explicit CapabilityProfile — what a model can do is declared, never assumed
+    if (r['capabilities'] === undefined) errors.push(`${label}.capabilities is required: declare what the model can do (e.g. [tool_use, structured_output]); nothing is assumed`);
+    if ((r['costPerMillionInputUsd'] === undefined) !== (r['costPerMillionOutputUsd'] === undefined)) {
+      errors.push(`${label}: declare both costPerMillionInputUsd and costPerMillionOutputUsd, or neither (an undeclared price is unknown)`);
+    }
     if (!str(errors, `${label}.provider`, r['provider'], true)) return;
     const provider = providers.get(r['provider']);
     if (!provider) {
@@ -578,7 +608,7 @@ function validatePolicy(errors: Errors, policy: unknown): void {
 const BUDGET_KEYS = ['maxWallClockMs', 'maxAgentConcurrency', 'maxModelTokens', 'maxModelCostUsd', 'maxToolCalls', 'maxComputeMinutes', 'maxExternalQps', 'maxArtifactBytes', 'maxWorkItems', 'maxAgentDepth', 'maxPlanRevisions'];
 /** Budget caps the control plane requires to be integers (≥ 1; maxAgentDepth ≥ 0): a run with another value is refused at start. */
 const INTEGER_BUDGET_KEYS: Record<string, number> = { maxWallClockMs: 1, maxAgentConcurrency: 1, maxModelTokens: 1, maxToolCalls: 1, maxWorkItems: 1, maxPlanRevisions: 1, maxAgentDepth: 0 };
-const GATE_KEYS = ['gateId', 'description', 'failOnUnresolvedSeverity', 'conditionalOnRiskLevel', 'requiredEvidence', 'requireDeterministicForCritical', 'requireIndependentReview', 'minCoverage', 'requireOracle'];
+const GATE_KEYS = ['gateId', 'description', 'failOnUnresolvedSeverity', 'conditionalOnRiskLevel', 'requiredEvidence', 'requireDeterministicForCritical', 'requireIndependentReview', 'minCoverage', 'requireOracle', 'requireContracts'];
 
 function validateBudget(errors: Errors, budget: unknown, path: string): void {
   if (budget === undefined || !objectAt(errors, path, budget, false)) return;
@@ -604,7 +634,7 @@ function validateGate(errors: Errors, gate: unknown, path: string): void {
   if (gate['description'] !== undefined && typeof gate['description'] !== 'string') errors.push(`${path}.description must be a string`);
   oneOf(errors, `${path}.failOnUnresolvedSeverity`, gate['failOnUnresolvedSeverity'], ['P0', 'P1', 'P2', 'P3'], false); // the domain's Severity (H3: 'P4' would disable C2)
   oneOf(errors, `${path}.conditionalOnRiskLevel`, gate['conditionalOnRiskLevel'], ['low', 'medium', 'high', 'critical'], false);
-  for (const k of ['requireDeterministicForCritical', 'requireIndependentReview', 'requireOracle']) if (gate[k] !== undefined && typeof gate[k] !== 'boolean') errors.push(`${path}.${k} must be a boolean`);
+  for (const k of ['requireDeterministicForCritical', 'requireIndependentReview', 'requireOracle', 'requireContracts']) if (gate[k] !== undefined && typeof gate[k] !== 'boolean') errors.push(`${path}.${k} must be a boolean`);
   const required = gate['requiredEvidence'];
   if (required !== undefined) {
     if (!Array.isArray(required)) errors.push(`${path}.requiredEvidence must be a list`);
@@ -792,7 +822,14 @@ function validateRest(errors: Errors, c: Record<string, unknown>): void {
       envs.forEach((e, i) => {
         const at = `environments[${i}]`;
         if (!objectAt(errors, at, e, true)) return;
-        unknownKeys(errors, at, e, ['environmentId', 'environmentClass', 'baseUrl', 'metricsUrl', 'prometheusUrl', 'generation', 'buildDigest', 'control']);
+        unknownKeys(errors, at, e, ['environmentId', 'environmentClass', 'baseUrl', 'metricsUrl', 'prometheusUrl', 'generation', 'buildDigest', 'control', 'isolation']);
+        // coverage-13: an operator-declared dedicated environment (experiments with isolation mode dedicated_environment)
+        const isolation = e['isolation'];
+        if (isolation !== undefined && objectAt(errors, `${at}.isolation`, isolation, false)) {
+          unknownKeys(errors, `${at}.isolation`, isolation, ['dedicated', 'namespace', 'database', 'account']);
+          if (typeof isolation['dedicated'] !== 'boolean') errors.push(`${at}.isolation.dedicated must be a boolean`);
+          for (const k of ['namespace', 'database', 'account']) if (isolation[k] !== undefined) str(errors, `${at}.isolation.${k}`, isolation[k], false);
+        }
         if (str(errors, `${at}.environmentId`, e['environmentId'], true)) {
           if (seen.has(e['environmentId'])) errors.push(`${at}.environmentId: duplicate environment '${e['environmentId']}'`);
           seen.add(e['environmentId']);

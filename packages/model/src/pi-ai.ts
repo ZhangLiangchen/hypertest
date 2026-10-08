@@ -26,8 +26,8 @@ import { googleVertexApi } from '@earendil-works/pi-ai/api/google-vertex.lazy';
 import { mistralConversationsApi } from '@earendil-works/pi-ai/api/mistral-conversations.lazy';
 import { openAICompletionsApi } from '@earendil-works/pi-ai/api/openai-completions.lazy';
 import { openAIResponsesApi } from '@earendil-works/pi-ai/api/openai-responses.lazy';
-import type { ModelCallRequest, ModelCallResponse, ModelProvider, ModelUsage, PiAiModelDefinition, PiAiProviderOptions, StopReason, StreamDelta } from './contracts.ts';
-import { httpStatusError, providerFault, scrubSecrets, secretsOf } from './errors.ts';
+import type { ModelCallRequest, ModelCallResponse, ModelProvider, ModelUsage, PiAiModelDefinition, PiAiProviderOptions, ProviderAvailability, StopReason, StreamDelta } from './contracts.ts';
+import { credentialAvailability, httpStatusError, missingCredentialError, providerFault, scrubSecrets, secretsOf } from './errors.ts';
 import { ToolNameMap } from './tool-names.ts';
 import { DEFAULT_TIMEOUT_MS, guardDelta, monoMs, normalizeTransportError, withDeadline } from './transport.ts';
 import { estimatedUsage } from './usage.ts';
@@ -88,6 +88,7 @@ export class PiAiProvider implements ModelProvider {
   readonly #timeoutMs: number;
   readonly #fetch: typeof fetch;
   readonly #apis = new Map<string, ProviderStreams>();
+  readonly #credential: ProviderAvailability;
 
   constructor(options: PiAiProviderOptions) {
     if (!options.providerId || !options.piProvider) throw new HypertestError('invalid_argument', 'PiAiProvider: providerId and piProvider are required');
@@ -100,6 +101,12 @@ export class PiAiProvider implements ModelProvider {
     this.#defaultApi = options.defaultApi ?? 'openai-completions';
     this.#timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.#fetch = options.fetchImpl ?? fetch;
+    this.#credential = credentialAvailability(this.providerId, options.requireApiKey, options.apiKey, options.apiKeySource);
+  }
+
+  /** Unavailable when a required API key is missing (the router never routes to it; complete() refuses locally). */
+  availability(): ProviderAvailability {
+    return this.#credential;
   }
 
   /** Resolves the pi-ai model definition for a model id (custom → built-in catalog → synthesized). */
@@ -152,6 +159,7 @@ export class PiAiProvider implements ModelProvider {
   }
 
   async complete(request: ModelCallRequest, options: { onDelta?: (d: StreamDelta) => void } = {}): Promise<ModelCallResponse> {
+    if (!this.#credential.ok) throw missingCredentialError(this.providerId, this.#credential.reason);
     const started = monoMs();
     const model = await this.resolveModel(request.model);
     const api = this.#api(model.api);

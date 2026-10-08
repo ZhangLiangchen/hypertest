@@ -1,9 +1,21 @@
 import { estimateTokens, type AssistantMessage, type ChatMessage, type ToolDefinition } from '@hypertest/domain';
 import type { ModelCapabilityProfile, ModelUsage } from './contracts.ts';
 
-/** USD cost of a call from per-million-token prices. Non-finite inputs yield NaN (callers fail closed). */
+/**
+ * USD cost of a call from per-million-token prices. An undeclared price is UNKNOWN (A[2]: never $0) and, like non-finite
+ * inputs, yields NaN (callers fail closed: a cost-limited request is never routed to it, usage carries no cost).
+ */
 export function estimateCostUsd(profile: Pick<ModelCapabilityProfile, 'costPerMillionInputUsd' | 'costPerMillionOutputUsd'>, inputTokens: number, outputTokens: number): number {
-  return (Math.max(0, inputTokens) * profile.costPerMillionInputUsd + Math.max(0, outputTokens) * profile.costPerMillionOutputUsd) / 1_000_000;
+  const inPrice = profile.costPerMillionInputUsd;
+  const outPrice = profile.costPerMillionOutputUsd;
+  if (typeof inPrice !== 'number' || typeof outPrice !== 'number') return Number.NaN;
+  return (Math.max(0, inputTokens) * inPrice + Math.max(0, outputTokens) * outPrice) / 1_000_000;
+}
+
+/** Whether a route declares both prices (finite, ≥ 0): its cost is known. */
+export function costKnown(profile: Pick<ModelCapabilityProfile, 'costPerMillionInputUsd' | 'costPerMillionOutputUsd'>): boolean {
+  const ok = (v: unknown) => typeof v === 'number' && Number.isFinite(v) && v >= 0;
+  return ok(profile.costPerMillionInputUsd) && ok(profile.costPerMillionOutputUsd);
 }
 
 /** Deterministic output-token estimate for providers that report no usage (never report 0 for real output). */

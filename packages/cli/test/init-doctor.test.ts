@@ -250,7 +250,7 @@ describe('hypertest doctor', () => {
     await mkdir(p);
     await writeFile(join(p, 'hypertest.config.yaml'), JSON.stringify({
       version: 1,
-      models: { providers: [{ id: 'sim', kind: 'scripted' }], routes: [{ routeId: 'sim', provider: 'sim', model: 's', capabilities: ['tool_use', 'structured_output', 'reasoning', 'long_context'], quality: { default: 0.9 } }] },
+      models: { providers: [{ id: 'sim', kind: 'scripted' }], routes: [{ routeId: 'sim', provider: 'sim', model: 's', capabilities: ['tool_use', 'structured_output', 'reasoning', 'long_context'], quality: { default: 0.9 }, maxActionRisk: 'critical', maxDataClassification: 'confidential', structuredOutput: 'native', costPerMillionInputUsd: 0, costPerMillionOutputUsd: 0 }] },
       bugate: { path: './no-bugate-here' },
     }));
     const r = await cli(['doctor', '--no-connect', '--json'], { cwd: p, env: NO_KEYS });

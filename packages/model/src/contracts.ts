@@ -74,7 +74,16 @@ export interface ModelProvider {
   /** Package + version for the RuntimeManifest. */
   readonly adapterInfo: { package: string; version: string };
   complete(request: ModelCallRequest, options?: { onDelta?: (d: StreamDelta) => void }): Promise<ModelCallResponse>;
+  /**
+   * (additive, optional) Whether the provider can serve calls at all in this process — e.g. a provider configured with a
+   * required credential whose variable is unset or empty is unavailable. The router rejects every route of an
+   * unavailable provider at the `capability` stage (no request ever leaves the process); absent ⇒ available.
+   */
+  availability?(): ProviderAvailability;
 }
+
+/** (additive) ModelProvider.availability(). */
+export type ProviderAvailability = { ok: true } | { ok: false; reason: string };
 
 /** Deterministic brain for ScriptedProvider: decides the next assistant message from the request. */
 export type ScriptedBrain = (request: ModelCallRequest, info: { callIndex: number; routeModel: string }) => ScriptedReply | Promise<ScriptedReply>;
@@ -101,8 +110,13 @@ export interface ModelCapabilityProfile {
   quality: Record<string, number>;
   /** Tool-call reliability 0..1 (executors weigh it). */
   toolReliability: number;
-  costPerMillionInputUsd: number;
-  costPerMillionOutputUsd: number;
+  /**
+   * USD per million input/output tokens. (contract change, A[2]) Optional: an undeclared price is UNKNOWN, never 0 — a
+   * cost-limited request (policy.maxCostPerCallUsd, or RouteRequest.costBudgeted) is never routed to a route whose cost
+   * is unknown, and usage on such a route carries no `costUsd` (the provider's reported cost is kept when it has one).
+   */
+  costPerMillionInputUsd?: number;
+  costPerMillionOutputUsd?: number;
   typicalLatencyMs: number;
   /** Highest risk class of actions this route may drive. */
   maxActionRisk: RiskClass;
@@ -128,7 +142,38 @@ export interface RouteRequest {
   providersToAvoid?: string[];
   /** Routes that already failed in this epoch sequence (excluded from fallback). */
   excludeRoutes?: string[];
+  /**
+   * (additive) The run or work item has a USD cost budget: a route whose cost is unknown (no declared price) is rejected
+   * at the `cost` stage — cost budgets must deplete with real prices, never silently at $0.
+   */
+  costBudgeted?: boolean;
+  /**
+   * (additive, cost switch) Only routes whose estimated call cost is strictly below this USD amount pass the `cost`
+   * stage (budget pressure: a cheaper eligible route, still after security → capability → role → quality floor).
+   */
+  cheaperThanUsd?: number;
 }
+
+/**
+ * (additive) Why no route can serve a request now. `transient`: a route may serve it again later (a circuit is open or
+ * half-open, a rate limit / timeout / unavailability, a price guard, routes that failed earlier in this epoch sequence) —
+ * the work PAUSES and resumes no earlier than `retryAt` (when known). Not transient: no configured route may serve it
+ * (security, capability incl. a missing credential, role, quality, latency, cost policy, a malformed request) — the work
+ * fails closed with `reason`.
+ */
+export interface ModelUnavailability {
+  transient: boolean;
+  reason: string;
+  /** Earliest moment a route is expected back (a circuit's half-open time, a provider's Retry-After), ISO-8601. */
+  retryAt?: string;
+  /** The routes involved (the failed route and the rejected candidates). */
+  routes: string[];
+}
+
+/** (additive) ModelRouter.validate(): the pure re-check of a decision for a request (no call, no event). */
+export type DecisionCheck =
+  | { ok: true }
+  | { ok: false; stage: RouteRejection['stage'] | 'catalog'; reason: string; transient: boolean; retryAt?: string };
 
 export interface RouteRejection {
   routeId: string;
@@ -154,7 +199,13 @@ export type RouteDecision =
       continuationCompatibilityClass: string;
       rejected: RouteRejection[];
     }
-  | { ok: false; reason: 'no_eligible_route'; rejected: RouteRejection[] };
+  | {
+      ok: false;
+      reason: 'no_eligible_route';
+      rejected: RouteRejection[];
+      /** (additive) Transient (pause) or permanent (fail closed), with the earliest retry time when known. */
+      unavailable?: ModelUnavailability;
+    };
 
 export interface InvokeRequest {
   decision: Extract<RouteDecision, { ok: true }>;
@@ -188,6 +239,11 @@ export type InvokeOutcome =
        * (new ModelEpoch), or undefined when policy is fail_closed / no eligible route remains.
        */
       fallback?: Extract<RouteDecision, { ok: true }>;
+      /**
+       * (additive) Set when there is no fallback (and the call was not cancelled): whether the failure is transient
+       * (the work pauses until `retryAt` / a route is back) or permanent (fail closed). See ModelUnavailability.
+       */
+      unavailable?: ModelUnavailability;
     };
 
 export interface RouterDeps extends BaseDeps {
@@ -201,6 +257,28 @@ export interface RouterDeps extends BaseDeps {
    * defaults of DEFAULT_CIRCUIT_BREAKER when omitted; `false` disables it (every route stays available).
    */
   circuitBreaker?: CircuitBreakerOptions | false;
+  /**
+   * (additive, A[1]) Observed route prices, read at a safe point (the start of every route() / invoke() / validate(),
+   * i.e. a turn boundary). An observed price is what the call costs now: cost estimates and budget reservations use it,
+   * the price guard's ceilings apply to it, and an increase over the catalog price beyond `priceGuard.maxIncreasePct`
+   * opens the route's circuit (`model.circuit_opened` reason `price_change`) until the price is back within the guard.
+   */
+  prices?: PriceSource;
+}
+
+/** (additive) A route's observed price (USD per million tokens). */
+export interface ObservedPrice {
+  inputPerMillionUsd: number;
+  outputPerMillionUsd: number;
+  /** When/where the price was observed (audit only). */
+  observedAt?: string;
+  source?: string;
+}
+
+/** (additive) Source of observed prices (e.g. a prices file reloaded when it changes, provider-reported pricing). */
+export interface PriceSource {
+  /** Observed prices by route id; a route without an entry is priced from the catalog. Errors fail the routing call. */
+  current(): Promise<Record<string, ObservedPrice>> | Record<string, ObservedPrice>;
 }
 
 /** (additive) Catalog price ceiling (USD per million tokens); an absent side is not checked. */
@@ -232,7 +310,17 @@ export interface CircuitBreakerOptions {
    * unavailable to cost-limited requests (policy.maxCostPerCallUsd set; `appliesTo: 'all'` for every request). Recorded
    * as `model.circuit_opened` / `model.circuit_closed` with reason `price_ceiling`.
    */
-  priceGuard?: { default?: PriceCeiling; routes?: Record<string, PriceCeiling>; appliesTo?: 'cost_limited' | 'all' };
+  priceGuard?: {
+    default?: PriceCeiling;
+    routes?: Record<string, PriceCeiling>;
+    appliesTo?: 'cost_limited' | 'all';
+    /**
+     * (additive, A[1]) Largest accepted increase (percent, ≥ 0) of an OBSERVED price (RouterDeps.prices) over the
+     * route's catalog price, for every request: beyond it the route's circuit opens (`model.circuit_opened` reason
+     * `price_change`) and closes again (`price_change_cleared`) once the observed price is back within the guard.
+     */
+    maxIncreasePct?: number;
+  };
 }
 
 export type CircuitState = 'closed' | 'open' | 'half_open';
@@ -279,10 +367,18 @@ export interface ModelRouter {
    * record the audit events after a successful call is thrown as a fault (never reported as a model failure).
    */
   invoke(request: InvokeRequest, routeRequest: RouteRequest): Promise<InvokeOutcome>;
-  /** Cost estimate for budget reservation. */
+  /** Cost estimate for budget reservation (NaN when the route's price is unknown). */
   estimateCostUsd(routeId: string, inputTokens: number, outputTokens: number): number;
   /** (additive, optional) The circuit breaker state of every route that has one (sorted by route id). */
   circuits?(): CircuitSnapshot[];
+  /**
+   * (additive, optional) Pure re-check of `decision` for `routeRequest` — the same checks invoke() makes before a call
+   * (catalog revision, the route unchanged, every stage including availability) — without calling, acquiring a probe
+   * slot or emitting events. The permission/profile re-check of a model switch BEFORE its new epoch is recorded (I3).
+   */
+  validate?(decision: Extract<RouteDecision, { ok: true }>, routeRequest: RouteRequest): Promise<DecisionCheck>;
+  /** (additive, optional) The catalog revision the router routes against now. */
+  readonly catalogRevision?: string;
 }
 
 // ----------------------------------------------------------------------------- provider options (additive)
@@ -303,6 +399,13 @@ export interface OpenAICompatibleProviderOptions {
   /** Base URL including the version prefix, e.g. `https://api.openai.com/v1`; `/chat/completions` is appended. */
   baseUrl: string;
   apiKey?: string;
+  /**
+   * (additive, e2e[3]) A key is required (the configuration names an apiKeyEnv): without a non-empty `apiKey` the provider
+   * is unavailable — availability() reports it and complete() refuses locally (precondition_failed) before any request.
+   */
+  requireApiKey?: boolean;
+  /** (additive) Where the key comes from (e.g. the environment variable name), for the unavailability reason only. */
+  apiKeySource?: string;
   headers?: Record<string, string>;
   /** Whole-call deadline (connect + stream). Default 120000. */
   timeoutMs?: number;
@@ -315,6 +418,13 @@ export interface AnthropicProviderOptions {
   /** Defaults to `https://api.anthropic.com`; `/v1/messages` is appended. */
   baseUrl?: string;
   apiKey?: string;
+  /**
+   * (additive, e2e[3]) A key is required (the configuration names an apiKeyEnv): without a non-empty `apiKey` the provider
+   * is unavailable — availability() reports it and complete() refuses locally (precondition_failed) before any request.
+   */
+  requireApiKey?: boolean;
+  /** (additive) Where the key comes from (e.g. the environment variable name), for the unavailability reason only. */
+  apiKeySource?: string;
   /** `anthropic-version` header. Default `2023-06-01`. */
   version?: string;
   headers?: Record<string, string>;
@@ -346,6 +456,13 @@ export interface PiAiProviderOptions {
   /** pi-ai provider id (built-in catalog lookup, e.g. `openai`, `anthropic`, `deepseek`, `openrouter`) or a custom name. */
   piProvider: string;
   apiKey?: string;
+  /**
+   * (additive, e2e[3]) A key is required (the configuration names an apiKeyEnv): without a non-empty `apiKey` the provider
+   * is unavailable — availability() reports it and complete() refuses locally (precondition_failed) before any request.
+   */
+  requireApiKey?: boolean;
+  /** (additive) Where the key comes from (e.g. the environment variable name), for the unavailability reason only. */
+  apiKeySource?: string;
   /** Overrides the model's base URL (custom gateways, local servers). */
   baseUrl?: string;
   headers?: Record<string, string>;

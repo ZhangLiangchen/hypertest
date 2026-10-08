@@ -159,11 +159,21 @@ function buildProviders(config: HypertestConfig, overrides: HypertestOverrides, 
   const brains = overrides.scriptedBrains ?? {};
   for (const p of config.models.providers) {
     const apiKey = p.apiKeyEnv ? env[p.apiKeyEnv] : undefined;
-    if (p.apiKeyEnv && (apiKey === undefined || apiKey === '')) {
-      logger.warn('model provider API key variable is not set; calls to this provider will fail until it is (see `hypertest doctor`)', { provider: p.id, apiKeyEnv: p.apiKeyEnv });
+    // e2e[3] fail closed on a missing credential: a provider that names an apiKeyEnv (or the hosted Anthropic API, which
+    // always needs one) is UNAVAILABLE without its key — the router never routes to it and no request leaves the process
+    const requireApiKey = p.apiKeyEnv !== undefined || (p.kind === 'anthropic' && !p.baseUrl);
+    if (requireApiKey && (apiKey === undefined || apiKey.trim() === '')) {
+      logger.warn('model provider credential is missing: its routes are unavailable (fail closed, no request is sent) until it is set (see `hypertest doctor`)', {
+        provider: p.id, apiKeyEnv: p.apiKeyEnv ?? null,
+      });
     }
-    const common: { apiKey?: string; headers?: Record<string, string>; timeoutMs?: number } = {};
+    const common: { apiKey?: string; headers?: Record<string, string>; timeoutMs?: number; requireApiKey?: boolean; apiKeySource?: string; fetchImpl?: typeof fetch } = {};
     if (apiKey) common.apiKey = apiKey;
+    if (p.kind !== 'scripted') {
+      common.requireApiKey = requireApiKey;
+      common.apiKeySource = p.apiKeyEnv ?? `models.providers[${p.id}].apiKeyEnv (not configured)`;
+      if (overrides.fetch) common.fetchImpl = overrides.fetch;
+    }
     if (p.headers) common.headers = { ...p.headers };
     if (p.timeoutMs !== undefined) common.timeoutMs = p.timeoutMs;
     let provider: ModelProvider;

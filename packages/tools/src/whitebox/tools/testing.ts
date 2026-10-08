@@ -5,6 +5,7 @@ import { DEFAULT_TEST_PATH_PATTERNS, matchesGlob } from '@hypertest/policy';
 import type { BuiltinToolOptions, CoverageMap, TestRunnerAdapter, TestRunResult, ToolContext, ToolSpec, WorkspaceHandle, WorkspaceManager } from '../../contracts.ts';
 import { detectCoverageFormat, parseCoverage, type CoverageFormat } from '../coverage.ts';
 import { MUTATION_OPERATORS, runMutationAnalysis } from '../mutation.ts';
+import { attributeExecutedTests, changedSubset, collectedCleanly, runOnBaseRevision, staticChecks, workspaceCodeRevision, type ExecutedTestsRecord } from '../executed.ts';
 import { commandRunner } from '../runners/command.ts';
 import { defaultTestRunners } from '../runners/index.ts';
 import { rebase } from '../runners/node.ts';
@@ -97,6 +98,7 @@ async function recordTestEvidence(
   run: Awaited<ReturnType<TestRunnerAdapter['run']>>,
   testArtifactIds: string[],
   delta: Record<string, JsonValue>,
+  binding: { executedTests: ExecutedTestsRecord; codeRevision: Record<string, JsonValue> },
 ): Promise<{ evidenceRefs: string[]; testResultIds: string[]; coverageIds: string[]; artifactRefs: ArtifactRef[] }> {
   const evidenceRefs: string[] = [];
   const parents: string[] = [];
@@ -121,6 +123,9 @@ async function recordTestEvidence(
   const base = JSON.parse(JSON.stringify(run.result)) as Record<string, JsonValue>;
   if (raw) base['rawReport'] = raw;
   base['workspaceDelta'] = delta;
+  // D-0: what the run executed (test files + digests + static checks) and on which code — the binding the gate re-derives
+  base['executedTests'] = binding.executedTests as unknown as JsonValue;
+  base['codeRevision'] = binding.codeRevision;
   // The QualityGate reads the singular `testArtifactId`: one record per linked artifact keeps its
   // eligibility check per artifact (an ineligible artifact can never ride along with an eligible one).
   const links: Array<string | undefined> = testArtifactIds.length > 0 ? testArtifactIds : [undefined];
@@ -144,7 +149,7 @@ async function recordTestEvidence(
   }
   const coverageIds: string[] = [];
   if (run.coverage) {
-    const coverage = { ...(JSON.parse(JSON.stringify(run.coverage)) as Record<string, JsonValue>), workspaceDelta: delta };
+    const coverage = { ...(JSON.parse(JSON.stringify(run.coverage)) as Record<string, JsonValue>), workspaceDelta: delta, codeRevision: binding.codeRevision };
     const ev = await ctx.recordEvidence({
       evidenceType: 'coverage',
       data: JSON.stringify(coverage),
@@ -168,7 +173,11 @@ interface TestRunInput {
   command?: string[];
   testArtifactId?: string;
   testArtifactIds?: string[];
+  /** (additive, D-1) `base`: run on the base revision (product code restored, test files kept) — a known-good run. */
+  revision?: 'workspace' | 'base';
 }
+
+const BASE_RUN_NOTE = '\nKNOWN-GOOD RUN ON THE BASE REVISION: product code restored to the base commit, your test files kept. This is validation evidence for test_artifact.validate (knownGoodEvidenceId) only — it is never evidence about the candidate.';
 
 export function testRunTool(options: BuiltinToolOptions): ToolSpec<TestRunInput> {
   const runners = options.runners ?? defaultTestRunners();
@@ -177,7 +186,7 @@ export function testRunTool(options: BuiltinToolOptions): ToolSpec<TestRunInput>
     id: 'test.run',
     title: 'Run tests',
     description:
-      'Run tests in the workspace and record a structured TestRunResult as test-result evidence (plus stdout/stderr, the raw report, and coverage when requested). framework: auto-detected (vitest, jest, node_test, pytest, go_test) or explicit; "command" runs an allowlisted command (exit-code only: it records the exit code but never counts as passed, since it proves no test case ran). selector: node "file::name-pattern" | file | name pattern; pytest nodeid or -k expression; go "pkg::-run regex" | "./pkg/..." | regex. Failing tests are a successful tool call with passed=false. Zero tests is never a pass.',
+      'Run tests in the workspace and record a structured TestRunResult as test-result evidence (plus stdout/stderr, the raw report, and coverage when requested). framework: auto-detected (vitest, jest, node_test, pytest, go_test) or explicit; "command" runs an allowlisted command (exit-code only: it records the exit code but never counts as passed, since it proves no test case ran). selector: node "file::name-pattern" | file | name pattern; pytest nodeid or -k expression; go "pkg::-run regex" | "./pkg/..." | regex. Failing tests are a successful tool call with passed=false. Zero tests is never a pass. The evidence records which test files ran (with their content digest and, for files changed since the base commit, a syntax/static check) and the code revision. revision "base" runs the selected tests on the BASE revision (product code restored to the base commit, your test files kept): the known-good run of a regression test for a defect of the candidate.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -189,6 +198,7 @@ export function testRunTool(options: BuiltinToolOptions): ToolSpec<TestRunInput>
         command: { type: 'array', minItems: 1, maxItems: 128, items: { type: 'string', maxLength: 4096 } },
         testArtifactId: { type: 'string', minLength: 1, maxLength: 128 },
         testArtifactIds: { type: 'array', items: { type: 'string', minLength: 1, maxLength: 128 }, maxItems: 50 },
+        revision: { enum: ['workspace', 'base'], default: 'workspace' },
       },
     },
     effect: 'execute',
@@ -216,9 +226,33 @@ export function testRunTool(options: BuiltinToolOptions): ToolSpec<TestRunInput>
       if (input.coverage) request.coverage = true;
       // the tree that is about to be tested (derived by the tool, never claimed by the caller): conformance-2
       const delta = await workspaceDelta(ctx.workspace, options.workspaces, input.selector);
-      const run = await runner.run(ctx.workspace, request, options.sandbox);
+      const base = input.revision === 'base';
+      if (base && input.framework === 'command') throw new HypertestError('invalid_argument', 'revision "base" needs a test framework (not "command")');
+      const selected = input.selector === undefined ? undefined : normalizeRel(input.selector.split('::')[0]!);
+      let run: Awaited<ReturnType<TestRunnerAdapter['run']>>;
+      let root = ctx.workspace.root;
+      let codeRevision: Record<string, JsonValue>;
+      let cleanup: (() => Promise<void>) | undefined;
+      if (base) {
+        const r = await runOnBaseRevision({ ws: ctx.workspace, workspaces: options.workspaces, runner, sandbox: options.sandbox, request, isTestFile: (p) => isTestFilePath(p) || p === selected });
+        run = r.run;
+        root = r.root;
+        codeRevision = r.codeRevision;
+        cleanup = r.cleanup;
+      } else {
+        run = await runner.run(ctx.workspace, request, options.sandbox);
+        codeRevision = workspaceCodeRevision(delta);
+      }
+      let executed: ExecutedTestsRecord;
+      try {
+        const attributed = await attributeExecutedTests(root, run.result, input.selector);
+        executed = attributed.record;
+        await staticChecks(ctx.workspace, root, changedSubset(executed.files, delta), collectedCleanly(run.result, attributed.perFile), options.sandbox, ctx.signal);
+      } finally {
+        await cleanup?.();
+      }
       const ids = [...new Set([...(input.testArtifactId ? [input.testArtifactId] : []), ...(input.testArtifactIds ?? [])])];
-      const ev = await recordTestEvidence(ctx, run, ids, delta);
+      const ev = await recordTestEvidence(ctx, run, ids, delta, { executedTests: executed, codeRevision });
       const structured = JSON.parse(JSON.stringify(run.result)) as Record<string, JsonValue>;
       if (run.result.cases.length > MAX_CASES_INLINE) {
         structured['cases'] = run.result.cases.slice(0, MAX_CASES_INLINE) as unknown as JsonValue;
@@ -228,7 +262,11 @@ export function testRunTool(options: BuiltinToolOptions): ToolSpec<TestRunInput>
       structured['evidence'] = { testResult: ev.testResultIds, coverage: ev.coverageIds };
       if (run.coverage) structured['coverage'] = { format: run.coverage.format, totals: run.coverage.totals as unknown as JsonValue };
       structured['workspaceDelta'] = delta;
-      return { status: 'success', structured, text: summarize(run.result) + deltaNote(delta), evidenceRefs: ev.evidenceRefs, artifactRefs: ev.artifactRefs };
+      structured['executedTests'] = executed as unknown as JsonValue;
+      structured['codeRevision'] = codeRevision;
+      const failedChecks = executed.files.filter((f) => f.staticCheck && !f.staticCheck.ok);
+      const checkNote = failedChecks.length ? `\nSTATIC CHECK FAILED: ${failedChecks.map((f) => `${f.path} (${f.staticCheck!.checker}): ${f.staticCheck!.detail ?? 'error'}`).join('; ')}` : '';
+      return { status: 'success', structured, text: summarize(run.result) + checkNote + (base ? BASE_RUN_NOTE : deltaNote(delta)), evidenceRefs: ev.evidenceRefs, artifactRefs: ev.artifactRefs };
     },
   };
 }
@@ -330,6 +368,8 @@ export function mutationRunTool(options: BuiltinToolOptions): ToolSpec<MutationI
     resources: (input, ctx) => [rootResource(ctx), pathResource(ctx, input.file)],
     async execute(input, ctx) {
       const runner = await selectRunner(runners, ctx.workspace, input.framework);
+      // D-0: the code the analysis runs on (derived before it runs) — recorded with the executed test files
+      const delta = await workspaceDelta(ctx.workspace, options.workspaces, input.testSelector);
       const analysis = await runMutationAnalysis({
         ws: ctx.workspace,
         file: normalizeRel(input.file),
@@ -341,7 +381,14 @@ export function mutationRunTool(options: BuiltinToolOptions): ToolSpec<MutationI
         timeoutMs: Math.min(input.timeoutMs ?? 1_800_000, ctx.permit.constraints?.maxDurationMs ?? Number.MAX_SAFE_INTEGER),
         signal: ctx.signal,
       });
+      if (analysis.executedTests) {
+        // the files are byte-identical in the workspace (the analysis ran on a private copy of it)
+        const files = analysis.executedTests.files;
+        await staticChecks(ctx.workspace, ctx.workspace.root, changedSubset(files, delta), (p) => files.some((f) => f.path === p && f.cases > 0) && analysis.baseline.harnessError === undefined, options.sandbox, ctx.signal);
+      }
       const structured = JSON.parse(JSON.stringify(analysis)) as Record<string, JsonValue>;
+      structured['codeRevision'] = workspaceCodeRevision(delta);
+      structured['workspaceDelta'] = delta;
       if (input.testArtifactId) structured['testArtifactId'] = input.testArtifactId;
       const ev = await ctx.recordEvidence({
         evidenceType: 'mutation-result',
@@ -351,8 +398,10 @@ export function mutationRunTool(options: BuiltinToolOptions): ToolSpec<MutationI
         structured,
       });
       const survivors = analysis.mutants.filter((m) => m.status === 'survived').slice(0, 30);
+      const ranFiles = analysis.executedTests?.files.map((f) => f.path) ?? [];
       const text =
         `mutation score ${(analysis.score * 100).toFixed(1)}%: ${analysis.killed} killed, ${analysis.survived} survived, ${analysis.errors} errors (${analysis.total} run of ${analysis.generated} generated)` +
+        `\nexecuted test files: ${ranFiles.join(', ') || 'none attributable'}${(analysis.executedTests?.unattributedCases ?? 0) > 0 ? ` (+${analysis.executedTests!.unattributedCases} unattributed case(s))` : ''} — this result validates a test artifact only when it executed exactly that artifact's file` +
         (survivors.length ? '\nsurvivors (tests did not notice):\n' + survivors.map((m) => `  L${m.line} ${m.operator}: ${JSON.stringify(m.original)} -> ${JSON.stringify(m.replacement)}`).join('\n') : '');
       return { status: 'success', structured, text, evidenceRefs: [ev.evidenceId] };
     },

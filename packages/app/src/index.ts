@@ -1,6 +1,6 @@
 export * from './contracts.ts';
 export {
-  DEFAULT_ENV_ALLOWLIST, ENGINE_KINDS, PROVIDER_KINDS, ROUTE_DEFAULTS, completeRoute, defaultConfig, interpolateConfig, loadConfig, mergeConfig,
+  DEFAULT_ENV_ALLOWLIST, ENGINE_KINDS, PROVIDER_KINDS, ROUTE_DEFAULTS, completeRoute, defaultConfig, defaultedRouteFields, interpolateConfig, loadConfig, mergeConfig,
   oracleConfigProblems, oracleSpecFromConfig, providerCompatibilityClass, resolveConfigPaths, roleOverrides, secretVariableNames, validateConfig, validateRunOverrides, withDerivedPaths,
 } from './config.ts';
 export {

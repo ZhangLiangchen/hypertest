@@ -1,7 +1,7 @@
 import { HypertestError, type JsonSchema, type JsonValue } from '@hypertest/core';
 import { projectForRoute, type AssistantMessage, type ChatMessage, type ContentPart, type ToolCall } from '@hypertest/domain';
-import type { AnthropicProviderOptions, ModelCallRequest, ModelCallResponse, ModelProvider, ModelUsage, StopReason, StreamDelta } from './contracts.ts';
-import { providerFault, secretsOf, type ProviderErrorCode } from './errors.ts';
+import type { AnthropicProviderOptions, ModelCallRequest, ModelCallResponse, ModelProvider, ModelUsage, ProviderAvailability, StopReason, StreamDelta } from './contracts.ts';
+import { credentialAvailability, missingCredentialError, providerFault, secretsOf, type ProviderErrorCode } from './errors.ts';
 import { ToolNameMap } from './tool-names.ts';
 import { DEFAULT_TIMEOUT_MS, guardDelta, isEventStream, monoMs, normalizeTransportError, parseJsonPayload, postJson, readSse, withDeadline } from './transport.ts';
 import { estimatedUsage, nonNegInt } from './usage.ts';
@@ -35,6 +35,7 @@ export class AnthropicProvider implements ModelProvider {
   readonly #timeoutMs: number;
   readonly #defaultMaxTokens: number;
   readonly #fetch: typeof fetch;
+  readonly #credential: ProviderAvailability;
 
   constructor(options: AnthropicProviderOptions = {}) {
     this.providerId = options.providerId ?? 'anthropic';
@@ -45,9 +46,16 @@ export class AnthropicProvider implements ModelProvider {
     this.#timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.#defaultMaxTokens = options.defaultMaxTokens ?? 4096;
     this.#fetch = options.fetchImpl ?? fetch;
+    this.#credential = credentialAvailability(this.providerId, options.requireApiKey, options.apiKey, options.apiKeySource);
+  }
+
+  /** Unavailable when a required API key is missing (the router never routes to it; complete() refuses locally). */
+  availability(): ProviderAvailability {
+    return this.#credential;
   }
 
   async complete(request: ModelCallRequest, options: { onDelta?: (d: StreamDelta) => void } = {}): Promise<ModelCallResponse> {
+    if (!this.#credential.ok) throw missingCredentialError(this.providerId, this.#credential.reason);
     const started = monoMs();
     const names = new ToolNameMap();
     const { body, structured } = buildAnthropicBody(request, names, this.#defaultMaxTokens);

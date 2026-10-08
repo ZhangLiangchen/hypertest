@@ -12,8 +12,7 @@ export const MODEL_CAPABILITY_PROFILE_SCHEMA: JsonSchema = {
   additionalProperties: false,
   required: [
     'routeId', 'provider', 'model', 'capabilities', 'structuredOutput', 'reasoning', 'contextWindow', 'maxOutputTokens',
-    'continuationCompatibilityClass', 'maxDataClassification', 'quality', 'toolReliability', 'costPerMillionInputUsd',
-    'costPerMillionOutputUsd', 'typicalLatencyMs', 'maxActionRisk', 'enabled',
+    'continuationCompatibilityClass', 'maxDataClassification', 'quality', 'toolReliability', 'typicalLatencyMs', 'maxActionRisk', 'enabled',
   ],
   properties: {
     routeId: { type: 'string', minLength: 1, maxLength: 200 },

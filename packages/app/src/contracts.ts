@@ -119,6 +119,8 @@ export interface HypertestOverrides {
    * chaos trials). The caller owns it: close() does not close it.
    */
   bus?: EventBus;
+  /** (additive, e2e[3]) The fetch the HTTP model providers use (tests prove that no request leaves the process). */
+  fetch?: typeof fetch;
 }
 
 export interface Hypertest {

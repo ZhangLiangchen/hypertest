@@ -7,7 +7,7 @@ import { DEFAULT_POLICY_RULES } from '@hypertest/policy';
 import { DEFAULT_SHELL_ALLOWLIST } from '@hypertest/tools';
 import { tempDir } from '@hypertest/testkit';
 import {
-  ROUTE_DEFAULTS, completeRoute, defaultConfig, interpolateConfig, loadConfig, mergeConfig, providerCompatibilityClass, validateConfig, validateRunOverrides, type HypertestConfig,
+  ROUTE_DEFAULTS, completeRoute, defaultConfig, defaultedRouteFields, interpolateConfig, loadConfig, mergeConfig, providerCompatibilityClass, validateConfig, validateRunOverrides, type HypertestConfig,
 } from '../src/index.ts';
 import { atLeastAsSevere } from '@hypertest/domain';
 
@@ -117,7 +117,7 @@ describe('loadConfig', () => {
         '  providers:',
         '    - { id: local, kind: openai-compatible, baseUrl: "${HT_BASE:-http://127.0.0.1:11434/v1}", apiKeyEnv: LOCAL_API_KEY }',
         '  routes:',
-        '    - { routeId: local-small, provider: local, model: qwen }',
+        '    - { routeId: local-small, provider: local, model: qwen, capabilities: [tool_use] }',
         'gate: { requireIndependentReview: false }',
       ].join('\n'),
     );
@@ -137,7 +137,7 @@ describe('loadConfig', () => {
 
   test('JSON files are accepted; a missing apiKeyEnv variable is not a load error (doctor reports it)', async () => {
     const file = join(dir.path, 'conf', 'ht.json');
-    await writeFile(file, JSON.stringify({ project: { name: 'j', dataDir: '/var/ht' }, models: { providers: [{ id: 'a', kind: 'anthropic', apiKeyEnv: 'HT_UNSET_ANTHROPIC_KEY' }], routes: [{ routeId: 'claude', provider: 'a', model: 'claude-x' }] } }));
+    await writeFile(file, JSON.stringify({ project: { name: 'j', dataDir: '/var/ht' }, models: { providers: [{ id: 'a', kind: 'anthropic', apiKeyEnv: 'HT_UNSET_ANTHROPIC_KEY' }], routes: [{ routeId: 'claude', provider: 'a', model: 'claude-x', capabilities: ['tool_use'] }] } }));
     const c = await loadConfig(file, { env: {} });
     assert.equal(c.project.dataDir, '/var/ht');
     assert.deepEqual(c.store, { kind: 'pglite', dataDir: '/var/ht/db' });
@@ -153,7 +153,7 @@ describe('loadConfig', () => {
     await writeFile(list, '- a\n- b\n');
     await assert.rejects(loadConfig(list), (e: unknown) => e instanceof HypertestError && /must contain a mapping at the top level/.test(e.message));
     const invalid = join(dir.path, 'invalid.yaml');
-    await writeFile(invalid, 'modelz: {}\nmodels:\n  providers: [{ id: o, kind: openai }]\n  routes: [{ routeId: r, provider: ghost, model: m }]\n');
+    await writeFile(invalid, 'modelz: {}\nmodels:\n  providers: [{ id: o, kind: openai }]\n  routes: [{ routeId: r, provider: ghost, model: m, capabilities: [tool_use] }]\n');
     await assert.rejects(loadConfig(invalid, { env: {} }), (e: unknown) => {
       assert.ok(e instanceof HypertestError && e.code === 'invalid_argument');
       assert.match(e.message, /unknown configuration key 'modelz'/);
@@ -183,7 +183,7 @@ describe('validateConfig', () => {
   const provider = { id: 'o', kind: 'openai-compatible', baseUrl: 'http://127.0.0.1:1/v1' };
 
   test('a complete valid configuration has no problems', () => {
-    const c = withModels({ providers: [provider, { id: 'c', kind: 'anthropic', apiKeyEnv: 'ANTHROPIC_API_KEY' }, { id: 'p', kind: 'pi-ai', piProvider: 'openai' }], routes: [{ routeId: 'r1', provider: 'o', model: 'm' }] });
+    const c = withModels({ providers: [provider, { id: 'c', kind: 'anthropic', apiKeyEnv: 'ANTHROPIC_API_KEY' }, { id: 'p', kind: 'pi-ai', piProvider: 'openai' }], routes: [{ routeId: 'r1', provider: 'o', model: 'm', capabilities: ['tool_use'] }] });
     assert.deepEqual(validateConfig(c), []);
   });
 
@@ -315,6 +315,12 @@ describe('validateConfig', () => {
     assert.deepEqual(validateRunOverrides({ gate: { failOnUnresolvedSeverity: 'P4' } }), ['gate.failOnUnresolvedSeverity must be one of P0, P1, P2, P3, got "P4"']);
   });
 
+  test('A[2] audit probe: a route that declares only routeId/provider/model is refused (capabilities required); half a price is refused', () => {
+    const errors = validateConfig(withModels({ providers: [provider], routes: [{ routeId: 'bare', provider: 'o', model: 'some-small-local-model' }, { routeId: 'half', provider: 'o', model: 'm', capabilities: ['tool_use'], costPerMillionInputUsd: 1 }] }));
+    assert.ok(errors.includes("models.routes[0] (bare).capabilities is required: declare what the model can do (e.g. [tool_use, structured_output]); nothing is assumed"), errors.join('\n'));
+    assert.ok(errors.includes('models.routes[1] (half): declare both costPerMillionInputUsd and costPerMillionOutputUsd, or neither (an undeclared price is unknown)'), errors.join('\n'));
+  });
+
   test('validation never reads the environment (missing API key variables are not load errors)', () => {
     const c = withModels({ providers: [{ ...provider, apiKeyEnv: 'HT_SURELY_UNSET_VARIABLE_1234' }], routes: [] });
     assert.deepEqual(validateConfig(c), []);
@@ -322,14 +328,25 @@ describe('validateConfig', () => {
 });
 
 describe('route completion', () => {
-  test('ROUTE_DEFAULTS fill every absent field; the provider tag is the continuation class', () => {
-    const p = completeRoute({ routeId: 'r', provider: 'o', model: 'm' }, 'o:m');
+  test('A[2]: ROUTE_DEFAULTS fill absent fields CONSERVATIVELY; nothing is assumed about capabilities or price; the provider tag is the continuation class', () => {
+    const p = completeRoute({ routeId: 'r', provider: 'o', model: 'm', capabilities: ['tool_use'] }, 'o:m');
     assert.deepEqual(p, {
-      ...ROUTE_DEFAULTS, capabilities: ['tool_use', 'structured_output'], quality: { default: 0.7 }, routeId: 'r', provider: 'o', model: 'm', continuationCompatibilityClass: 'o:m',
+      ...ROUTE_DEFAULTS, capabilities: ['tool_use'], structuredOutput: 'none', quality: { default: 0.7 }, routeId: 'r', provider: 'o', model: 'm', continuationCompatibilityClass: 'o:m',
     });
     assert.equal(p.contextWindow, 128_000);
-    assert.equal(p.maxDataClassification, 'confidential');
-    assert.equal(p.maxActionRisk, 'high');
+    // security fields: the conservative end (before A[2]: confidential / high for any undeclared route)
+    assert.equal(p.maxDataClassification, 'internal');
+    assert.equal(p.maxActionRisk, 'low');
+    // an undeclared price is unknown, never $0
+    assert.equal(p.costPerMillionInputUsd, undefined);
+    assert.equal(p.costPerMillionOutputUsd, undefined);
+    // structured output: prompted when the capability is declared (never assumed native), none otherwise
+    assert.equal(completeRoute({ routeId: 's', provider: 'o', model: 'm', capabilities: ['tool_use', 'structured_output'] }, 'o:m').structuredOutput, 'prompted');
+    assert.deepEqual(completeRoute({ routeId: 'bare', provider: 'o', model: 'm' }, 'o:m').capabilities, [], 'an undeclared capability list grants nothing');
+    assert.deepEqual(defaultedRouteFields({ routeId: 'bare', provider: 'o', model: 'm' }), {
+      defaulted: ['reasoning', 'contextWindow', 'maxOutputTokens', 'maxDataClassification', 'quality', 'toolReliability', 'typicalLatencyMs', 'maxActionRisk', 'enabled', 'structuredOutput'],
+      costUnknown: true,
+    });
     const custom = completeRoute({ routeId: 'r', provider: 'o', model: 'm', quality: { default: 0.9, lead: 0.95 }, enabled: false }, 'o:m');
     assert.deepEqual(custom.quality, { default: 0.9, lead: 0.95 });
     assert.equal(custom.enabled, false);

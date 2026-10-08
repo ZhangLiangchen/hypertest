@@ -82,11 +82,19 @@ describe('diagnose (hypertest doctor)', () => {
     assert.deepEqual(of(r, 'models'), [{ name: 'models', status: 'error', detail: 'no model routes are configured: every run fails when it routes its lead agent (add models.providers and models.routes)' }]);
   });
 
-  test('a route with default capabilities cannot serve the lead (error) nor the analysts (warning)', async () => {
-    const cfg = base({ models: { providers: [{ id: 'local', kind: 'openai-compatible', baseUrl: 'http://127.0.0.1:1/v1' }], routes: [{ routeId: 'plain', provider: 'local', model: 'm' }] } });
+  test('A[2]: a route declaring only [tool_use, structured_output] cannot serve the lead (error) nor the analysts (warning); its defaulted fields and unknown price are reported', async () => {
+    const cfg = base({ models: { providers: [{ id: 'local', kind: 'openai-compatible', baseUrl: 'http://127.0.0.1:1/v1' }], routes: [{ routeId: 'plain', provider: 'local', model: 'm', capabilities: ['tool_use', 'structured_output'] }] } });
     const r = await diagnose(cfg, { env: {}, connect: false });
     assert.equal(r.ok, false);
-    const models = of(r, 'models');
+    const all = of(r, 'models');
+    assert.deepEqual(all.slice(0, 2), [
+      {
+        name: 'models', status: 'warn',
+        detail: 'route plain: defaulted fields reasoning, contextWindow, maxOutputTokens, maxDataClassification, quality, toolReliability, typicalLatencyMs, maxActionRisk, enabled, structuredOutput (declare them; security fields default to maxDataClassification internal, maxActionRisk low)',
+      },
+      { name: 'models', status: 'warn', detail: 'route plain: price unknown (no costPerMillionInputUsd/costPerMillionOutputUsd): runs or work items with a USD cost budget never route to it' },
+    ]);
+    const models = all.slice(2);
     assert.equal(models.length, 4);
     assert.equal(models[0]!.status, 'error');
     assert.match(models[0]!.detail, /^no route can serve the lead role \(plain: .+\): every run would fail at routing$/);
@@ -96,7 +104,7 @@ describe('diagnose (hypertest doctor)', () => {
     assert.doesNotMatch(models[1]!.detail, /vision_gui|local_private/, 'the specialist roles are reported on their own');
     assert.deepEqual(models.slice(2).map((m) => m.status), ['warn', 'warn']);
     assert.match(models[2]!.detail, /^vision_gui: no route can serve GUI testing \(plain: .*vision.*\): GUI work items fail at routing — add a route with capabilities \[tool_use, structured_output, vision\]$/);
-    assert.match(models[3]!.detail, /^local_private: no route can take restricted data \(plain: route accepts data up to confidential; request carries restricted\): restricted work fails closed at routing and is never sent to another model/);
+    assert.match(models[3]!.detail, /^local_private: no route can take restricted data \(plain: route accepts data up to internal; request carries restricted\): restricted work fails closed at routing and is never sent to another model/);
   });
 
   test('specialist route coverage: vision (+ computer-use fallback) and restricted data only on local routes', async () => {
@@ -105,7 +113,7 @@ describe('diagnose (hypertest doctor)', () => {
       { id: 'local', kind: 'openai-compatible', baseUrl: 'http://127.0.0.1:11434/v1' },
     ];
     const hosted = { routeId: 'claude-big', provider: 'claude', model: 'c', ...FULL_ROUTE, capabilities: [...FULL_ROUTE.capabilities, 'vision', 'computer_use'], quality: { default: 0.95 } };
-    const local = { routeId: 'local-qwen', provider: 'local', model: 'q', capabilities: ['tool_use', 'structured_output'], quality: { default: 0.6 }, maxDataClassification: 'restricted' };
+    const local = { routeId: 'local-qwen', provider: 'local', model: 'q', ...FULL_ROUTE, capabilities: ['tool_use', 'structured_output'], quality: { default: 0.6 }, maxDataClassification: 'restricted' };
     // hosted vision route + a local restricted route: both specialists are served, restricted data stays local
     let r = await diagnose(base({ models: { providers, routes: [hosted, local] } }), { env: { HT_DOCTOR_KEY: 'k' }, connect: false });
     assert.deepEqual(of(r, 'models').slice(1), [

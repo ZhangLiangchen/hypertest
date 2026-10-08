@@ -113,6 +113,10 @@ export class CircuitBreakers {
       if (!pg || typeof pg !== 'object') throw new HypertestError('invalid_argument', 'circuitBreaker.priceGuard must be an object');
       validCeiling(pg.default, 'priceGuard.default');
       for (const [routeId, c] of Object.entries(pg.routes ?? {})) validCeiling(c, `priceGuard.routes.${routeId}`);
+      const pct = pg.maxIncreasePct;
+      if (pct !== undefined && !(typeof pct === 'number' && Number.isFinite(pct) && pct >= 0)) {
+        throw new HypertestError('invalid_argument', `circuitBreaker.priceGuard.maxIncreasePct must be a finite number ≥ 0 (got ${String(pct)})`);
+      }
       if (pg.appliesTo !== undefined && pg.appliesTo !== 'cost_limited' && pg.appliesTo !== 'all') {
         throw new HypertestError('invalid_argument', `circuitBreaker.priceGuard.appliesTo must be 'cost_limited' or 'all' (got ${String(pg.appliesTo)})`);
       }
@@ -243,10 +247,11 @@ export class CircuitBreakers {
   priceCheck(profile: ModelCapabilityProfile, request: RouteRequest): { applies: false } | { applies: true; violation?: PriceViolation } {
     const pg = this.#price;
     if (!pg) return { applies: false };
-    if (pg.appliesTo !== 'all' && request.policy.maxCostPerCallUsd === undefined) return { applies: false };
+    if (pg.appliesTo !== 'all' && request.policy.maxCostPerCallUsd === undefined && request.costBudgeted !== true) return { applies: false };
     const ceiling = (pg.routes && Object.hasOwn(pg.routes, profile.routeId) ? pg.routes[profile.routeId] : undefined) ?? pg.default;
     if (!ceiling) return { applies: false };
-    const price = { inputPerMillionUsd: profile.costPerMillionInputUsd, outputPerMillionUsd: profile.costPerMillionOutputUsd };
+    // an unknown (undeclared) price never passes a ceiling (fail closed)
+    const price = { inputPerMillionUsd: profile.costPerMillionInputUsd ?? Number.NaN, outputPerMillionUsd: profile.costPerMillionOutputUsd ?? Number.NaN };
     const over = (p: number, max: number | undefined) => max !== undefined && !(typeof p === 'number' && Number.isFinite(p) && p <= max);
     if (over(price.inputPerMillionUsd, ceiling.inputPerMillionUsd) || over(price.outputPerMillionUsd, ceiling.outputPerMillionUsd)) {
       return { applies: true, violation: { routeId: profile.routeId, ceiling, price } };

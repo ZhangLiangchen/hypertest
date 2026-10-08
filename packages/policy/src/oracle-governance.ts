@@ -1,6 +1,7 @@
 import { HypertestError, canonicalJson, validateJson } from '@hypertest/core';
 import { EVENT_TYPES, ORACLE_ASSERTION_SCHEMA, eventFrom, type ActorRef, type EventContext, type OracleChangeProposal, type OracleSpec } from '@hypertest/domain';
 import type { OracleGovernance, OracleGovernanceDeps } from './contracts.ts';
+import { ORACLE_AUTHORITY_KINDS } from './gate.ts';
 import { KeyedMutex, agentIndependenceViolation } from './independence.ts';
 
 function assertActor(actor: ActorRef, what: string): void {
@@ -38,11 +39,30 @@ export function assertMayDecide(oracle: OracleSpec, proposal: OracleChangePropos
   }
   // agent
   if (!approvers.includes('independent_agent')) throw denied(`oracle ${oracle.oracleId} does not accept agent approvers`, { rule: 'approver_kind' });
+  // D-7: approvals are checked against the oracle's authorities — an expert-approved criterion is changed only by a human
+  if (approve && (oracle.authorities ?? []).some((a) => a.authority === 'expert_approved')) {
+    throw denied(`oracle ${oracle.oracleId} rests on an expert_approved authority; only a human may approve its change`, { rule: 'authority_requires_human' });
+  }
   const violation = agentIndependenceViolation(proposer, decidedBy);
   if (violation) throw denied(violation.message, { rule: violation.rule });
   if (approve && proposal.wouldFlipRecordedFailure && approvers.includes('human')) {
     throw denied(`proposal ${proposal.proposalId} would flip a recorded failure; a human approver is required`, { rule: 'flip_requires_human' });
   }
+}
+
+/**
+ * (D-7) Why an oracle's authorities do not meet the design (empty: they do): at least one authority, each with a non-empty
+ * sourceRef and a known kind, and an `expert_approved` authority only with a human approver.
+ */
+export function authorityProblems(authorities: OracleSpec['authorities'] | undefined, approver?: ActorRef): string[] {
+  const out: string[] = [];
+  if (!Array.isArray(authorities) || authorities.length === 0) return ['an oracle needs at least one authority (formal_spec, approved_requirement, business_rule, known_good_reference, differential_reference, expert_approved)'];
+  for (const a of authorities) {
+    if (!a || typeof a.sourceRef !== 'string' || a.sourceRef.trim() === '') out.push('every authority needs a non-empty sourceRef');
+    else if (!ORACLE_AUTHORITY_KINDS.has(a.authority)) out.push(`authority ${a.sourceRef}: unknown kind ${String(a.authority)}`);
+  }
+  if (approver !== undefined && authorities.some((a) => a?.authority === 'expert_approved') && approver.kind !== 'human') out.push('an expert_approved authority must be established by a human');
+  return out;
 }
 
 /**
@@ -68,6 +88,8 @@ export function createOracleGovernance(deps: OracleGovernanceDeps): OracleGovern
       if (approver.kind === 'agent') throw denied(`agents cannot establish oracles (${approver.id})`, { rule: 'agent_establish' });
       if (spec.changePolicy.selfApprove !== false) throw new HypertestError('invalid_argument', 'changePolicy.selfApprove must be false');
       if (spec.changePolicy.approvers.length === 0) throw new HypertestError('invalid_argument', 'changePolicy.approvers must not be empty');
+      const authority = authorityProblems(spec.authorities, approver);
+      if (authority.length > 0) throw new HypertestError('invalid_argument', `oracle ${spec.oracleId}: ${authority.join('; ')}`, { details: { rule: 'authorities' } });
       for (const a of spec.assertions) {
         const v = validateJson(ORACLE_ASSERTION_SCHEMA, a);
         if (!v.valid) throw new HypertestError('schema_violation', `invalid oracle assertion ${a.assertionId}: ${v.issues.map((i) => `${i.path} ${i.message}`).join('; ')}`);
@@ -81,7 +103,7 @@ export function createOracleGovernance(deps: OracleGovernanceDeps): OracleGovern
             details: { oracleId: spec.oracleId, revision: existing.revision },
           });
         }
-        const { revision: _r, createdAt: _c, supersedes: _s, ...clean } = spec as typeof spec & { revision?: number; createdAt?: string; supersedes?: number };
+        const { revision: _r, createdAt: _c, supersedes: _s, invalidation: _i, ...clean } = spec as typeof spec & { revision?: number; createdAt?: string; supersedes?: number; invalidation?: unknown };
         const saved = await store.saveOracle({ ...clean, status: 'approved', approvedBy: [approver], approvedAt: clock.isoNow(), revision: 1 }, ctx);
         logger.info('oracle established', { oracleId: saved.oracleId, revision: saved.revision, approver: approver.id });
         return saved;
@@ -184,7 +206,7 @@ export function createOracleGovernance(deps: OracleGovernanceDeps): OracleGovern
 
         let newRevision: OracleSpec = current;
         if (!resumed) {
-          const { revision: _r, createdAt: _c, supersedes: _s, ...base } = current;
+          const { revision: _r, createdAt: _c, supersedes: _s, invalidation: _i, ...base } = current;
           // compare-and-set: exactly revision current+1 (the store refuses with conflict when it already exists)
           newRevision = await store.saveOracle(
             { ...base, assertions: proposal.proposedAssertions, status: 'approved', approvedBy: [decidedBy], approvedAt: decidedAt, revision: current.revision + 1 },
@@ -222,6 +244,41 @@ export function createOracleGovernance(deps: OracleGovernanceDeps): OracleGovern
         }
         logger.info('oracle change approved', { proposalId, oracleId: proposal.oracleId, newRevision: newRevision.revision, invalidated: invalidatedDecisions.length });
         return { proposal: saved, newRevision, invalidatedDecisions };
+      });
+    },
+
+    async invalidate(oracleId, revision, by, reason, ctx) {
+      assertActor(by, 'by');
+      if (by.kind === 'agent') throw denied(`agents cannot declare an oracle invalid (${by.id}); propose a change instead`, { rule: 'agent_invalidate' });
+      if (typeof reason !== 'string' || reason.trim().length === 0) throw new HypertestError('invalid_argument', 'a reason is required to declare an oracle revision invalid');
+      return mutex.run(oracleId, async () => {
+        const current = await store.getOracle(oracleId);
+        if (!current) throw new HypertestError('not_found', `oracle ${oracleId} not found`);
+        if (current.revision !== revision) {
+          throw new HypertestError('conflict', `oracle ${oracleId} is at revision ${current.revision}; only the latest revision (not ${revision}) can be declared invalid`, { details: { oracleId, revision, latest: current.revision } });
+        }
+        if (current.status !== 'approved') throw new HypertestError('precondition_failed', `oracle ${oracleId} revision ${revision} is ${current.status}, not approved`);
+        const at = clock.isoNow();
+        const { revision: _r, createdAt: _c, supersedes: _s, invalidation: _i, ...base } = current;
+        // append-only: the declaration is a new revision (history is never updated)
+        const invalid = await store.saveOracle(
+          { ...base, status: 'invalid', approvedBy: [by], approvedAt: at, invalidation: { revision, reason, by, at }, revision: current.revision + 1 },
+          ctx,
+        );
+        const invalidatedDecisions: string[] = [];
+        if (decisions) {
+          // unconditionally (whatever the change policy says): a decision that rests on an invalid criterion must be re-judged
+          const affected = await decisions.findByOracleRevision(oracleId, revision);
+          for (const d of [...affected].sort((a, b) => (a.decisionId < b.decisionId ? -1 : a.decisionId > b.decisionId ? 1 : 0))) {
+            await decisions.markNeedsReassessment(d.decisionId, `oracle ${oracleId} revision ${revision} declared invalid by ${by.kind}:${by.id}: ${reason}`, ctx);
+            invalidatedDecisions.push(d.decisionId);
+          }
+        }
+        if (events) {
+          await events.emit([eventFrom(ctx, EVENT_TYPES.oracleInvalidated, 'oracle', oracleId, { oracleId, revision, invalidRevision: invalid.revision, by: by.id, byKind: by.kind, reason, invalidatedDecisions })]);
+        }
+        logger.info('oracle revision declared invalid', { oracleId, revision, by: by.id, invalidated: invalidatedDecisions.length });
+        return { invalid, invalidatedDecisions };
       });
     },
   };

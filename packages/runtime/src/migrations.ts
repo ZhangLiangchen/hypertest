@@ -18,6 +18,9 @@ import { RELEASE_MIGRATION } from './releases.ts';
  * - 005 (runtime release registry, `releases.ts`): `ht_runtime_releases` (registered manifests and their release state;
  *   the manifest is immutable), `ht_runtime_release_pointer` (the active pointer), `ht_runtime_release_lock`,
  *   `ht_runtime_suite_results` / `ht_runtime_release_transitions` / `ht_runtime_epochs` (append-only).
+ * - 006: `ht_epochs.route_profile` (A[3]: the route's capability profile when the epoch started, to tell a quality switch
+ *   from a policy switch after a catalog change), `ht_model_pauses` (A[0]: a session paused for model unavailability, durable resume time), `ht_model_switches` +
+ *   `ht_model_switch_outcomes` (A[3]: manual model switch requests and each target agent's applied/refused outcome).
  */
 export const runtimeMigrations: Migration[] = [
   {
@@ -177,4 +180,48 @@ ALTER TABLE ht_agents ADD COLUMN IF NOT EXISTS max_depth integer CHECK (max_dept
 `,
   },
   RELEASE_MIGRATION,
+  {
+    // A[0] fallback end state PAUSE: a session whose model routes are transiently unavailable waits until resume_at.
+    // A[3] manual model switches: operator requests (append-only) and each target agent's outcome (once per agent).
+    id: 'runtime/006-model-pauses-switches',
+    sql: `
+ALTER TABLE ht_epochs ADD COLUMN IF NOT EXISTS route_profile jsonb;
+
+CREATE TABLE IF NOT EXISTS ht_model_pauses (
+  session_id   text PRIMARY KEY REFERENCES ht_sessions (session_id),
+  run_id       text NOT NULL,
+  agent_id     text NOT NULL,
+  turn         integer NOT NULL CHECK (turn >= 0),
+  reason       text NOT NULL,
+  resume_at    timestamptz NOT NULL,
+  routes       jsonb NOT NULL DEFAULT '[]'::jsonb,
+  consecutive  integer NOT NULL CHECK (consecutive >= 1),
+  created_at   timestamptz NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ht_model_pauses_run_idx ON ht_model_pauses (run_id);
+
+CREATE TABLE IF NOT EXISTS ht_model_switches (
+  switch_id     text PRIMARY KEY,
+  run_id        text NOT NULL,
+  target_kind   text NOT NULL CHECK (target_kind IN ('agent', 'role')),
+  target        text NOT NULL,
+  route_id      text NOT NULL,
+  reason        text,
+  requested_by  text NOT NULL,
+  created_at    timestamptz NOT NULL,
+  seq           bigserial NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ht_model_switches_run_idx ON ht_model_switches (run_id, seq);
+
+CREATE TABLE IF NOT EXISTS ht_model_switch_outcomes (
+  switch_id  text NOT NULL REFERENCES ht_model_switches (switch_id),
+  agent_id   text NOT NULL,
+  outcome    text NOT NULL CHECK (outcome IN ('applied', 'refused')),
+  epoch_id   text,
+  detail     text NOT NULL,
+  at         timestamptz NOT NULL,
+  PRIMARY KEY (switch_id, agent_id)
+);
+`,
+  },
 ];

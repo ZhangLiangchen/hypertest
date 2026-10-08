@@ -1,6 +1,6 @@
 import { HypertestError, toIso, toNumber } from '@hypertest/core';
 import { EVENT_TYPES, eventFrom, type ModelEpoch, type ModelSwitchReason } from '@hypertest/domain';
-import type { EpochDeps, EpochManager, EpochRouting, OkRouteDecision, PendingFallback, TurnRecord } from './contracts.ts';
+import type { EpochDeps, EpochManager, EpochRouting, ModelPause, ModelSwitchOutcome, ModelSwitchRequest, OkRouteDecision, PendingFallback, TurnRecord } from './contracts.ts';
 import { assertNonEmpty, jsonOrNull, jsonParam, parseJson } from './util.ts';
 
 export const SWITCH_REASONS: readonly ModelSwitchReason[] = ['initial', 'policy', 'quality', 'rate_limit', 'unavailable', 'cost', 'manual'];
@@ -60,7 +60,60 @@ export function safeEpochTurn(last: Pick<TurnRecord, 'turn' | 'status'> | undefi
   return { ok: true, turn: last.turn + 1 };
 }
 
-/** SQL EpochManager over ht_epochs (+ ht_pending_fallbacks). Emits model.epoch_started in the insert transaction. */
+interface PauseRow {
+  session_id: string;
+  run_id: string;
+  agent_id: string;
+  turn: unknown;
+  reason: string;
+  resume_at: unknown;
+  routes: unknown;
+  consecutive: unknown;
+  created_at: unknown;
+}
+
+function rowToPause(r: PauseRow): ModelPause {
+  return {
+    sessionId: r.session_id,
+    runId: r.run_id,
+    agentId: r.agent_id,
+    turn: toNumber(r.turn),
+    reason: r.reason,
+    resumeAt: toIso(r.resume_at),
+    routes: parseJson<string[]>(r.routes) ?? [],
+    consecutive: toNumber(r.consecutive),
+    createdAt: toIso(r.created_at),
+  };
+}
+
+interface SwitchRow {
+  switch_id: string;
+  run_id: string;
+  target_kind: 'agent' | 'role';
+  target: string;
+  route_id: string;
+  reason: string | null;
+  requested_by: string;
+  created_at: unknown;
+}
+
+function rowToSwitch(r: SwitchRow): ModelSwitchRequest {
+  const out: ModelSwitchRequest = {
+    switchId: r.switch_id,
+    runId: r.run_id,
+    target: r.target_kind === 'agent' ? { kind: 'agent', agentId: r.target } : { kind: 'role', role: r.target },
+    routeId: r.route_id,
+    requestedBy: r.requested_by,
+    createdAt: toIso(r.created_at),
+  };
+  if (r.reason) out.reason = r.reason;
+  return out;
+}
+
+/**
+ * SQL EpochManager over ht_epochs (+ ht_pending_fallbacks, ht_model_pauses, ht_model_switches). Emits
+ * model.epoch_started in the insert transaction (and model.switch_requested with a manual switch request).
+ */
 export function createEpochManager(deps: EpochDeps): EpochManager {
   const { db, ids, clock } = deps;
 
@@ -119,11 +172,11 @@ export function createEpochManager(deps: EpochDeps): EpochManager {
         else delete e.previousEpochId;
         await tx.query(
           `INSERT INTO ht_epochs (epoch_id, run_id, agent_id, session_id, previous_epoch_id, route_id, provider, model, capability_profile_revision, continuation_compatibility_class,
-                                  context_snapshot_id, switch_reason, started_at_turn, started_at, decision, excluded_routes)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16::jsonb)`,
+                                  context_snapshot_id, switch_reason, started_at_turn, started_at, decision, excluded_routes, route_profile)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16::jsonb, $17::jsonb)`,
           [
             e.epochId, e.runId, e.agentId, e.sessionId, e.previousEpochId ?? null, e.routeId, e.provider, e.model, e.capabilityProfileRevision, e.continuationCompatibilityClass,
-            e.contextSnapshotId, e.switchReason, e.startedAtTurn, e.startedAt, jsonOrNull(decision), jsonParam(excluded),
+            e.contextSnapshotId, e.switchReason, e.startedAtTurn, e.startedAt, jsonOrNull(decision), jsonParam(excluded), jsonOrNull(options.profile),
           ],
         );
         await tx.query(`UPDATE ht_sessions SET current_epoch_id = $2, updated_at = $3 WHERE session_id = $1`, [e.sessionId, e.epochId, e.startedAt]);
@@ -172,12 +225,14 @@ export function createEpochManager(deps: EpochDeps): EpochManager {
     },
 
     async routing(epochId): Promise<EpochRouting | undefined> {
-      const r = await db.query<{ decision: unknown; excluded_routes: unknown }>(`SELECT decision, excluded_routes FROM ht_epochs WHERE epoch_id = $1`, [epochId]);
+      const r = await db.query<{ decision: unknown; excluded_routes: unknown; route_profile: unknown }>(`SELECT decision, excluded_routes, route_profile FROM ht_epochs WHERE epoch_id = $1`, [epochId]);
       const row = r.rows[0];
       if (!row) return undefined;
       const out: EpochRouting = { excludedRoutes: parseJson<string[]>(row.excluded_routes) ?? [] };
       const decision = parseJson<OkRouteDecision>(row.decision);
       if (decision !== undefined) out.decision = decision;
+      const profile = parseJson<EpochRouting['profile']>(row.route_profile);
+      if (profile !== undefined) out.profile = profile;
       return out;
     },
 
@@ -194,6 +249,127 @@ export function createEpochManager(deps: EpochDeps): EpochManager {
            from_epoch_id = EXCLUDED.from_epoch_id, error = EXCLUDED.error, excluded_routes = EXCLUDED.excluded_routes, created_at = EXCLUDED.created_at`,
         [sessionId, jsonParam(fallback.decision), fallback.reason, fallback.fromRouteId, fallback.fromEpochId ?? null, jsonParam(fallback.error), jsonParam(fallback.excludedRoutes), clock.isoNow()],
       );
+    },
+
+    async clearPendingFallback(sessionId) {
+      assertNonEmpty(sessionId, 'sessionId');
+      await db.query(`DELETE FROM ht_pending_fallbacks WHERE session_id = $1`, [sessionId]);
+    },
+
+    async modelPause(sessionId) {
+      const r = await db.query<PauseRow>(
+        `SELECT session_id, run_id, agent_id, turn, reason, resume_at, routes, consecutive, created_at FROM ht_model_pauses WHERE session_id = $1`,
+        [sessionId],
+      );
+      return r.rows[0] ? rowToPause(r.rows[0]) : undefined;
+    },
+
+    async setModelPause(pause) {
+      for (const f of ['sessionId', 'runId', 'agentId', 'reason', 'resumeAt'] as const) assertNonEmpty(pause?.[f], f);
+      if (!Number.isSafeInteger(pause.turn) || pause.turn < 0) throw new HypertestError('invalid_argument', 'pause.turn must be a non-negative integer');
+      if (!Number.isSafeInteger(pause.consecutive) || pause.consecutive < 1) throw new HypertestError('invalid_argument', 'pause.consecutive must be an integer ≥ 1');
+      if (!Number.isFinite(Date.parse(pause.resumeAt))) throw new HypertestError('invalid_argument', `pause.resumeAt must be an ISO-8601 time (got ${pause.resumeAt})`);
+      assertStringList(pause.routes, 'pause.routes');
+      const createdAt = clock.isoNow();
+      await db.query(
+        `INSERT INTO ht_model_pauses (session_id, run_id, agent_id, turn, reason, resume_at, routes, consecutive, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)
+         ON CONFLICT (session_id) DO UPDATE SET turn = EXCLUDED.turn, reason = EXCLUDED.reason, resume_at = EXCLUDED.resume_at, routes = EXCLUDED.routes,
+           consecutive = EXCLUDED.consecutive, created_at = EXCLUDED.created_at`,
+        [pause.sessionId, pause.runId, pause.agentId, pause.turn, pause.reason, pause.resumeAt, jsonParam(pause.routes), pause.consecutive, createdAt],
+      );
+      return { ...pause, routes: [...pause.routes], createdAt };
+    },
+
+    async clearModelPause(sessionId) {
+      await db.query(`DELETE FROM ht_model_pauses WHERE session_id = $1`, [sessionId]);
+    },
+
+    async listModelPauses(runId) {
+      const r = await db.query<PauseRow>(
+        `SELECT session_id, run_id, agent_id, turn, reason, resume_at, routes, consecutive, created_at FROM ht_model_pauses WHERE run_id = $1 ORDER BY session_id`,
+        [runId],
+      );
+      return r.rows.map(rowToPause);
+    },
+
+    async releaseModelPauses(runId, at) {
+      assertNonEmpty(runId, 'runId');
+      if (!Number.isFinite(Date.parse(at))) throw new HypertestError('invalid_argument', `at must be an ISO-8601 time (got ${at})`);
+      const r = await db.query<{ session_id: string }>(`UPDATE ht_model_pauses SET resume_at = LEAST(resume_at, $2::timestamptz) WHERE run_id = $1 RETURNING session_id`, [runId, at]);
+      return r.rows.map((row) => row.session_id).sort();
+    },
+
+    async requestSwitch(request, ctx) {
+      assertNonEmpty(request?.runId, 'runId');
+      assertNonEmpty(request.routeId, 'routeId');
+      assertNonEmpty(request.requestedBy, 'requestedBy');
+      const t = request.target;
+      if (t?.kind === 'agent') assertNonEmpty(t.agentId, 'target.agentId');
+      else if (t?.kind === 'role') assertNonEmpty(t.role, 'target.role');
+      else throw new HypertestError('invalid_argument', `target must be { kind: 'agent', agentId } or { kind: 'role', role }`);
+      const out: ModelSwitchRequest = { ...request, switchId: ids.next('msw'), createdAt: clock.isoNow() };
+      if (out.reason === undefined) delete out.reason;
+      await db.transaction(async (tx) => {
+        await tx.query(
+          `INSERT INTO ht_model_switches (switch_id, run_id, target_kind, target, route_id, reason, requested_by, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [out.switchId, out.runId, t.kind, t.kind === 'agent' ? t.agentId : t.role, out.routeId, out.reason ?? null, out.requestedBy, out.createdAt],
+        );
+        if (deps.events) {
+          await deps.events.emit(
+            [eventFrom(ctx, EVENT_TYPES.modelSwitchRequested, 'model', out.switchId, { switchId: out.switchId, target: t, routeId: out.routeId, reason: out.reason ?? null, requestedBy: out.requestedBy })],
+            tx,
+          );
+        }
+      });
+      return out;
+    },
+
+    async pendingSwitch(runId, agentId, role) {
+      const r = await db.query<SwitchRow>(
+        `SELECT s.switch_id, s.run_id, s.target_kind, s.target, s.route_id, s.reason, s.requested_by, s.created_at
+           FROM ht_model_switches s
+          WHERE s.run_id = $1 AND ((s.target_kind = 'agent' AND s.target = $2) OR (s.target_kind = 'role' AND s.target = $3))
+            AND NOT EXISTS (SELECT 1 FROM ht_model_switch_outcomes o WHERE o.switch_id = s.switch_id AND o.agent_id = $2)
+            -- a request older than one this agent already handled is superseded by it
+            AND s.seq > COALESCE((SELECT max(s2.seq) FROM ht_model_switches s2 JOIN ht_model_switch_outcomes o2 ON o2.switch_id = s2.switch_id
+                                   WHERE s2.run_id = $1 AND o2.agent_id = $2), 0)
+          ORDER BY s.seq DESC LIMIT 1`,
+        [runId, agentId, role],
+      );
+      return r.rows[0] ? rowToSwitch(r.rows[0]) : undefined;
+    },
+
+    async recordSwitchOutcome(outcome) {
+      assertNonEmpty(outcome?.switchId, 'switchId');
+      assertNonEmpty(outcome.agentId, 'agentId');
+      if (outcome.outcome !== 'applied' && outcome.outcome !== 'refused') throw new HypertestError('invalid_argument', `outcome must be applied or refused`);
+      // once per agent (older unhandled requests are superseded: pendingSwitch never returns them again)
+      await db.query(
+        `INSERT INTO ht_model_switch_outcomes (switch_id, agent_id, outcome, epoch_id, detail, at) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (switch_id, agent_id) DO NOTHING`,
+        [outcome.switchId, outcome.agentId, outcome.outcome, outcome.epochId ?? null, outcome.detail, clock.isoNow()],
+      );
+    },
+
+    async listSwitches(runId) {
+      const r = await db.query<SwitchRow>(
+        `SELECT switch_id, run_id, target_kind, target, route_id, reason, requested_by, created_at FROM ht_model_switches WHERE run_id = $1 ORDER BY seq`,
+        [runId],
+      );
+      const o = await db.query<{ switch_id: string; agent_id: string; outcome: 'applied' | 'refused'; epoch_id: string | null; detail: string; at: unknown }>(
+        `SELECT o.switch_id, o.agent_id, o.outcome, o.epoch_id, o.detail, o.at FROM ht_model_switch_outcomes o JOIN ht_model_switches s ON s.switch_id = o.switch_id WHERE s.run_id = $1 ORDER BY o.at, o.agent_id`,
+        [runId],
+      );
+      return r.rows.map((row) => {
+        const outcomes: ModelSwitchOutcome[] = o.rows
+          .filter((x) => x.switch_id === row.switch_id)
+          .map((x) => {
+            const out: ModelSwitchOutcome = { switchId: x.switch_id, agentId: x.agent_id, outcome: x.outcome, detail: x.detail, at: toIso(x.at) };
+            if (x.epoch_id) out.epochId = x.epoch_id;
+            return out;
+          });
+        return { ...rowToSwitch(row), outcomes };
+      });
     },
 
     async pendingFallback(sessionId): Promise<PendingFallback | undefined> {

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { HypertestError, throwIfAborted } from '@hypertest/core';
 import type { Mutant, MutantStatus, MutationAnalysisResult, MutationLanguage, MutationOperator, SandboxRunner, TestRunResult, TestRunnerAdapter, WorkspaceHandle } from '../contracts.ts';
+import { attributeExecutedTests } from './executed.ts';
 import { confineExisting } from './paths.ts';
 
 export const MUTATION_OPERATORS: readonly MutationOperator[] = ['arithmetic', 'relational', 'logical', 'boolean', 'numeric_literal', 'return_value', 'off_by_one'];
@@ -403,7 +404,7 @@ async function mirrorNodeModules(src: string, dst: string, root: string, copyRoo
  * symlink into the workspace is re-pointed at the same path in the copy (copied verbatim it would lead
  * tests — and mutant writes — back into the original).
  */
-async function copyWorkspace(ws: WorkspaceHandle, dest: string): Promise<void> {
+export async function copyWorkspace(ws: WorkspaceHandle, dest: string): Promise<void> {
   const root = await realpath(ws.root);
   const destReal = dest;
   const tempReal = ws.tempDir ? await realpath(ws.tempDir).catch(() => ws.tempDir!) : undefined;
@@ -495,6 +496,9 @@ export async function runMutationAnalysis(input: MutationAnalysisInput): Promise
       (await input.runner.run(copyWs, { ...(input.selector !== undefined ? { selector: input.selector } : {}), timeoutMs, signal: input.signal }, input.sandbox)).result;
 
     const baseline = await runTests(Math.max(1000, deadline - Date.now()));
+    // D-0: which test files the analysis executes (the baseline's cases attributed to files of the copy — the same paths
+    // and contents as the workspace): a mutation result counts for an artifact only when it executed nothing else
+    const executed = (await attributeExecutedTests(copyRoot, baseline, input.selector)).record;
     const baselineInfo: MutationAnalysisResult['baseline'] = { passed: baseline.passed, total: baseline.totals.total };
     if (baseline.harnessError !== undefined) baselineInfo.harnessError = baseline.harnessError;
     if (!baseline.passed) {
@@ -533,6 +537,7 @@ export async function runMutationAnalysis(input: MutationAnalysisInput): Promise
       score: killed + survived === 0 ? 0 : killed / (killed + survived),
       baseline: baselineInfo,
       mutants: results,
+      executedTests: executed,
     };
     if (input.selector !== undefined) out.selector = input.selector;
     return out;

@@ -65,3 +65,21 @@ export async function unreadMessages(deps: Pick<ControlDeps, 'sessions'>, d: Del
   const read = agent ? await readMessageIds(deps, agent) : new Set<string>();
   return d.messages.filter((m) => !read.has(m.messageId));
 }
+
+/**
+ * (A[0]) Operation id a work item waits on while its agent is PAUSED for model unavailability (fallback pipeline end state
+ * PAUSE): the agent's ModelPause (ht_model_pauses) says until when. Resumed by observeWaiting once the pause's resumeAt
+ * has passed (a circuit's half-open time, a Retry-After, a backoff) or an operator released it (`hypertest resume`).
+ */
+export function modelWaitOperationId(agentId: string): string {
+  return `model:${agentId}`;
+}
+
+export function parseModelWaitOperationId(operationId: string): string | undefined {
+  return operationId.startsWith('model:') ? operationId.slice('model:'.length) : undefined;
+}
+
+/** A work item paused for model unavailability. */
+export function isModelPaused(item: Pick<WorkItem, 'state' | 'waitingOn'>): boolean {
+  return item.state === 'waiting' && item.waitingOn.some((op) => parseModelWaitOperationId(op) !== undefined);
+}

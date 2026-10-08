@@ -1,11 +1,13 @@
 import { canonicalJson, deepFreeze, sha256Hex, type JsonValue } from '@hypertest/core';
 import {
-  RISK_ORDER, SEVERITY_ORDER, atLeastAsSevere, isEligibleTestArtifact, isUnresolvedFinding,
-  type ApprovedException, type BlackboardRecord, type Comparator, type CriterionResult, type EvidenceRecord, type Finding, type GateSpec,
+  RISK_ORDER, SEVERITY_ORDER, atLeastAsSevere, evaluateClaim, isUnresolvedFinding,
+  type ApprovedException, type BlackboardRecord, type Comparator, type CriterionResult, type EvidenceRecord, type ExperimentSpec, type Finding, type GateSpec,
   type OracleAssertion, type OracleCheck, type OracleSpec, type QualityDecision, type QualityVerdict, type Review, type ReviewerDecision,
   type TestArtifact,
 } from '@hypertest/domain';
-import type { GateInput } from './contracts.ts';
+import type { EnvironmentFacts, GateInput } from './contracts.ts';
+import { experimentValidity, type GateOperation } from './experiments.ts';
+import { artifactEligibility, caseInFile, isBaseRevisionRun, type ArtifactEligibility, type EligibilityContext } from './sensitivity.ts';
 
 /**
  * The deterministic QualityGate (I7). Pure: the decision depends only on the input (no clock, no
@@ -15,26 +17,64 @@ import type { GateInput } from './contracts.ts';
  *   C0 oracle_in_force      – (conformance-1) unless gate.requireOracle is false: at least one approved oracle pinned by
  *                             the run with at least one deterministic P0/P1 assertion (a machine check other than an LLM
  *                             rubric); otherwise unknown — a run judged against no correctness criterion is never `pass`.
+ *                             (D-7) An oracle is in force only when its revision is governed as the design states: at
+ *                             least one authority (known kind, non-empty sourceRef), approvedBy non-empty, an
+ *                             `expert_approved` authority approved by a human, agent approvers only when the change policy
+ *                             lists `independent_agent`, selfApprove false. (D-10) A pinned revision superseded by a newer
+ *                             approved one, or declared invalid, is unknown.
  *   C1 evidence_integrity   – ledger root count equals the evidence handed in, no foreign-run evidence, and
  *                             at least one ELIGIBLE evidence record (a pass with zero evidence, or with only
  *                             evidence from ineligible generated tests, is impossible). Not waivable.
- *                             Eligibility: a declared testArtifactId must name an eligible artifact, and evidence
- *                             carrying a `workspaceDelta` (test.run) counts only when every test file added/modified
- *                             since the base commit is covered by a validated artifact with that exact digest.
+ *                             Eligibility (D-0/D-1, re-derived — no stored score or state is trusted): a declared
+ *                             testArtifactId must name an eligible artifact, and evidence carrying a `workspaceDelta`
+ *                             (test.run) counts only when every test file added/modified since the base commit is covered by
+ *                             an artifact with that exact digest whose whole lifecycle is re-derived from the cited evidence
+ *                             and review records (sensitivity.ts `artifactEligibility`: bound static check, bound known-good
+ *                             pass or an explicit unavailability reason, bound known-bad failure or bound mutation kill,
+ *                             independent oracle consistency review against the oracles in force). Runs on the BASE revision
+ *                             (known-good validation runs) are never evidence about the candidate.
  *   C2 unresolved_findings  – unresolved product/security/performance/unknown findings at or above
  *                             gate.failOnUnresolvedSeverity ⇒ violated (fail); unresolved test/infra/environment
- *                             findings at that severity ⇒ unknown (the evidence itself is in doubt).
+ *                             findings at that severity ⇒ unknown (the evidence itself is in doubt). (D-11) A finding that
+ *                             once was a blocking product finding and was cleared (downgraded, re-categorised, rejected,
+ *                             accepted) by an AGENT is unknown unless deterministic evidence supports the clearing (its
+ *                             oracleRef assertion is satisfied in C3): a reviewer or RCA cannot bypass the gate.
  *   C3 critical_oracles     – every approved P0/P1 oracle assertion needs deterministic supporting evidence;
  *                             a matching evidence that contradicts it ⇒ violated (fail); LLM-only/no support ⇒ unknown.
- *   C4 required_evidence    – gate.requiredEvidence + critical WorkItem.evidenceRequirements ⇒ missing ⇒ unknown.
+ *                             Only critical-eligible evidence decides (an artifact whose known-good run is merely
+ *                             "unavailable" never supports nor violates a P0/P1 assertion); evidence of an ineligible
+ *                             generated test can neither satisfy nor violate it (named in the detail, the assertion stays
+ *                             unknown). (D-11) A failing case of an eligible artifact bound to the assertion through its
+ *                             oracleRefs violates it ("critical test failed"), whatever the oracle's selector matches.
+ *   C4 required_evidence    – gate.requiredEvidence + critical WorkItem.evidenceRequirements + (D-3) the
+ *                             evidenceRequirements of every started experiment (counted on its own evidence) ⇒ missing ⇒
+ *                             unknown.
  *   C5 failed_work          – failed or unfinished work items serving open P0/P1 objectives ⇒ unknown.
- *   C6 independent_review   – reject ⇒ violated (conditional + human review); needs_more_evidence ⇒ unknown;
+ *   C6 independent_review   – required by gate.requireIndependentReview OR (D-7) by the judgePolicy of an oracle in force:
+ *                             reject ⇒ violated (conditional + human review); needs_more_evidence ⇒ unknown;
  *                             no independent approval ⇒ violated (conditional + human review).
  *   C7 unresolved_risks     – open risks at or above gate.conditionalOnRiskLevel ⇒ violated (conditional).
  *   C8 coverage             – latest coverage evidence below gate.minCoverage ⇒ violated (fail); none ⇒ unknown.
- *   C9 critical_claims      – critical report claims without resolvable evidence ⇒ unknown.
+ *   C9 critical_claims      – (area-C-0) every critical report claim is EVALUATED (domain `evaluateClaim`: the
+ *                             evidenceQuery aggregation over the cited evidence compared with the claimed value): no or
+ *                             dangling evidence, or an unevaluable claim ⇒ unknown; a value the evidence contradicts ⇒
+ *                             violated (fail).
+ *   C10 experiment_validity – (D-3/D-4/D-5) every experiment whose actions or evidence support the decision is valid
+ *                             (experiments.ts `experimentValidity`): claims never lapsed and no foreign action on its
+ *                             exclusive resources, environment generation unchanged, executed faults/load == declared plan,
+ *                             no action after a met stop condition ⇒ otherwise violated (fail); evidence requirements
+ *                             unmet, declared faults never executed, unverifiable actions, a superseded oracle revision ⇒
+ *                             unknown.
+ *   C11 environment_validity– (D-11) the environments the run used are valid: registered, no unresolved P0–P2
+ *                             environment finding, no generation drift not explained by the run's own verified
+ *                             restarts/deploys, no environment operation in an uncertain state (failed, outcome_unknown,
+ *                             reconciling, manual_review) ⇒ otherwise unknown.
+ *   C12 domain_contracts    – (coverage-1) unless gate.requireContracts is false: the run has a SystemModel revision (with
+ *                             at least one component) and every write/fault/load action belongs to an ExperimentSpec of the
+ *                             run ⇒ otherwise unknown.
  * Verdict: fail-type violation ⇒ fail; else unknown ⇒ inconclusive; else conditional-type violation ⇒
- * conditional; else pass. Unexpired exceptions approved by a human/system actor waive a criterion (never C1).
+ * conditional; else pass. Unexpired exceptions approved by a human/system actor waive a criterion (never C1); an agent
+ * (reviewer, RCA …) can never waive anything.
  */
 
 export const GATE_CRITERIA = [
@@ -48,6 +88,9 @@ export const GATE_CRITERIA = [
   { id: 'C7', name: 'unresolved_risks', violation: 'conditional' },
   { id: 'C8', name: 'coverage', violation: 'fail' },
   { id: 'C9', name: 'critical_claims', violation: 'fail' },
+  { id: 'C10', name: 'experiment_validity', violation: 'fail' },
+  { id: 'C11', name: 'environment_validity', violation: 'fail' },
+  { id: 'C12', name: 'domain_contracts', violation: 'fail' },
 ] as const;
 
 type CriterionId = (typeof GATE_CRITERIA)[number]['id'];
@@ -61,9 +104,16 @@ export const DEFAULT_GATE_SPEC: GateSpec = deepFreeze<GateSpec>({
   requireDeterministicForCritical: true,
   requireIndependentReview: true,
   requireOracle: true,
+  requireContracts: true,
 });
 
 const PRODUCT_CATEGORIES: ReadonlySet<Finding['category']> = new Set(['product_defect', 'security', 'performance', 'unknown']);
+
+/** (D-7) The authority kinds of the design (§OracleSpec). */
+export const ORACLE_AUTHORITY_KINDS: ReadonlySet<string> = new Set(['formal_spec', 'approved_requirement', 'business_rule', 'known_good_reference', 'differential_reference', 'expert_approved']);
+
+/** Operation states after which the environment's state is uncertain (C11). */
+const UNCERTAIN_OPERATION_STATES: ReadonlySet<string> = new Set(['failed', 'outcome_unknown', 'reconciling', 'manual_review']);
 
 interface Outcome {
   status: CriterionResult['status'];
@@ -288,6 +338,33 @@ function currentOracles(oracles: readonly OracleSpec[]): OracleSpec[] {
   return [...m.values()].sort((a, b) => byString(a.oracleId, b.oracleId));
 }
 
+/**
+ * (D-7) Why an approved oracle revision is not governed as the design requires (empty: it is): authorities present with
+ * known kinds and non-empty source refs, approvedBy non-empty, an `expert_approved` authority approved by a human, an agent
+ * approver only when the change policy accepts independent agents, selfApprove false.
+ */
+export function oracleAuthorityProblems(o: OracleSpec): string[] {
+  const out: string[] = [];
+  const authorities = Array.isArray(o.authorities) ? o.authorities : [];
+  if (authorities.length === 0) out.push('it names no authority (formal spec, approved requirement, business rule, reference, expert)');
+  for (const a of authorities) {
+    if (!a || typeof a.sourceRef !== 'string' || a.sourceRef.trim() === '') out.push('an authority has no sourceRef');
+    else if (!ORACLE_AUTHORITY_KINDS.has(a.authority)) out.push(`authority ${a.sourceRef} has an unknown kind ${String(a.authority)}`);
+  }
+  const approvedBy = Array.isArray(o.approvedBy) ? o.approvedBy : [];
+  if (approvedBy.length === 0) out.push('it records no approver (approvedBy is empty)');
+  if (authorities.some((a) => a?.authority === 'expert_approved') && !approvedBy.some((a) => a.kind === 'human')) out.push('an expert_approved authority requires a human approver');
+  if (approvedBy.some((a) => a.kind === 'agent') && !(o.changePolicy?.approvers ?? []).includes('independent_agent')) out.push('it was approved by an agent but its change policy accepts no agent approver');
+  if (o.changePolicy?.selfApprove !== false) out.push('its change policy allows self-approval');
+  return out;
+}
+
+/** The experiment an evidence record was produced for (`provenance.experimentId`). */
+function experimentOf(e: EvidenceRecord): string | undefined {
+  const id = (e.provenance as { experimentId?: unknown } | undefined)?.experimentId;
+  return typeof id === 'string' && id !== '' ? id : undefined;
+}
+
 function latestArtifacts(artifacts: readonly TestArtifact[]): Map<string, TestArtifact> {
   const m = new Map<string, TestArtifact>();
   for (const a of artifacts) {
@@ -297,41 +374,50 @@ function latestArtifacts(artifacts: readonly TestArtifact[]): Map<string, TestAr
   return m;
 }
 
-/**
- * A test file that is new or changed since the base commit is, whatever its artifact claims, not an existing test: it
- * must have demonstrated sensitivity (known-bad or mutation) and not be draft/quarantined/retired.
- */
-function provesSensitivity(a: TestArtifact): boolean {
-  return isEligibleTestArtifact(a.sourceType === 'existing' ? { ...a, sourceType: 'generated' } : a);
+interface Eligibility {
+  /** Why the record does not count (undefined: it counts). */
+  problem?: string;
+  /** It may support or violate a P0/P1 assertion. */
+  critical: boolean;
 }
 
 /**
- * conformance-2: eligibility of evidence from its recorded `workspaceDelta` (written by test.run from the workspace
+ * conformance-2 / D-0: eligibility of evidence from its recorded `workspaceDelta` (written by test.run from the workspace
  * itself — a derived linkage, never a caller claim). Every test file added or modified since the base commit must be
- * covered by the LATEST revision of a TestArtifact with exactly that content digest that proved its sensitivity; an
- * unavailable delta counts only for a read-only workspace (agents cannot have written tests there). Evidence without
- * a delta (other producers) is not judged here.
+ * covered by the LATEST revision of an artifact with exactly that content digest whose lifecycle is re-derived as complete
+ * (a changed "existing" file is judged as generated); an unavailable delta counts only for a read-only workspace (agents
+ * cannot have written tests there). Evidence without a delta (other producers) is not judged here.
  */
-function deltaIneligibility(e: EvidenceRecord, byDigest: ReadonlyMap<string, TestArtifact[]>): string | undefined {
+function deltaEligibility(e: EvidenceRecord, byDigest: ReadonlyMap<string, TestArtifact[]>, judge: (a: TestArtifact, changed: boolean) => ArtifactEligibility): Eligibility {
   const delta = getField(e.structured, 'workspaceDelta');
-  if (delta === undefined) return undefined;
-  if (delta === null || typeof delta !== 'object' || Array.isArray(delta)) return 'malformed workspace delta';
+  if (delta === undefined) return { critical: true };
+  if (delta === null || typeof delta !== 'object' || Array.isArray(delta)) return { problem: 'malformed workspace delta', critical: false };
   const d = delta as Record<string, JsonValue>;
   if (d['status'] !== 'computed') {
-    return d['readOnly'] === true ? undefined : `workspace delta unavailable (${String(d['reason'] ?? 'unknown')}): the tests that ran cannot be tied to the base commit or to validated artifacts`;
+    return d['readOnly'] === true ? { critical: true } : { problem: `workspace delta unavailable (${String(d['reason'] ?? 'unknown')}): the tests that ran cannot be tied to the base commit or to validated artifacts`, critical: false };
   }
-  if (d['testFilesTruncated'] === true) return 'too many changed test files to verify';
+  if (d['testFilesTruncated'] === true) return { problem: 'too many changed test files to verify', critical: false };
   const files = d['testFiles'];
-  if (!Array.isArray(files)) return 'malformed workspace delta (no testFiles)';
+  if (!Array.isArray(files)) return { problem: 'malformed workspace delta (no testFiles)', critical: false };
+  let critical = true;
   for (const f of files) {
-    if (f === null || typeof f !== 'object' || Array.isArray(f)) return 'malformed workspace delta entry';
+    if (f === null || typeof f !== 'object' || Array.isArray(f)) return { problem: 'malformed workspace delta entry', critical: false };
     const { path, change, sha256 } = f as Record<string, JsonValue>;
     if (change === 'deleted') continue;
-    if (typeof sha256 !== 'string' || sha256 === '') return `test file ${String(path)} (${String(change)}) has no content digest`;
-    const covering = (byDigest.get(sha256) ?? []).filter(provesSensitivity);
-    if (covering.length === 0) return `test file ${String(path)} is ${String(change)} since the base commit and no validated test artifact has its content (sha256 ${sha256.slice(0, 12)})`;
+    if (typeof sha256 !== 'string' || sha256 === '') return { problem: `test file ${String(path)} (${String(change)}) has no content digest`, critical: false };
+    const judged = (byDigest.get(sha256) ?? []).map((a) => judge(a, true));
+    const covering = judged.filter((j) => j.eligible);
+    if (covering.length === 0) {
+      const why = judged.length === 0 ? 'no test artifact has its content' : `its artifact is not eligible: ${judged.flatMap((j) => j.reasons).slice(0, 3).join('; ')}`;
+      return { problem: `test file ${String(path)} is ${String(change)} since the base commit and ${why} (sha256 ${sha256.slice(0, 12)})`, critical: false };
+    }
+    if (!covering.some((j) => j.criticalSupport)) critical = false;
   }
-  return undefined;
+  return { critical };
+}
+
+function envIdOfResource(key: string): string | undefined {
+  return key.startsWith('env/') ? key.slice(4).split('/')[0] : undefined;
 }
 
 export class QualityGate {
@@ -340,65 +426,128 @@ export class QualityGate {
     const allEvidence = [...input.evidence].sort((a, b) => a.seq - b.seq || byString(a.evidenceId, b.evidenceId));
     const runEvidence = allEvidence.filter((e) => e.runId === run.runId);
     const evidenceIds = new Set(runEvidence.map((e) => e.evidenceId));
+    const evidenceById = new Map(runEvidence.map((e) => [e.evidenceId, e]));
+    const allReviews = input.reviews.filter((r) => r.runId === run.runId);
 
-    // Evidence from generated tests that never demonstrated sensitivity does not count (nor does evidence
-    // pointing at an unknown artifact, nor evidence of a run over new/changed test files no validated artifact covers).
+    // ------------------------------------------------------------------------------------- oracles in force (C0, D-7)
+    const authorityProblems = new Map<string, string[]>();
+    for (const o of currentOracles(input.oracles)) {
+      const p = oracleAuthorityProblems(o);
+      if (p.length > 0) authorityProblems.set(o.oracleId, p);
+    }
+    const invalidated = new Map<string, OracleSpec>();
+    for (const o of input.oracles) {
+      const pinned = run.oracleRevisions?.[o.oracleId];
+      if (o.status === 'invalid' && (pinned === undefined || o.revision > pinned)) {
+        const prev = invalidated.get(o.oracleId);
+        if (!prev || o.revision > prev.revision) invalidated.set(o.oracleId, o);
+      }
+    }
+    /** Approved, governed and not declared invalid: the oracles C3 judges and artifacts must be consistent with. */
+    const oraclesInForce = currentOracles(input.oracles).filter((o) => !authorityProblems.has(o.oracleId) && !invalidated.has(o.oracleId));
+
+    // ------------------------------------------------------------------------------------- eligibility (C1, D-0/D-1)
+    // Evidence from generated tests that did not complete their lifecycle does not count (nor does evidence pointing at an
+    // unknown artifact, nor evidence of a run over new/changed test files no eligible artifact covers, nor a known-good
+    // validation run on the base revision). Every stage is re-derived from the cited evidence and review records.
     const artifacts = latestArtifacts(input.testArtifacts);
+    const eligibilityCtx: EligibilityContext = { evidence: evidenceById, reviews: allReviews, oraclesInForce };
+    const memo = new Map<string, ArtifactEligibility>();
+    const judge = (a: TestArtifact, changed: boolean): ArtifactEligibility => {
+      const key = `${a.artifactId}@${a.revision}:${changed}`;
+      let j = memo.get(key);
+      if (!j) {
+        j = artifactEligibility(changed && a.sourceType === 'existing' ? { ...a, sourceType: 'generated' } : a, eligibilityCtx);
+        memo.set(key, j);
+      }
+      return j;
+    };
     const byDigest = new Map<string, TestArtifact[]>();
     for (const a of artifacts.values()) byDigest.set(a.artifactDigest, [...(byDigest.get(a.artifactDigest) ?? []), a]);
     const ignored: string[] = [];
+    const ineligible: EvidenceRecord[] = [];
+    const validationOnly: string[] = [];
+    const criticalOk = new Set<string>();
     const eligible = runEvidence.filter((e) => {
-      const unproven = deltaIneligibility(e, byDigest);
-      if (unproven !== undefined) {
-        ignored.push(`${e.evidenceId} (${unproven})`);
+      if (isBaseRevisionRun(e)) {
+        validationOnly.push(e.evidenceId);
         return false;
       }
+      const d = deltaEligibility(e, byDigest, judge);
+      if (d.problem !== undefined) {
+        ignored.push(`${e.evidenceId} (${d.problem})`);
+        ineligible.push(e);
+        return false;
+      }
+      let critical = d.critical;
       const id = getField(e.structured, 'testArtifactId');
-      if (id === undefined) return true;
-      const a = typeof id === 'string' ? artifacts.get(id) : undefined;
-      if (a && isEligibleTestArtifact(a)) return true;
-      ignored.push(`${e.evidenceId} (test artifact ${String(id)} ${a ? 'not eligible' : 'unknown'})`);
-      return false;
+      if (id !== undefined) {
+        const a = typeof id === 'string' ? artifacts.get(id) : undefined;
+        const j = a ? judge(a, false) : undefined;
+        if (!j || !j.eligible) {
+          ignored.push(`${e.evidenceId} (test artifact ${String(id)} ${a ? `not eligible: ${j!.reasons.slice(0, 3).join('; ')}` : 'unknown'})`);
+          ineligible.push(e);
+          return false;
+        }
+        if (!j.criticalSupport) critical = false;
+      }
+      if (critical) criticalOk.add(e.evidenceId);
+      return true;
     });
+    const criticalEligible = eligible.filter((e) => criticalOk.has(e.evidenceId));
 
-    const findings = currentRecords(input.findings).filter((r) => r.runId === run.runId);
+    const findingHistory = input.findings.filter((r) => r.runId === run.runId);
+    const findings = currentRecords(findingHistory);
     const risks = currentRecords(input.risks).filter((r) => r.runId === run.runId);
-    const reviews = currentRecords(input.reviews).filter((r) => r.runId === run.runId);
+    const reviews = currentRecords(allReviews);
+    const experiments = latestExperiments(input.experiments.filter((x) => x.runId === undefined || x.runId === run.runId));
+    const operations = input.operations;
 
     const outcomes = new Map<CriterionId, Outcome>();
 
-    // C0 oracle_in_force (conformance-1): the run is judged against a governed, deterministic correctness criterion
+    // C0 oracle_in_force (conformance-1, D-7, D-10): the run is judged against a governed, deterministic correctness criterion
     {
       const superseded = Object.entries(run.oracleRevisions ?? {}).filter(([id, rev]) => {
         const current = input.currentOracleRevisions?.[id];
         return current !== undefined && current > rev;
       });
+      const declaredInvalid = [...invalidated.values()].filter((o) => Object.hasOwn(run.oracleRevisions ?? {}, o.oracleId));
       if (superseded.length > 0) {
         // conformance-4: an oracle approved in a new revision during the run replaces the criterion this run pinned
         outcomes.set('C0', {
           status: 'unknown',
           evidenceRefs: [],
-          detail: `${superseded.map(([id, rev]) => `oracle ${id} revision ${rev} is superseded by approved revision ${input.currentOracleRevisions![id]}`).join('; ')}: the verdict would rest on a replaced criterion — judge the candidate against the new revision in a new run`,
+          detail: `${superseded.map(([id, rev]) => `oracle ${id} revision ${rev} is superseded by approved revision ${input.currentOracleRevisions![id]}`).join('; ')}: the verdict would rest on a replaced criterion — re-evaluate under the new revision (the control plane re-pins the run and replans)`,
           reasons: ['a pinned oracle was superseded during the run'],
+        });
+      } else if (declaredInvalid.length > 0) {
+        outcomes.set('C0', {
+          status: 'unknown',
+          evidenceRefs: [],
+          detail: declaredInvalid.map((o) => `oracle ${o.oracleId} revision ${o.invalidation?.revision ?? o.supersedes ?? '?'} was declared invalid (${o.invalidation?.reason ?? 'no reason recorded'})`).join('; '),
+          reasons: ['a pinned oracle was declared invalid: re-judge under an approved revision'],
         });
       } else if (gate.requireOracle === false) {
         outcomes.set('C0', { status: 'satisfied', evidenceRefs: [], detail: 'no oracle required by the gate (gate.requireOracle false: a recorded override)', reasons: ['gate.requireOracle is false: the verdict rests on no oracle'] });
       } else {
-        const pinned = currentOracles(input.oracles).filter((o) => run.oracleRevisions?.[o.oracleId] === o.revision);
+        const pinnedAll = currentOracles(input.oracles).filter((o) => run.oracleRevisions?.[o.oracleId] === o.revision);
+        const ungoverned = pinnedAll.filter((o) => authorityProblems.has(o.oracleId));
+        const pinned = pinnedAll.filter((o) => !authorityProblems.has(o.oracleId));
         const critical = pinned.flatMap((o) =>
           o.assertions
             .filter((a) => SEVERITY_ORDER[a.severity] <= SEVERITY_ORDER.P1 && a.check !== undefined && a.check.type !== 'llm_rubric' && a.kind !== 'llm_semantic')
             .map((a) => `${o.oracleId}/${a.assertionId}`),
         );
+        const ungovernedReasons = ungoverned.map((o) => `oracle ${o.oracleId}@${o.revision} is not in force: ${authorityProblems.get(o.oracleId)!.join('; ')}`);
         outcomes.set(
           'C0',
           critical.length > 0
-            ? { status: 'satisfied', evidenceRefs: [], detail: `${critical.length} deterministic P0/P1 assertion(s) in force: ${critical.slice(0, 10).join(', ')}`, reasons: [] }
+            ? { status: 'satisfied', evidenceRefs: [], detail: `${critical.length} deterministic P0/P1 assertion(s) in force: ${critical.slice(0, 10).join(', ')}`, reasons: ungovernedReasons }
             : {
                 status: 'unknown',
                 evidenceRefs: [],
-                detail: pinned.length === 0 ? 'no approved oracle is pinned by the run' : `the pinned oracles (${pinned.map((o) => o.oracleId).join(', ')}) have no deterministic P0/P1 assertion`,
-                reasons: ['no oracle in force: establish one (human authority) and pin it to the run — correctness is never decided by the agents'],
+                detail: pinnedAll.length === 0 ? 'no approved oracle is pinned by the run' : pinned.length === 0 ? `the pinned oracles are not governed as required: ${ungovernedReasons.join('; ')}` : `the pinned oracles (${pinned.map((o) => o.oracleId).join(', ')}) have no deterministic P0/P1 assertion`,
+                reasons: ['no oracle in force: establish one (human authority) and pin it to the run — correctness is never decided by the agents', ...ungovernedReasons],
               },
         );
       }
@@ -422,9 +571,66 @@ export class QualityGate {
         reasons.push('no evidence recorded');
       } else if (eligible.length === 0) {
         status = 'unknown';
-        reasons.push(`no eligible evidence: all ${runEvidence.length} run evidence records come from ineligible or unknown generated tests`);
+        reasons.push(`no eligible evidence: none of the ${runEvidence.length} run evidence records is evidence about the candidate from an eligible source (ineligible generated tests, base-revision validation runs)`);
       }
       outcomes.set('C1', { status, evidenceRefs: [], detail: status === 'satisfied' ? `${allEvidence.length} evidence records match root ${input.evidenceRoot.rootHash}` : reasons.join('; '), reasons });
+    }
+
+    // C3 critical_oracles (evaluated before C2: a cleared critical finding may rest on its satisfied assertion)
+    const assertionStatus = new Map<string, CriterionResult['status']>();
+    {
+      const reasons: string[] = [];
+      const refs: string[] = [];
+      let violated = 0;
+      let unknown = 0;
+      let checked = 0;
+      const eligibleArtifacts = [...artifacts.values()].filter((a) => judge(a, a.sourceType !== 'existing').criticalSupport);
+      for (const o of oraclesInForce) {
+        const deterministicRequired = gate.requireDeterministicForCritical || o.judgePolicy.deterministicRequiredForCritical || !o.judgePolicy.allowLlmOnlyDecision;
+        for (const a of [...o.assertions].sort((x, y) => byString(x.assertionId, y.assertionId))) {
+          if (SEVERITY_ORDER[a.severity] > SEVERITY_ORDER.P1) continue;
+          const label = `${o.oracleId}@${o.revision}/${a.assertionId} (${a.severity})`;
+          const key = `${o.oracleId}/${a.assertionId}`;
+          checked++;
+          if (isLlmOnly(a)) {
+            if (deterministicRequired) {
+              unknown++;
+              assertionStatus.set(key, 'unknown');
+              reasons.push(a.check === undefined ? `${label}: no machine-checkable check; deterministic evidence required` : `${label}: only LLM/semantic support; deterministic evidence required`);
+            } else reasons.push(`${label}: LLM-only assertion not gate-evaluable (allowed by gate and oracle policy)`);
+            continue;
+          }
+          let r = evaluateCheck(a.check!, criticalEligible);
+          // D-11 "critical test failed": an eligible artifact bound to this assertion whose own cases failed on the latest build
+          const bound = eligibleArtifacts.filter((t) => t.oracleRefs.some((ref) => ref.oracleId === o.oracleId && ref.revision === o.revision && ref.assertionIds.includes(a.assertionId)));
+          if (bound.length > 0) {
+            const tests = latestBuild(criticalEligible.filter((e) => e.evidenceType === 'test-result'));
+            const failures: Array<{ ref: string; path: string }> = [];
+            for (const t of bound) {
+              for (const e of tests) {
+                const cases = getField(e.structured, 'cases');
+                if (!Array.isArray(cases)) continue;
+                if (cases.some((c) => caseInFile(c, t.path) && ['failed', 'xfail'].includes(String((c as CaseLike).status)))) failures.push({ ref: e.evidenceId, path: t.path });
+              }
+            }
+            if (failures.length > 0) r = { status: 'violated', refs: uniqSorted(failures.map((f) => f.ref)), detail: `test artifact(s) bound to this assertion failed: ${uniqSorted(failures.map((f) => f.path)).join(', ')}` };
+          }
+          refs.push(...r.refs);
+          assertionStatus.set(key, r.status);
+          if (r.status === 'violated') {
+            violated++;
+            reasons.push(`${label} violated: ${r.detail}`);
+          } else if (r.status === 'unknown') {
+            unknown++;
+            // evidence that is not critical-eligible never decides; say which records would have
+            const shadow = evaluateCheck(a.check!, [...ineligible, ...eligible.filter((e) => !criticalOk.has(e.evidenceId))]);
+            const note = shadow.status !== 'unknown' ? ` (ignored: ${shadow.refs.join(', ')} from ineligible or non-critical generated tests would have ${shadow.status === 'violated' ? 'violated' : 'satisfied'} it — they neither satisfy nor violate a critical assertion)` : '';
+            reasons.push(`${label} unproven: ${r.detail}${note}`);
+          }
+        }
+      }
+      const status: Outcome['status'] = violated ? 'violated' : unknown ? 'unknown' : 'satisfied';
+      outcomes.set('C3', { status, evidenceRefs: uniqSorted(refs), detail: `${checked} critical assertions: ${violated} violated, ${unknown} unproven`, reasons });
     }
 
     // C2 unresolved_findings
@@ -435,7 +641,8 @@ export class QualityGate {
       const thresholdKnown = typeof gate.failOnUnresolvedSeverity === 'string' && Object.hasOwn(SEVERITY_ORDER, gate.failOnUnresolvedSeverity);
       const threshold = thresholdKnown ? gate.failOnUnresolvedSeverity : 'P3';
       if (!thresholdKnown) reasons.push(`gate.failOnUnresolvedSeverity ${JSON.stringify(gate.failOnUnresolvedSeverity)} is not a severity (${Object.keys(SEVERITY_ORDER).join(', ')}): every unresolved finding blocks`);
-      const blocking = findings.filter((r) => isUnresolvedFinding(r.payload) && atLeastAsSevere(r.payload.severity, threshold));
+      const blocks = (f: Finding) => isUnresolvedFinding(f) && atLeastAsSevere(f.severity, threshold);
+      const blocking = findings.filter((r) => blocks(r.payload));
       const product = blocking.filter((r) => PRODUCT_CATEGORIES.has(r.payload.category));
       const infra = blocking.filter((r) => !PRODUCT_CATEGORIES.has(r.payload.category));
       for (const r of product) {
@@ -444,61 +651,48 @@ export class QualityGate {
         if (r.evidenceRefs.length === 0) reasons.push(`unevidenced finding ${r.recordId} (still blocking)`);
       }
       for (const r of infra) reasons.push(`unresolved ${r.payload.severity} ${r.payload.category} finding ${r.recordId} casts doubt on the evidence: ${r.payload.title}`);
-      const status: Outcome['status'] = product.length ? 'violated' : infra.length || !thresholdKnown ? 'unknown' : 'satisfied';
+      // D-11: a blocking product finding cleared by an agent without deterministic support stays in doubt
+      const blockingLineages = new Set(product.map((r) => r.lineageId));
+      const cleared: Array<BlackboardRecord<Finding>> = [];
+      for (const cur of findings) {
+        if (blocks(cur.payload) && PRODUCT_CATEGORIES.has(cur.payload.category)) continue;
+        const history = findingHistory.filter((r) => r.lineageId === cur.lineageId);
+        if (!history.some((r) => blocks(r.payload) && PRODUCT_CATEGORIES.has(r.payload.category))) continue;
+        if (/^(human|system):/.test(cur.createdBy)) continue;
+        if (cur.payload.status === 'duplicate' && cur.payload.duplicateOf !== undefined && (blockingLineages.has(cur.payload.duplicateOf) || product.some((p) => p.recordId === cur.payload.duplicateOf))) continue;
+        const ref = cur.payload.oracleRef;
+        if (ref?.assertionId !== undefined && assertionStatus.get(`${ref.oracleId}/${ref.assertionId}`) === 'satisfied') continue;
+        cleared.push(cur);
+        reasons.push(`finding ${cur.recordId} was a blocking product finding and was cleared by agent ${cur.createdBy} (now ${cur.payload.severity} ${cur.payload.category} ${cur.payload.status}) without deterministic support: needs a satisfied oracle assertion (oracleRef) or a human decision`);
+      }
+      const status: Outcome['status'] = product.length ? 'violated' : infra.length || cleared.length || !thresholdKnown ? 'unknown' : 'satisfied';
       outcomes.set('C2', {
         status,
-        evidenceRefs: uniqSorted([...product, ...infra].flatMap((r) => r.evidenceRefs)),
+        evidenceRefs: uniqSorted([...product, ...infra, ...cleared].flatMap((r) => r.evidenceRefs)),
         detail:
           status === 'satisfied'
             ? `no unresolved findings at or above ${threshold}`
-            : !thresholdKnown && product.length + infra.length === 0
+            : !thresholdKnown && product.length + infra.length + cleared.length === 0
               ? `unknown severity threshold ${JSON.stringify(gate.failOnUnresolvedSeverity)}`
-              : `${product.length} product and ${infra.length} test/infrastructure findings unresolved`,
+              : `${product.length} product and ${infra.length} test/infrastructure findings unresolved${cleared.length ? `, ${cleared.length} critical finding(s) cleared by an agent without deterministic support` : ''}`,
         reasons,
       });
     }
 
-    // C3 critical_oracles
-    {
-      const reasons: string[] = [];
-      const refs: string[] = [];
-      let violated = 0;
-      let unknown = 0;
-      let checked = 0;
-      for (const o of currentOracles(input.oracles)) {
-        const deterministicRequired = gate.requireDeterministicForCritical || o.judgePolicy.deterministicRequiredForCritical || !o.judgePolicy.allowLlmOnlyDecision;
-        for (const a of [...o.assertions].sort((x, y) => byString(x.assertionId, y.assertionId))) {
-          if (SEVERITY_ORDER[a.severity] > SEVERITY_ORDER.P1) continue;
-          const label = `${o.oracleId}@${o.revision}/${a.assertionId} (${a.severity})`;
-          checked++;
-          if (isLlmOnly(a)) {
-            if (deterministicRequired) {
-              unknown++;
-              reasons.push(a.check === undefined ? `${label}: no machine-checkable check; deterministic evidence required` : `${label}: only LLM/semantic support; deterministic evidence required`);
-            } else reasons.push(`${label}: LLM-only assertion not gate-evaluable (allowed by gate and oracle policy)`);
-            continue;
-          }
-          const r = evaluateCheck(a.check!, eligible);
-          refs.push(...r.refs);
-          if (r.status === 'violated') {
-            violated++;
-            reasons.push(`${label} violated: ${r.detail}`);
-          } else if (r.status === 'unknown') {
-            unknown++;
-            reasons.push(`${label} unproven: ${r.detail}`);
-          }
-        }
-      }
-      const status: Outcome['status'] = violated ? 'violated' : unknown ? 'unknown' : 'satisfied';
-      outcomes.set('C3', { status, evidenceRefs: uniqSorted(refs), detail: `${checked} critical assertions: ${violated} violated, ${unknown} unproven`, reasons });
+    // experiments in scope: started (an action or evidence of their own)
+    const experimentEvidence = new Map<string, EvidenceRecord[]>();
+    for (const e of runEvidence) {
+      const x = experimentOf(e);
+      if (x !== undefined) experimentEvidence.set(x, [...(experimentEvidence.get(x) ?? []), e]);
     }
+    const started = experiments.filter((x) => (experimentEvidence.get(x.experimentId)?.length ?? 0) > 0 || (operations ?? []).some((o) => o.experimentId === x.experimentId));
 
     // C4 required_evidence
     {
       const reasons: string[] = [];
       const refs: string[] = [];
       let missing = 0;
-      const reqs: Array<{ label: string; type: string; min: number; workItemId?: string }> = [];
+      const reqs: Array<{ label: string; type: string; min: number; workItemId?: string; experimentId?: string }> = [];
       for (const r of gate.requiredEvidence) reqs.push({ label: `gate requires ${r.minCount}× ${r.evidenceType}`, type: r.evidenceType, min: r.minCount });
       for (const w of [...input.workItems].sort((a, b) => byString(a.workItemId, b.workItemId))) {
         if (w.state === 'cancelled') continue;
@@ -506,8 +700,11 @@ export class QualityGate {
           if (r.critical === true) reqs.push({ label: `work item ${w.workItemId} requires ${r.minCount}× ${r.evidenceType}`, type: r.evidenceType, min: r.minCount, workItemId: w.workItemId });
         }
       }
+      for (const x of started) {
+        for (const r of x.evidenceRequirements ?? []) reqs.push({ label: `experiment ${x.experimentId} requires ${r.minCount}× ${r.evidenceType}`, type: r.evidenceType, min: r.minCount, experimentId: x.experimentId });
+      }
       for (const q of reqs) {
-        const found = eligible.filter((e) => e.evidenceType === q.type && (q.workItemId === undefined || e.workItemId === q.workItemId));
+        const found = eligible.filter((e) => e.evidenceType === q.type && (q.workItemId === undefined || e.workItemId === q.workItemId) && (q.experimentId === undefined || experimentOf(e) === q.experimentId));
         refs.push(...found.map((e) => e.evidenceId));
         if (found.length < q.min) {
           missing++;
@@ -552,9 +749,13 @@ export class QualityGate {
       const dependentApprovals = onSubject.filter((r) => r.payload.verdict === 'approve' && !independent(r));
       for (const r of dependentApprovals) reasons.push(`review ${r.recordId} not independent (provider ${r.payload.modelProvider ?? 'unknown'} also produced findings/tests)`);
       if (producers.size === 0 && approvals.length) reasons.push('reviewer heterogeneity unverified: producerProviders not supplied');
+      // D-7: an oracle in force whose judgePolicy requires an independent reviewer requires it whatever the gate says
+      const requiredBy = oraclesInForce.filter((o) => o.judgePolicy?.independentReviewerRequired === true).map((o) => `${o.oracleId}@${o.revision}`);
+      const required = gate.requireIndependentReview || requiredBy.length > 0;
+      if (!gate.requireIndependentReview && requiredBy.length > 0) reasons.push(`independent review required by the judgePolicy of oracle ${requiredBy.join(', ')} (the gate's requireIndependentReview false does not override an oracle's judge policy)`);
       let outcome: Outcome;
-      if (!gate.requireIndependentReview) {
-        outcome = { status: 'satisfied', evidenceRefs: [], detail: 'independent review not required by the gate', reasons: [] };
+      if (!required) {
+        outcome = { status: 'satisfied', evidenceRefs: [], detail: 'independent review not required by the gate or any oracle in force', reasons: [] };
       } else if (rejects.length) {
         outcome = { status: 'violated', evidenceRefs: uniqSorted(rejects.flatMap((r) => r.payload.checkedEvidenceRefs)), detail: `rejected by review ${rejects.map((r) => r.recordId).join(', ')}`, reasons: [...rejects.map((r) => `review ${r.recordId} rejected: ${r.payload.rationale}`), ...reasons], humanReview: true };
       } else if (more.length) {
@@ -625,26 +826,160 @@ export class QualityGate {
       }
     }
 
-    // C9 critical_claims
+    // C9 critical_claims (area-C-0): every critical claim is evaluated against its evidence
     {
       const reasons: string[] = [];
       const refs: string[] = [];
-      let bad = 0;
+      let unknownClaims = 0;
+      let contradicted = 0;
+      const data = new Map(Object.entries(input.claimData ?? {}));
       for (const c of [...input.claims].sort((a, b) => byString(a.claimId, b.claimId))) {
-        if (!c.critical) continue;
-        if (c.evidenceRefs.length === 0) {
-          bad++;
+        const cited = (c.evidenceRefs ?? []).filter((r) => evidenceIds.has(r));
+        const dangling = (c.evidenceRefs ?? []).filter((r) => !evidenceIds.has(r));
+        const evaluation = dangling.length === 0 && cited.length > 0 ? evaluateClaim(c, cited.map((r) => evidenceById.get(r)!), data) : undefined;
+        if (!c.critical) {
+          if (evaluation?.status === 'mismatch') reasons.push(`(non-critical) claim ${c.claimId} contradicts its evidence: ${evaluation.detail}`);
+          continue;
+        }
+        if ((c.evidenceRefs ?? []).length === 0) {
+          unknownClaims++;
           reasons.push(`critical claim ${c.claimId} has no evidence: ${c.statement}`);
           continue;
         }
-        const dangling = c.evidenceRefs.filter((r) => !evidenceIds.has(r));
         if (dangling.length) {
-          bad++;
+          unknownClaims++;
           reasons.push(`critical claim ${c.claimId} cites unknown evidence ${dangling.join(', ')}`);
+          continue;
         }
-        refs.push(...c.evidenceRefs.filter((r) => evidenceIds.has(r)));
+        refs.push(...cited);
+        if (evaluation?.status === 'mismatch') {
+          contradicted++;
+          reasons.push(`critical claim ${c.claimId} ("${c.statement}") is contradicted by its evidence: ${evaluation.detail}`);
+        } else if (evaluation?.status === 'unevaluable') {
+          unknownClaims++;
+          reasons.push(`critical claim ${c.claimId} cannot be evaluated: ${evaluation.detail}`);
+        }
       }
-      outcomes.set('C9', { status: bad ? 'unknown' : 'satisfied', evidenceRefs: uniqSorted(refs), detail: bad ? `${bad} critical claims without resolvable evidence` : 'all critical claims cite evidence', reasons });
+      const status: Outcome['status'] = contradicted ? 'violated' : unknownClaims ? 'unknown' : 'satisfied';
+      outcomes.set('C9', {
+        status,
+        evidenceRefs: uniqSorted(refs),
+        detail: status === 'satisfied' ? 'every critical claim is supported by its evaluated evidence' : `${contradicted} critical claim(s) contradicted, ${unknownClaims} without evaluable evidence`,
+        reasons,
+      });
+    }
+
+    // C10 experiment_validity (D-3/D-4/D-5)
+    {
+      const reasons: string[] = [];
+      let violated = 0;
+      let unknown = 0;
+      const refs: string[] = [];
+      for (const x of started) {
+        if (operations === undefined) {
+          unknown++;
+          reasons.push(`experiment ${x.experimentId}: the run's actions were not supplied; its validity cannot be judged`);
+          continue;
+        }
+        const facts = input.experimentFacts?.find((f) => f.experimentId === x.experimentId);
+        const env = input.environments?.find((e) => e.environmentId === x.environment.environmentId);
+        const v = experimentValidity({
+          spec: x, evidence: experimentEvidence.get(x.experimentId) ?? [], operations, ...(facts ? { facts } : {}), oraclesInForce,
+          ...(env?.dedicated !== undefined ? { environmentDedicated: env.dedicated } : {}), now: input.now,
+        });
+        refs.push(...(experimentEvidence.get(x.experimentId) ?? []).map((e) => e.evidenceId));
+        if (v.violations.length) violated++;
+        else if (v.unknowns.length) unknown++;
+        for (const m of v.violations) reasons.push(`experiment ${x.experimentId} invalid: ${m}`);
+        for (const m of v.unknowns) reasons.push(`experiment ${x.experimentId} unproven: ${m}`);
+      }
+      const status: Outcome['status'] = violated ? 'violated' : unknown ? 'unknown' : 'satisfied';
+      outcomes.set('C10', {
+        status,
+        evidenceRefs: uniqSorted(refs),
+        detail: started.length === 0 ? 'no experiment ran' : `${started.length} experiment(s): ${violated} invalid, ${unknown} unproven`,
+        reasons,
+      });
+    }
+
+    // C11 environment_validity (D-11)
+    {
+      const reasons: string[] = [];
+      const used = new Set<string>();
+      for (const e of runEvidence) if (e.environment?.environmentId) used.add(e.environment.environmentId);
+      for (const x of experiments) if (x.environment.environmentId !== 'local' || input.environments?.some((f) => f.environmentId === 'local')) used.add(x.environment.environmentId);
+      if (run.target.environmentId !== undefined) used.add(run.target.environmentId);
+      for (const o of operations ?? []) {
+        const id = envIdOfResource(o.resourceKey);
+        if (id !== undefined) used.add(id);
+      }
+      let problems = 0;
+      if (used.size > 0 && input.environments === undefined) {
+        problems++;
+        reasons.push(`the environment registry's view was not supplied: ${[...used].sort().join(', ')} cannot be checked`);
+      }
+      for (const id of [...used].sort()) {
+        if (input.environments === undefined) break;
+        const facts: EnvironmentFacts | undefined = input.environments.find((f) => f.environmentId === id);
+        if (!facts || !facts.registered) {
+          problems++;
+          reasons.push(`environment ${id} is not registered: its state cannot be established`);
+          continue;
+        }
+        const gens = runEvidence.filter((e) => e.environment?.environmentId === id).map((e) => e.environment!.generation);
+        for (const x of experiments) if (x.environment.environmentId === id) gens.push(x.environment.generation);
+        if (gens.length > 0 && facts.generation !== undefined) {
+          const gMin = Math.min(...gens);
+          const gMax = Math.max(...gens, facts.generation);
+          const explained = (operations ?? []).filter((o) => (o.toolId === 'env.restart' || o.toolId === 'env.deploy') && o.status === 'verified' && envIdOfResource(o.resourceKey) === id).length;
+          if (gMax - gMin > explained) {
+            problems++;
+            reasons.push(`environment ${id} drifted during the run: generation ${gMin} → ${gMax} but the run itself verified only ${explained} restart/deploy(s)`);
+          }
+        }
+      }
+      for (const o of operations ?? []) {
+        if (!o.toolId.startsWith('env.') || !UNCERTAIN_OPERATION_STATES.has(o.status)) continue;
+        problems++;
+        reasons.push(`${o.toolId} operation ${o.operationId} on ${o.resourceKey} is ${o.status}: the environment's state is uncertain`);
+      }
+      const envFindings = findings.filter((r) => r.payload.category === 'environment' && isUnresolvedFinding(r.payload) && SEVERITY_ORDER[r.payload.severity] <= SEVERITY_ORDER.P2);
+      for (const r of envFindings) {
+        problems++;
+        reasons.push(`unresolved ${r.payload.severity} environment finding ${r.recordId}: ${r.payload.title}`);
+      }
+      outcomes.set('C11', {
+        status: problems ? 'unknown' : 'satisfied',
+        evidenceRefs: uniqSorted(envFindings.flatMap((r) => r.evidenceRefs)),
+        detail: problems ? `${problems} environment problem(s)` : used.size === 0 ? 'no environment in use' : `environments valid: ${[...used].sort().join(', ')}`,
+        reasons,
+      });
+    }
+
+    // C12 domain_contracts (coverage-1)
+    {
+      const reasons: string[] = [];
+      if (gate.requireContracts === false) {
+        outcomes.set('C12', { status: 'satisfied', evidenceRefs: [], detail: 'domain contracts not required by the gate (gate.requireContracts false: a recorded override)', reasons: ['gate.requireContracts is false: the verdict may rest on no SystemModel / no ExperimentSpec'] });
+      } else {
+        const sm = input.systemModel;
+        if (run.systemModelRevision === undefined || !sm) reasons.push('the run has no SystemModel revision: record the system under test (system_model.record) before judging it');
+        else if (sm.revision !== run.systemModelRevision) reasons.push(`the run names SystemModel revision ${run.systemModelRevision} but revision ${sm.revision} was supplied`);
+        else if (!Array.isArray(sm.components) || sm.components.length === 0) reasons.push(`SystemModel ${sm.systemModelId}@${sm.revision} has no component`);
+        if (operations === undefined) reasons.push("the run's write/fault/load actions were not supplied: their ExperimentSpecs cannot be checked");
+        else {
+          const known = new Set(experiments.map((x) => x.experimentId));
+          const loose = operations.filter((o) => o.experimentId === undefined || !known.has(o.experimentId));
+          for (const o of loose.slice(0, 10)) reasons.push(`${o.toolId} operation ${o.operationId} (${o.effect}) on ${o.resourceKey} ${o.experimentId === undefined ? 'belongs to no ExperimentSpec' : `names unknown experiment ${o.experimentId}`}`);
+          if (loose.length > 10) reasons.push(`… and ${loose.length - 10} more action(s) without an ExperimentSpec`);
+        }
+        outcomes.set('C12', {
+          status: reasons.length ? 'unknown' : 'satisfied',
+          evidenceRefs: [],
+          detail: reasons.length ? `${reasons.length} domain contract gap(s)` : `SystemModel ${sm!.systemModelId}@${sm!.revision}; every action belongs to an ExperimentSpec`,
+          reasons,
+        });
+      }
     }
 
     // exceptions (waivers) — never C1, never agent-approved, never expired
@@ -710,6 +1045,7 @@ export class QualityGate {
     }
     reasons.push(...exceptionReasons);
     if (ignored.length) reasons.push(`ignored evidence from ineligible generated tests: ${ignored.join(', ')}`);
+    if (validationOnly.length) reasons.push(`validation-only evidence (known-good runs on the base revision, never evidence about the candidate): ${validationOnly.join(', ')}`);
 
     const verdict: QualityVerdict = failType ? 'fail' : unknownAny ? 'inconclusive' : conditionalType ? 'conditional' : 'pass';
     reasons.push(`verdict ${verdict}: ${verdictWhy(verdict, violatedCriteria, unknownCriteria)}`);
@@ -720,6 +1056,11 @@ export class QualityGate {
     for (const e of [...input.experiments].sort((a, b) => byString(a.experimentId, b.experimentId))) {
       experimentRevisions[e.experimentId] = Math.max(experimentRevisions[e.experimentId] ?? 0, e.revision);
     }
+    const testArtifactRevisions: Record<string, number> = {};
+    for (const a of [...artifacts.values()].sort((x, y) => byString(x.artifactId, y.artifactId))) testArtifactRevisions[a.artifactId] = a.revision;
+    const builds = new Set<string>();
+    for (const b of input.systemModel?.subject.buildDigests ?? []) builds.add(b);
+    for (const x of experiments) for (const s of x.subjects) if (s.buildDigest && s.buildDigest !== 'unknown') builds.add(s.buildDigest);
 
     const decision: QualityDecision = {
       decisionId: input.decisionId,
@@ -731,6 +1072,7 @@ export class QualityGate {
       requiresHumanReview,
       oracleRevisions,
       experimentRevisions,
+      testArtifactRevisions,
       evidenceRootHash: input.evidenceRoot.rootHash,
       evidenceCount: input.evidenceRoot.count,
       satisfiedCriteria,
@@ -747,10 +1089,22 @@ export class QualityGate {
       gateOverrides: gateOverrides(gate),
       decidedAt: input.now,
     };
+    if (builds.size > 0) decision.buildDigests = uniqSorted(builds);
     if (input.supersedes !== undefined) decision.supersedes = input.supersedes;
     if (run.systemModelRevision !== undefined) decision.systemModelRevision = run.systemModelRevision;
+    if (input.systemModel !== undefined) decision.systemModelId = input.systemModel.systemModelId;
     return decision;
   }
+}
+
+/** Latest revision per experiment id. */
+function latestExperiments(experiments: readonly ExperimentSpec[]): ExperimentSpec[] {
+  const m = new Map<string, ExperimentSpec>();
+  for (const x of experiments) {
+    const prev = m.get(x.experimentId);
+    if (!prev || x.revision > prev.revision) m.set(x.experimentId, x);
+  }
+  return [...m.values()].sort((a, b) => byString(a.experimentId, b.experimentId));
 }
 
 /** conformance-9: the effective gate's fields that differ from DEFAULT_GATE_SPEC, as `field=<canonical JSON>`. */
@@ -772,3 +1126,5 @@ function verdictWhy(verdict: QualityVerdict, violated: CriterionResult[], unknow
   if (verdict === 'inconclusive') return `insufficient evidence for ${unknown.map((c) => c.criterionId).join(', ')}`;
   return `conditional on ${violated.map((c) => c.criterionId).join(', ')}`;
 }
+
+export type { GateOperation };

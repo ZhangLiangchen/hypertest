@@ -8,7 +8,7 @@ import {
 import {
   PERMISSION_PROFILES, attenuateCapability, createRootCapability, intersectPatterns, resourcePatternCovers, signCapability, type CapabilityConstraints, type PermissionProfileName,
 } from '@hypertest/policy';
-import { createModelInvoker, type EngineHost, type SpawnRequest } from '@hypertest/runtime';
+import { createModelInvoker, type EngineHost, type ModelInvocation, type ModelInvoker, type ModelPause, type SpawnRequest } from '@hypertest/runtime';
 import type { RoleDefinition } from '@hypertest/agents';
 import type { WorkspaceHandle } from '@hypertest/tools';
 import type { ExecuteTurnOptions, TurnOutcome } from './contracts.ts';
@@ -19,7 +19,7 @@ import { createToolDispatcher, offeredRisk } from './dispatcher.ts';
 import { createPhaseGovernor } from './phases.ts';
 import { describeUnmet, unmetRequirements, workItemConstraint, type UnmetRequirement } from './capability-grant.ts';
 import {
-  delegationChatMessage, delegationSettled, inputWaitOperationId, isAwaitingInput, parseDelegationOperationId, unreadMessages,
+  delegationChatMessage, delegationSettled, inputWaitOperationId, isAwaitingInput, isModelPaused, modelWaitOperationId, parseDelegationOperationId, unreadMessages,
 } from './delegation.ts';
 import { workLeaseKey, yieldWorkClaim } from './scheduler.ts';
 import { runExperimentIds } from './isolation.ts';
@@ -96,6 +96,21 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
   const itemMutex = new KeyedMutex();
   const workerActor = systemActor(config.workerId);
   const phases = createPhaseGovernor(deps, config);
+  /** (A[0]) The last model invocation of each session's current turn (its exact failure reason / pause), read once. */
+  const lastInvocations = new Map<string, ModelInvocation>();
+
+  /** (A[3] cost switch) The tightest USD budget left for an item's model calls (run and work scopes with a cost limit). */
+  async function costPressure(runId: string, workItemId: string): Promise<{ remainingUsd: number; limitUsd: number } | undefined> {
+    let best: { remainingUsd: number; limitUsd: number } | undefined;
+    for (const scope of [runScope(runId), workScope(workItemId)]) {
+      const u = await budget.usage(scope);
+      const limit = u?.limits.costUsd;
+      if (u === undefined || limit === undefined) continue;
+      const remaining = limit - (u.used.costUsd ?? 0) - (u.reserved.costUsd ?? 0);
+      if (!best || remaining < best.remainingUsd) best = { remainingUsd: remaining, limitUsd: limit };
+    }
+    return best;
+  }
 
   // ------------------------------------------------------------------------------------------------ workspaces
 
@@ -354,7 +369,11 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
     });
     const offeredIds = tools.definitions().map((d) => d.name.replaceAll('__', '.'));
     const independent = spec.modelPolicy.independentFromRoles ?? [];
-    const model = createModelInvoker({
+    // A[2]: a run or item with a USD budget never routes to a route whose cost is unknown; A[3]: budget pressure switches
+    const costBudgeted = run.budget.maxModelCostUsd !== undefined || item.budget.maxCostUsd !== undefined;
+    // A[4]: the engine's capabilities choose the switch behaviour (an engine without providerSwitch stays on its provider)
+    const engineCaps = deps.engines.get(agent.engineKind).capabilities;
+    const invoker = createModelInvoker({
       ids: deps.ids,
       clock: deps.clock,
       logger: deps.logger,
@@ -372,7 +391,19 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
       eventContext,
       // reviewer heterogeneity: resolved at every boundary ([] = resolved, none used yet)
       routeRequestExtras: async () => (independent.length > 0 ? { providersToAvoid: await epochs.providersUsedByRoles(run.runId, independent) } : {}),
+      events,
+      ...(deps.catalog ? { catalog: deps.catalog } : {}),
+      costBudgeted,
+      ...(costBudgeted ? { costPressure: () => costPressure(run.runId, item.workItemId) } : {}),
+      providerSwitch: engineCaps?.providerSwitch !== false,
     });
+    const model: ModelInvoker = {
+      async invoke(request) {
+        const out = await invoker.invoke(request);
+        lastInvocations.set(agent.sessionId, out);
+        return out;
+      },
+    };
     const context = createContextProvider(deps, config, { run, item, role, agentId: agent.agentId, workspace: ws, eventContext, turnState, tools });
     return { model, tools, context, sessions, eventContext, events };
   }
@@ -648,6 +679,14 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
         await fenced(() => blackboard.transitionWorkItem(workItemId, 'waiting', { waitingOn: unresumed }, agentCtx, { expectedFencingToken: fencingToken, expectedFrom: ['running'] }));
         return { status: 'waiting', workItemId, operationIds: unresumed };
       }
+      // A[0]: an agent paused for model unavailability runs no turn before its resume time (e.g. a crash between the pause
+      // and the item's wait): the item waits on the pause again (observeWaiting resumes it)
+      const paused = epochs.modelPause ? await epochs.modelPause(agent.sessionId) : undefined;
+      if (paused && Date.parse(paused.resumeAt) > clock.nowMs()) {
+        const op = modelWaitOperationId(agent.agentId);
+        await fenced(() => blackboard.transitionWorkItem(workItemId, 'waiting', { waitingOn: [op] }, agentCtx, { expectedFencingToken: fencingToken, expectedFrom: ['running'] }));
+        return { status: 'waiting', workItemId, operationIds: [op] };
+      }
       if (options.expectedTurn !== undefined) {
         const session = await sessions.get(agent.sessionId);
         const last = await sessions.lastTurn(agent.sessionId);
@@ -676,6 +715,8 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
       }
       await stop();
       const result = step.result;
+      const invocation = lastInvocations.get(agent.sessionId);
+      lastInvocations.delete(agent.sessionId);
       switch (result.status) {
         case 'continue': {
           const now = await blackboard.getWorkItem(workItemId);
@@ -710,8 +751,15 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
         case 'boundary': {
           if (result.boundary === 'retry_next_turn') return { status: 'continue', workItemId, turn: result.turn };
           if (result.boundary === 'cancelled') throw new HypertestError('cancelled', `turn of work item ${workItemId} was cancelled before the model call`);
+          const failedInvocation = invocation && !invocation.ok ? invocation : undefined;
+          if (result.boundary === 'model_unavailable') {
+            // A[0] the fallback pipeline ends in ALLOW or PAUSE: no route for now ⇒ the work PAUSES (never a silent failure)
+            const pause = failedInvocation?.pause ?? (epochs.modelPause ? await epochs.modelPause(agent.sessionId) : undefined);
+            if (pause && (failedInvocation?.pause !== undefined || pause.turn === result.turn)) return await pauseItem(item, agent, pause, fencingToken, agentCtx);
+          }
           const reason = result.boundary === 'budget_exhausted' ? 'budget_exhausted' : 'model_unavailable';
-          const message = `model boundary ${result.boundary}`;
+          // the exact reason (e.g. no configured route may serve the role: a missing credential, a capability) — fail closed
+          const message = failedInvocation?.message ?? `model boundary ${result.boundary}`;
           await settleAgentFailed(agent, { reason, message }, agentCtx);
           await failItem(item, fencingToken, reason, message, agentCtx);
           if (reason === 'budget_exhausted') {
@@ -781,6 +829,74 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
     return waited ? undefined : [...ops];
   }
 
+  /**
+   * (A[0]) PAUSE: the item waits on `model:<agentId>` until its agent's ModelPause may resume (L0 `work.paused`, pauseReason
+   * model_unavailable, in the same transaction as the transition). Its claim, agent and session stay; nothing is failed.
+   */
+  async function pauseItem(item: WorkItem, agent: AgentInstance, pause: ModelPause, token: number, ctx: EventContext): Promise<TurnOutcome> {
+    const op = modelWaitOperationId(agent.agentId);
+    await fenced(() =>
+      db.transaction(async (tx) => {
+        await blackboard.transitionWorkItem(item.workItemId, 'waiting', { waitingOn: [op] }, ctx, { expectedFencingToken: token, expectedFrom: ['running'], tx });
+        await events.append(
+          [
+            event(ctx, EVENT_TYPES.workPaused, 'work_item', item.workItemId, {
+              workItemId: item.workItemId, agentId: agent.agentId, pauseReason: 'model_unavailable', resumeAt: pause.resumeAt, routes: pause.routes, reason: pause.reason,
+              consecutive: pause.consecutive, turn: pause.turn,
+            }),
+          ],
+          tx,
+        );
+      }),
+    );
+    logger.warn('work item paused: no model route can serve its agent for now', { workItemId: item.workItemId, agentId: agent.agentId, resumeAt: pause.resumeAt, consecutive: pause.consecutive });
+    return { status: 'waiting', workItemId: item.workItemId, operationIds: [op] };
+  }
+
+  /**
+   * (A[0]) observeWaiting of a model-paused item: before the pause's resumeAt it keeps waiting (bounded by the item's and
+   * the run's wall clock); afterwards (or once an operator released it) the item runs again and its next turn routes anew.
+   */
+  async function resumeModelPause(item: WorkItem, agent: AgentInstance, run: TestRun, token: number, ctx: EventContext, lastTurn: number): Promise<TurnOutcome> {
+    const workItemId = item.workItemId;
+    const pause = epochs.modelPause ? await epochs.modelPause(agent.sessionId) : undefined;
+    const now = clock.nowMs();
+    if (pause && Date.parse(pause.resumeAt) > now) {
+      const expired =
+        now - Date.parse(agent.createdAt) >= item.budget.maxWallClockMs
+          ? `the work item's maxWallClockMs (${item.budget.maxWallClockMs} ms)`
+          : now - Date.parse(run.createdAt) > run.budget.maxWallClockMs
+            ? `the run's maxWallClockMs (${run.budget.maxWallClockMs} ms)`
+            : undefined;
+      if (!expired) return { status: 'waiting', workItemId, operationIds: item.waitingOn };
+      const message = `paused for model unavailability past ${expired}: ${pause.reason}`;
+      try {
+        const done = await blackboard.transitionWorkItem(workItemId, 'failed', { failure: { reason: 'model_unavailable', message } }, ctx, { expectedFencingToken: token, expectedFrom: ['waiting'] });
+        await release(done);
+      } catch (e) {
+        if (isHypertestError(e, 'stale_fence') || isHypertestError(e, 'conflict')) return { status: 'lease_lost', workItemId };
+        throw e;
+      }
+      await settleAgentFailed(agent, { reason: 'model_unavailable', message }, ctx);
+      logger.warn('model-paused work item timed out', { runId: item.runId, workItemId });
+      return { status: 'failed', workItemId };
+    }
+    try {
+      await db.transaction(async (tx) => {
+        await blackboard.transitionWorkItem(workItemId, 'running', { waitingOn: [] }, ctx, { expectedFencingToken: token, expectedFrom: ['waiting'], tx });
+        await events.append(
+          [event(ctx, EVENT_TYPES.workResumed, 'work_item', workItemId, { workItemId, agentId: agent.agentId, pauseReason: 'model_unavailable', pausedSince: pause?.createdAt ?? null, resumeAt: pause?.resumeAt ?? null })],
+          tx,
+        );
+      });
+    } catch (e) {
+      if (isHypertestError(e, 'stale_fence') || isHypertestError(e, 'conflict')) return { status: 'lease_lost', workItemId };
+      throw e;
+    }
+    logger.info('model-paused work item resumes: its next turn routes again', { workItemId, agentId: agent.agentId });
+    return { status: 'continue', workItemId, turn: lastTurn };
+  }
+
   async function workBudgetExhausted(item: WorkItem, agent: AgentInstance): Promise<string | undefined> {
     const b = item.budget;
     const session = await sessions.get(agent.sessionId);
@@ -828,6 +944,8 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
     await renewResourceClaims(item, ctx, 'waiting');
     // a continuable delegation between tasks: more input from its parent resumes it; its release completes it
     if (isAwaitingInput(item)) return awaitInput(item, agent, run, token, ctx, lastTurn);
+    // A[0] an agent paused for model unavailability: resumes once its pause's resume time has passed
+    if (isModelPaused(item)) return resumeModelPause(item, agent, run, token, ctx, lastTurn);
 
     const lines: string[] = [];
     const evidenceIds: string[] = [];

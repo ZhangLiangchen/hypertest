@@ -5,6 +5,7 @@ export * from './plan.ts';
 export * from './blackboard.ts';
 export * from './testing.ts';
 export * from './evidence.ts';
+export * from './claims.ts';
 export * from './operation.ts';
 export * from './context.ts';
 export * from './events.ts';

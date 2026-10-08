@@ -1,5 +1,5 @@
 import type { BaseDeps, Clock, SqlDatabase, SqlExecutor } from '@hypertest/core';
-import type { ArtifactRef, DataClassification, DomainEventSink, EventContext, EvidenceInput, EvidenceRecord, EvidenceSeal, ReportClaim } from '@hypertest/domain';
+import type { ArtifactRef, ClaimEvaluation, DataClassification, DomainEventSink, EventContext, EvidenceInput, EvidenceRecord, EvidenceSeal, ReportClaim } from '@hypertest/domain';
 
 /**
  * @hypertest/evidence — content-addressed artifacts + tamper-evident evidence ledger (I6).
@@ -187,16 +187,27 @@ export interface RecordEvidenceInput extends Omit<EvidenceInput, 'artifact'> {
 export interface ResolveClaimOptions {
   /** Every referenced evidence must belong to this run (else: all references must share one run). */
   runId?: string;
+  /**
+   * (additive, area-C-0) The artifact store of the evidence: when a claim's `field` is not in a record's structured payload
+   * and the record's artifact is JSON, its content is read (digest-checked by the store) and the field taken from it.
+   */
+  artifacts?: Pick<ArtifactStore, 'get'>;
 }
 
 /**
  * `supported` is false (with `problems`) unless every reference exists, matches the claim's query,
- * belongs to one run, and — additionally — its stored metadata/record hashes still recompute (a
- * record rewritten behind the ledger never supports a claim). Chain and artifact checks: verify().
+ * belongs to one run, its stored metadata/record hashes still recompute (a record rewritten behind the
+ * ledger never supports a claim) and — (additive, area-C-0) — the claim EVALUATES true: the evidenceQuery
+ * aggregation over the referenced evidence equals claim.value (domain `evaluateClaim`: exact for strings,
+ * booleans and structured values, CLAIM_RELATIVE_TOLERANCE for numbers). `evaluation` says how it was judged
+ * (a value the evidence contradicts is `mismatch`, one that cannot be computed `unevaluable`). Chain and artifact
+ * checks: verify().
  */
 export interface ClaimResolution {
   claim: ReportClaim;
   supported: boolean;
   evidence: EvidenceRecord[];
   problems: string[];
+  /** (additive, area-C-0) The deterministic evaluation of the claim (absent when the references themselves failed). */
+  evaluation?: ClaimEvaluation;
 }

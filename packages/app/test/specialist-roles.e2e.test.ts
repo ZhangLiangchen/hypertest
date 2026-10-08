@@ -19,7 +19,7 @@ const HOSTED_ROUTE = {
   capabilities: [...FULL_ROUTE.capabilities, 'vision'], quality: { default: 0.95 }, maxDataClassification: 'confidential',
 };
 const LOCAL_ROUTE = {
-  routeId: 'local-small', provider: 'local', model: 'local-1', capabilities: ['tool_use', 'structured_output', 'long_context'],
+  routeId: 'local-small', provider: 'local', model: 'local-1', ...FULL_ROUTE, capabilities: ['tool_use', 'structured_output', 'long_context'],
   quality: { default: 0.7 }, maxActionRisk: 'critical', maxDataClassification: 'restricted',
 };
 

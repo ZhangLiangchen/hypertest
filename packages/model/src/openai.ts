@@ -1,7 +1,7 @@
 import { HypertestError, sha256Hex, type JsonValue } from '@hypertest/core';
 import type { AssistantMessage, ChatMessage, ContentPart, ToolCall } from '@hypertest/domain';
-import type { ModelCallRequest, ModelCallResponse, ModelProvider, ModelUsage, OpenAICompatibleProviderOptions, StopReason, StreamDelta } from './contracts.ts';
-import { codeForHttpStatus, providerFault, secretsOf, type ProviderErrorCode } from './errors.ts';
+import type { ModelCallRequest, ModelCallResponse, ModelProvider, ModelUsage, OpenAICompatibleProviderOptions, ProviderAvailability, StopReason, StreamDelta } from './contracts.ts';
+import { codeForHttpStatus, credentialAvailability, missingCredentialError, providerFault, secretsOf, type ProviderErrorCode } from './errors.ts';
 import { ToolNameMap } from './tool-names.ts';
 import { DEFAULT_TIMEOUT_MS, guardDelta, isEventStream, monoMs, normalizeTransportError, parseJsonPayload, postJson, readSse, withDeadline } from './transport.ts';
 import { estimatedUsage, nonNegInt } from './usage.ts';
@@ -26,6 +26,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
   readonly #headers: Record<string, string>;
   readonly #timeoutMs: number;
   readonly #fetch: typeof fetch;
+  readonly #credential: ProviderAvailability;
 
   constructor(options: OpenAICompatibleProviderOptions) {
     if (!options.providerId) throw new HypertestError('invalid_argument', 'OpenAICompatibleProvider: providerId is required');
@@ -36,9 +37,16 @@ export class OpenAICompatibleProvider implements ModelProvider {
     this.#headers = options.headers ?? {};
     this.#timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.#fetch = options.fetchImpl ?? fetch;
+    this.#credential = credentialAvailability(this.providerId, options.requireApiKey, options.apiKey, options.apiKeySource);
+  }
+
+  /** Unavailable when a required API key is missing (the router never routes to it; complete() refuses locally). */
+  availability(): ProviderAvailability {
+    return this.#credential;
   }
 
   async complete(request: ModelCallRequest, options: { onDelta?: (d: StreamDelta) => void } = {}): Promise<ModelCallResponse> {
+    if (!this.#credential.ok) throw missingCredentialError(this.providerId, this.#credential.reason);
     const started = monoMs();
     const names = new ToolNameMap();
     const body = buildOpenAIBody(request, names);

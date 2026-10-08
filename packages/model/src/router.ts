@@ -12,7 +12,10 @@ import {
 } from '@hypertest/domain';
 import type {
   CircuitSnapshot,
+  DecisionCheck,
   InvokeOutcome,
+  ModelUnavailability,
+  ObservedPrice,
   InvokeRequest,
   ModelCallRequest,
   ModelCapabilityProfile,
@@ -23,9 +26,9 @@ import type {
   ModelCallResponse,
   RouterDeps,
 } from './contracts.ts';
-import { CircuitBreakers, type CircuitTransition, type PriceViolation } from './circuit.ts';
+import { AVAILABILITY_FAILURES, CircuitBreakers, type CircuitTransition, type PriceViolation } from './circuit.ts';
 import { FALLBACK_ELIGIBLE, SAME_ROUTE_RETRYABLE } from './errors.ts';
-import { estimateCostUsd } from './usage.ts';
+import { costKnown, estimateCostUsd } from './usage.ts';
 
 type OkDecision = Extract<RouteDecision, { ok: true }>;
 
@@ -65,7 +68,12 @@ type Evaluation = { ok: true; candidate: Candidate } | { ok: false; rejection: R
 interface PriceNote {
   profile: ModelCapabilityProfile;
   violation?: PriceViolation;
+  /** (A[1]) An observed-price change guard note (kind `change`) instead of a ceiling note. */
+  change?: { violated: boolean; observed: ObservedPrice; increasePct: number; maxIncreasePct: number };
 }
+
+/** The rejection stages after which a route may come back by itself (pause, never fail closed). */
+const TRANSIENT_STAGES: ReadonlySet<RouteRejection['stage']> = new Set(['availability', 'excluded']);
 
 export function createModelRouter(deps: RouterDeps): ModelRouter {
   return new DefaultModelRouter(deps);
@@ -138,18 +146,138 @@ function validateRequest(request: RouteRequest): void {
 class DefaultModelRouter implements ModelRouter {
   readonly #deps: RouterDeps;
   readonly #breakers: CircuitBreakers | undefined;
+  /** (A[1]) Observed prices by route id, refreshed from deps.prices at every safe point (route/invoke/validate). */
+  #observed: ReadonlyMap<string, ObservedPrice> = new Map();
+  /** (A[1]) Routes whose observed price is currently beyond the change guard (circuit open, reason price_change). */
+  readonly #priceChanged = new Set<string>();
+  readonly #maxIncreasePct: number | undefined;
 
   constructor(deps: RouterDeps) {
     this.#deps = deps;
     this.#breakers = deps.circuitBreaker === false ? undefined : new CircuitBreakers(deps.circuitBreaker ?? {});
+    const pct = deps.circuitBreaker === false ? undefined : deps.circuitBreaker?.priceGuard?.maxIncreasePct;
+    if (pct !== undefined && !(typeof pct === 'number' && Number.isFinite(pct) && pct >= 0)) {
+      throw new HypertestError('invalid_argument', `circuitBreaker.priceGuard.maxIncreasePct must be a finite number ≥ 0 (got ${String(pct)})`);
+    }
+    this.#maxIncreasePct = pct;
+  }
+
+  get catalogRevision(): string {
+    return this.#deps.catalog.revision;
   }
 
   circuits(): CircuitSnapshot[] {
     return this.#breakers ? this.#breakers.snapshots(this.#deps.clock.nowMs()) : [];
   }
 
+  /**
+   * (A[1]) Refreshes the observed prices at a safe point (a turn boundary: the start of route / invoke / validate). A
+   * failing price source keeps the last observed prices (logged): the guard never flaps open on a read error, and the
+   * catalog prices stay in force for routes never observed.
+   */
+  async #refreshPrices(): Promise<void> {
+    const source = this.#deps.prices;
+    if (!source) return;
+    try {
+      const current = await source.current();
+      const next = new Map<string, ObservedPrice>();
+      for (const [routeId, price] of Object.entries(current ?? {})) {
+        const ok = (v: unknown) => typeof v === 'number' && Number.isFinite(v) && v >= 0;
+        if (!price || !ok(price.inputPerMillionUsd) || !ok(price.outputPerMillionUsd)) {
+          this.#deps.logger.warn('observed model price ignored: prices must be finite numbers ≥ 0', { routeId });
+          continue;
+        }
+        next.set(routeId, price);
+      }
+      this.#observed = next;
+    } catch (e) {
+      this.#deps.logger.error('model price source could not be read; keeping the last observed prices', { error: (e as Error).message });
+    }
+  }
+
+  /** The profile priced at its observed price (when one is observed): what a call on it costs now. */
+  #priced(p: ModelCapabilityProfile): ModelCapabilityProfile {
+    const o = this.#observed.get(p.routeId);
+    if (!o) return p;
+    return { ...p, costPerMillionInputUsd: o.inputPerMillionUsd, costPerMillionOutputUsd: o.outputPerMillionUsd };
+  }
+
+  /** (A[1]) The price-change guard: observed price vs catalog price, beyond maxIncreasePct ⇒ violated. */
+  #priceChange(p: ModelCapabilityProfile): PriceNote['change'] | undefined {
+    const max = this.#maxIncreasePct;
+    const o = this.#observed.get(p.routeId);
+    if (max === undefined || !o || !costKnown(p)) return undefined;
+    const pct = (observed: number, catalog: number) => (observed <= catalog ? 0 : catalog === 0 ? Number.POSITIVE_INFINITY : ((observed - catalog) / catalog) * 100);
+    const increasePct = Math.max(pct(o.inputPerMillionUsd, p.costPerMillionInputUsd!), pct(o.outputPerMillionUsd, p.costPerMillionOutputUsd!));
+    return { violated: increasePct > max, observed: o, increasePct, maxIncreasePct: max };
+  }
+
+  /**
+   * Classifies a request no route can serve: transient (an open/half-open circuit, a price guard, an availability failure,
+   * routes that failed earlier in this epoch sequence) ⇒ the work pauses until `retryAt`; otherwise permanent (fail closed).
+   */
+  #unavailability(rejected: readonly RouteRejection[], failure?: { routeId: string; err: HypertestError }): ModelUnavailability {
+    const nowMs = this.#deps.clock.nowMs();
+    const routes = [...new Set([...(failure ? [failure.routeId] : []), ...rejected.map((r) => r.routeId)])];
+    const retryCandidates: number[] = [];
+    const halfOpenOf = (routeId: string) => {
+      const snap = this.#breakers?.snapshot(routeId, nowMs);
+      if (snap && snap.state === 'open' && snap.halfOpenAt) retryCandidates.push(Date.parse(snap.halfOpenAt));
+    };
+    let transient = false;
+    const why: string[] = [];
+    if (failure) {
+      const { err } = failure;
+      const stage = (err.details as { stage?: unknown } | undefined)?.stage;
+      if (AVAILABILITY_FAILURES.has(err.code) || (err.code === 'precondition_failed' && typeof stage === 'string' && TRANSIENT_STAGES.has(stage as RouteRejection['stage']))) {
+        transient = true;
+        const retryAfterMs = (err.details as { retryAfterMs?: unknown } | undefined)?.retryAfterMs;
+        if (typeof retryAfterMs === 'number' && Number.isFinite(retryAfterMs) && retryAfterMs >= 0) retryCandidates.push(nowMs + retryAfterMs);
+        halfOpenOf(failure.routeId);
+      }
+      why.push(`route ${failure.routeId} failed (${err.code}: ${err.message})`);
+    }
+    for (const r of rejected) {
+      if (TRANSIENT_STAGES.has(r.stage)) {
+        transient = true;
+        halfOpenOf(r.routeId);
+      }
+      why.push(`${r.routeId}: ${r.stage} (${r.reason})`);
+    }
+    const out: ModelUnavailability = {
+      transient,
+      reason: `${transient ? 'no model route is available now' : 'no configured model route may serve this request'}${why.length > 0 ? `: ${why.join('; ')}` : ''}`,
+      routes,
+    };
+    if (transient && retryCandidates.length > 0) out.retryAt = new Date(Math.min(...retryCandidates)).toISOString();
+    return out;
+  }
+
+  async validate(decision: OkDecision, routeRequest: RouteRequest): Promise<DecisionCheck> {
+    validateRequest(routeRequest);
+    await this.#refreshPrices();
+    const classification = requiredClassification(routeRequest);
+    try {
+      this.#checkDecision(decision, routeRequest, classification);
+      return { ok: true };
+    } catch (e) {
+      const err = toHypertestError(e);
+      if (err.code !== 'precondition_failed') throw err;
+      const rawStage = (err.details as { stage?: unknown } | undefined)?.stage;
+      const stage = typeof rawStage === 'string' ? (rawStage as RouteRejection['stage'] | 'catalog') : 'catalog';
+      const transient = stage !== 'catalog' && TRANSIENT_STAGES.has(stage);
+      const out: DecisionCheck = { ok: false, stage, reason: err.message, transient };
+      if (transient) {
+        const u = this.#unavailability([{ routeId: decision.routeId, stage: stage as RouteRejection['stage'], reason: err.message }]);
+        if (u.retryAt) out.retryAt = u.retryAt;
+      }
+      return out;
+    }
+  }
+
   async route(request: RouteRequest, ctx: EventContext): Promise<RouteDecision> {
     validateRequest(request);
+    await this.#refreshPrices();
     const classification = requiredClassification(request);
     if ((request.policy.independentFromRoles?.length ?? 0) > 0 && request.providersToAvoid === undefined) {
       // Independence can only be enforced from resolved providers; [] means "resolved, none used yet".
@@ -194,7 +322,7 @@ class DefaultModelRouter implements ModelRouter {
         rejected: rejected as unknown as JsonValue,
         ...base,
       });
-      return { ok: false, reason: 'no_eligible_route', rejected };
+      return { ok: false, reason: 'no_eligible_route', rejected, unavailable: this.#unavailability(rejected) };
     }
 
     let selectedByPolicy: SelectionCriterion = 'only_eligible_route';
@@ -262,6 +390,9 @@ class DefaultModelRouter implements ModelRouter {
 
     // 2. capability
     if (!this.#deps.providers.has(p.provider)) return reject('capability', `no adapter registered for provider ${p.provider}`);
+    // e2e[3]: a provider without its required credential is unavailable — no request ever leaves the process for it
+    const providerState = this.#deps.providers.get(p.provider).availability?.();
+    if (providerState && providerState.ok !== true) return reject('capability', `provider ${p.provider} is unavailable: ${providerState.reason}`);
     const required = new Set<ModelCapability>([...request.requiredCapabilities, ...(policy.requiredCapabilities ?? [])]);
     const routeCaps: readonly unknown[] = Array.isArray(p.capabilities) ? p.capabilities : [];
     const missing = [...required].filter((c) => !routeCaps.includes(c)).sort();
@@ -278,10 +409,22 @@ class DefaultModelRouter implements ModelRouter {
     if (policy.minQuality !== undefined && !(score >= policy.minQuality)) return reject('quality', `quality ${score} < minQuality ${policy.minQuality}`);
 
     // 4. availability (circuit breaker, price guard) — after every eligibility stage: it only ever rejects
+    const priced = this.#priced(p);
     if (this.#breakers) {
       const v = this.#breakers.availability(p.routeId, this.#deps.clock.nowMs());
       if (!v.available) return reject('availability', v.reason);
-      const price = this.#breakers.priceCheck(p, request);
+      // A[1]: an observed price beyond the change guard opens the route's circuit for every request
+      const change = this.#priceChange(p);
+      if (change) {
+        priceNotes?.push({ profile: p, change });
+        if (change.violated) {
+          return reject(
+            'availability',
+            `circuit open (price_change): observed price $${change.observed.inputPerMillionUsd}/$${change.observed.outputPerMillionUsd} per M in/out is ${Number.isFinite(change.increasePct) ? `+${change.increasePct.toFixed(1)}%` : 'an unbounded increase'} over the catalog price $${p.costPerMillionInputUsd}/$${p.costPerMillionOutputUsd} (priceGuard.maxIncreasePct ${change.maxIncreasePct}%)`,
+          );
+        }
+      }
+      const price = this.#breakers.priceCheck(priced, request);
       if (price.applies) {
         priceNotes?.push(price.violation ? { profile: p, violation: price.violation } : { profile: p });
         if (price.violation) {
@@ -299,10 +442,17 @@ class DefaultModelRouter implements ModelRouter {
       return reject('latency', `typical latency ${p.typicalLatencyMs}ms > budget ${policy.latencyBudgetMs}ms`);
     }
 
-    // 6. cost (never first)
-    const cost = estimateCostUsd(p, request.contextTokensEstimate, p.maxOutputTokens);
+    // 6. cost (never first). A[2]: an undeclared price is unknown — never routed for a cost-limited request
+    const cost = estimateCostUsd(priced, request.contextTokensEstimate, p.maxOutputTokens);
+    const costLimited = policy.maxCostPerCallUsd !== undefined || request.costBudgeted === true || request.cheaperThanUsd !== undefined;
+    if (costLimited && !costKnown(priced)) {
+      return reject('cost', 'route cost is unknown (no costPerMillionInputUsd/costPerMillionOutputUsd declared or observed) and the request is cost-limited');
+    }
     if (policy.maxCostPerCallUsd !== undefined && !(cost <= policy.maxCostPerCallUsd)) {
       return reject('cost', `estimated cost $${Number.isFinite(cost) ? cost.toFixed(6) : 'NaN'} > limit $${policy.maxCostPerCallUsd}`);
+    }
+    if (request.cheaperThanUsd !== undefined && !(cost < request.cheaperThanUsd)) {
+      return reject('cost', `estimated cost $${Number.isFinite(cost) ? cost.toFixed(6) : 'NaN'} is not below $${request.cheaperThanUsd} (budget pressure: a cheaper route is required)`);
     }
 
     const pref = policy.preferredRoutes?.indexOf(p.routeId) ?? -1;
@@ -314,6 +464,7 @@ class DefaultModelRouter implements ModelRouter {
     // Malformed inputs are caller faults (thrown, no events), exactly like route().
     const maxAttempts = normalizeAttempts(request.maxAttempts);
     validateRequest(routeRequest);
+    await this.#refreshPrices();
     const classification = requiredClassification(routeRequest);
     const startedMs = this.#deps.clock.nowMs();
     const identity = { routeId: decision.routeId, provider: decision.provider, model: decision.model, snapshotId: routeRequest.contextSnapshotId };
@@ -325,12 +476,14 @@ class DefaultModelRouter implements ModelRouter {
     /** A half-open probe slot this call holds until the breaker got its verdict. */
     let probe = false;
     let probeSettled = false;
+    /** Price-guard observations of the decision's re-check (recorded as circuit events whatever the outcome). */
+    const priceNotes: PriceNote[] = [];
     // Only the decision check and the provider call are inside this try: a failure there is a MODEL outcome
     // (reported + possibly a fallback). Anything after the call succeeded (e.g. the audit sink) is a fault.
     try {
       // the decision is re-validated for THIS request — including the availability stage: an open breaker refuses here,
       // before any provider call (precondition_failed ⇒ re-validated fallback, or none under fail_closed)
-      profile = this.#checkDecision(decision, routeRequest, classification);
+      profile = this.#checkDecision(decision, routeRequest, classification, priceNotes);
       if (breakers) {
         const slot = breakers.acquire(decision.routeId, this.#deps.clock.nowMs());
         if (slot.kind === 'refused') {
@@ -387,10 +540,14 @@ class DefaultModelRouter implements ModelRouter {
         // The caller gave up (whatever its abort reason, e.g. its own turn deadline): not a route failure, no fallback.
         err = new HypertestError('cancelled', `model call cancelled by caller: ${err.message}`, { retryable: false, cause: err });
       }
+      await this.#notePrices(ctx, routeRequest, this.#deps.catalog.revision, priceNotes);
       return this.#failed(err, attempts, startedMs, identity, decision, routeRequest, call, ctx, transitions);
     }
+    await this.#notePrices(ctx, routeRequest, this.#deps.catalog.revision, priceNotes);
     if (response.usage.costUsd === undefined) {
-      response.usage.costUsd = estimateCostUsd(profile, response.usage.inputTokens, response.usage.outputTokens);
+      // priced at the observed price when one is known; an unknown price leaves the cost unknown (never $0, A[2])
+      const estimated = estimateCostUsd(this.#priced(profile), response.usage.inputTokens, response.usage.outputTokens);
+      if (Number.isFinite(estimated)) response.usage.costUsd = estimated;
     }
     const opaque = response.message.reasoning?.opaque;
     if (opaque && opaque.compatibilityClass !== profile.continuationCompatibilityClass) {
@@ -442,16 +599,19 @@ class DefaultModelRouter implements ModelRouter {
    * unchanged, and every filter stage (security first) passing for this request. A decision may be reused across
    * turns of an epoch while the request changes (data classification, action risk, independence, context size).
    */
-  #checkDecision(decision: OkDecision, routeRequest: RouteRequest, classification: { level: number; name: DataClassification }): ModelCapabilityProfile {
+  #checkDecision(decision: OkDecision, routeRequest: RouteRequest, classification: { level: number; name: DataClassification }, priceNotes?: PriceNote[]): ModelCapabilityProfile {
     const catalog = this.#deps.catalog;
     const profile = catalog.get(decision.routeId);
     if (!profile || profile.provider !== decision.provider || profile.model !== decision.model || profile.continuationCompatibilityClass !== decision.continuationCompatibilityClass) {
-      throw new HypertestError('precondition_failed', `route ${decision.routeId} is no longer available as decided`, { retryable: false, details: { routeId: decision.routeId } });
+      throw new HypertestError('precondition_failed', `route ${decision.routeId} is no longer available as decided`, { retryable: false, details: { routeId: decision.routeId, stage: 'catalog' } });
     }
     if (decision.capabilityProfileRevision !== catalog.revision) {
-      throw new HypertestError('precondition_failed', `decision was made against catalog ${decision.capabilityProfileRevision}; current is ${catalog.revision}`, { retryable: false, details: { routeId: decision.routeId } });
+      throw new HypertestError('precondition_failed', `decision was made against catalog ${decision.capabilityProfileRevision}; current is ${catalog.revision}`, {
+        retryable: false,
+        details: { routeId: decision.routeId, stage: 'catalog' },
+      });
     }
-    const ev = this.#evaluate(profile, routeRequest, classification);
+    const ev = this.#evaluate(profile, routeRequest, classification, priceNotes);
     if (!ev.ok) {
       const { stage, reason } = ev.rejection;
       throw new HypertestError('precondition_failed', `route ${decision.routeId} is not eligible for this request (${stage}): ${reason}`, {
@@ -485,7 +645,12 @@ class DefaultModelRouter implements ModelRouter {
       await this.#deps.events.emit([failed, ...transitions.map((t) => this.#circuitEvent(ctx, t, decision, routeRequest.contextSnapshotId))]);
     }
     const outcome: InvokeOutcome = { ok: false, error, attempts };
-    if (!FALLBACK_ELIGIBLE.has(err.code)) return outcome;
+    const failure = { routeId: decision.routeId, err };
+    if (!FALLBACK_ELIGIBLE.has(err.code)) {
+      // a malformed request (provider_error), a caller-side fault: permanent — never answered by another model
+      if (err.code !== 'cancelled') outcome.unavailable = this.#unavailability([], failure);
+      return outcome;
+    }
 
     const failClosed = routeRequest.policy.fallback === 'fail_closed';
     const excludeRoutes = [...new Set([...(routeRequest.excludeRoutes ?? []), decision.routeId])];
@@ -499,6 +664,7 @@ class DefaultModelRouter implements ModelRouter {
         excludeRoutes,
         snapshotId: routeRequest.contextSnapshotId,
       });
+      outcome.unavailable = this.#unavailability([], failure);
       return outcome;
     }
     // Full re-validation (security → capability incl. tool compatibility → quality → …) of every remaining route.
@@ -512,13 +678,14 @@ class DefaultModelRouter implements ModelRouter {
       snapshotId: routeRequest.contextSnapshotId,
     });
     if (next.ok) outcome.fallback = next;
+    else outcome.unavailable = this.#unavailability(next.rejected, failure);
     return outcome;
   }
 
   estimateCostUsd(routeId: string, inputTokens: number, outputTokens: number): number {
     const p = this.#deps.catalog.get(routeId);
     if (!p) throw new HypertestError('not_found', `unknown route ${routeId}`, { details: { routeId } });
-    return estimateCostUsd(p, inputTokens, outputTokens);
+    return estimateCostUsd(this.#priced(p), inputTokens, outputTokens);
   }
 
   /** `model.circuit_opened` / `model.circuit_closed` for a breaker transition caused by a call. */
@@ -537,11 +704,34 @@ class DefaultModelRouter implements ModelRouter {
     if (!this.#breakers || notes.length === 0) return;
     const out: Array<DomainEventInput<Record<string, JsonValue>>> = [];
     for (const n of notes) {
+      if (n.change) {
+        // A[1] price-change guard: opened the first time the observed price is beyond the guard, closed once back within
+        const routeId = n.profile.routeId;
+        const was = this.#priceChanged.has(routeId);
+        if (n.change.violated === was) continue;
+        const base: Record<string, JsonValue> = {
+          routeId, provider: n.profile.provider, model: n.profile.model, catalogRevision, snapshotId: request.contextSnapshotId,
+          catalogPrice: { inputPerMillionUsd: n.profile.costPerMillionInputUsd ?? null, outputPerMillionUsd: n.profile.costPerMillionOutputUsd ?? null },
+          observedPrice: { inputPerMillionUsd: n.change.observed.inputPerMillionUsd, outputPerMillionUsd: n.change.observed.outputPerMillionUsd, observedAt: n.change.observed.observedAt ?? null, source: n.change.observed.source ?? null },
+          increasePct: Number.isFinite(n.change.increasePct) ? Number(n.change.increasePct.toFixed(3)) : null,
+          maxIncreasePct: n.change.maxIncreasePct,
+        };
+        if (n.change.violated) {
+          this.#priceChanged.add(routeId);
+          this.#deps.logger.warn('model circuit opened by the price-change guard', { routeId, increasePct: n.change.increasePct });
+          out.push(eventFrom(ctx, MODEL_CIRCUIT_EVENTS.opened, 'model', routeId, { ...base, reason: 'price_change', appliesTo: 'all_requests' }));
+        } else {
+          this.#priceChanged.delete(routeId);
+          this.#deps.logger.info('model price-change guard cleared', { routeId });
+          out.push(eventFrom(ctx, MODEL_CIRCUIT_EVENTS.closed, 'model', routeId, { ...base, reason: 'price_change_cleared' }));
+        }
+        continue;
+      }
       const change = this.#breakers.notePrice(n.profile.routeId, catalogRevision, n.violation !== undefined);
       if (!change) continue;
       const base: Record<string, JsonValue> = {
         routeId: n.profile.routeId, provider: n.profile.provider, model: n.profile.model, catalogRevision, snapshotId: request.contextSnapshotId,
-        price: { inputPerMillionUsd: n.profile.costPerMillionInputUsd, outputPerMillionUsd: n.profile.costPerMillionOutputUsd },
+        price: { inputPerMillionUsd: this.#priced(n.profile).costPerMillionInputUsd ?? null, outputPerMillionUsd: this.#priced(n.profile).costPerMillionOutputUsd ?? null },
       };
       if (change === 'opened') {
         const ceiling = n.violation!.ceiling;

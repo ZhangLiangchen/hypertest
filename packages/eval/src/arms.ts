@@ -28,6 +28,8 @@ function route(routeId: string, provider: string, quality: Record<string, number
   return {
     routeId, provider, model: `${routeId}-1`, capabilities: [...ALL_CAPABILITIES], quality, toolReliability, typicalLatencyMs,
     contextWindow: 200_000, maxOutputTokens: 4096, maxActionRisk: 'critical', maxDataClassification: 'restricted', structuredOutput: 'native', reasoning: 'visible',
+    // an explicit capability profile (A[2]): scripted models are free — a declared price of 0, never an unknown one
+    costPerMillionInputUsd: 0, costPerMillionOutputUsd: 0, enabled: true,
   };
 }
 

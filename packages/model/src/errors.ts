@@ -69,3 +69,22 @@ export function secretsOf(apiKey: string | undefined, headers: Record<string, st
   }
   return out;
 }
+
+/**
+ * (e2e[3]) Credential availability of an HTTP provider: when the configuration requires a key (it names an apiKeyEnv) and
+ * the key is missing or blank, the provider is unavailable — the router never routes to it and complete() refuses
+ * locally, so no request (prompt, goal, target description) ever leaves the process unauthenticated.
+ */
+export function credentialAvailability(providerId: string, required: boolean | undefined, apiKey: string | undefined, source: string | undefined): { ok: true } | { ok: false; reason: string } {
+  if (required !== true) return { ok: true };
+  if (typeof apiKey === 'string' && apiKey.trim() !== '') return { ok: true };
+  return {
+    ok: false,
+    reason: `provider ${providerId} has no credential: ${source ? `environment variable ${source} is not set or empty` : 'its required API key is missing'} (fail closed: no request is sent)`,
+  };
+}
+
+/** The local refusal of complete() on a provider without its required credential (never reaches the network). */
+export function missingCredentialError(providerId: string, reason: string): HypertestError {
+  return new HypertestError('precondition_failed', reason, { retryable: false, details: { provider: providerId, stage: 'capability', reason: 'missing_credential' } });
+}

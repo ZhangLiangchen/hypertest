@@ -97,6 +97,13 @@ export const EVENT_TYPES = {
   workRequeued: 'work.requeued',
   workBlocked: 'work.blocked',
   workUpdated: 'work.updated',
+  /**
+   * (additive, A[0]) A work item's agent was paused / resumed because no model route could serve it for now (fallback
+   * pipeline end state PAUSE): `{ workItemId, agentId, pauseReason: 'model_unavailable', resumeAt, routes, reason,
+   * consecutive }` / `{ workItemId, agentId, pauseReason, by: 'timer' | 'operator', pausedSince }`.
+   */
+  workPaused: 'work.paused',
+  workResumed: 'work.resumed',
 
   agentSpawned: 'agent.spawned',
   agentTurnStarted: 'agent.turn_started',
@@ -114,6 +121,15 @@ export const EVENT_TYPES = {
   modelFallback: 'model.fallback',
   modelCircuitOpened: 'model.circuit_opened',
   modelCircuitClosed: 'model.circuit_closed',
+  /**
+   * (additive, A[3]) A manual model switch was requested (`{ switchId, target, routeId, reason, requestedBy }`) / a model
+   * switch was refused at its boundary re-check — no epoch recorded (`{ switchReason, routeId, fromRouteId, stage,
+   * reason, switchId? }`).
+   */
+  modelSwitchRequested: 'model.switch_requested',
+  modelSwitchRefused: 'model.switch_refused',
+  /** (additive, A[0]) An operator released the run's model pauses (`hypertest resume`): `{ sessions, by }`. */
+  modelPausesReleased: 'model.pauses_released',
 
   toolCalled: 'tool.called',
   toolCompleted: 'tool.completed',
@@ -144,6 +160,8 @@ export const EVENT_TYPES = {
   testRecovered: 'test.recovered',
   testArtifactRegistered: 'test_artifact.registered',
   testArtifactValidated: 'test_artifact.validated',
+  /** (additive, D-1) The oracle consistency review of a test artifact (approve ⇒ approved, reject ⇒ draft). */
+  testArtifactReviewed: 'test_artifact.reviewed',
 
   evidenceAttached: 'evidence.attached',
   evidenceSealed: 'evidence.sealed',
@@ -161,7 +179,23 @@ export const EVENT_TYPES = {
   oracleChangeRejected: 'oracle.change_rejected',
   oracleRevised: 'oracle.revised',
   experimentDefined: 'experiment.defined',
+  /**
+   * (additive, D-3) Experiment governance: `experiment.action` — a write/fault/load call executed FOR the experiment
+   * (`{ experimentId, toolId, invocationId, kind?, target?, ratePerSecond?, durationMs? }`, one per invocation);
+   * `experiment.stopped` — a stop condition was met or a manual stop recorded (`{ experimentId, condition, observed?, reason }`,
+   * once per experiment): its fault/load/write calls are refused from then on.
+   */
+  experimentAction: 'experiment.action',
+  experimentStopped: 'experiment.stopped',
   systemModelRecorded: 'system_model.recorded',
+  /** (additive, D-10) A human/system authority declared an oracle revision invalid (a new `invalid` revision). */
+  oracleInvalidated: 'oracle.invalidated',
+  /**
+   * (additive, D-10 / coverage-17) A run re-pinned to a newer approved oracle revision (`{ oracleId, from, to }`), and a
+   * replan scheduled by a trigger other than drain/gate feedback (`{ reason, workItemId, triggers }`).
+   */
+  runOracleRepinned: 'run.oracle_repinned',
+  replanTriggered: 'replan.triggered',
 
   contextSnapshotCreated: 'context.snapshot_created',
   contextCompacted: 'context.compacted',

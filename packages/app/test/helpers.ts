@@ -138,11 +138,24 @@ export async function sumRepo(): Promise<{ path: string; head: string; cleanup()
   return { path: repo.path, head: repo.commits[0]!, cleanup: repo.cleanup };
 }
 
-/** Every capability, high quality: a route every built-in role can use. */
+/**
+ * Every capability, high quality: a route every built-in role can use — an EXPLICIT capability profile (A[2]: nothing is
+ * left to defaults; a scripted model is free, so its price is declared as 0).
+ */
 export const FULL_ROUTE = {
   capabilities: ['tool_use', 'parallel_tool_calls', 'structured_output', 'reasoning', 'long_context'],
+  structuredOutput: 'native',
+  reasoning: 'visible',
+  contextWindow: 200_000,
+  maxOutputTokens: 4096,
+  maxDataClassification: 'confidential',
   quality: { default: 0.9 },
+  toolReliability: 0.9,
+  typicalLatencyMs: 100,
+  costPerMillionInputUsd: 0,
+  costPerMillionOutputUsd: 0,
   maxActionRisk: 'critical',
+  enabled: true,
 } as const;
 
 /**

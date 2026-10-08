@@ -233,7 +233,7 @@ describe('composition failures fail fast and leave nothing open', () => {
     } finally {
       await ht.close();
     }
-    const weak = { ...noRoutes, models: { ...noRoutes.models, routes: [{ routeId: 'plain', provider: 'sim', model: 'm' }] } };
+    const weak = { ...noRoutes, models: { ...noRoutes.models, routes: [{ routeId: 'plain', provider: 'sim', model: 'm', capabilities: ['reasoning' as const] }] } };
     const ht2 = await createHypertest(weak, { scriptedBrains: { sim: roleRouter({}) }, logger: new MemoryLogger() });
     try {
       await assert.rejects(ht2.start({ goal: GOAL, target: {} }), (e: unknown) => {

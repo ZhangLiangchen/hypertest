@@ -192,6 +192,12 @@ export interface ToolExecutionRequest {
    */
   experimentId?: string;
   /**
+   * (additive, D-8/D-9) The run's SystemModel revision when the call was made: recorded in the provenance of every evidence
+   * record the call produces (`provenance.systemModelRevision`), so evidence is traceable to the system model it was
+   * gathered under (as decisions are).
+   */
+  systemModelRevision?: number;
+  /**
    * (additive, conformance-5) Resource bounds of this call: `maxArtifactBytes` — the artifact budget left to the caller; a
    * put that would exceed it is refused (`budget_exhausted`), nothing is stored.
    */
@@ -210,6 +216,8 @@ export interface ToolUsage {
  */
 export interface ExperimentProvenance extends Provenance {
   experimentId?: string;
+  /** (additive, D-8) The run's SystemModel revision at the call (ToolExecutionRequest.systemModelRevision). */
+  systemModelRevision?: number;
 }
 
 export interface ToolExecutionResult {
@@ -366,6 +374,13 @@ export interface EnvironmentDescriptor {
    * review. Declare it only for SUTs that really honour the header.
    */
   honoursIdempotencyKey?: boolean;
+  /**
+   * (additive, coverage-13) The environment's isolation as registered by its operator (never claimed by an agent):
+   * `dedicated` — the environment (and the namespace / database / account named here) serves one experiment at a time.
+   * Only a dedicated environment admits an experiment with isolation mode `dedicated_environment`; the experiment records
+   * these fields in its IsolationPlan.
+   */
+  isolation?: { dedicated: boolean; namespace?: string; database?: string; account?: string };
 }
 
 export interface EnvironmentRegistry {
@@ -506,6 +521,12 @@ export interface MutationAnalysisResult {
   score: number;
   baseline: { passed: boolean; total: number; harnessError?: string };
   mutants: Array<{ id: string; line: number; operator: MutationOperator; original: string; replacement: string; status: MutantStatus; detail?: string }>;
+  /**
+   * (additive, D-0) The test files the analysis executed (the baseline run's cases attributed to files, with their content
+   * digests): `mutation.run` records it on the mutation-result, and a mutation result counts for a TestArtifact only when
+   * it executed exactly that artifact's file and content (policy `sensitivityBinding`).
+   */
+  executedTests?: { attribution: 'complete' | 'partial' | 'none'; files: Array<{ path: string; sha256?: string; cases: number; staticCheck?: { checker: string; ok: boolean; detail?: string } }>; unattributedCases: number };
 }
 
 /** (additive) Options of createLocalSandbox(). */

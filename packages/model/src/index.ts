@@ -10,3 +10,7 @@ export { AnthropicProvider, STRUCTURED_OUTPUT_TOOL, anthropicCompatibilityClass,
 export { PiAiProvider, piCompatibilityClass, toPiContext, fromPiAssistant, mapPiUsage, mapPiStopReason } from './pi-ai.ts';
 export { ToolNameMap, WIRE_TOOL_NAME } from './tool-names.ts';
 export { SAME_ROUTE_RETRYABLE, FALLBACK_ELIGIBLE, codeForHttpStatus, type ProviderErrorCode } from './errors.ts';
+export { credentialAvailability, missingCredentialError } from './errors.ts';
+export { costKnown } from './usage.ts';
+export { createFilePriceSource, parsePricesFile, readPricesFile, updatePricesFile, type PricesFile } from './prices.ts';
+export { ROUTE_SCORES_METHOD, deriveRouteScores, parseRouteScoresFile, type RouteScoresFile, type ScoredTrial } from './scores.ts';

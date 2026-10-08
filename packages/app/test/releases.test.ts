@@ -72,8 +72,9 @@ describe('condenser privacy floor (local_private stays on local routes)', () => 
       new ScriptedProvider({ providerId: 'local', brain: () => (calls.push('local'), { text: 'summary (local)' }) }),
     ]);
     const catalog = new ModelCatalog([
-      completeRoute({ routeId: 'hosted-big', provider: 'hosted', model: 'h', capabilities: ['tool_use', 'long_context'], quality: { default: 0.95 } }, 'hosted:h'),
-      completeRoute({ routeId: 'local-small', provider: 'local', model: 'l', capabilities: ['tool_use', 'long_context'], quality: { default: 0.6 }, maxDataClassification: 'restricted' }, 'local:l'),
+      // explicit prices (A[2]): the condenser's policy is cost-limited, and a route of unknown price never serves it
+      completeRoute({ routeId: 'hosted-big', provider: 'hosted', model: 'h', capabilities: ['tool_use', 'long_context'], quality: { default: 0.95 }, costPerMillionInputUsd: 1, costPerMillionOutputUsd: 2 }, 'hosted:h'),
+      completeRoute({ routeId: 'local-small', provider: 'local', model: 'l', capabilities: ['tool_use', 'long_context'], quality: { default: 0.6 }, maxDataClassification: 'restricted', costPerMillionInputUsd: 0, costPerMillionOutputUsd: 0 }, 'local:l'),
     ]);
     const raw = createModelRouter({ ids: new SequentialIdGenerator(), clock: new FixedClock(), logger: noopLogger, catalog, providers });
     const router = condenserPrivacyFloor(raw, classify());

@@ -4,7 +4,7 @@ import type {
   EventContext, ModelEpoch, ModelPolicy, ModelSwitchReason, RiskClass, RuntimeManifest, ToolCall, ToolDefinition, ToolPolicy, ToolResultMessage, WorkBudget,
 } from '@hypertest/domain';
 import type { Compaction, TranscriptEntry } from '@hypertest/context';
-import type { ModelUsage, ModelRouter, RouteDecision, RouteRequest } from '@hypertest/model';
+import type { ModelCapabilityProfile, ModelCatalogLike, ModelUnavailability, ModelUsage, ModelRouter, RouteDecision, RouteRequest } from '@hypertest/model';
 import type { ToolExecutionResult } from '@hypertest/tools';
 
 /**
@@ -59,8 +59,64 @@ export interface EngineSessionRef {
 
 export type ModelInvocation =
   | { ok: true; message: AssistantMessage; usage: ModelUsage; routeId: string; epochId: string; stopReason: string }
-  /** The turn must end without executing anything; the host starts a new epoch (or pauses) before the next turn. */
-  | { ok: false; boundary: 'retry_next_turn' | 'budget_exhausted' | 'model_unavailable' | 'cancelled'; message: string };
+  /**
+   * The turn must end without executing anything; the host starts a new epoch (or pauses) before the next turn.
+   * (additive, A[0]) For `model_unavailable`: `unavailable` says whether no route can serve the agent for now (transient:
+   * the agent is PAUSED — `pause` is the recorded ModelPause, resumed no earlier than its resumeAt) or ever (permanent:
+   * fail closed with `unavailable.reason`).
+   */
+  | {
+      ok: false;
+      boundary: 'retry_next_turn' | 'budget_exhausted' | 'model_unavailable' | 'cancelled';
+      message: string;
+      unavailable?: ModelUnavailability;
+      pause?: ModelPause;
+    };
+
+/**
+ * (additive, A[0]) Fallback pipeline end state PAUSE: a transient model unavailability that paused an agent (no route can
+ * serve it now — circuits open, rate limits / timeouts after retries, a single-route or fail_closed role). Durable
+ * (`ht_model_pauses`): the host waits until `resumeAt` (the earliest half-open time / Retry-After, else an exponential
+ * backoff), then the next turn routes again; a successful call clears it. `consecutive` counts pauses without a success.
+ */
+export interface ModelPause {
+  sessionId: string;
+  runId: string;
+  agentId: string;
+  /** The turn that ended at the boundary. */
+  turn: number;
+  reason: string;
+  resumeAt: string;
+  routes: string[];
+  consecutive: number;
+  createdAt: string;
+}
+
+/**
+ * (additive, A[3]) An operator's manual model switch (`hypertest model switch`, POST /runs/:id/model-switch): applied by
+ * the target agents' invokers at their NEXT safe turn boundary — after the permission/profile re-check — as a new epoch
+ * with switchReason `manual`, or refused (`model.switch_refused`, no epoch). A role target also applies to agents of the
+ * role created later. Append-only: the outcome per agent is recorded once.
+ */
+export interface ModelSwitchRequest {
+  switchId: string;
+  runId: string;
+  target: { kind: 'agent'; agentId: string } | { kind: 'role'; role: string };
+  routeId: string;
+  reason?: string;
+  requestedBy: string;
+  createdAt: string;
+}
+
+/** (additive, A[3]) What one agent did with a ModelSwitchRequest. */
+export interface ModelSwitchOutcome {
+  switchId: string;
+  agentId: string;
+  outcome: 'applied' | 'refused';
+  epochId?: string;
+  detail: string;
+  at: string;
+}
 
 export interface ModelInvoker {
   /**
@@ -349,6 +405,29 @@ export interface EpochManager {
   setPendingFallback?(sessionId: string, fallback: Omit<PendingFallback, 'createdAt'>): Promise<void>;
   /** (additive, optional) The session's pending fallback, if any. */
   pendingFallback?(sessionId: string): Promise<PendingFallback | undefined>;
+  /** (additive, optional) Drops the session's pending fallback (it was refused at the boundary re-check). */
+  clearPendingFallback?(sessionId: string): Promise<void>;
+  /** (additive, optional, A[0]) The session's ModelPause, if it is paused for model unavailability. */
+  modelPause?(sessionId: string): Promise<ModelPause | undefined>;
+  /** (additive, optional, A[0]) Records (upserts) the session's ModelPause. */
+  setModelPause?(pause: Omit<ModelPause, 'createdAt'>): Promise<ModelPause>;
+  /** (additive, optional, A[0]) Clears the session's ModelPause (a successful call). */
+  clearModelPause?(sessionId: string): Promise<void>;
+  /** (additive, optional, A[0]) The run's model pauses. */
+  listModelPauses?(runId: string): Promise<ModelPause[]>;
+  /** (additive, optional, A[0]) Operator resume (`hypertest resume`): every pause of the run may resume at `at`. Returns the sessions. */
+  releaseModelPauses?(runId: string, at: string): Promise<string[]>;
+  /** (additive, optional, A[3]) Records a manual switch request (validated by the caller). */
+  requestSwitch?(request: Omit<ModelSwitchRequest, 'switchId' | 'createdAt'>, ctx: EventContext): Promise<ModelSwitchRequest>;
+  /**
+   * (additive, optional, A[3]) The newest manual switch request of the run that targets this agent (or its role) and has
+   * no recorded outcome for it.
+   */
+  pendingSwitch?(runId: string, agentId: string, role: string): Promise<ModelSwitchRequest | undefined>;
+  /** (additive, optional, A[3]) Records what an agent did with a switch request (once per agent; idempotent). */
+  recordSwitchOutcome?(outcome: Omit<ModelSwitchOutcome, 'at'>): Promise<void>;
+  /** (additive, optional, A[3]) The run's switch requests and their outcomes. */
+  listSwitches?(runId: string): Promise<Array<ModelSwitchRequest & { outcomes: ModelSwitchOutcome[] }>>;
 }
 
 /** (additive) An ok RouteDecision (what ModelRouter.invoke takes). */
@@ -361,12 +440,16 @@ export interface StartEpochOptions {
   excludedRoutes?: string[];
   /** Deletes the session's pending fallback in the same transaction as the epoch insert. */
   consumeFallback?: boolean;
+  /** (additive, A[3]) The route's capability profile at the start (compared after a catalog change: quality vs policy switch). */
+  profile?: ModelCapabilityProfile;
 }
 
 /** (additive) Routing data stored with an epoch. */
 export interface EpochRouting {
   decision?: OkRouteDecision;
   excludedRoutes: string[];
+  /** (additive) The route's capability profile when the epoch started (when recorded). */
+  profile?: ModelCapabilityProfile;
 }
 
 /** (additive) A re-validated fallback computed by the router after a failed invoke, applied at the next boundary. */
@@ -411,6 +494,32 @@ export interface InvokerDeps extends BaseDeps {
    * the stricter of deps and extras; identity, role, taskType, policy, snapshot and token estimate are never overridden.
    */
   routeRequestExtras?: () => Promise<Partial<RouteRequest>>;
+  /** (additive) L0 sink for the switch decisions the invoker takes (model.switch_refused). */
+  events?: DomainEventSink;
+  /**
+   * (additive, A[3]) The catalog the router routes against: the started epoch records its route's profile, and after a
+   * catalog change the switch is `quality` when the route's profile changed in its scores only, `policy` otherwise.
+   */
+  catalog?: Pick<ModelCatalogLike, 'get' | 'revision'>;
+  /** (additive, A[2]) The run or work item has a USD cost budget: cost-unknown routes are never used (RouteRequest.costBudgeted). */
+  costBudgeted?: boolean;
+  /**
+   * (additive, A[3] cost switch) The tightest USD cost budget left for this agent's calls (run and work item scopes), or
+   * undefined without a cost budget. Under budget pressure — remaining < costPressureRatio × limit, or the current route's
+   * next call costing more than what remains — the invoker switches at the boundary to a strictly cheaper eligible route
+   * (switchReason `cost`), still after security → capability → role → quality floor.
+   */
+  costPressure?: () => Promise<{ remainingUsd: number; limitUsd: number } | undefined>;
+  /** (additive) Default 0.25. */
+  costPressureRatio?: number;
+  /**
+   * (additive, A[4]) EngineCapabilities.providerSwitch of the agent's engine (default true). An engine that cannot switch
+   * providers mid-session is emulated where possible: switches stay within the current provider; a switch to another
+   * provider is refused (`model.switch_refused`) and an unavailable provider pauses the agent instead.
+   */
+  providerSwitch?: boolean;
+  /** (additive, A[0]) Backoff of a pause whose resume time is not known (default base 5000 ms, doubling, max 300000 ms). */
+  pauseBackoff?: { baseMs?: number; maxMs?: number };
 }
 
 // ----------------------------------------------------------------------------- subagents

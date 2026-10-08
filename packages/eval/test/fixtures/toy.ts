@@ -29,6 +29,11 @@ export const FULL_ROUTE = {
   capabilities: ['tool_use', 'parallel_tool_calls', 'structured_output', 'reasoning', 'long_context'],
   quality: { default: 0.9 },
   maxActionRisk: 'critical',
+  // an explicit profile (A[2]): what the defaults used to assume, declared
+  maxDataClassification: 'confidential',
+  structuredOutput: 'native',
+  costPerMillionInputUsd: 0,
+  costPerMillionOutputUsd: 0,
 } as const;
 
 /** One scripted provider `sim` + one route; no independent reviewer (the toy runs have none); `gate` overrides. */
@@ -37,7 +42,7 @@ export function toyConfig(base: HypertestConfig, gate: HypertestConfig['gate'] =
     ...base,
     models: {
       providers: [{ id: 'sim', kind: 'scripted' }],
-      routes: [{ routeId: 'sim-large', provider: 'sim', model: 'sim-1', capabilities: [...FULL_ROUTE.capabilities], quality: { ...FULL_ROUTE.quality }, maxActionRisk: FULL_ROUTE.maxActionRisk }],
+      routes: [{ routeId: 'sim-large', provider: 'sim', model: 'sim-1', ...FULL_ROUTE, capabilities: [...FULL_ROUTE.capabilities], quality: { ...FULL_ROUTE.quality } }],
     },
     gate: { ...(base.gate ?? {}), requireIndependentReview: false, ...gate },
   };

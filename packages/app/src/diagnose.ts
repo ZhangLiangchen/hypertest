@@ -4,12 +4,12 @@ import { dirname } from 'node:path';
 import { connect } from 'node:net';
 import { FixedClock, HypertestError, SequentialIdGenerator, noopLogger } from '@hypertest/core';
 import { openDatabase } from '@hypertest/store';
-import { ModelCatalog, PiAiProvider, ProviderRegistry, createModelRouter, piCompatibilityClass, type ModelCapabilityProfile, type ModelProvider } from '@hypertest/model';
+import { ModelCatalog, PiAiProvider, ProviderRegistry, createModelRouter, credentialAvailability, piCompatibilityClass, type ModelCapabilityProfile, type ModelProvider } from '@hypertest/model';
 import { resolveProtocolBinding } from '@hypertest/policy';
 import { createOciSandbox, networkIsolation } from '@hypertest/tools';
 import { BUILTIN_ROLES, RoleCatalog, SPECIALIST_ROLES, type RoleDefinition } from '@hypertest/agents';
 import { isLoopbackHost } from './api.ts';
-import { completeRoute, providerCompatibilityClass, resolveConfigPaths, roleOverrides, validateConfig, withDerivedPaths } from './config.ts';
+import { completeRoute, defaultedRouteFields, providerCompatibilityClass, resolveConfigPaths, roleOverrides, validateConfig, withDerivedPaths } from './config.ts';
 import { sandboxProfile } from './compose.ts';
 import { lockFileFor, lockHolder } from './lock.ts';
 import type { DiagnoseOptions, DiagnosticCheck, DiagnosticReport, HypertestConfig, ProviderConfig } from './contracts.ts';
@@ -43,7 +43,8 @@ export async function diagnose(input: HypertestConfig, options: DiagnoseOptions 
   };
   for (const p of config.models.providers) {
     if (p.apiKeyEnv) secret('secrets', p.apiKeyEnv, true, `provider ${p.id} (apiKeyEnv)`);
-    else if (p.kind === 'anthropic') add('secrets', 'warn', `provider ${p.id}: no apiKeyEnv configured; calls are sent without an API key`);
+    else if (p.kind === 'anthropic' && !p.baseUrl) add('secrets', 'error', `provider ${p.id}: no apiKeyEnv configured; the hosted Anthropic API needs a key — the provider is unavailable (fail closed, no request is sent)`);
+    else if (p.kind === 'anthropic') add('secrets', 'warn', `provider ${p.id}: no apiKeyEnv configured; calls to ${p.baseUrl} are sent without an API key`);
   }
   if (config.store.kind === 'postgres') secret('secrets', config.store.urlEnv, true, 'store (urlEnv)');
   if (config.policy?.capabilitySecretEnv) {
@@ -64,8 +65,8 @@ export async function diagnose(input: HypertestConfig, options: DiagnoseOptions 
     if (p.maxRetries !== undefined) add('models', 'warn', `provider ${p.id}: maxRetries is not supported (retries and fail-closed fallback are the model router's); the value is ignored`);
   }
 
-  // ---- models: can the roles be routed?
-  await checkRoutes(config, add);
+  // ---- models: can the roles be routed? (a provider without its credential is unavailable: e2e[3])
+  await checkRoutes(config, add, env);
 
   // ---- protocol + engines + sandbox
   try {
@@ -141,21 +142,35 @@ export async function diagnose(input: HypertestConfig, options: DiagnoseOptions 
 
 type Add = (name: string, status: DiagnosticCheck['status'], detail: string) => void;
 
-async function checkRoutes(config: HypertestConfig, add: Add): Promise<void> {
+async function checkRoutes(config: HypertestConfig, add: Add, env: Record<string, string | undefined>): Promise<void> {
   if (config.models.routes.filter((r) => r.enabled !== false).length === 0) {
     add('models', 'error', 'no model routes are configured: every run fails when it routes its lead agent (add models.providers and models.routes)');
     return;
   }
-  // stub providers: routing never calls a provider
+  // stub providers: routing never calls a provider. A provider without its required credential is unavailable exactly as in
+  // createHypertest (e2e[3]): its routes are never used, so roles routable only through it are reported unroutable.
   const providers = new ProviderRegistry(
-    config.models.providers.map((p): ModelProvider => ({
-      providerId: p.id,
-      adapterInfo: { package: 'doctor', version: '0' },
-      complete: () => Promise.reject(new HypertestError('unsupported', 'doctor stub')),
-    })),
+    config.models.providers.map((p): ModelProvider => {
+      const requireApiKey = p.kind !== 'scripted' && (p.apiKeyEnv !== undefined || (p.kind === 'anthropic' && !p.baseUrl));
+      const credential = credentialAvailability(p.id, requireApiKey, p.apiKeyEnv ? env[p.apiKeyEnv] : undefined, p.apiKeyEnv ?? `models.providers[${p.id}].apiKeyEnv (not configured)`);
+      if (!credential.ok) {
+        const routes = config.models.routes.filter((r) => r.provider === p.id).map((r) => r.routeId);
+        add('models', 'warn', `${credential.reason}: routes ${routes.join(', ') || '(none)'} are unavailable — never routed to, no request is sent`);
+      }
+      return {
+        providerId: p.id,
+        adapterInfo: { package: 'doctor', version: '0' },
+        complete: () => Promise.reject(new HypertestError('unsupported', 'doctor stub')),
+        availability: () => credential,
+      };
+    }),
   );
   const profiles: ModelCapabilityProfile[] = [];
   for (const route of config.models.routes) {
+    // A[2]: every route has an explicit profile — report what is left to (conservative) defaults and unknown prices
+    const { defaulted, costUnknown } = defaultedRouteFields(route);
+    if (defaulted.length > 0) add('models', 'warn', `route ${route.routeId}: defaulted fields ${defaulted.join(', ')} (declare them; security fields default to maxDataClassification internal, maxActionRisk low)`);
+    if (costUnknown) add('models', 'warn', `route ${route.routeId}: price unknown (no costPerMillionInputUsd/costPerMillionOutputUsd): runs or work items with a USD cost budget never route to it`);
     const p = config.models.providers.find((x) => x.id === route.provider)!;
     let tag = providerCompatibilityClass(p, route.model);
     if (p.kind === 'pi-ai') {

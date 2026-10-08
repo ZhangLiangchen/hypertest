@@ -70,7 +70,9 @@ models:
   # A route is provider + model + what it can do. The router filters routes in the order
   # security → capability → role suitability → quality → latency → cost (never cost first) and falls back
   # fail-closed. \`quality\` scores are 0..1 per role or task type (\`default\` otherwise); keep them honest (evals).
-  # Omitted fields take defaults (capabilities [tool_use, structured_output], contextWindow 128000, ...).
+  # Every route declares its capabilities (nothing is assumed). Security fields default CONSERVATIVELY when omitted
+  # (maxDataClassification internal, maxActionRisk low); an omitted price is UNKNOWN (never $0): runs with a USD cost
+  # budget never route to it. \`hypertest doctor\` lists every defaulted field.
   routes:
     - routeId: deepseek-chat
       provider: deepseek
@@ -78,8 +80,11 @@ models:
       capabilities: [tool_use, parallel_tool_calls, structured_output, reasoning, long_context]
       contextWindow: 128000
       maxOutputTokens: 8192
+      maxDataClassification: confidential   # what this hosted model may receive
+      maxActionRisk: high                   # the riskiest tool calls it may drive (environment changes, fixes)
       quality: { default: 0.8 }
-      # costPerMillionInputUsd / costPerMillionOutputUsd: set them from your price list (budget accounting).
+      # costPerMillionInputUsd / costPerMillionOutputUsd: set both from your price list (budget accounting); while they
+      # are unset the price is unknown and a run with budget.maxModelCostUsd never routes to this route.
 
     - routeId: claude-opus
       provider: anthropic
@@ -88,6 +93,8 @@ models:
       reasoning: opaque              # thinking blocks are replayed only to the same model
       contextWindow: 1000000
       maxOutputTokens: 32000
+      maxDataClassification: confidential
+      maxActionRisk: high
       quality: { default: 0.9 }
       costPerMillionInputUsd: 5
       costPerMillionOutputUsd: 25
@@ -100,6 +107,8 @@ models:
       reasoning: opaque
       contextWindow: 1000000
       maxOutputTokens: 32000
+      maxDataClassification: confidential
+      maxActionRisk: high
       quality: { default: 0.85 }
       costPerMillionInputUsd: 2
       costPerMillionOutputUsd: 10
@@ -112,7 +121,10 @@ models:
     #   structuredOutput: prompted
     #   contextWindow: 32768
     #   maxDataClassification: restricted   # data never leaves the machine
+    #   maxActionRisk: medium
     #   quality: { default: 0.6 }
+    #   costPerMillionInputUsd: 0            # a local model: declare its price (0) so cost-budgeted runs may use it
+    #   costPerMillionOutputUsd: 0
 
     # The local_private role (restricted data: secrets, personal data) is routed ONLY to routes accepting restricted data
     # like this one; without one its work fails closed (\`hypertest doctor\` warns). vision_gui needs a vision route.
@@ -159,6 +171,7 @@ gate:
   failOnUnresolvedSeverity: P1     # unresolved P0/P1 findings fail the gate
   # minCoverage: { lines: 80 }
   # requireOracle: false           # only to accept a verdict with NO oracle in force (default true: such a run is inconclusive)
+  # requireContracts: false        # only to accept a verdict with no SystemModel / write-fault-load actions outside an ExperimentSpec (default true)
 
 # Oracles: what \`correct\` means, decided by a named human, never by an agent. A run that names no oracles pins the
 # ones configured here; without an approved oracle in force the best verdict is \`inconclusive\` (gate criterion C0).

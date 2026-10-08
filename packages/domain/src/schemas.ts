@@ -287,6 +287,47 @@ export const SYSTEM_MODEL_INPUT_SCHEMA: JsonSchema = {
     dependencies: { type: 'array', items: { type: 'object' } },
     stateMachines: { type: 'array', items: { type: 'object' } },
     invariants: stringArray,
+    // (additive, coverage-12) the design's dataAssets and securityBoundaries, and the model's provenance (sources)
+    dataAssets: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['assetId', 'name', 'kind'],
+        properties: {
+          assetId: { type: 'string', minLength: 1 },
+          name: { type: 'string', minLength: 1 },
+          kind: { type: 'string', enum: ['database', 'table', 'collection', 'bucket', 'queue', 'topic', 'cache', 'file', 'secret', 'other'] },
+          componentId: { type: 'string' },
+          classification: { type: 'string', enum: ['public', 'internal', 'confidential', 'restricted'] },
+          description: { type: 'string' },
+        },
+      },
+    },
+    securityBoundaries: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['boundaryId', 'name', 'kind', 'components'],
+        properties: {
+          boundaryId: { type: 'string', minLength: 1 },
+          name: { type: 'string', minLength: 1 },
+          kind: { type: 'string', enum: ['network', 'authentication', 'authorization', 'tenant', 'process', 'trust', 'other'] },
+          components: stringArray,
+          description: { type: 'string' },
+        },
+      },
+    },
+    sources: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['kind', 'id'],
+        properties: { kind: { type: 'string', enum: ['evidence', 'file', 'commit', 'url', 'record', 'artifact'] }, id: { type: 'string', minLength: 1 }, note: { type: 'string' } },
+      },
+    },
     changedComponents: stringArray,
     riskTags: stringArray,
   },

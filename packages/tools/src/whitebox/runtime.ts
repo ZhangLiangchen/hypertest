@@ -409,6 +409,9 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
         // conformance-6: evidence of a call made for an experiment names it (runtime-set, never the tool's say)
         if (request.experimentId !== undefined) provenance.experimentId = request.experimentId;
         else delete provenance.experimentId;
+        // D-8: evidence names the SystemModel revision it was gathered under (runtime-set)
+        if (request.systemModelRevision !== undefined) provenance.systemModelRevision = request.systemModelRevision;
+        else delete provenance.systemModelRevision;
         const evInput: RecordEvidenceInput = {
           runId: request.runId,
           evidenceType: inp.evidenceType,

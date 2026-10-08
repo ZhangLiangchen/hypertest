@@ -78,7 +78,7 @@ function reference(ps: ModelCapabilityProfile[], q: RouteRequest): { stages: Map
   const need = Math.max(CO[q.dataClassification], q.policy.privacyClass ? CO[q.policy.privacyClass] : 0);
   const caps = new Set([...q.requiredCapabilities, ...(q.policy.requiredCapabilities ?? [])]);
   const score = (p: ModelCapabilityProfile) => p.quality[q.role] ?? p.quality[q.taskType] ?? p.quality['default'] ?? 0;
-  const cost = (p: ModelCapabilityProfile) => (q.contextTokensEstimate * p.costPerMillionInputUsd + p.maxOutputTokens * p.costPerMillionOutputUsd) / 1e6;
+  const cost = (p: ModelCapabilityProfile) => (q.contextTokensEstimate * (p.costPerMillionInputUsd ?? Number.NaN) + p.maxOutputTokens * (p.costPerMillionOutputUsd ?? Number.NaN)) / 1e6;
   const eligible: ModelCapabilityProfile[] = [];
   for (const p of ps) {
     let stage: string | undefined;

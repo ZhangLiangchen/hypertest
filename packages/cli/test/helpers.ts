@@ -58,6 +58,11 @@ export const SIM_ROUTE = {
   capabilities: ['tool_use', 'parallel_tool_calls', 'structured_output', 'reasoning', 'long_context'],
   quality: { default: 0.9 },
   maxActionRisk: 'critical',
+  // an explicit profile (A[2]): what the defaults used to assume, declared
+  maxDataClassification: 'confidential',
+  structuredOutput: 'native',
+  costPerMillionInputUsd: 0,
+  costPerMillionOutputUsd: 0,
 };
 
 /**

@@ -2,8 +2,9 @@ import type { BaseDeps, Clock, JsonValue, SqlDatabase } from '@hypertest/core';
 import type {
   ActionCapability, ActorRef, ApprovedException, BlackboardRecord, CoverageGap, DomainEventSink, EventContext, EvidenceRecord,
   ExperimentSpec, Finding, GateSpec, Objective, OracleAssertion, OracleChangeProposal, OracleSpec, PermissionProfile, QualityDecision,
-  QualityVerdict, ReportClaim, Review, Risk, RiskClass, TestArtifact, TestRun, ToolEffect, WorkItem,
+  QualityVerdict, ReportClaim, Review, Risk, RiskClass, SystemModel, TestArtifact, TestRun, ToolEffect, WorkItem,
 } from '@hypertest/domain';
+import type { ExperimentFacts, GateOperation } from './experiments.ts';
 
 /**
  * @hypertest/policy — governance outside the model: capabilities (I2), action permits (I1), oracle
@@ -350,6 +351,14 @@ export interface OracleGovernance {
    * when invalidatesPriorDecisions, marks decisions based on the old revision needs_reassessment.
    */
   decide(proposalId: string, approve: boolean, decidedBy: ActorRef, rationale: string, ctx: EventContext): Promise<{ proposal: OracleChangeProposal; newRevision?: OracleSpec; invalidatedDecisions: string[] }>;
+  /**
+   * (additive, D-10) Declares revision `revision` (the latest) of an oracle invalid — the design's rollback "Oracle v2
+   * declared invalid → v3 approved → decisions on v2 needs_reassessment → re-execute/re-judge". Append-only: a new revision
+   * with status `invalid` and `invalidation` is written (history is never updated), every decision based on the revision
+   * is marked needs_reassessment regardless of the change policy, and `oracle.invalidated` is emitted (live runs pinned
+   * to it replan). Only a human or system authority may invalidate (permission_denied for agents); a reason is required.
+   */
+  invalidate?(oracleId: string, revision: number, by: ActorRef, reason: string, ctx: EventContext): Promise<{ invalid: OracleSpec; invalidatedDecisions: string[] }>;
 }
 
 // ----------------------------------------------------------------------------- self-heal classification
@@ -427,6 +436,37 @@ export interface GateInput {
    * replaced criterion).
    */
   currentOracleRevisions?: Record<string, number>;
+  /**
+   * (additive, coverage-1 / D-8) The run's latest SystemModel revision (criterion C12 domain_contracts; recorded in the
+   * decision with its build digests).
+   */
+  systemModel?: SystemModel;
+  /**
+   * (additive, D-3 / D-4) Every write / fault-injection / load action of the run: the operations of tools whose effect is
+   * external or destructive, with the experiment they ran for and what each call did (criteria C10, C11, C12).
+   */
+  operations?: GateOperation[];
+  /** (additive, D-3) Admission lapses and recorded stops per experiment (criterion C10). */
+  experimentFacts?: ExperimentFacts[];
+  /**
+   * (additive, D-11) The registry's view of every environment the run's evidence or experiments name, at gate time
+   * (criterion C11 environment_validity): registered, current generation, build digest, dedicated.
+   */
+  environments?: EnvironmentFacts[];
+  /**
+   * (additive, area-C-0) Parsed JSON artifact content of evidence referenced by claims whose field is not in the record's
+   * structured payload (loaded and hash-checked by the caller), keyed by evidence id (criterion C9 evaluates claims).
+   */
+  claimData?: Record<string, JsonValue>;
+}
+
+/** (additive, D-11) What the environment registry says about one environment at gate time. */
+export interface EnvironmentFacts {
+  environmentId: string;
+  registered: boolean;
+  generation?: number;
+  buildDigest?: string;
+  dedicated?: boolean;
 }
 
 // ----------------------------------------------------------------------------- BUGate protocol

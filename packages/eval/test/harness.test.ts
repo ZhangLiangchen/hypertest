@@ -117,7 +117,7 @@ describe('runTrial: fail fast and infra errors', () => {
 
   test('a scripted provider without a brain fails at composition (infra error, fixture cleaned up)', async () => {
     const { t, calls } = tracked();
-    const scripted = arm((c) => ({ ...c, models: { providers: [{ id: 'sim', kind: 'scripted' }], routes: [{ routeId: 'r', provider: 'sim', model: 'm' }] } }));
+    const scripted = arm((c) => ({ ...c, models: { providers: [{ id: 'sim', kind: 'scripted' }], routes: [{ routeId: 'r', provider: 'sim', model: 'm', capabilities: ['tool_use' as const] }] } }));
     const r = await runTrial(t, scripted, { workDir: dir.path, trial: 0, seed: 's' });
     assert.deepEqual([r.result, r.error, calls.cleanup], ['infra_error', "models.providers (sim): scripted provider has no brain; pass overrides.scriptedBrains['sim']", 1]);
   });

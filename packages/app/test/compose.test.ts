@@ -40,7 +40,7 @@ describe('model catalog from the configuration', () => {
       cfg({
         providers,
         routes: [
-          { routeId: 'c', provider: 'claude', model: 'claude-x' },
+          { routeId: 'c', provider: 'claude', model: 'claude-x', capabilities: ['tool_use', 'structured_output'] },
           { routeId: 'l', provider: 'local', model: 'qwen' },
           { routeId: 'p', provider: 'pi', model: 'llama3' },
           { routeId: 's', provider: 'sim', model: 'sim-1', quality: { default: 0.9 } },
@@ -54,6 +54,10 @@ describe('model catalog from the configuration', () => {
     );
     assert.deepEqual(catalog.get('s')!.quality, { default: 0.9 });
     assert.deepEqual(catalog.get('c')!.capabilities, ['tool_use', 'structured_output']);
+    // A[2]: declared capabilities only — an undeclared list grants nothing, structured output is never assumed native
+    assert.deepEqual(catalog.get('l')!.capabilities, []);
+    assert.equal(catalog.get('c')!.structuredOutput, 'prompted');
+    assert.equal(catalog.get('l')!.structuredOutput, 'none');
   });
 
   test('a pinned tag that differs from the provider tag, an unresolvable pi model and an unregistered provider are refused', async () => {
@@ -129,8 +133,8 @@ describe('createHypertest (fast paths)', () => {
   after(async () => dir.cleanup());
 
   test('an unresolvable route fails before the data directory is created', async () => {
-    const c = defaultConfig({ project: { dataDir: join(dir.path, 'x') }, models: { providers: [{ id: 'pi', kind: 'pi-ai', piProvider: 'nosuchprovider' }], routes: [{ routeId: 'p', provider: 'pi', model: 'm' }] } });
-    await assert.rejects(createHypertest(c, { logger: new MemoryLogger() }), (e: unknown) => e instanceof HypertestError && e.code === 'invalid_argument');
+    const c = defaultConfig({ project: { dataDir: join(dir.path, 'x') }, models: { providers: [{ id: 'pi', kind: 'pi-ai', piProvider: 'nosuchprovider' }], routes: [{ routeId: 'p', provider: 'pi', model: 'm', capabilities: ['tool_use'] }] } });
+    await assert.rejects(createHypertest(c, { logger: new MemoryLogger() }), (e: unknown) => e instanceof HypertestError && e.code === 'invalid_argument' && /pi-ai: model m is not defined/.test(e.message));
     assert.equal(existsSync(join(dir.path, 'x')), false);
   });
 
@@ -140,16 +144,20 @@ describe('createHypertest (fast paths)', () => {
     assert.equal(existsSync(join(dir.path, 'y', 'db')), false, 'the database was never opened');
   });
 
-  test('a missing API key variable is a warning (never the value), not a composition failure', async () => {
+  test('a missing API key variable is a warning (never the value), not a composition failure — the provider is unavailable (e2e[3])', async () => {
     const logger = new MemoryLogger();
     const c = defaultConfig({
       project: { dataDir: join(dir.path, 'z') },
-      models: { providers: [{ id: 'local', kind: 'openai-compatible', baseUrl: 'http://127.0.0.1:1/v1', apiKeyEnv: 'HT_COMPOSE_KEY' }], routes: [{ routeId: 'l', provider: 'local', model: 'm' }] },
+      models: { providers: [{ id: 'local', kind: 'openai-compatible', baseUrl: 'http://127.0.0.1:1/v1', apiKeyEnv: 'HT_COMPOSE_KEY' }], routes: [{ routeId: 'l', provider: 'local', model: 'm', capabilities: ['tool_use'] }] },
     });
     const ht = await createHypertest(c, { logger, env: { OTHER: 'x' } });
     try {
-      const warn = logger.entries.find((e) => e.msg.startsWith('model provider API key variable is not set'));
+      const warn = logger.entries.find((e) => e.msg.startsWith('model provider credential is missing'));
       assert.deepEqual(warn?.fields, { provider: 'local', apiKeyEnv: 'HT_COMPOSE_KEY' });
+      assert.deepEqual(ht.services.providers.get('local').availability?.(), {
+        ok: false,
+        reason: 'provider local has no credential: environment variable HT_COMPOSE_KEY is not set or empty (fail closed: no request is sent)',
+      });
       assert.equal(ht.services.workerId, `worker:${hostname()}`);
       assert.equal(ht.config.store.kind === 'pglite' && ht.config.store.dataDir, join(dir.path, 'z', 'db'));
     } finally {
