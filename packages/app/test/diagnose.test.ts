@@ -65,9 +65,19 @@ describe('diagnose (hypertest doctor)', () => {
     assert.equal(JSON.stringify(r).includes('sk-doctor-SECRET'), false);
   });
 
-  test('security-2: an open sandbox network is a warning (no egress governance for commands agents run)', async () => {
+  test('security-2 / E[4]: an open sandbox network leaves keys, capability secret and store readable by agent commands — an ERROR unless loudly accepted', async () => {
+    // (changed by E[4]: before, a warning — while a command an agent ran could read the capability secret and the signing keys)
     const r = await diagnose(base({ sandbox: { network: 'open' } }), { env: { HT_DOCTOR_KEY: 'k' }, connect: false });
-    assert.deepEqual(of(r, 'sandbox'), [{ name: 'sandbox', status: 'warn', detail: 'local sandbox, network open (commands agents run reach any host: no egress governance), env allowlist PATH, HOME, LANG, LC_ALL, TMPDIR' }]);
+    assert.equal(r.ok, false);
+    assert.deepEqual(of(r, 'sandbox'), [{
+      name: 'sandbox', status: 'error',
+      detail: 'local sandbox, network open (commands agents run reach any host: no egress governance, no namespaces): keys, capability secret and store would NOT be hidden from commands agents run, so Hypertest refuses to start — use the OCI sandbox or a host with python3 and PID/mount namespaces, or accept it with sandbox.insecureAllowUnhiddenSecrets: true',
+    }]);
+    const accepted = await diagnose(base({ sandbox: { network: 'open', insecureAllowUnhiddenSecrets: true } }), { env: { HT_DOCTOR_KEY: 'k' }, connect: false });
+    assert.deepEqual(of(accepted, 'sandbox'), [{
+      name: 'sandbox', status: 'warn',
+      detail: 'local sandbox, network open (commands agents run reach any host: no egress governance, no namespaces); INSECURE (sandbox.insecureAllowUnhiddenSecrets): keys, capability secret and store are NOT hidden from commands agents run, env allowlist PATH, HOME, LANG, LC_ALL, TMPDIR',
+    }]);
   });
 
   test('a missing API key variable is an error (reported by doctor, not at load)', async () => {

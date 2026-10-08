@@ -2,9 +2,12 @@ import { timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { HypertestError, noopLogger, type ErrorCode, type JsonValue, type Logger } from '@hypertest/core';
-import { isTerminalRun, type TestRun } from '@hypertest/domain';
-import type { StartRunInput } from '@hypertest/control';
-import type { ApiServer, ApiServerOptions, Hypertest, HypertestInstance } from './contracts.ts';
+import { isTerminalRun, type OperationRecord, type TestRun } from '@hypertest/domain';
+import { budgetRaiseProblems, type BudgetRaiseInput, type StartRunInput } from '@hypertest/control';
+import type { ApiServer, ApiServerOptions, Hypertest, HypertestInstance, ResumeRunOptions } from './contracts.ts';
+
+/** (stubs[8]) The operation statuses GET /operations accepts. */
+const OPERATION_STATUSES: readonly string[] = ['prepared', 'dispatching', 'acknowledged', 'verified', 'not_applied', 'outcome_unknown', 'reconciling', 'compensating', 'compensated', 'manual_review', 'failed'];
 
 /**
  * The Hypertest REST API (node:http, JSON in and out, JSON errors `{ error: { code, message } }`).
@@ -19,14 +22,20 @@ import type { ApiServer, ApiServerOptions, Hypertest, HypertestInstance } from '
  *   GET  /runs/:id/report[?format=markdown]  RunReport JSON (or its markdown)
  *   GET  /runs/:id/evidence/verify        { ok, problems }
  *   POST /runs/:id/cancel                 { reason } → { ok }
- *   (additive) POST /runs/:id/resume      → { ok, releasedPauses }  (releases model pauses, resumes a paused run; an
- *                                          operator decision: requires the API token)
+ *   (additive) POST /runs/:id/resume      [{ raise: { maxModelTokens?, maxModelCostUsd?, maxToolCalls?, maxWallClockMs?,
+ *                                          maxWorkItems?, maxComputeMinutes?, maxArtifactBytes?, experiments? }, by,
+ *                                          rationale }] → { ok, releasedPauses }  (releases model pauses, raises the budget
+ *                                          by the given amounts (E[3]), resumes a paused run; an operator decision:
+ *                                          requires the API token)
  *   (additive) GET  /runs/:id/agents      { agents } — each agent's engine.inspect state, epoch, model pause (A[4])
  *   (additive) POST /runs/:id/model-switch { target, routeId, by, reason? } → { switch } (manual model switch, A[3];
  *                                          an operator decision: requires the API token)
  *   GET  /approvals[?runId=&status=a,b]   { approvals }
  *   POST /approvals/:id                   { approve, by, rationale } → { ok }  (human decision)
  *   POST /oracle-proposals/:id            { approve, by, rationale } → { ok }  (human decision)
+ *   (additive) GET  /operations[?runId=&status=a,b&limit=n]  { operations } (default status: manual_review)
+ *   (additive) POST /operations/:id/resolve { outcome: succeeded|failed|compensated, by, note } → { ok, operation }
+ *                                          (a human resolves a manual review; requires the API token)
  *
  * Security: binds 127.0.0.1 by default and has no authentication there; the Host header must name the loopback
  * listener (DNS-rebinding guard) and request bodies must be `application/json` (no simple cross-site form posts).
@@ -341,8 +350,20 @@ export async function startApiServer(ht: Hypertest, options: ApiServerOptions): 
         // an operator decision (it un-pauses a run an operator or the budget paused): an agent reaching the loopback API
         // must not resume runs (I1)
         requireDecisionToken();
+        // (E[3]) an optional body raises the run's budget first: { raise: { maxModelTokens?: n, … }, by, rationale }
+        const hasBody = Number(req.headers['content-length'] ?? 0) > 0 || req.headers['transfer-encoding'] !== undefined;
+        const body = hasBody ? await readJson(req, maxBody) : {};
+        for (const k of Object.keys(body)) if (!['raise', 'by', 'rationale'].includes(k)) throw new HttpError(400, 'invalid_argument', `unknown field '${k}'`);
+        const options: ResumeRunOptions = {};
+        if (body['raise'] !== undefined) {
+          const problems = budgetRaiseProblems(body['raise']);
+          if (problems.length > 0) throw new HttpError(400, 'invalid_argument', problems.join('; '));
+          options.raise = body['raise'] as BudgetRaiseInput;
+          options.by = requireString(body, 'by');
+          options.rationale = requireString(body, 'rationale');
+        } else if (body['by'] !== undefined || body['rationale'] !== undefined) throw new HttpError(400, 'invalid_argument', 'by/rationale are only meaningful with a raise');
         await mustRun(id);
-        const r = await need((ht as Partial<HypertestInstance>).resume?.bind(ht), 'resume')(id);
+        const r = await need((ht as Partial<HypertestInstance>).resume?.bind(ht), 'resume')(id, options);
         sendJson(res, 200, { ok: true, releasedPauses: r.releasedPauses });
         return;
       }
@@ -390,6 +411,37 @@ export async function startApiServer(ht: Hypertest, options: ApiServerOptions): 
       const d = decisionBody(await readJson(req, maxBody));
       await ht.approve(id, d.approve, { kind: 'human', id: d.by }, d.rationale);
       sendJson(res, 200, { ok: true });
+      return;
+    }
+    if (head === 'operations' && parts.length === 1) {
+      // (stubs[8]) operations by status — default: those awaiting a human manual review
+      allow('GET');
+      const filter: { runId?: string; status?: OperationRecord['status'][]; limit?: number } = {};
+      const runId = url.searchParams.get('runId');
+      if (runId) filter.runId = runId;
+      const status = listParam(url, 'status');
+      if (status) {
+        for (const st of status) if (!OPERATION_STATUSES.includes(st)) throw new HttpError(400, 'invalid_argument', `unknown operation status '${st}'`);
+        filter.status = status as OperationRecord['status'][];
+      }
+      const limit = intParam(url, 'limit', 1);
+      if (limit !== undefined) filter.limit = limit;
+      sendJson(res, 200, { operations: (await need((ht as Partial<HypertestInstance>).listOperations?.bind(ht), 'operation listing')(filter)) as unknown as JsonValue });
+      return;
+    }
+    if (head === 'operations' && id !== undefined && parts.length === 3 && parts[2] === 'resolve') {
+      // (stubs[8]) a human resolves a manual review: an agent reaching the loopback API must never resolve its own unknown
+      // side effect (I1, I4)
+      allow('POST');
+      requireDecisionToken();
+      const body = await readJson(req, maxBody);
+      for (const k of Object.keys(body)) if (!['outcome', 'by', 'note'].includes(k)) throw new HttpError(400, 'invalid_argument', `unknown field '${k}'`);
+      const outcome = body['outcome'];
+      if (outcome !== 'succeeded' && outcome !== 'failed' && outcome !== 'compensated') throw new HttpError(400, 'invalid_argument', 'outcome must be one of succeeded, failed, compensated');
+      const by = requireString(body, 'by');
+      const note = requireString(body, 'note');
+      const operation = await need((ht as Partial<HypertestInstance>).resolveOperation?.bind(ht), 'operation resolution')(id, outcome, { kind: 'human', id: by }, note);
+      sendJson(res, 200, { ok: true, operation: operation as unknown as JsonValue });
       return;
     }
     if (head === 'oracle-proposals' && id !== undefined && parts.length === 2) {

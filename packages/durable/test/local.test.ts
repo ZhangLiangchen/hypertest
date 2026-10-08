@@ -658,3 +658,40 @@ describe('LocalDurableRuntime: awaitCompletion, validation and shutdown', () => 
     await assert.rejects(rt.resumeIncomplete(), rejectsCode('precondition_failed'));
   });
 });
+
+describe('LocalDurableRuntime: ApprovalSignal (E[8])', () => {
+  test('an approval decision wakes the waiting item at once (not after its observe backoff); the signal is validated', async () => {
+    const store = new MemoryWorld();
+    // the item waits after its first turn on something that never settles by itself (a pending human approval)
+    await addRun(store, 'run_ap', [{ workItemId: 'wi_ap', turns: 2, waitAfterTurn: 1, waitPolls: 1_000_000 }]);
+    const control = new FakeControl({ instance: 'p1', store });
+    const rt = runtime(control, { maxIdleMs: 60_000 });
+    try {
+      await rt.startRun('run_ap');
+      // observe backoff 250 → 500 → 1000 → 2000 ms: after the third poll the next one is 2 s away
+      await until(() => control.callsOf('observeWaiting', 'wi_ap').length >= 3, 10_000);
+      const polls = control.callsOf('observeWaiting', 'wi_ap').length;
+      // the human decides: the item settles on its next observation
+      await store.mutate((w) => {
+        const item = w.runs['run_ap']!.items['wi_ap']!;
+        item.waitPolls = item.polls;
+      });
+      const t0 = Date.now();
+      await assert.rejects(rt.signal('run_ap', { type: 'approval', approvalId: '' }), rejectsCode('invalid_argument', /approvalId is required/));
+      await rt.signal('run_ap', { type: 'approval', approvalId: 'appr_1' });
+      assert.equal((await rt.awaitCompletion('run_ap', { timeoutMs: 5000 })).status, 'completed');
+      assert.ok(Date.now() - t0 < 1500, `observed at once on the approval signal (took ${Date.now() - t0} ms; the backoff was 2000 ms)`);
+      assert.equal(control.callsOf('observeWaiting', 'wi_ap').length, polls + 1, 'exactly one more observation');
+      assert.deepEqual(turnsOf(await store.read(), 'wi_ap'), [1, 2]);
+    } finally {
+      await rt.shutdown();
+    }
+    // no loop (another process drives the run): an approval signal is a no-op, never an error
+    const idle = new LocalDurableRuntime({ control: new FakeControl({ instance: 'p2', store: new MemoryWorld() }), listRuns: async () => [], maxConcurrentTurns: 1 });
+    try {
+      await idle.signal('run_elsewhere', { type: 'approval', approvalId: 'appr_2' });
+    } finally {
+      await idle.shutdown();
+    }
+  });
+});

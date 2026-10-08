@@ -7,17 +7,20 @@ re-check the snapshot's read set against those stores (`FreshnessGuard`).
 
 | Layer | Component | Module |
 |---|---|---|
-| L0 event store | read only (collab `EventStore`) for provenance | – |
+| L0 event store | collab `EventStore` (immutable); (B[8]) every agent transcript entry and compaction is recorded on it, and an agent's working context is rebuilt from it alone: `recordTranscriptOnL0`, `rebuildWorkingContext` | `transcript-l0.ts` |
 | Snapshots | `SnapshotStore`, `SnapshotBuilder`, `FreshnessGuard`, `ResolverRegistry` + built-in resolvers | `snapshots.ts`, `freshness.ts`, `resolvers.ts` |
 | Observed read set | `ObservationLog` (SQL), `observationsOf` (tool results → read-set entries), `observeToolRuntime` (the per-turn collector fed by every tool execution) | `observations.ts` |
 | L1 prompt assembly | `PromptAssembler` | `assembler.ts` |
 | L2 working context | `WorkingContextManager`, `deterministicSummarizer`, `offloadToolResult` | `working.ts` |
-| L3 retrieval | `ExactSearch`, `SymbolIndex` (+ symbol graph: usages, writers, callers, import edges), `HashEmbedder`, `InMemoryVectorIndex`, `createPgVectorIndex`, `WorkspaceVectorRetriever` (chunked workspace corpus per root + commit), `HybridRetriever` | `retrieval/*` |
-| L4 durable memory | `createExperienceStore` (SQL), `PowerContextClient` (HTTP) | `experience.ts`, `powercontext.ts` |
+| L3 retrieval | `ExactSearch`, `SymbolIndex` (+ symbol graph: usages, writers, callers, import edges) over syntax trees (`parseTsJs`, `parsePythonFiles`, `parseGoFiles`), `HashEmbedder`, `OpenAICompatibleEmbedder`, `InMemoryVectorIndex`, `createPgVectorIndex`, `WorkspaceVectorRetriever` (chunked workspace corpus per root + commit), `HybridRetriever`, `createCodeToolRetrieval` (the code tools' port) | `retrieval/*` |
+| L4 durable memory | `createExperienceStore` (SQL), `PowerContextClient` (HTTP), (B[4]) the memory service `createMemoryServiceHandler` / `listenMemoryService`, `withExperienceEvents` | `experience.ts`, `powercontext.ts`, `memory-service.ts` |
+| Skills (learning) | (B[7]) `createSkillRegistry` (store-enforced: candidate → eval-validated → published → retired), `withTrialSkills`, `skillDigest`, `skillArmId`, `renderSkillMarkdown` | `skills.ts` |
 | L5 provenance | `createProvenanceService` | `provenance.ts` |
 
-Depends on `core`, `domain`, `collab`, `evidence` only. No third-party dependencies (ripgrep is used as an
-external binary when it is on `PATH`).
+Depends on `core`, `domain`, `collab`, `evidence` and one third-party package, `typescript` (5.9.3, Apache-2.0: the
+compiler API parses TS/JS for the symbol graph; confined to this package by `scripts/check-boundaries.mjs`). External
+binaries are optional: ripgrep (exact search), python3 (`ast`) and Go (`go/ast`) for the symbol graph — without them the
+regex extractor is the per-file fallback.
 
 ## API (`src/contracts.ts` is the ABI)
 
@@ -43,8 +46,9 @@ external binary when it is on `PATH`).
   the caller's entries; it is sorted and de-duplicated. Unknown run ⇒ `not_found`. `eventSeq` is the L0 position
   observed before the snapshot's own event, so the next build sees `eventSeq + 1`. (additive) With `input.observer`
   (`{agentId}`, empty id ⇒ `invalid_argument`) and `deps.observations`, the agent's latest observation of every resource
-  (at most `maxObservedEntries`, default 256, most recent first) joins the read set — what it read or wrote through its
-  tool calls up to this build: the NEXT turn's snapshot includes the current turn's observations.
+  joins the read set — what it read or wrote through its tool calls up to this build: the NEXT turn's snapshot includes the
+  current turn's observations. (B[0]) Nothing is dropped: there is no cap by default; an explicit `maxObservedEntries`
+  that the agent's observations exceed fails closed (`precondition_failed`) instead of silently unpinning the oldest.
 - `createResolverRegistry(resolvers?)` (Map; re-registering a type replaces it) and built-in resolvers over structural
   ports: `environmentResolver(getEnv)` (`"<generation>:<buildDigest ?? ''>"`), `oracleResolver(getOracle)` and
   `experimentResolver(getExperiment)` (`String(revision)`), `recordResolver(head, {resourceType?})` (version = head
@@ -100,6 +104,27 @@ external binary when it is on `PATH`).
   `generation:buildDigest` (`ports.environmentVersion`; `env.*` tools: own WRITE — only while the environment is still
   at the generation the action's verified result names, so another agent's deploy landing right after it is never
   recorded as this agent's own knowledge).
+- (B[0]) Further observing tools: `fs.search` and `code.symbols` / `code.references` pin the files of the lines they showed
+  (content-verified: a line that no longer reads the same pins `unverified:<invocation>` for `fs.search` — a later action
+  on the file is refused until it is re-read — and nothing for the index-based code tools; a symbol-graph row's
+  `⟦usage in Owner.method⟧ ` annotation is stripped before the comparison); `git.blame` pins the current lines;
+  `git.diff` of the working tree pins its files at their current version (ABSENT when deleted); `evidence.get` /
+  `evidence.query` pin the evidence they returned (immutable); `plan.read` / `plan.propose_revision` the `plan`
+  `run/<runId>/plan` at its accepted revision (`planResourceId`; `planResolver`); `experiment.define` the experiment
+  revision; `oracle.get` / `oracle.list` the oracle revisions (`oracle.get` of an explicitly requested revision the run does
+  not use is history and pins nothing — review: `oracle` is always checked, so such a pin would refuse every later action
+  for good). Every finding the agent saw (a `blackboard.read` row, a
+  post) also pins `finding_withdrawal` `<lineage>` = `active` | `withdrawn:<rejected|duplicate>`
+  (`findingWithdrawalResolver`; always checked): a finding withdrawn after the agent saw it blocks its next mutating
+  action until it re-reads it. The control plane also records what each PROMPT delivered (`context.assemble`
+  observations: plan, blackboard records, code lines, skills, environments), so knowledge that only reached the agent
+  through its prompt is pinned too. A finding merely LISTED among the open records is pinned as `record` (checked for the
+  actions that name its lineage) plus `finding_withdrawal` (always checked); the always-checked `finding` version is
+  pinned only for a finding the agent acts on (a work-item input, one it read in full or posted) — review: a confirmation
+  or new evidence on any of up to 60 listed findings would otherwise refuse every mutating action of every agent.
+- (B[1]) `createFreshnessPassLog({db, …})` (`ht_context_freshness_passes`, append-only): the durable record that a
+  record-effect domain tool passed the guard for an invocation, so a resumed or replayed call is not re-judged against
+  a later state.
 - `observeToolRuntime(runtime, {log, logger, now?, environmentVersion?})` wraps a ToolRuntime-shaped object: every
   execution records its observations BEFORE the result is returned (the next call of the turn is validated against
   them). A recording (or mapping) failure fails closed for the read-only observing tools (`fs.read`, `git.show`,
@@ -164,17 +189,32 @@ returned over budget and the caller must condense. Returns `droppedSections`, `t
   id: relPath}, path, line, snippet, score}` with score from line/file match counts and the first-match column.
   `query.root`/globs that are absolute or contain `..`, globs that do not compile, and non-finite limits ⇒
   `invalid_argument`; a subdirectory resolving outside the root ⇒ `permission_denied`.
-- `new SymbolIndex({root, languages?})`: `build()`, `findDefinitions(name)`, `findReferences(name)`, `search(q)`
+- `new SymbolIndex({root, languages?, goHelperDir?})`: `build()`, `findDefinitions(name)`, `findReferences(name)`, `search(q)`
   (`q.symbol ?? identifiers in q.text`; exact definition 1.0, case-insensitive prefix 0.7, word-boundary reference 0.3).
-  Extraction: TS/JS `function`, `class`, `interface`, `type`, `enum`, `const X = {…}` (`const_object`), top-level
+  (B[6]) Definitions and usages come from real syntax trees: the TypeScript compiler API for TS/JS/TSX/JSX
+  (`parseTsJs`, in process), python3 `ast` (`parsePythonFiles`: one `python3 -I` subprocess per build, all changed files
+  batched) and Go `go/ast` (`parseGoFiles(files, {helperDir})`: a helper program built once per `goHelperDir`). The helper
+  runs in the Hypertest process, OUTSIDE every sandbox, so it is built only into the PRIVATE directory the caller names —
+  `@hypertest/app` passes `<dataDir>/state/parsers`, which the local sandbox hides from every agent command — and never at a
+  shared temp path (review: a sandboxed command running as the same user could replace a helper under `/tmp` and have the
+  host execute it). Without `goHelperDir`, Go files use the regex fallback; a directory or binary that is not this user's
+  private (not group/other-writable) file is never used; the build sees no host credentials, a private GOCACHE/GOPATH,
+  `GOENV=off`, `GOPROXY=off`, `GOTOOLCHAIN=local`. python3 runs isolated (`-I`) with a minimal environment. Each definition carries its syntax-tree span
+  (`endLine`): the enclosing definition of a reference is the innermost function / method / class / struct containing
+  it. Usages are classified from the tree (assignment / `++` / `--` target ⇒ write, callee or `new` ⇒ call, import
+  specifier ⇒ import, else read): a name inside a string or comment is never a write. A file a parser cannot handle (no
+  python3 / go, a syntax error) falls back to the regex extractor below; `parserEngines()` says which engine parsed each
+  file (`typescript`, `python-ast`, `go-ast`, `regex-fallback`). `build()` is incremental: every file is re-read, only a
+  changed file is parsed again. `definitionsMatching(query, limit)`: definitions whose name contains the query.
+  Regex fallback: TS/JS `function`, `class`, `interface`, `type`, `enum`, `const X = {…}` (`const_object`), top-level
   `const/let/var`, arrow functions, class methods and arrow properties (brace-depth class scope, strings/comments
   stripped); Python `class`, `def`, `async def` (methods by indentation scope, docstrings skipped); Go `func`,
   receiver methods (container = receiver type), `type X struct|interface`, other `type`, `type (…)` blocks,
   `var/const`. The index is built lazily on first use; call `build()` again to refresh (when builds overlap, the
   latest `build()` call wins even if an older one finishes later). `query.root` may name a directory or a file.
-- (additive) Symbol graph (regex, no parser): every reference carries `usage` (`import` > `write` — `=`, compound
-  assignment, `:=`, `++`/`--` — > `call` > `read`; comparisons and arrows are not writes; `classifyUsage`) and its
-  `enclosing` definition (the nearest preceding function/method/class: `Container.name`); `findReferences(name, limit,
+- (additive) Symbol graph: every reference carries `usage` (`import` > `write` > `call` > `read`; from the syntax tree, or
+  for a regex-fallback file `classifyUsage` — `=`, compound assignment, `:=`, `++`/`--`; comparisons and arrows are not
+  writes) and its `enclosing` definition (`Container.name`); `findReferences(name, limit,
   {usage?})`; `writers(target)` — "who writes X?", `Type.member` narrows to writes inside `Type`'s definitions or in files
   referencing `Type`; `callers(name)` (call edges enclosing → name); `imports(path?)` / `importers(path)` — import edges
   (`extractImports`: TS/JS `import … from`, `export … from`, bare `import`, `require()`/`import()`; Python `import` /
@@ -183,7 +223,19 @@ returned over budget and the caller must condense. Returns `droppedSections`, `t
   outside the repository). `search()` answers "who writes|assigns|sets|mutates|modifies|updates X" (writers, 0.9) and
   "who calls|invokes|uses X" (calls / all non-import references, 0.8) above plain references.
 - `new HashEmbedder({dims=256})`: lowercase alphanumeric tokens with camelCase/snake splitting, FNV-1a feature hashing
-  with a sign hash, L2-normalized (`modelId = hash-v1-<dims>`).
+  with a sign hash, L2-normalized (`modelId = hash-v1-<dims>`). The default embedder.
+- (B[6]) `new OpenAICompatibleEmbedder({baseUrl, model, dimensions, apiKey?, headers?, timeoutMs=30 s, batchSize=64,
+  fetch?})`: semantic embeddings over an OpenAI-compatible `POST <baseUrl>/embeddings` (`{model, input}` →
+  `{data: [{index, embedding}]}`), batched; every answer is verified (one vector per text, ordered by `index`, exactly
+  `dimensions` finite numbers; an empty text is sent as one space) — anything else, an HTTP error or a timeout is
+  `provider_error`, and the API key never appears in an error. `modelId = openai-compatible:<model>:<dimensions>` (its
+  pgvector rows never mix with the hashing embedder's). `@hypertest/app` uses it for `retrieval.embedder`.
+- (B[6]) `createCodeToolRetrieval({logger?, maxRoots=16, goHelperDir?})`: the retrieval port of the agent code tools
+  (`BuiltinToolOptions.retrieval`): `code.symbols` → `definitionsMatching` rows labelled `⟦definition <kind>
+  <Container.name>⟧ <signature>`; `code.references` (`name` or `Owner.member`) → the definitions, then every reference
+  classified from the syntax tree — writes, calls, reads, imports — labelled `⟦<usage> in <enclosing>⟧ <line>`, the
+  writes of `Owner.member` narrowed like `writers()` ("who writes AccountState.version?"). One index per workspace root
+  (LRU), rebuilt incrementally before every query so an agent sees its own edits. `stripSymbolAnnotation`.
 - `new InMemoryVectorIndex(embedder)`: cosine; `query.kinds` filters by `namespace`; `query.root` keeps documents whose
   `path` lies inside it (documents without a path never match a root).
 - `await createPgVectorIndex(db, embedder)`: `CREATE EXTENSION IF NOT EXISTS vector` (failure ⇒ `unsupported`), then
@@ -235,6 +287,52 @@ returned over budget and the caller must condense. Returns `droppedSections`, `t
   than the decision asked for ⇒ `provider_error`; `propose` must keep `createdBy` (else `provider_error`);
   `retrieve` drops anything not approved/published **or outside the requested scope**, and `list` re-applies its
   status/run filter (a service ignoring a parameter cannot widen results).
+
+- (B[4]) The memory SERVICE: `createMemoryServiceHandler({memory, apiKey?, logger?, maxBodyBytes=1 MiB})` /
+  `listenMemoryService({…, host='127.0.0.1', port=0})` serve exactly the API `PowerContextClient` speaks (`GET
+  /v1/health` without auth; the rest behind `Authorization: Bearer <apiKey>`, constant-time compared), over any
+  `DurableMemory` — the process hosting it owns its storage (`@hypertest/app` `serveMemory` / `hypertest memory serve`:
+  its own PGlite directory; `memory.kind: service`: a child process Hypertest starts and stops). The store's invariants
+  hold server side, including reviewer ≠ creator against the calling actor the client names (`x-hypertest-actor-id` /
+  `x-hypertest-agent-id`, URI-encoded); errors are `{error: {code, message}}` with the status the client maps back to
+  the same code (400, 401/403, 404, 409, 412, 413, 429, 5xx). `withExperienceEvents(memory, {events})`: the decisions a
+  remote memory accepted are also appended to this deployment's L0 (`experience.proposed` / `experience.reviewed`,
+  deterministic ids: a retried call never appends twice).
+
+### Skills (B[7], learning pipeline)
+
+- `createSkillRegistry({db, events?, experiences, …})` (`ht_skills`, `ht_skill_validations`): approved experience →
+  candidate SKILL → eval validation bound to the revision → published (the active registry) → retired.
+  `propose({name, description, body, scope?, sourceExperienceIds, createdBy, skillId?})`: every source experience must be
+  approved or published (else `precondition_failed`); the revision is content-addressed (`skillDigest` of name,
+  description, body, scope). `recordValidation(skillId, revision, evalResult, {recordedBy, minPassRate=1, minTrials=1,
+  baselineArmId?})`: counts only the trials of the arm bound to that revision (`skillArmId` =
+  `skill-<id>-r<rev>-<digest12>`); passed ⇔ enough trials, pass rate ≥ minPassRate and not below the baseline (cold
+  track) arm; a pass makes it `validated`. `minPassRate` must be in (0, 1] (review: a zero threshold let a skill whose
+  every trial failed pass); migration `context/006-skill-validation-consistency` makes the database refuse a validation
+  row whose `passed` contradicts its own numbers (no passing trial, too few trials, pass rate ≠ passes / trials or below
+  the threshold or the baseline). A validation judges the SuiteResult it is given: `hypertest skill validate --suite`
+  runs the eval itself; `--result <file>` trusts the operator-supplied file (its arm id must still be the revision's). `publish` (publisher ≠ creator; retires the previously published revision),
+  `retire`, `reject`, `get`, `list`, `validations`; `forPrompt({role, text})`: PUBLISHED revisions only, scope-matched.
+  Enforced in the DATABASE, not only here: a skill row is inserted as `candidate`; its content never changes;
+  transitions are `candidate → validated | rejected`, `validated → published | candidate | rejected`, `published →
+  retired`; `validated` and `published` require that the LATEST validation of that exact digest passed; one published
+  revision per skill; no DELETE/TRUNCATE; validations are append-only. Events `skill.proposed|validated|
+  validation_failed|published|retired|rejected` on L0.
+- `withTrialSkills(registry, trial)`: an eval arm's `skills.trial` revisions (digest-checked, marked as candidates under
+  evaluation) join `forPrompt` for that instance only; they never enter the registry. `skills.trial` is an ordinary
+  configuration key: an instance configured with it shows those UNPUBLISHED revisions to its agents (marked), so
+  `@hypertest/app` logs a warning at every start of such an instance.
+
+### L0 as the root of context reconstruction (B[8])
+
+- `recordTranscriptOnL0(sessions, {db, events, logger})` wraps the runtime SessionStore: every transcript entry a
+  session commits (task input, model responses, tool results, drained inputs) is appended to L0 as
+  `context.transcript_recorded` (per-session ordinal, deterministic id `transcriptEventId`) IN THE SAME TRANSACTION as
+  the session write — a failed append rolls the write back, so the mutable session tables never hold history L0 lacks.
+  Compactions are on L0 as `context.compacted` with their summary.
+- `rebuildWorkingContext(events, runId, sessionId)` reconstructs the transcript and compactions from L0 alone; a gap, a
+  duplicate ordinal or a compaction without its summary is `integrity_violation`.
 
 ### L5 provenance
 
@@ -298,6 +396,14 @@ returned over budget and the caller must condense. Returns `droppedSections`, `t
 | Symbol graph | assignments vs comparisons/arrows, qualified `Type.member` writers, callers with enclosing definitions, import edges (TS `.js`→`.ts`, index, dynamic import, Python relative, Go module path, never outside the repo) | `test/symbol-graph.test.ts` |
 | Vector corpus lazy, per workspace + commit, bounded, isolated | embed counts; commit change re-populates and retires the old corpus; bounds truncate; failed population retried; pgvector shared by two workspaces without cross-talk; hybrid reaches a README section no identifier names | `test/workspace-vector.test.ts` |
 | L5 gaps are explicit | missing tool events, operation events, work item, agent, env/commit; inconsistent invocation id, tool id, agent, operation/tool work item; record citing evidence of another run; unknown evidence/record; record citing nothing | `test/provenance.test.ts` |
+| (B[0]) The read set never drops an observation | 300 distinct observations: every one is pinned, a write to the first one observed is still checked; an explicit cap exceeded ⇒ `precondition_failed` | `test/observations.test.ts` |
+| (B[0]) What every observing tool showed is pinned | fs.search / code.symbols / code.references / git.blame / git.diff / evidence / plan / experiment / oracle results ⇒ exact pins; a line that no longer matches ⇒ unverified (fs.search) or nothing (index-based); annotated symbol-graph rows verified | `test/observations.test.ts` |
+| (B[2]) Every state the design lists is re-checked before a side effect | build digest, environment generation, oracle upgrade, withdrawn finding (rejected / duplicate), lease owner, metric window — one at a time; plan revision for plan CAS | `test/freshness.test.ts` |
+| (B[6]) Syntax-tree symbols with a per-file fallback | TS compiler API kinds and containers; a name in a string / comment is not a write (the regex classifier was fooled); python3 `ast` and `go/ast` usages; a syntax error / missing python3 ⇒ regex fallback recorded per file | `test/parsers.test.ts` |
+| (B[6]) The code tools answer from the symbol graph | "who writes AccountState.version" ⇒ writes first with enclosing definitions, owner-narrowed; an edit is seen by the next query | `test/code-port.test.ts` |
+| (B[6]) Semantic embeddings verified, never padded | reordered answers, wrong dimensions, missing / duplicate / out-of-range index, non-finite numbers, HTTP 401, bad JSON, network error; the key never in an error | `test/embedder.test.ts` |
+| (B[4]) The memory service keeps the store's invariants over HTTP | bad JSON, oversized body, missing fields, unknown status, unknown route, wrong token; self-review via the calling actor; non-ASCII actors; remote decisions appended to L0 once | `test/memory-service.test.ts`; app `test/memory-service.e2e.test.ts` (a real child process, restart keeps the data) |
+| (B[7]) Only eval-validated skills are published; only published skills reach prompts | candidate / rejected / unknown source experience; publish without a validation, after a failing one, by the creator; direct SQL INSERT as published, UPDATE of content or status, DELETE of a skill or a validation ⇒ refused by triggers; a later failing validation sends a validated revision back to candidate | `test/skills.test.ts` |
 | L5 observation lineage (eval PoC C: SLO numbers of a load job observed in another work item trace completely); a forged operation link is still a gap | `test/provenance.test.ts` › an observation is lineage |
 
 ## Testing
@@ -346,5 +452,21 @@ The ripgrep-vs-JS test skips with a reason when `rg` is not on `PATH`.
   `SymbolIndex.findReferences(name, limit?, options?)`, `.writers()`, `.callers()`, `.imports()`, `.importers()`;
   `classifyUsage`, `extractImports`, `resolveImport`. Vectors: `WorkspaceVectorRetriever`, `VectorCorpusCache`,
   `chunkText`, `gitHeadCommit`, `CodeChunk`, `WorkspaceVectorOptions`.
+
+- (context-learning, additive) `DEFAULT_MAX_OBSERVED_ENTRIES` is `undefined` (no cap; an explicit cap exceeded fails
+  closed); `FreshnessPass` / `FreshnessPassLog` + `createFreshnessPassLog` (migration `context/004-freshness-passes`);
+  `findingWithdrawalResolver`, `planResolver`, `planResourceId`, `FINDING_WITHDRAWN_STATUSES`,
+  `findingWithdrawalVersion`, `UNVERIFIED_VERSION_PREFIX`, `shownLineEntries`; `finding_withdrawal` is always checked.
+- (context-learning) Skills: `SkillStatus`, `SkillRevision`, `SkillEvalResult`, `SkillValidation`,
+  `SkillValidationOptions`, `SkillRegistry`; `createSkillRegistry`, `withTrialSkills`, `skillDigest`, `skillArmId`,
+  `renderSkillMarkdown`, `SKILL_EVENTS`, `SKILL_STATUSES`, `SKILL_NAME_RE`; migration `context/005-skills`.
+- (context-learning) L0: `recordTranscriptOnL0`, `rebuildWorkingContext`, `transcriptEventId`,
+  `TRANSCRIPT_RECORDED_EVENT`, `COMPACTED_EVENT`.
+- (context-learning) L3: `SymbolDefinition.endLine?`; `SymbolIndexOptions.goHelperDir?`; `parseTsJs`, `parsePythonFiles`,
+  `parseGoFiles(files, {helperDir?})`, `goAstHelper(helperDir)` (review: no shared temp-path default),
+  `ParsedFile`, `ParserEngine`; `SymbolIndex.parserEngines()`, `.definitionsMatching()`; `OpenAICompatibleEmbedder`;
+  `createCodeToolRetrieval`, `stripSymbolAnnotation`. Dependency `typescript` 5.9.3.
+- (context-learning) L4: `createMemoryServiceHandler`, `listenMemoryService`, `withExperienceEvents`; the client sends
+  `x-hypertest-actor-id` / `x-hypertest-agent-id`.
 
 Events emitted that are not in the domain `EVENT_TYPES` catalog: `experience.reviewed` (aggregate `context`).

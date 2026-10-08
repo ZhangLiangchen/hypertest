@@ -187,11 +187,14 @@ test('permit.constraints.allowedHosts is a hard bound even for the addressed env
   assert.equal(evidence.length, 0);
 });
 
-test('non-idempotent methods carry Idempotency-Key = invocationId unless the caller sets one', async () => {
+test('non-idempotent methods carry Idempotency-Key = the operation id (E[9]; the invocation id only when unledgered) unless the caller sets one', async () => {
   const { ctx } = fakeContext({ environments: env.environments, invocationId: 'sess_x:3:call_7' });
   const out = await tool.execute({ method: 'POST', url: `${server.url}/echo`, json: { a: 1 } }, ctx);
   assert.equal(out.status, 'success');
   assert.deepEqual(structuredOf(out)['json'], { method: 'POST', idempotencyKey: 'sess_x:3:call_7', body: '{"a":1}' });
+  // a ledgered execution names its operation: the target receives idempotencyKey = operationId
+  const ledgered = await tool.execute({ method: 'POST', url: `${server.url}/echo`, json: { a: 2 } }, { ...ctx, operationId: 'op_01JLEDGEREDKEY0000000000000' });
+  assert.equal(structuredOf(ledgered)['json']['idempotencyKey'], 'op_01JLEDGEREDKEY0000000000000');
   const own = await tool.execute({ method: 'PUT', url: `${server.url}/echo`, body: 'raw', headers: { 'Idempotency-Key': 'mine' } }, ctx);
   assert.equal(structuredOf(own)['json']['idempotencyKey'], 'mine');
   const get = await tool.execute({ method: 'GET', url: `${server.url}/echo` }, ctx);
@@ -434,7 +437,10 @@ test('conformance-7: for an environment that honours Idempotency-Key the interru
   assert.equal(replay.status, 'success', JSON.stringify(replay.error));
   const sent = server.requests.slice(before);
   assert.equal(sent.length, 2, 'one safe resend');
-  assert.deepEqual(sent.map((r) => r.headers['idempotency-key']), [req.invocationId, req.invocationId], 'the resend carries the same key');
+  // E[9]: idempotencyKey = operationId — the key the ledger records is the one the SUT deduplicates by, on both sends
+  const op = await newGateway(env, []).ledger.get(replay.operationId!);
+  assert.equal(op?.idempotencyKey, replay.operationId);
+  assert.deepEqual(sent.map((r) => r.headers['idempotency-key']), [replay.operationId, replay.operationId], 'the resend carries the same key: the operation id');
   assert.equal(appliedTransfers - appliedBefore, 1, 'the SUT applied the transfer once');
   // settled: further replays return the recorded response
   const third = await newRuntime(env, [tool], newGateway(env, []).gateway).execute({ ...req });

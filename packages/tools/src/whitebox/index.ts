@@ -7,7 +7,11 @@ export { createSqlEnvironmentRegistry, toolsMigrations } from './sql-environment
 export { RECORD_EFFECT_ADAPTER_ID, RECORD_EFFECT_RESENDABLE_ADAPTER_ID, bindRecordEffect, recordEffectAdapters, type RecordedToolOutcome } from './record-effects.ts';
 export { createWorkspaceManager, workspaceIdFor } from './workspaces.ts';
 export { confineExisting, normalizeRel, workspaceResource } from './paths.ts';
-export { createLocalSandbox, createOciSandbox, buildDockerArgs, dockerNetwork, dockerCliEnv, dockerContainerEnv, allowlistedEnv, sandboxCwd, loopbackEndpoints, SANDBOX_BASE_ENV, SANDBOX_MARKER_ENV, DOCKER_CLI_ENV_KEYS } from './sandbox.ts';
+export { createLocalSandbox, createOciSandbox, buildDockerArgs, dockerNetwork, dockerCliEnv, dockerContainerEnv, allowlistedEnv, sandboxCwd, loopbackEndpoints, loopbackEndpointPolicies, SANDBOX_BASE_ENV, SANDBOX_MARKER_ENV, DOCKER_CLI_ENV_KEYS } from './sandbox.ts';
+export {
+  EGRESS_OPERATION_HEADER, MAX_EGRESS_BODY_BYTES, METHOD_OVERRIDE_HEADERS, SAFE_EGRESS_METHODS, SANDBOX_HTTP_OPERATION, createEgressHttpServer, currentEgressContext, effectiveMethod, egressResource,
+  runWithEgressContext, type EgressCallContext, type EgressWrite,
+} from './egress-relay.ts';
 export { networkIsolation, probeNetworkIsolation, resolveProgram, type IsolationSpec, type NetworkIsolation, type NetworkIsolationOptions } from './netns.ts';
 export { argumentPathDenial, argumentPathTokens } from './argv-guard.ts';
 export { spawnProcess, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_KILL_GRACE_MS, type SpawnRequest } from './process.ts';

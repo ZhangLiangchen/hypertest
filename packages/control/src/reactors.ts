@@ -1,5 +1,5 @@
-import type { DeliveredEvent, SqlExecutor } from '@hypertest/core';
-import { EVENT_TYPES, SEVERITY_ORDER, isUnresolvedFinding, workItemFingerprint, type BlackboardRecord, type DomainEvent, type Finding, type Ref, type Severity, type WorkItem } from '@hypertest/domain';
+import { sha256Hex, type DeliveredEvent, type SqlExecutor } from '@hypertest/core';
+import { EVENT_TYPES, SEVERITY_ORDER, eventFrom, isUnresolvedFinding, workItemFingerprint, type BlackboardRecord, type DomainEvent, type Finding, type Ref, type Severity, type WorkItem } from '@hypertest/domain';
 import type { NewWorkItem } from '@hypertest/collab';
 import { matchesSubscription, renderSubscriptionWork, type RoleSubscription, type SubscriptionSubject } from '@hypertest/agents';
 import type { AgentRole } from '@hypertest/domain';
@@ -13,6 +13,20 @@ export const REACTOR_CONSUMER = 'reactors';
 /** Durable bus consumer and subject filter used when an event bus is configured. */
 export const REACTOR_SUBJECTS = ['ht.*.>'];
 const BATCH = 200;
+
+/** (row 155) Inbox consumer of the test.passed events examined for a recovery (each examined once, I5). */
+export const TEST_RECOVERY_CONSUMER = 'reactors:test-recovery';
+
+/** (row 155) Deterministic id of the test.recovered event a test.passed event produced (a redelivery appends nothing twice). */
+export function testRecoveredEventId(passedEventId: string): string {
+  return `evt_trec_${sha256Hex(`test.recovered\u0000${passedEventId}`).slice(0, 32)}`;
+}
+
+/** Identity of a test outcome on L0: the runner framework and selector it ran (test.failed / test.passed payload). */
+function testKey(e: DomainEvent<unknown>): string {
+  const p = (e.payload ?? {}) as Record<string, unknown>;
+  return `${String(p['framework'] ?? '')}\u0000${String(p['selector'] ?? '(all)')}`;
+}
 
 /** (coverage-17) Inbox consumer of the finding events that scheduled a lead replan (each event triggers at most once, I5). */
 export const CRITICAL_FINDING_REPLAN_CONSUMER = 'lead-replan:critical-finding';
@@ -248,6 +262,43 @@ export function createReactorService(deps: ControlDeps): ReactorService {
     return created;
   }
 
+  /**
+   * (row 155: "test.failed/recovered") A test.passed whose test (framework + selector) last FAILED earlier in the run is a
+   * recovery: test.recovered is appended once (deterministic id, inbox-deduped consumer), caused by the passing event and
+   * citing the failing and the passing evidence — the L0 signal that a previously failing test passes on later evidence.
+   */
+  async function recover(e: DomainEvent<unknown>, tx: SqlExecutor): Promise<void> {
+    const eventId = testRecoveredEventId(e.eventId);
+    if (await events.get(eventId)) return;
+    const key = testKey(e);
+    const earlier = (await events.read(e.runId, { types: [EVENT_TYPES.testFailed, EVENT_TYPES.testPassed] })).filter((x) => x.eventId !== e.eventId && (x.seq ?? 0) < (e.seq ?? Number.MAX_SAFE_INTEGER) && testKey(x) === key);
+    const last = earlier.at(-1);
+    if (!last || last.eventType !== EVENT_TYPES.testFailed) return;
+    const failed = (last.payload ?? {}) as Record<string, unknown>;
+    const passed = (e.payload ?? {}) as Record<string, unknown>;
+    // a known-good check on the BASE revision passing after the candidate failed is no recovery (same code never fixed)
+    const passedEvidence = await deps.evidence.getMany((Array.isArray(passed['evidenceIds']) ? passed['evidenceIds'] : []).filter((x): x is string => typeof x === 'string'));
+    const revisions = passedEvidence.map((r) => ((r.structured ?? {}) as Record<string, unknown>)['codeRevision']).filter((x): x is Record<string, unknown> => !!x && typeof x === 'object');
+    if (revisions.some((r) => r['kind'] === 'base')) return;
+    const ctx = { runId: e.runId, correlationId: e.correlationId, causationId: e.eventId, actorId: 'system:reactors', ...(e.workItemId ? { workItemId: e.workItemId } : {}), ...(e.agentId ? { agentId: e.agentId } : {}) };
+    await events.append([{
+      ...eventFrom(ctx, EVENT_TYPES.testRecovered, 'tool', e.aggregateId, {
+        selector: (passed['selector'] ?? '(all)') as string,
+        framework: (passed['framework'] ?? null) as string | null,
+        failedEventId: last.eventId,
+        passedEventId: e.eventId,
+        failedEvidenceIds: (Array.isArray(failed['evidenceIds']) ? failed['evidenceIds'] : []) as string[],
+        passedEvidenceIds: (Array.isArray(passed['evidenceIds']) ? passed['evidenceIds'] : []) as string[],
+        failedToolInvocationId: (failed['toolInvocationId'] ?? null) as string | null,
+        passedToolInvocationId: (passed['toolInvocationId'] ?? null) as string | null,
+        failedWorkItemId: last.workItemId ?? null,
+        passedCodeRevision: (revisions[0] ?? null) as Record<string, unknown> | null,
+      }),
+      eventId,
+    }], tx);
+    logger.info('test recovered', { runId: e.runId, selector: passed['selector'], failedEventId: last.eventId, passedEventId: e.eventId });
+  }
+
   return {
     subscribedEventTypes: () => [...types()].sort(),
 
@@ -261,6 +312,11 @@ export function createReactorService(deps: ControlDeps): ReactorService {
         if (batch.length === 0) break;
         for (const e of batch) {
           const seq = e.seq ?? cursor;
+          if (e.eventType === EVENT_TYPES.testPassed) {
+            await db.transaction(async (tx) => {
+              if (await inbox.tryConsume(TEST_RECOVERY_CONSUMER, e.eventId, tx)) await recover(e, tx);
+            });
+          }
           if (subscribed.has(e.eventType)) {
             const made = await db.transaction(async (tx) => {
               const fresh = await inbox.tryConsume(REACTOR_CONSUMER, e.eventId, tx);
@@ -284,6 +340,11 @@ export function createReactorService(deps: ControlDeps): ReactorService {
       if (!e || typeof e !== 'object' || typeof e.eventId !== 'string' || typeof e.runId !== 'string') {
         logger.warn('reactor ignored a malformed bus envelope', { eventId: delivered.eventId, subject: delivered.subject });
         return;
+      }
+      if (e.eventType === EVENT_TYPES.testPassed) {
+        await db.transaction(async (tx) => {
+          if (await inbox.tryConsume(TEST_RECOVERY_CONSUMER, e.eventId, tx)) await recover(e, tx);
+        });
       }
       if (!types().has(e.eventType)) return;
       await db.transaction(async (tx) => {

@@ -1,9 +1,14 @@
-import { HypertestError, deepFreeze, newId, systemClock, validateJson, type Clock, type JsonSchema } from '@hypertest/core';
-import { RISK_ORDER } from '@hypertest/domain';
+import { HypertestError, deepFreeze, hashCanonical, isHypertestError, newId, systemClock, validateJson, type Clock, type JsonSchema, type JsonValue } from '@hypertest/core';
+import type { ActorRef, EventContext } from '@hypertest/domain';
+import { EFFECT_ORDER, RISK_ORDER } from '@hypertest/domain';
 import { capabilityAllows, verifyCapability } from './capabilities.ts';
-import type { ActionPermit, ActionRequest, PermitConstraints, PolicyEngine, PolicyEngineOptions, PolicyRule } from './contracts.ts';
+import type { ActionPermit, ActionRequest, ApprovalGateOptions, ApprovalRequest, PermitConstraints, PolicyEngine, PolicyEngineOptions, PolicyRule } from './contracts.ts';
 import { intersectPatterns, matchesResourcePattern, matchesToolPattern } from './patterns.ts';
 import { POLICY_PHASES, flaggedActionsOf, requestPhase } from './phases.ts';
+import { storable } from './storable.ts';
+
+/** The tool effects (review E[2]: a relayed write names its call's own effect). */
+const EFFECT_ORDER_KEYS: ReadonlySet<string> = new Set(Object.keys(EFFECT_ORDER));
 
 type Decision = ActionPermit['decision'];
 const DECISION_RANK: Record<Decision, number> = { allow: 0, approval_required: 1, deny: 2 };
@@ -235,12 +240,20 @@ export function checkCapability(request: ActionRequest, clock: Clock, secret: st
   if (request.workItemId !== undefined && request.workItemId !== request.capability.workItemId) {
     return { ok: false, reason: `capability_work_item_mismatch: ${request.capability.workItemId} != ${request.workItemId}` };
   }
+  // (review E[2]) a relayed write of a sandboxed command is bounded by the CALL's grant and the environment class
+  const relayed = request.relayedWrite;
+  if (relayed !== undefined) {
+    if (!relayed || typeof relayed !== 'object' || !EFFECT_ORDER_KEYS.has(relayed.callEffect)) return { ok: false, reason: 'malformed_request: relayedWrite.callEffect must be a tool effect' };
+    if (request.environmentClass === undefined) return { ok: false, reason: 'capability_denied: a relayed write needs the environment class of its target' };
+  }
   const check = capabilityAllows(request.capability, {
     tool: request.tool,
-    effect: request.effect,
+    effect: relayed !== undefined ? relayed.callEffect : request.effect,
     riskClass: request.riskClass,
-    resources: request.resources,
+    resources: relayed !== undefined ? [] : request.resources,
     ...(request.environmentClass !== undefined ? { environmentClass: request.environmentClass } : {}),
+    // E[4]: a brokered credential the call uses must be granted by the capability
+    ...(request.credentialScopes !== undefined && request.credentialScopes.length > 0 ? { credentialScopes: request.credentialScopes } : {}),
     now: clock.isoNow(),
   });
   if (check.allowed) return { ok: true };
@@ -360,4 +373,194 @@ export class CompositePolicyEngine implements PolicyEngine {
 
 function isDecision(x: unknown): x is Decision {
   return x === 'allow' || x === 'deny' || x === 'approval_required';
+}
+
+
+// ------------------------------------------------------------------------------------------------ approval gate (E[8])
+
+/** Default validity of an action approval request (its `subject.expiresAt`). */
+export const DEFAULT_ACTION_APPROVAL_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * (E[8]) The exact action an approval authorizes: run, work item, tool, effect, risk, resources (the target), environment
+ * class and the digest of the (redacted) arguments. The same call with other arguments, on another target or for another
+ * work item is another action and needs its own approval.
+ */
+export function actionDigest(request: Pick<ActionRequest, 'runId' | 'workItemId' | 'tool' | 'effect' | 'riskClass' | 'resources' | 'environmentClass' | 'input'>): string {
+  // (review) over the STORED form (storable: U+0000 → U+FFFD), so the digest an approval's subject re-describes matches
+  return hashCanonical(
+    storable({
+      runId: request.runId,
+      workItemId: request.workItemId ?? null,
+      tool: request.tool,
+      effect: request.effect,
+      riskClass: request.riskClass,
+      resources: [...request.resources].sort(),
+      environmentClass: request.environmentClass ?? null,
+      inputDigest: hashCanonical(storable(request.input === undefined ? null : request.input)),
+    }),
+  );
+}
+
+/** The action digest an approval request is bound to (`subject.actionDigest`). */
+export function approvalActionDigest(a: Pick<ApprovalRequest, 'subject'>): string | undefined {
+  const s = a.subject as { actionDigest?: unknown } | null;
+  return s && typeof s === 'object' && typeof s.actionDigest === 'string' ? s.actionDigest : undefined;
+}
+
+/**
+ * (review) The digest of the action an approval's subject DESCRIBES — what its decider was shown: tool, effect, risk,
+ * resources, work item, environment class and the (redacted) arguments of run `a.runId`. undefined when the subject is
+ * not a complete action description. The gate honours an approval only when this equals its `actionDigest`: anyone may
+ * FILE an action approval (an agent's request_approval), but the action it authorizes is always exactly the one a human
+ * saw and approved — never another action hidden behind a forged digest.
+ */
+export function subjectActionDigest(a: Pick<ApprovalRequest, 'runId' | 'subject'>): string | undefined {
+  const s = a.subject as Record<string, unknown> | null;
+  if (!s || typeof s !== 'object' || Array.isArray(s)) return undefined;
+  const { tool, effect, riskClass, resources, workItemId, environmentClass } = s;
+  if (typeof tool !== 'string' || typeof effect !== 'string' || typeof riskClass !== 'string') return undefined;
+  if (!Array.isArray(resources) || resources.some((r) => typeof r !== 'string')) return undefined;
+  if (workItemId !== undefined && typeof workItemId !== 'string') return undefined;
+  if (environmentClass !== undefined && typeof environmentClass !== 'string') return undefined;
+  if (!Object.prototype.hasOwnProperty.call(s, 'input')) return undefined;
+  const described: Pick<ActionRequest, 'runId' | 'workItemId' | 'tool' | 'effect' | 'riskClass' | 'resources' | 'environmentClass' | 'input'> = {
+    runId: a.runId, tool, effect: effect as ActionRequest['effect'], riskClass: riskClass as ActionRequest['riskClass'], resources: resources as string[],
+  };
+  if (s['input'] !== null && s['input'] !== undefined) described.input = s['input'] as NonNullable<ActionRequest['input']>;
+  if (workItemId !== undefined) described.workItemId = workItemId;
+  if (environmentClass !== undefined) described.environmentClass = environmentClass;
+  return actionDigest(described);
+}
+
+/** (review) Why an action approval cannot authorize anything (undefined: it is a truthful, time-boxed action description). */
+function unusableActionApproval(a: Pick<ApprovalRequest, 'approvalId' | 'runId' | 'subject'>): string | undefined {
+  const bound = approvalActionDigest(a);
+  if (bound === undefined || subjectActionDigest(a) !== bound) return `approval_mismatch: approval ${a.approvalId} does not describe the action it is bound to (its subject's tool, arguments and target do not digest to ${bound ?? 'its actionDigest'}): it authorizes nothing`;
+  if (approvalExpiresAt(a) === undefined) return `approval_unusable: approval ${a.approvalId} has no decision window (subject.expiresAt): it authorizes nothing`;
+  return undefined;
+}
+
+function approvalExpiresAt(a: Pick<ApprovalRequest, 'subject'>): number | undefined {
+  const s = a.subject as { expiresAt?: unknown } | null;
+  const t = s && typeof s === 'object' && typeof s.expiresAt === 'string' ? Date.parse(s.expiresAt) : Number.NaN;
+  return Number.isFinite(t) ? t : undefined;
+}
+
+/**
+ * (E[8]) The human-in-the-loop of action permits. Wraps an engine (the built-in rules + OPA composite): a `before_action`
+ * request the inner engine sends to `approval_required` is turned into
+ *  - `allow`, when an approval of kind `action` bound to the exact action digest is `approved` by an independent human or
+ *    system actor (never the requesting agent: approvals of kind action are never decided by agents), not expired, and
+ *    can be CONSUMED by this request (exactly once: a replay of the same request finds its own consumption; another
+ *    request is refused) — the permit names it (`approvalId`) and keeps the inner engine's constraints;
+ *  - `deny`, when the latest decision on this exact action is a denial, or its approval expired (no silent re-request);
+ *  - `approval_required` with the `approvalId` of the pending request for this exact action — created (subject: action
+ *    digest, tool, input digest, resources, risk, effect, environment class, run, work item, invocation, expiresAt) when
+ *    none is pending.
+ * An `approvalId` named by the request that does not match the action (another digest, another run, not an action
+ * approval) is refused (deny, exact reason). Every other decision of the inner engine is returned unchanged.
+ */
+export class ApprovalGatedPolicyEngine implements PolicyEngine {
+  readonly revision: string;
+  readonly #inner: PolicyEngine;
+  readonly #o: ApprovalGateOptions;
+  readonly #ttlMs: number;
+
+  constructor(inner: PolicyEngine, options: ApprovalGateOptions) {
+    if (!options?.approvals) throw new HypertestError('invalid_argument', 'ApprovalGatedPolicyEngine requires an approval service');
+    this.#inner = inner;
+    this.#o = options;
+    this.#ttlMs = options.approvalTtlMs ?? DEFAULT_ACTION_APPROVAL_TTL_MS;
+    if (!Number.isFinite(this.#ttlMs) || this.#ttlMs <= 0) throw new HypertestError('invalid_argument', 'approvalTtlMs must be positive');
+    // the gate does not change which actions need approval: the policy revision is the inner engine's
+    this.revision = inner.revision;
+  }
+
+  async evaluate(request: ActionRequest): Promise<ActionPermit> {
+    const permit = await this.#inner.evaluate(request);
+    if (permit.decision !== 'approval_required' || requestPhase(request) !== 'before_action') return permit;
+    const digest = actionDigest(request);
+    const ctx: EventContext = { runId: request.runId, correlationId: request.requestId, actorId: request.agentId !== undefined ? `agent:${request.agentId}` : 'system:policy' };
+    if (request.workItemId !== undefined) ctx.workItemId = request.workItemId;
+    if (request.agentId !== undefined) ctx.agentId = request.agentId;
+    const nowMs = this.#o.clock.nowMs();
+    const deny = (reason: string, approvalId?: string): ActionPermit => {
+      const out: ActionPermit = { decision: 'deny', decisionId: permit.decisionId, reasons: [...permit.reasons, reason], policyRevision: permit.policyRevision };
+      if (approvalId !== undefined) out.approvalId = approvalId;
+      return out;
+    };
+    let candidates: ApprovalRequest[];
+    if (request.approvalId !== undefined) {
+      const named = await this.#o.approvals.get(request.approvalId);
+      if (!named || named.kind !== 'action' || named.runId !== request.runId) return deny(`approval_mismatch: ${request.approvalId} is not an action approval of run ${request.runId}`);
+      if (approvalActionDigest(named) !== digest) return deny(`approval_mismatch: approval ${request.approvalId} authorizes another action (digest ${approvalActionDigest(named) ?? 'none'}, this action ${digest})`, request.approvalId);
+      // (review) the approval must truthfully describe this action (what its decider saw) and be time-boxed
+      const unusable = unusableActionApproval(named);
+      if (unusable !== undefined) return deny(unusable, request.approvalId);
+      candidates = [named];
+    } else {
+      // (review) only truthful, time-boxed descriptions of THIS action count: an approval filed with a forged digest (its
+      // subject shows another action) neither authorizes nor blocks it
+      candidates = (await this.#o.approvals.list({ runId: request.runId })).filter((a) => a.kind === 'action' && approvalActionDigest(a) === digest && unusableActionApproval(a) === undefined).reverse();
+    }
+    // newest first: an approved one (unconsumed or consumed by this very request) authorizes the action once
+    for (const a of candidates) {
+      if (a.status === 'approved') {
+        const until = approvalExpiresAt(a);
+        if (until !== undefined && until <= nowMs) return deny(`approval_expired: approval ${a.approvalId} of this action expired at ${new Date(until).toISOString()}`, a.approvalId);
+        const by = a.decidedBy;
+        if (!by || (by.kind !== 'human' && by.kind !== 'system') || by.id === a.requestedBy.id || (request.agentId !== undefined && by.id === request.agentId)) {
+          return deny(`approval_not_independent: approval ${a.approvalId} was not decided by an independent human or system actor`, a.approvalId);
+        }
+        if (!this.#o.approvals.consume) return deny('approval_unconsumable: the approval store cannot consume approvals (exactly-once is required)', a.approvalId);
+        const used = await this.#o.approvals.consume(a.approvalId, { requestId: request.requestId, digest }, ctx);
+        if (!used.consumed) {
+          // consumed by another request: this one needs (and gets) its own approval request below
+          continue;
+        }
+        const allowed: ActionPermit = { decision: 'allow', decisionId: permit.decisionId, reasons: [...permit.reasons, `approval:${a.approvalId}: granted by ${by.kind}:${by.id}${a.rationale ? ` (${a.rationale})` : ''}; consumed by ${request.requestId}`], policyRevision: permit.policyRevision, approvalId: a.approvalId };
+        if (permit.constraints) allowed.constraints = permit.constraints;
+        return allowed;
+      }
+      if (a.status === 'denied') return deny(`approval_denied: approval ${a.approvalId} of this action was denied by ${a.decidedBy ? `${a.decidedBy.kind}:${a.decidedBy.id}` : 'its decider'}${a.rationale ? ` (${a.rationale})` : ''}; do not retry it`, a.approvalId);
+      if (a.status === 'expired') return deny(`approval_expired: approval ${a.approvalId} of this action expired before it was decided`, a.approvalId);
+      if (a.status === 'pending') {
+        const until = approvalExpiresAt(a);
+        if (until !== undefined && until <= nowMs) {
+          if (this.#o.approvals.expire) await this.#o.approvals.expire(a.approvalId, ctx);
+          return deny(`approval_expired: approval ${a.approvalId} of this action expired before it was decided`, a.approvalId);
+        }
+        return { ...permit, approvalId: a.approvalId, reasons: [...permit.reasons, `approval:${a.approvalId}: pending`] };
+      }
+    }
+    // (review E[2]) a caller that cannot wait for a decision (a relayed sandbox write) gets approval_required as is: no request
+    if (request.noApprovalRequest === true) return { ...permit, reasons: [...permit.reasons, 'approval: not requested (the caller cannot wait for a human decision)'] };
+    // no usable approval for this exact action: request one
+    const requestedBy: ActorRef = request.agentId !== undefined ? { kind: 'agent', id: request.agentId } : { kind: 'system', id: 'policy' };
+    if (request.role !== undefined) requestedBy.role = request.role;
+    const subject: Record<string, JsonValue> = {
+      actionDigest: digest,
+      tool: request.tool,
+      effect: request.effect,
+      riskClass: request.riskClass,
+      resources: [...request.resources].sort(),
+      inputDigest: hashCanonical(storable(request.input === undefined ? null : request.input)),
+      input: request.input ?? null,
+      requestId: request.requestId,
+      policyDecisionId: permit.decisionId,
+      reasons: permit.reasons.slice(0, 20),
+      expiresAt: new Date(nowMs + this.#ttlMs).toISOString(),
+    };
+    if (request.workItemId !== undefined) subject['workItemId'] = request.workItemId;
+    if (request.environmentClass !== undefined) subject['environmentClass'] = request.environmentClass;
+    let created: ApprovalRequest;
+    try {
+      created = await this.#o.approvals.request({ runId: request.runId, kind: 'action', subject, requestedBy, rationale: `policy ${permit.decisionId}: ${permit.reasons.join('; ').slice(0, 1000)}` }, ctx);
+    } catch (e) {
+      if (isHypertestError(e)) return deny(`approval_unavailable: the approval request could not be recorded (${e.code}): ${e.message}`);
+      throw e;
+    }
+    return { ...permit, approvalId: created.approvalId, reasons: [...permit.reasons, `approval:${created.approvalId}: requested`] };
+  }
 }

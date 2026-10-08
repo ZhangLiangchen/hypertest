@@ -53,6 +53,9 @@ export const CONTAINED = [
   { prefix: '@modelcontextprotocol/', allowed: ['tools'] },
   { prefix: 'ajv', allowed: ['core'] },
   { prefix: 'yaml', exact: true, allowed: ['app', 'policy', 'cli', 'eval'] },
+  // the TypeScript compiler API is the syntax-tree parser of the code-retrieval symbol index (B[6]); the runtime adapters'
+  // public-API tests type-check their exported surface with it
+  { prefix: 'typescript', exact: true, allowed: ['context', 'runtime-pi', 'runtime-dsh'] },
 ];
 
 const IMPORT_RE = /(?:^|[\s;])(?:import|export)\s[^'"`]*?from\s*['"]([^'"]+)['"]|(?:^|[\s;(=])import\s*\(\s*['"]([^'"]+)['"]\s*\)|(?:^|[\s;])import\s*['"]([^'"]+)['"]/gm;

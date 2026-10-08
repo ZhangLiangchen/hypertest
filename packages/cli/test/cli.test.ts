@@ -104,12 +104,32 @@ describe('dispatch, help and usage errors', () => {
       [['run', 'goal', '--url', 'http://h', '--label', ' =v'], /^hypertest run: --label must be key=value \(got " =v"\)\n/],
       [['run', 'goal', '--repo', '.', '--commit=--output=/tmp/x'], /^hypertest run: --commit must be a commit-ish \(got "--output=\/tmp\/x"\)\n/],
       [['run', 'goal', '--url', 'http://h', '--timeout-ms', '0'], /^hypertest run: --timeout-ms must be an integer ≥ 1 \(got "0"\)\n/],
+      [['run', 'goal', '--url', 'http://h', '--on-budget-exhausted', 'never'], /^hypertest run: --on-budget-exhausted must be gate, pause or approval \(got "never"\)\n/],
       [['status', '--limit', 'ten'], /^hypertest status: --limit must be an integer between 1 and 10000 \(got "ten"\)\n/],
       [['status', '--status', 'running,bogus'], /^hypertest status: --status: unknown run status "bogus"/],
       [['approve', 'appr_1', '--reason', 'ok'], /^hypertest approve: --by is required\n/],
       [['approve', 'appr_1', '--by', 'alice'], /^hypertest approve: --reason is required\n/],
       [['approve', 'appr_1', '--by', '   ', '--reason', 'r'], /^hypertest approve: --by is required\n/],
       [['approve', 'appr_1', '--by', 'al;ce', '--reason', 'r'], /^hypertest approve: --by must be a person's name or handle/],
+      [['resume', '--raise-tokens', '5'], /^hypertest resume: a budget raise needs <runId>\n/],
+      [['resume', 'run_1', '--raise-tokens', '0'], /^hypertest resume: --raise-tokens must be an integer > 0 \(got "0"\)\n/],
+      [['resume', 'run_1', '--raise-cost-usd', 'lots'], /^hypertest resume: --raise-cost-usd must be a number > 0 \(got "lots"\)\n/],
+      [['resume', 'run_1', '--raise-tokens', '5'], /^hypertest resume: --by is required\n/],
+      [['resume', 'run_1', '--raise-tokens', '5', '--by', 'alice'], /^hypertest resume: --reason is required\n/],
+      [['resume', 'run_1', '--by', 'alice'], /^hypertest resume: --by\/--reason are only meaningful with a --raise-… option\n/],
+      [['operations'], /^hypertest operations: missing sub-command \(operations list \| operations resolve <operationId>\)\n/],
+      [['operations', 'purge'], /^hypertest operations: unknown sub-command operations purge\n/],
+      [['operations', 'list', '--status', 'bogus'], /^hypertest operations: --status: unknown operation status "bogus"/],
+      [['operations', 'list', '--status', 'failed', '--all'], /^hypertest operations: --status and --all are mutually exclusive\n/],
+      [['operations', 'resolve'], /^hypertest operations: missing <operationId>\n/],
+      [['operations', 'resolve', 'op_1', '--by', 'alice', '--note', 'n'], /^hypertest operations: --outcome is required\n/],
+      [['operations', 'resolve', 'op_1', '--outcome', 'maybe', '--by', 'alice', '--note', 'n'], /^hypertest operations: --outcome must be one of succeeded, failed, compensated \(got "maybe"\)\n/],
+      [['operations', 'resolve', 'op_1', '--outcome', 'failed', '--note', 'n'], /^hypertest operations: --by is required\n/],
+      [['operations', 'resolve', 'op_1', '--outcome', 'failed', '--by', 'alice'], /^hypertest operations: --note is required\n/],
+      [['reject'], /^hypertest reject: missing <approvalId>\n/],
+      [['reject', 'appr_1', '--reason', 'no'], /^hypertest reject: --by is required\n/],
+      [['reject', 'appr_1', '--by', 'alice'], /^hypertest reject: --reason is required\n/],
+      [['reject', 'appr_1', '--by', 'al;ce', '--reason', 'r'], /^hypertest reject: --by must be a person's name or handle/],
       [['approvals', '--status', 'pending', '--all'], /^hypertest approvals: --status and --all are mutually exclusive\n/],
       [['oracle'], /^hypertest oracle: missing sub-command/],
       [['oracle', 'nope'], /^hypertest oracle: unknown sub-command oracle nope\n/],
@@ -239,6 +259,18 @@ describe('processes that execute no agent turn', () => {
       const a = await cli(['approve', 'appr_1', '--by', 'alice', '--reason', 'looks fine'], { cwd: dir.path, env });
       assert.deepEqual([a.code, a.stdout], [1, '']);
       assert.equal(a.stderr, 'hypertest approve: approve is a human decision and cannot be taken from inside a Hypertest sandbox (HYPERTEST_SANDBOX is set): an agent never decides its own approval or oracle change [permission_denied]\n');
+      // E[3] raising a run budget is a human decision too
+      const raise = await cli(['resume', 'run_1', '--raise-tokens', '5000', '--by', 'alice', '--reason', 'more'], { cwd: dir.path, env });
+      assert.deepEqual([raise.code, raise.stdout], [1, '']);
+      assert.match(raise.stderr, /^hypertest resume: raising a run budget is a human decision and cannot be taken from inside a Hypertest sandbox .*\[permission_denied\]\n$/);
+      // stubs[8] resolving a manual review is a human decision too
+      const resolve = await cli(['operations', 'resolve', 'op_1', '--outcome', 'succeeded', '--by', 'alice', '--note', 'checked'], { cwd: dir.path, env });
+      assert.deepEqual([resolve.code, resolve.stdout], [1, '']);
+      assert.match(resolve.stderr, /^hypertest operations: operations resolve is a human decision and cannot be taken from inside a Hypertest sandbox .*\[permission_denied\]\n$/);
+      // E[8] rejecting is a human decision too
+      const r = await cli(['reject', 'appr_1', '--by', 'alice', '--reason', 'no'], { cwd: dir.path, env });
+      assert.deepEqual([r.code, r.stdout], [1, '']);
+      assert.match(r.stderr, /^hypertest reject: reject is a human decision and cannot be taken from inside a Hypertest sandbox .*\[permission_denied\]\n$/);
       const o = await cli(['oracle', 'decide', 'ocp_1', '--by', 'alice', '--reason', 'fine', '--json'], { cwd: dir.path, env });
       assert.equal(o.code, 1);
       assert.equal(parseJsonError(o.stdout), 'permission_denied');

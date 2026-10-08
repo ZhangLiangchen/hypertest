@@ -8,6 +8,7 @@ import type { ModelCatalogLike, ModelRouter } from '@hypertest/model';
 import type {
   DurableMemory, FreshnessGuard, ProvenanceService, ResolverRegistry, Retriever, SnapshotBuilder, SnapshotStore, WorkingContextManager,
 } from '@hypertest/context';
+import type { FreshnessPassLog, ObservationLog, SkillRegistry } from '@hypertest/context';
 import type { EnvironmentRegistry, ToolRegistryLike, ToolRuntime, WorkspaceManager } from '@hypertest/tools';
 import type { AgentRepository, AgentRunner, ContextHook, EngineRegistryLike, EpochManager, SessionStore, SubagentRuntime, TurnLimits } from '@hypertest/runtime';
 import type { RoleCatalogLike } from '@hypertest/agents';
@@ -37,8 +38,11 @@ export interface ControlConfig {
   defaultBudget?: Partial<BudgetEnvelope>;
   /** Gate defaults: DEFAULT_GATE_SPEC ⊕ defaultGate ⊕ StartRunInput.gate. */
   defaultGate?: Partial<GateSpec>;
-  /** What a model budget boundary does to the run: leave it to convergence ('gate', default) or pause it. */
-  onBudgetExhausted?: 'gate' | 'pause';
+  /**
+   * What a run budget exhaustion does to a run without its own `budget.onExhausted` (E[3]): converge to the gate ('gate',
+   * default), pause it for a raise ('pause'), or pause it on a budget-extension approval request ('approval').
+   */
+  onBudgetExhausted?: 'gate' | 'pause' | 'approval';
   /** Repository used when a run's target names none. */
   targetRepoPath?: string;
   /** Token budget of the L2 working view (default: route context window × 0.6, else 48000). */
@@ -99,9 +103,23 @@ export interface ControlDeps extends BaseDeps {
   freshness?: FreshnessGuard;
   resolvers: ResolverRegistry;
   workingContext: WorkingContextManager;
-  retrieverFactory: (root: string) => Retriever;
+  /**
+   * L3 retriever of a workspace root. (additive, B[6] privacy) `restricted`: the agent's context is classified `restricted`
+   * (local_private) — its workspace is never embedded by a provider outside this host / private network.
+   */
+  retrieverFactory: (root: string, options?: { restricted?: boolean }) => Retriever;
   memory: DurableMemory;
   provenance: ProvenanceService;
+  /**
+   * (additive, optional, B[0]/B[2]) The agents' ObservationLog (the one the snapshot builder and the FreshnessGuard read): the
+   * context provider records what each assembled prompt delivered (records, findings, files, evidence, the plan) under the
+   * turn's snapshot.
+   */
+  observations?: ObservationLog;
+  /** (additive, optional, B[1]) Freshness passes of record-effect domain tools (durable replays are recognised). */
+  freshnessPasses?: FreshnessPassLog;
+  /** (additive, optional, B[7]) The skill registry: only its PUBLISHED skills (forPrompt) reach L1 prompts. */
+  skills?: Pick<SkillRegistry, 'forPrompt'>;
   // tools
   toolRuntime: ToolRuntime;
   registry: ToolRegistryLike;
@@ -128,7 +146,7 @@ export interface ResolvedControlConfig extends ControlConfig {
   leaseTtlMs: number;
   runLeaseTtlMs: number;
   turnLimits: TurnLimits;
-  onBudgetExhausted: 'gate' | 'pause';
+  onBudgetExhausted: 'gate' | 'pause' | 'approval';
   maxOutputTokens: number;
   heartbeatMs: number;
   maxWorkAttempts: number;

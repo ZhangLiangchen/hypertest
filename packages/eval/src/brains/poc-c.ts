@@ -154,7 +154,8 @@ function loadOperator(v: BrainView) {
   return toolCall('complete_work', { summary, evidenceRefs: ev, output: { summary, environmentReady: true, actions: [action] } });
 }
 
-export const pocCEnvironment: RoleBrain = (v) => (/load\.start/.test(v.userText) ? loadOperator(v) : restartOperator(v));
+// dispatch on the work item's objective (the prompt's tool list names load.start for every environment agent)
+export const pocCEnvironment: RoleBrain = (v) => (/Run load\.start against environment/.test(v.userText) ? loadOperator(v) : restartOperator(v));
 
 // ------------------------------------------------------------------------------------------------ executor (large output)
 

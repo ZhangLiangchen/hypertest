@@ -438,6 +438,13 @@ Security violations, duplicate side effects and unpaired critical false releases
 that recorded them, infra errors included; a result holding one arm/task/trial twice is refused.
 `eval run --out <file>` persists the SuiteResult JSON the gate reads (and `hypertest runtime record-suite --from-eval`).
 
+## Scripted brains and the L1 prompt (context-learning)
+
+The L1 prompt now lists every agent's available tools (`## Available tools`), so a scripted brain must never dispatch on
+a tool id appearing anywhere in the prompt: the PoC C environment brain (`pocCEnvironment`) recognises the load item by
+its objective (`Run load.start against environment …`), not by the substring `load.start` (which every environment
+agent's tool list contains — the restart item would otherwise start a second load job).
+
 ## Known gaps
 
 - Trial isolation covers local paths and PostgreSQL (fresh schema per trial). Trials configured on a NATS bus or

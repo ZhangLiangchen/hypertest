@@ -68,6 +68,7 @@ describe('waitForRun', () => {
   });
 
   test('a run paused for a human decision gets exactly one notice naming the pending approvals', async () => {
+    // (E[8]: the notice now names the pause reason and each request's subject, and offers approve and reject)
     const fake = fakeInstance({ approvals: [{ approvalId: 'appr_1', kind: 'action', requestedBy: { kind: 'agent', id: 'ag_1' } }] });
     fake.status.value = { runId: 'r1', status: 'paused', pauseReason: 'approval' };
     const { ctx, stderr } = ctxWith();
@@ -78,13 +79,46 @@ describe('waitForRun', () => {
     assert.equal(
       stderr.text(),
       [
-        'run r1 is waiting for a human decision:',
+        'run r1 is paused (approval) and is waiting for a human decision:',
         '  approval appr_1 (action) requested by agent:ag_1',
-        '  decide with `hypertest approve <approvalId> [--deny] --by <name> --reason "<text>"`',
-        '  (the embedded store admits one process: stop this command first — the run stays resumable — then approve and `hypertest resume`)',
+        '  decide with `hypertest approve <approvalId> --by <name> --reason "<text>"` or `hypertest reject <approvalId> --by <name> --reason "<text>"`',
+        '  (the embedded store admits one process: stop this command first — the run stays resumable — then decide and `hypertest resume`)',
         '',
       ].join('\n'),
     );
+  });
+
+  test('E[8] a running run whose work waits for an action approval gets the notice too (subject included), once per request', async () => {
+    const fake = fakeInstance({ approvals: [{ approvalId: 'appr_2', kind: 'action', requestedBy: { kind: 'agent', id: 'ag_7' }, subject: { tool: 'env.deploy' } } as never] });
+    const { ctx, stderr } = ctxWith();
+    const waiting = waitForRun(ctx, fake.ht, 'r1', { follow: false });
+    await new Promise((r) => setTimeout(r, WAIT_POLL_MS * 2 + 200));
+    fake.finish({ status: 'cancelled' });
+    await waiting;
+    const lines = stderr.text().split('\n');
+    assert.equal(lines[0], 'run r1 is waiting for a human decision:');
+    assert.equal(lines[1], '  approval appr_2 (action) requested by agent:ag_7: {"tool":"env.deploy"}');
+    assert.equal(lines.filter((l) => l.includes('appr_2')).length, 1, 'announced once');
+  });
+
+  test('(review) an approval the policy gate filed is announced with the exact action it authorizes (tool, effect/risk, target, arguments), not its digest; a budget extension with its raise', async () => {
+    const gateSubject = { actionDigest: 'f'.repeat(64), tool: 'env.deploy', effect: 'destructive', riskClass: 'critical', resources: ['env/staging-1'], environmentClass: 'staging', input: { environmentId: 'staging-1', buildRef: 'app@sha256:1' }, expiresAt: '2099-01-01T00:00:00.000Z' };
+    const budgetSubject = { source: 'budget_exhaustion', dimension: 'tokens', limit: 6000, raise: { maxModelTokens: 3000 } };
+    const fake = fakeInstance({
+      approvals: [
+        { approvalId: 'appr_3', kind: 'action', requestedBy: { kind: 'agent', id: 'ag_env' }, subject: gateSubject } as never,
+        { approvalId: 'appr_4', kind: 'budget', requestedBy: { kind: 'system', id: 'budget' }, subject: budgetSubject } as never,
+      ],
+    });
+    const { ctx, stderr } = ctxWith();
+    const waiting = waitForRun(ctx, fake.ht, 'r1', { follow: false });
+    await new Promise((r) => setTimeout(r, WAIT_POLL_MS * 2 + 200));
+    fake.finish({ status: 'cancelled' });
+    await waiting;
+    const lines = stderr.text().split('\n');
+    assert.equal(lines[1], '  approval appr_3 (action) requested by agent:ag_env: env.deploy destructive/critical on env/staging-1 [staging] args {"environmentId":"staging-1","buildRef":"app@sha256:1"}');
+    assert.equal(lines[2], '  approval appr_4 (budget) requested by system:budget: extend tokens (limit 6000) by {"maxModelTokens":3000}');
+    assert.equal(stderr.text().includes('f'.repeat(64)), false, 'the digest alone is not what a human decides on');
   });
 
   test('interruption returns at once; the pending completion never becomes an unhandled rejection', async () => {

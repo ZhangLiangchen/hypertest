@@ -195,6 +195,34 @@ export interface ActionRequest {
   transition?: TransitionFacts;
   /** (additive) before_acceptance: the gate input digest and the gate's verdict. */
   acceptance?: AcceptanceFacts;
+  /**
+   * (additive, E[8]) An approval of kind `action` the request relies on. The approval gate (ApprovalGatedPolicyEngine)
+   * verifies it — same action digest (actionDigest), decided `approved` by an independent human/system actor (never the
+   * requesting agent), not expired, not consumed by another request — and consumes it exactly once; the decision is then
+   * `allow`. Without it the gate looks the exact action's approval up by digest.
+   */
+  approvalId?: string;
+  /**
+   * (additive, E[4]) The brokered credential scopes the call uses (`credential:<environmentId>/<name>`): the capability
+   * must grant each one (capabilityAllows), a permit's `credentialScope` constraint must cover each one.
+   */
+  credentialScopes?: string[];
+  /**
+   * (additive, review E[2]) The caller cannot wait for a human decision (a state-changing request a sandboxed command sends
+   * through the egress relay): the approval gate records NO approval request for it — `approval_required` is returned as
+   * is (the caller refuses the action); an approved approval of the exact action is still honoured.
+   */
+  noApprovalRequest?: boolean;
+  /**
+   * (additive, review E[2]) The effect is a state-changing request that a SANDBOXED COMMAND of a call of `tool` sends to a
+   * relayed endpoint of the system under test (the egress relay). The capability check then verifies the CALL's grant —
+   * the tool, the call's own effect (`callEffect`, e.g. execute), the risk ceiling, the environment class (required) and
+   * expiry — instead of `effect` / `resources`: exercising the SUT is what the commands of test.run / shell.exec do (a
+   * test author's regression run writes to the SUT), and the capability still bounds WHICH environments they may touch.
+   * The rules judge `effect` (external) on `environmentClass` exactly as for any other call (staging ⇒ approval,
+   * production ⇒ deny).
+   */
+  relayedWrite?: { callEffect: ToolEffect };
 }
 
 export interface PermitConstraints {
@@ -218,6 +246,16 @@ export interface ActionPermit {
 export interface PolicyEngine {
   readonly revision: string;
   evaluate(request: ActionRequest): Promise<ActionPermit>;
+}
+
+/**
+ * (additive, E[8]) Options of ApprovalGatedPolicyEngine: the approval store, the clock and how long an action approval
+ * request stays valid (default 24 h; `subject.expiresAt`).
+ */
+export interface ApprovalGateOptions {
+  approvals: ApprovalService;
+  clock: Clock;
+  approvalTtlMs?: number;
 }
 
 /**
@@ -305,8 +343,28 @@ export interface ApprovalRequest {
   decidedAt?: string;
 }
 
+/** (additive, E[8]) The single consumption of an approved `action` approval (ht_approval_consumptions). */
+export interface ApprovalConsumption {
+  approvalId: string;
+  runId: string;
+  /** The ActionRequest.requestId (tool invocation) that consumed it: a replay of the same request finds its own consumption. */
+  consumedBy: string;
+  digest: string;
+  consumedAt: string;
+}
+
 export interface ApprovalService {
   request(input: Omit<ApprovalRequest, 'approvalId' | 'status' | 'createdAt'>, ctx: EventContext): Promise<ApprovalRequest>;
+  /**
+   * (additive, optional, E[8]) Consumes an approved approval exactly once (append-only ht_approval_consumptions, primary key
+   * = approval id): `consumed` true for the first consumer and for a replay of the same request (`consumedBy`); false with
+   * the earlier consumer otherwise. Refuses (precondition_failed) an approval that is not approved.
+   */
+  consume?(approvalId: string, consumer: { requestId: string; digest: string }, ctx: EventContext): Promise<{ consumed: true; consumption: ApprovalConsumption } | { consumed: false; consumption: ApprovalConsumption }>;
+  /** (additive, optional, E[8]) The consumption of an approval, if any. */
+  consumption?(approvalId: string): Promise<ApprovalConsumption | undefined>;
+  /** (additive, optional, E[8]) Marks a PENDING approval expired (its subject's `expiresAt` passed); emits approval.expired. */
+  expire?(approvalId: string, ctx: EventContext): Promise<ApprovalRequest>;
   /** The requester can never approve their own request. */
   decide(approvalId: string, approve: boolean, decidedBy: ActorRef, rationale: string, ctx: EventContext): Promise<ApprovalRequest>;
   get(approvalId: string): Promise<ApprovalRequest | undefined>;

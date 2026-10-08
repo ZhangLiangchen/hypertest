@@ -1,6 +1,6 @@
 import type { BaseDeps, JsonValue } from '@hypertest/core';
 import type {
-  ActorRef, BudgetEnvelope, ContextSnapshot, EventContext, GateSpec, PlanRevision, QualityDecision, ReportClaim, TargetRef, TestRun, WorkItem,
+  ActorRef, BudgetEnvelope, ContextSnapshot, EventContext, GateSpec, OperationRecord, PlanRevision, QualityDecision, ReportClaim, TargetRef, TestRun, WorkItem,
 } from '@hypertest/domain';
 import type { RoleCatalogLike } from '@hypertest/agents';
 import type { ModelSwitchRequest } from '@hypertest/runtime';
@@ -141,6 +141,23 @@ export interface ControlPlane {
   pauseRun(runId: string, reason: TestRun['pauseReason']): Promise<void>;
   resumeRun(runId: string): Promise<void>;
   /**
+   * (additive, optional, E[3]) An operator raises the run's budget (PAUSED_BUDGET is resumable after a raise): amounts are
+   * ADDED to the current limits (run envelope + ledger; experiments' own budgets via `experiments`), audited on L0
+   * (`budget.raised`, by `human:<by>`). Refused for a finished run, an unlimited dimension or an invalid raise.
+   */
+  raiseBudget?(runId: string, raise: BudgetRaiseInput, by: string, rationale: string): Promise<TestRun>;
+  /**
+   * (additive, optional, E[3]) Applies the decision on the run's budget-extension request (NEEDS_APPROVAL): approved ⇒
+   * raised by the approved amount + resumed; rejected/expired ⇒ resumed to converge to the gate. Idempotent.
+   */
+  resolveBudgetApproval?(runId: string): Promise<'raised' | 'gate' | 'pending' | 'none'>;
+  /**
+   * (additive, optional, stubs[8]) A human resolves an operation under manual review (`hypertest operations resolve`):
+   * succeeded ⇒ verified, failed ⇒ failed, compensated ⇒ compensated; audited (L0 `operation.resolved`); the work item
+   * waiting on it resumes with that outcome. Agents never resolve operations.
+   */
+  resolveOperation?(operationId: string, outcome: 'succeeded' | 'failed' | 'compensated', by: string, note: string): Promise<OperationRecord>;
+  /**
    * (additive, optional, A[0]) Operator release of the run's model pauses (`hypertest resume`): every agent paused for
    * model unavailability may resume at its next observation (its next turn routes again). Returns the released sessions.
    */
@@ -157,6 +174,14 @@ export interface ControlPlane {
   /** (additive, optional) Releases process resources (e.g. the reactors' bus subscription). */
   close?(): Promise<void>;
 }
+
+/**
+ * (additive, E[3]) A budget raise: amounts ADDED to the run's limits (maxModelTokens, maxModelCostUsd, maxToolCalls,
+ * maxWallClockMs, maxWorkItems, maxComputeMinutes, maxArtifactBytes) and to experiments' own budgets.
+ */
+export type BudgetRaiseInput = Partial<Record<'maxModelTokens' | 'maxModelCostUsd' | 'maxToolCalls' | 'maxWallClockMs' | 'maxWorkItems' | 'maxComputeMinutes' | 'maxArtifactBytes', number>> & {
+  experiments?: Record<string, { maxToolCalls?: number; maxWallClockMs?: number }>;
+};
 
 /** (additive, H6) Options of ControlPlane.tick. */
 export interface TickOptions {

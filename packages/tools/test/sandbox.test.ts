@@ -427,3 +427,27 @@ test('H1a: argumentPathDenial keeps ordinary commands working (scripts, regexes,
   await allow(['node', '-e', 'process.stdout.write("x")']);
   await allow(['cat', 'does-not-exist-yet.txt']);
 });
+
+test('E[4] audit probe: hidden paths that cannot be hidden (no jail, or an open network) ⇒ the command is refused, never run with the secret readable', async () => {
+  const root = await tempDir('ht-unhidden-');
+  try {
+    const keys = join(root.path, 'keys');
+    await mkdir(keys, { recursive: true });
+    await writeFile(join(keys, 'capability.secret'), 'TOPSECRET');
+    const noJail = await networkIsolation({ python: false });
+    const sb = createLocalSandbox({ hiddenPaths: [keys], networkIsolation: { python: false } });
+    if (noJail.available) {
+      // before: `cat` printed TOPSECRET (exit 0) under the fallback strategy
+      await assert.rejects(sb.run(ws, ['cat', join(keys, 'capability.secret')], { timeoutMs: 10_000, signal: never() }), (e) => isHypertestError(e, 'precondition_failed') && /cannot hide .*keys from commands on this host \(strategy \w+ has no PID\/mount jail\): refused \(fail closed\)/.test(e.message));
+      // the operator's explicit acceptance (sandbox.insecureAllowUnhiddenSecrets) runs it — and it can read the file
+      const accepted = createLocalSandbox({ hiddenPaths: [keys], networkIsolation: { python: false }, allowUnhiddenPaths: true });
+      assert.equal((await accepted.run(ws, ['cat', join(keys, 'capability.secret')], { timeoutMs: 10_000, signal: never() })).stdout, 'TOPSECRET');
+    }
+    const open: WorkspaceHandle = { ...ws, sandbox: { kind: 'local', network: 'open', envAllowlist: [] } };
+    await assert.rejects(createLocalSandbox({ hiddenPaths: [keys] }).run(open, ['cat', join(keys, 'capability.secret')], { timeoutMs: 10_000, signal: never() }), (e) => isHypertestError(e, 'precondition_failed') && /open network \(no namespaces\): refused/.test(e.message));
+    // without hidden paths nothing changes (a sandbox that hides nothing has nothing to fail closed on)
+    assert.equal((await createLocalSandbox().run(open, ['node', '-e', 'process.stdout.write("ok")'], { timeoutMs: 10_000, signal: never() })).stdout, 'ok');
+  } finally {
+    await root.cleanup();
+  }
+});

@@ -31,6 +31,8 @@ Depends on `core`, `domain`, `app`, `eval`, `evidence`, `store` (+ `yaml`), per 
 | `oracle establish <file> --by <name>` | Establishes an oracle (the run's correctness criterion) as a named human; runs without an oracle in force are at best `inconclusive` (gate C0). An existing oracle is a `conflict` (it changes only through proposals). Refused when `$HYPERTEST_SANDBOX` is set. |
 | `waive <runId> <criterionId> --by <name> --reason "<text>" [--expires <time>]` | A governed human waiver of one gate criterion (approval kind `gate_exception`), applied at the run's next gate evaluation; never C1; refused for a finished run and when `$HYPERTEST_SANDBOX` is set. |
 | `experience list [--run r] [--status s1,s2 \| --all]` / `experience review <experienceId> --decision review\|approve\|publish\|reject\|quarantine --by <name>` | The learning loop's human surface: only approved/published experience is retrieved into later runs; the creator of a candidate can never review it. `review` is refused when `$HYPERTEST_SANDBOX` is set. |
+| `skill list [--status s1,s2] [--json]` / `skill show <skillId> [--revision n]` / `skill propose --from <xp>[,<xp>…] --name <name> --description <text> (--body <text> \| --body-file <file>) [--role r] [--skill <skillId>] --by <name>` / `skill validate <skillId> [--revision n] (--suite <id> [--trials n] [--arm <baseline>] \| --result <file>) [--min-pass-rate r] [--min-trials n] --by <name>` / `skill publish\|reject <skillId> [--revision n] --by <name>` / `skill retire <skillId> --by <name>` | (B[7]) The learning pipeline: approved experience → candidate SKILL → eval validation bound to the revision (the eval runs the cold-track arm and the arm `skill-<id>-r<rev>-<digest>` whose config injects exactly that revision) → published into the active registry (only published skills reach prompts) → retired. The registry and the database refuse: unapproved source experience, publishing without a passing validation of the exact revision, publishing by the creator, a `--min-pass-rate` outside (0, 1] and a validation whose verdict contradicts its own numbers (review). `--result` trusts the SuiteResult file it is given. Decisions are refused when `$HYPERTEST_SANDBOX` is set. |
+| `memory serve [--data-dir d] [--port 7430] [--host 127.0.0.1] [--api-key-env VAR]` | (B[4]) The L4 durable-memory service in the foreground: its own storage (default `memory.dataDir` of a `service` configuration, else `<dataDir>/memory`), the HTTP API `PowerContextClient` speaks; bearer token from `$HYPERTEST_MEMORY_API_KEY` or `--api-key-env` (at least 16 characters; required on a non-loopback host). Point a deployment at it with `memory: { kind: powercontext, baseUrl, apiKeyEnv }`. |
 | `oracle proposals [...]` / `oracle decide <proposalId> [--reject] --by <name> --reason "<text>"` | Oracle change proposals: list, or decide as a human (I8). `decide` is refused when `$HYPERTEST_SANDBOX` is set. |
 | `oracle invalidate <oracleId> --revision <n> --by <name> --reason "<text>"` | (D-10) Declare the latest revision of an oracle invalid as a human: an append-only `invalid` revision (history is never rewritten), every decision based on it marked needs_reassessment; a run pinned to it is at best inconclusive until a new revision is approved through a proposal (the run is then re-pinned and replans). Only the latest revision can be invalidated (`conflict` otherwise); refused when `$HYPERTEST_SANDBOX` is set. |
 | `cancel <runId> --reason "<text>"` | Cancels a run; a finished run keeps its outcome (`conflict`, exit 1). |
@@ -153,6 +155,8 @@ or when requested with `--arms config`.
   `conflict`); the `init` template documents `gate.requireOracle` and a commented `oracles:` example; the template's
   reviewer lists every evidence-producing role in `independentFromRoles`.
 - (hardening, conformance-13/11) `experience list` / `experience review`, and `waive` (both in `COMMANDS`).
+- (context-learning) `skill list|show|propose|validate|publish|retire|reject` (B[7]) and `memory serve` (B[4]); tests
+  `test/skill.e2e.test.ts`, `test/memory.e2e.test.ts`.
 - (gate-governance) the `init` template documents `gate.requireContracts` (commented; default true). The CLI e2e
   scenario brains record a SystemModel first, and the test oracle states its judge policy explicitly.
 - (runtime release management) `runtime list | show | register | record-suite | promote | rollback | migrate`
@@ -169,6 +173,22 @@ or when requested with `--arms config`.
   --out <file>` now always writes the SuiteResult JSON (before: the displayed report — markdown unless `--json`); the
   displayed report goes to `--report`. Output directories are created. `EvalModuleLike` gains `evaluateReleaseGate?`,
   `renderReleaseGateReport?`, `scriptedJudge?`; new export `withJudge(suite)`.
+
+## Side-effect governance commands (audit wave 2)
+
+- `hypertest reject <approvalId> --by <name> --reason "…"` — the explicit counterpart of `approve --deny`.
+- `hypertest operations list [--run <runId>] [--status … | --all] [--json]` and
+  `hypertest operations resolve <opId> --outcome succeeded|failed|compensated --by <name> --note "…"` — a human
+  resolves a manual review (audited); refused inside a sandbox.
+- `hypertest resume <runId> --raise-tokens <n> | --raise-cost-usd <x> | --raise-tool-calls <n> | --raise-wall-clock-ms <n> |
+  --raise-work-items <n> | --raise-compute-minutes <x> | --raise-artifact-bytes <n> --by <name> --reason "…"` — raise a
+  PAUSED_BUDGET run's budget, then resume it; refused inside a sandbox.
+- `run --follow`/`watch` announce every pending approval (action and budget), with `approve`/`reject`. (review) An action
+  approval is shown as the exact action it authorizes — tool, effect/risk, target, environment class, arguments
+  (`approvalSubjectSummary`) — and a budget extension as its dimension, limit and proposed raise, in the notice and in
+  `hypertest approvals` (never only the opaque digest).
+- (review, E[3]) `hypertest run … --on-budget-exhausted gate|pause|approval` — this run's exhaustion policy (overrides the
+  configured `budget.onExhausted`).
 
 ## How to run
 

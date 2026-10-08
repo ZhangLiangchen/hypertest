@@ -2,10 +2,13 @@ import { HypertestError, abortReason, compileSchema, throwIfAborted, withTimeout
 import { EFFECT_ORDER, EVENT_TYPES, RISK_ORDER, eventFrom, type ArtifactRef, type EnvironmentRef, type EventContext, type EvidenceRecord, type ResourceRef, type RiskClass, type ToolEffect } from '@hypertest/domain';
 import { recordEvidence, type RecordEvidenceInput } from '@hypertest/evidence';
 import type { SideEffectGateway, SideEffectOutcome } from '@hypertest/operation';
-import { capabilityAllows, matchesResourcePattern, verifyCapability, type ActionPermit, type ActionRequest } from '@hypertest/policy';
+import { capabilityAllows, matchesResourcePattern, matchesToolPattern, verifyCapability, type ActionPermit, type ActionRequest } from '@hypertest/policy';
 import type { ExperimentProvenance, ToolContext, ToolExecutionRequest, ToolExecutionResult, ToolOutcome, ToolRuntime, ToolRuntimeDeps, ToolSpec, ToolStatus } from '../contracts.ts';
 import { RECORD_EFFECT_ADAPTER_ID, RECORD_EFFECT_RESENDABLE_ADAPTER_ID, bindRecordEffect, type RecordedToolOutcome } from './record-effects.ts';
 import { UsageMeter, meteredArtifacts, runMetered } from './usage-meter.ts';
+import { runWithEgressContext, type EgressCallContext, type EgressWrite } from './egress-relay.ts';
+import { checkHost, controlEndpointReason, environmentClassForUrl, redactUrl } from '../blackbox/common.ts';
+import { credentialScope } from '../blackbox/secrets.ts';
 
 /** Default model-visible byte budget before a tool output is offloaded to the ArtifactStore (I9). */
 export const DEFAULT_MAX_INLINE_BYTES = 16 * 1024;
@@ -191,6 +194,8 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
       if (request.claim !== undefined && (!request.claim || typeof request.claim.workItemId !== 'string' || !Number.isSafeInteger(request.claim.fencingToken) || request.claim.fencingToken <= 0)) {
         throw new HypertestError('invalid_argument', 'malformed ToolExecutionRequest: claim needs a workItemId and a positive integer fencingToken');
       }
+      if (request.commitGuard !== undefined && typeof request.commitGuard !== 'function') throw new HypertestError('invalid_argument', 'malformed ToolExecutionRequest: commitGuard must be a function');
+      if (request.egressGuard !== undefined && typeof request.egressGuard !== 'function') throw new HypertestError('invalid_argument', 'malformed ToolExecutionRequest: egressGuard must be a function');
       const leaseOwner = request.leaseOwner ?? request.agentId;
       const started = clock.nowMs();
       const evCtx: EventContext = {
@@ -206,7 +211,15 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
         await deps.events.emit([eventFrom(evCtx, eventType, 'tool', request.invocationId, clean)]);
       };
 
-      const finish = (stage: Stage, modelText: string, permit?: ActionPermit): ToolExecutionResult => {
+      const finish = (stage: Stage, modelText0: string, permit?: ActionPermit): ToolExecutionResult => {
+        // E[4] (defence in depth): no long-lived secret and no minted credential leaves a tool call towards the model
+        const modelText = deps.secrets ? deps.secrets.redact(modelText0) : modelText0;
+        if (deps.secrets && stage.structured !== undefined) {
+          const json = JSON.stringify(stage.structured);
+          const clean = deps.secrets.redact(json);
+          if (clean !== json) stage.structured = JSON.parse(clean) as JsonValue;
+        }
+        if (deps.secrets && stage.error) stage.error = { ...stage.error, message: deps.secrets.redact(stage.error.message) };
         const r: ToolExecutionResult = {
           toolId: request.toolId,
           invocationId: request.invocationId,
@@ -277,6 +290,7 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
       let riskClass: RiskClass;
       let resources: string[];
       let environmentClass: string | undefined;
+      let credentialScopes: string[] = [];
       try {
         effect = typeof spec.effect === 'function' ? spec.effect(input) : spec.effect;
         riskClass = typeof spec.riskClass === 'function' ? spec.riskClass(input) : spec.riskClass;
@@ -285,12 +299,15 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
         resources = spec.resources(input, { workspace: request.workspace, runId: request.runId, environments: deps.environments });
         if (!Array.isArray(resources) || resources.some((r) => typeof r !== 'string')) throw new HypertestError('internal', `tool ${spec.id} returned malformed resources`);
         environmentClass = spec.environmentClass?.(input, { environments: deps.environments });
+        // E[4]: the brokered credentials the call uses are capability scopes too
+        credentialScopes = spec.credentialScopes?.(input, { environments: deps.environments }) ?? [];
+        if (!Array.isArray(credentialScopes) || credentialScopes.some((c) => typeof c !== 'string' || c === '')) throw new HypertestError('internal', `tool ${spec.id} returned malformed credential scopes`);
       } catch (e) {
         const he = e instanceof HypertestError ? e : new HypertestError('internal', (e as Error)?.message ?? String(e));
         if (he.code === 'internal') logger.error('tool classification failed', { error: he.message });
         return deny('denied', he.code, `cannot classify the action: ${he.message}`);
       }
-      const check = capabilityAllows(cap, { tool: spec.id, effect, riskClass, resources, ...(environmentClass !== undefined ? { environmentClass } : {}), now: clock.isoNow() });
+      const check = capabilityAllows(cap, { tool: spec.id, effect, riskClass, resources, ...(environmentClass !== undefined ? { environmentClass } : {}), ...(credentialScopes.length > 0 ? { credentialScopes } : {}), now: clock.isoNow() });
       if (!check.allowed) return deny('denied', 'permission_denied', `capability_denied: ${check.reason}`);
 
       // 5 policy permit (redacted input) + decision log
@@ -309,7 +326,9 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
         phase: 'before_action',
       };
       if (environmentClass !== undefined) actionRequest.environmentClass = environmentClass;
+      if (credentialScopes.length > 0) actionRequest.credentialScopes = [...credentialScopes];
       if (request.snapshot?.snapshotId) actionRequest.snapshotId = request.snapshot.snapshotId;
+      if (typeof request.approvalId === 'string' && request.approvalId !== '') actionRequest.approvalId = request.approvalId;
       let permit: ActionPermit;
       try {
         permit = await deps.policy.evaluate(actionRequest);
@@ -330,25 +349,38 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
       }
       if (permit.decision === 'deny') return deny('denied', 'permission_denied', `policy denied (decision ${permit.decisionId}): ${permit.reasons.join('; ') || 'no reason given'}`, permit);
       if (permit.decision === 'approval_required') {
-        const approvalId = permit.approvalId ?? permit.decisionId;
-        return deny(
-          'denied',
-          'approval_required',
-          `approval required (approvalId ${approvalId}, decision ${permit.decisionId}): ${permit.reasons.join('; ')}`,
-          permit,
-          `To proceed, request approval referencing approvalId ${approvalId} (policy decision ${permit.decisionId}), then retry once it is granted.`,
-        );
+        // E[8]: the policy's approval gate recorded an approval request bound to this exact action (permit.approvalId); the
+        // call is NOT executed. The control plane waits for a human decision; once approved, the SAME call (identical
+        // arguments) runs once — the approval is consumed by it.
+        if (permit.approvalId !== undefined) {
+          return deny(
+            'denied',
+            'approval_required',
+            `approval required (approvalId ${permit.approvalId}, decision ${permit.decisionId}): ${permit.reasons.join('; ')}`,
+            permit,
+            `The action was NOT executed. It waits for an independent human decision on approval ${permit.approvalId}; once it is approved, issue exactly the same call again (identical arguments): it runs once.`,
+          );
+        }
+        return deny('denied', 'approval_required', `approval required (decision ${permit.decisionId}), but no approval request could be recorded (no approval gate is configured): ${permit.reasons.join('; ')}`, permit);
       }
       const allowedPaths = permit.constraints?.allowedPaths;
       if (allowedPaths !== undefined) {
         const outside = resources.filter((r) => !allowedPaths.some((p) => matchesResourcePattern(p, r)));
         if (outside.length > 0) return deny('denied', 'permission_denied', `permit_constraint_violated: resources outside allowedPaths: ${outside.join(', ')}`, permit);
       }
+      // E[4] / coverage[8]: the permit's credential constraint (a policy rule or OPA narrowing which credentials a call uses)
+      const permittedCredentials = permit.constraints?.credentialScope;
+      if (permittedCredentials !== undefined) {
+        const outside = credentialScopes.filter((c) => !permittedCredentials.some((p) => matchesToolPattern(p, c)));
+        if (outside.length > 0) return deny('denied', 'permission_denied', `permit_constraint_violated: credentials outside credentialScope: ${outside.join(', ')}`, permit);
+      }
 
       // conformance-7: an external/destructive effect without a dedicated adapter (http.request POST, browser.click/fill,
       // mcp.*) still goes through the Operation Ledger — the call is recorded under the invocation id, a replay returns
       // its recorded outcome, an interrupted call is never blindly re-sent. Without a configured gateway it runs directly.
       const recordEffect = !spec.sideEffect && deps.sideEffects !== undefined && LEDGERED_EFFECTS.has(effect);
+      /** (review) the call's own effect (what its capability was checked against): the relay re-checks it per write */
+      const callEffect: ToolEffect = effect;
 
       // 6 freshness for mutating effects — fail closed: a configured guard with no snapshot cannot vouch for the action.
       //   Exception: the REPLAY of a side-effect call that was already dispatched (the same invocation: a durable retry of
@@ -401,7 +433,11 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
 
       // 8 execute
       const produced: EvidenceRecord[] = [];
-      const recordEv: ToolContext['recordEvidence'] = async (inp) => {
+      /** (E[2]) Exchanges the egress relay ledgered for this call's sandboxed commands (listed in the model text, not in evidenceRefs). */
+      const relayed: EvidenceRecord[] = [];
+      /** (review) Writes of this call's sandboxed commands the relay refused or left unsettled (⇒ the call is a fault). */
+      const refusedEgress: string[] = [];
+      const recordEvTo = (sink: EvidenceRecord[]): ToolContext['recordEvidence'] => async (inp) => {
         const provenance: ExperimentProvenance = { ...(inp.provenance ?? {}), toolId: spec.id, toolInvocationId: request.invocationId, workspaceId: request.workspace.workspaceId };
         const commit = inp.provenance?.commit ?? request.workspace.baseCommit;
         if (commit !== undefined) provenance.commit = commit;
@@ -433,9 +469,10 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
         const eventContext: Partial<Omit<EventContext, 'runId'>> = { correlationId: evCtx.correlationId, actorId: evCtx.actorId, workItemId: request.workItemId, agentId: request.agentId };
         if (evCtx.causationId !== undefined) eventContext.causationId = evCtx.causationId;
         const rec = await recordEvidence(deps.evidence, artifacts, evInput, undefined, { eventContext });
-        produced.push(rec);
+        sink.push(rec);
         return rec;
       };
+      const recordEv = recordEvTo(produced);
 
       let timeoutMs = spec.timeoutMs;
       if (typeof request.timeoutMs === 'number' && Number.isFinite(request.timeoutMs) && request.timeoutMs > 0) timeoutMs = Math.min(timeoutMs, request.timeoutMs);
@@ -470,6 +507,8 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
                 ...(request.experimentId !== undefined ? { experimentId: request.experimentId } : {}),
                 // a replay settles its operation; a (re-)dispatch would be a new decision on a snapshot nobody validated
                 ...(replayOf !== undefined ? { reconcileOnly: true } : {}),
+                // E[0]: the work claim is re-validated atomically with the dispatching record (the commit point)
+                ...(request.commitGuard !== undefined ? { commitGuard: request.commitGuard } : {}),
               }),
             timeoutMs,
             request.signal,
@@ -501,6 +540,7 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
                   signal,
                   ...(request.experimentId !== undefined ? { experimentId: request.experimentId } : {}),
                   ...(replayOf !== undefined ? { reconcileOnly: true } : {}),
+                  ...(request.commitGuard !== undefined ? { commitGuard: request.commitGuard } : {}),
                 }),
               timeoutMs,
               request.signal,
@@ -511,8 +551,20 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
             unbind();
           }
         } else {
-          const outcome: ToolOutcome = await withTimeout(timeoutMs, (signal) => spec.execute(input, makeCtx(signal)), request.signal, `tool ${spec.id}`);
+          // E[2]: sandboxed commands of this call reach the SUT through the egress relay, which ledgers their state-changing
+          // requests for THIS invocation (operation ids, Idempotency-Key, evidence; replays answered from the record)
+          const outcome: ToolOutcome = await withTimeout(timeoutMs, (signal) => runWithEgressContext(egressContext(), () => spec.execute(input, makeCtx(signal))), request.signal, `tool ${spec.id}`);
           if (!outcome || typeof outcome !== 'object' || typeof outcome.status !== 'string') throw new HypertestError('internal', `tool ${spec.id} returned a malformed outcome`);
+          // (review) writes of its commands that governance refused (or left unsettled): the call is a tool FAULT, never an
+          // outcome of the system under test (a test that could not write tells nothing about the SUT — no fake FAIL)
+          if (refusedEgress.length > 0 && (outcome.status === 'success' || outcome.status === 'failed')) {
+            const listed = refusedEgress.slice(0, MAX_LISTED_EVIDENCE).map((r) => `  - ${r}`).join('\n');
+            outcome.status = 'failed';
+            outcome.error = {
+              code: 'egress_refused',
+              message: `${refusedEgress.length} state-changing request(s) of this call's commands to the system under test were refused or left unsettled by sandbox egress governance; the outcome of this call does not describe the system under test:\n${listed}${refusedEgress.length > MAX_LISTED_EVIDENCE ? `\n  - … +${refusedEgress.length - MAX_LISTED_EVIDENCE} more` : ''}`,
+            };
+          }
           stage.status = outcome.status;
           const structured = toJson(outcome.structured, `tool ${spec.id} structured output`);
           if (structured !== undefined) stage.structured = structured;
@@ -552,6 +604,8 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
       let body = stage.status === 'success' ? '' : stage.error ? `[${stage.status}] ${stage.error.code}: ${stage.error.message}${opNote}` : `[${stage.status}]${opNote}`;
       const content = stage.text ?? (stage.structured !== undefined ? JSON.stringify(stage.structured) : '');
       if (content) body = body ? `${body}\n${content}` : content;
+      // E[2]: the side effects the call's sandboxed commands caused on the SUT (each a ledgered operation with its evidence)
+      if (relayed.length > 0) body = `${body}${body ? '\n' : ''}${relayed.slice(0, MAX_LISTED_EVIDENCE).map((r) => `[sandbox egress: ${r.summary} — evidence ${r.evidenceId}]`).join('\n')}${relayed.length > MAX_LISTED_EVIDENCE ? `\n[sandbox egress: +${relayed.length - MAX_LISTED_EVIDENCE} more relayed writes]` : ''}`;
       const maxInline = spec.maxInlineBytes ?? DEFAULT_MAX_INLINE_BYTES;
       let modelText: string;
       const bodyBytes = Buffer.byteLength(body, 'utf8');
@@ -620,6 +674,109 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
         return recorded;
       }
 
+      /**
+       * (review, I-chain) A state-changing request a sandboxed command of this call sends to the SUT through the egress
+       * relay is an `external` effect of THIS tool on the environment's resource, authorized like a tool call of its own:
+       * the call's capability bounds it (tool grant and effect, risk, environment class: `relayedWrite`), the policy must
+       * permit the external effect on that class
+       * (decision logged; `approval_required` refuses it — a sandboxed command cannot wait for a human, so no approval
+       * request is recorded: such a write goes through http.request, which waits), the permit's allowedHosts apply and the
+       * environment-control endpoints stay out of reach. The exact reason, or undefined when authorized.
+       */
+      async function authorizeEgressWrite(w: EgressWrite): Promise<string | undefined> {
+        const s = spec!;
+        let url: URL;
+        try {
+          url = new URL(w.url);
+        } catch {
+          return `malformed target ${w.url}`;
+        }
+        const envId = w.resource.startsWith('env/') ? w.resource.slice('env/'.length).split('/')[0] : undefined;
+        const environmentClass = envId !== undefined ? deps.environments.get(envId)?.environmentClass : environmentClassForUrl(url, deps.environments);
+        const effect: ToolEffect = 'external';
+        const risk: RiskClass = 'medium';
+        // capability: the environment must be one this call may act on (its class among the capability's environment
+        // classes; an agent confined to local/sandbox never touches staging or production through its commands), within
+        // the risk ceiling, while the capability is valid. The tool grant itself (shell.exec / test.run reaching relayed
+        // endpoints) is what lets a command exercise the system under test — a test author's regression run writes to the
+        // SUT — so the capability's effects and resource scopes need not name `external` / `env/**` (what http.request
+        // needs); the policy below judges the external effect itself.
+        if (environmentClass === undefined) return `capability_denied: the environment class of ${w.resource} is unknown (no policy can judge a write to it)`;
+        const check = capabilityAllows(cap, { tool: s.id, effect: callEffect, riskClass: risk, resources: [], environmentClass, now: clock.isoNow() });
+        if (!check.allowed) return `capability_denied: ${check.reason} (a write of ${s.id} to ${w.resource}, environment class ${environmentClass})`;
+        const control = controlEndpointReason(url, deps.environments);
+        if (control !== undefined) return control;
+        const ar: ActionRequest = {
+          requestId: w.key,
+          runId: request.runId,
+          workItemId: request.workItemId,
+          agentId: request.agentId,
+          role: request.role,
+          tool: s.id,
+          effect,
+          riskClass: risk,
+          resources: [w.resource],
+          capability: cap,
+          input: { method: w.method, url: redactUrl(url), bodySha256: w.bodySha256, relayedFor: request.invocationId },
+          phase: 'before_action',
+          noApprovalRequest: true,
+          // the policy's own capability check verifies the CALL's grant for a relayed write (tool, its effect, class)
+          relayedWrite: { callEffect },
+        };
+        if (environmentClass !== undefined) ar.environmentClass = environmentClass;
+        if (request.snapshot?.snapshotId) ar.snapshotId = request.snapshot.snapshotId;
+        let p: ActionPermit;
+        try {
+          p = await deps.policy.evaluate(ar);
+          if (!p || (p.decision !== 'allow' && p.decision !== 'deny' && p.decision !== 'approval_required') || !Array.isArray(p.reasons)) throw new HypertestError('internal', 'policy engine returned a malformed permit');
+        } catch (e) {
+          return `policy_engine_error: ${(e as Error).message} (fail closed)`;
+        }
+        if (deps.decisionLog) {
+          try {
+            await deps.decisionLog.record(ar, p, evCtx);
+          } catch (e) {
+            return `policy decision ${p.decisionId} could not be recorded: ${(e as Error).message}`;
+          }
+        }
+        if (p.decision === 'deny') return `policy denied (decision ${p.decisionId}): ${p.reasons.join('; ') || 'no reason given'}`;
+        if (p.decision === 'approval_required') {
+          return `approval required (decision ${p.decisionId}): ${p.reasons.join('; ')} — a sandboxed command cannot wait for a human decision; send this request with the http.request tool (it waits for the approval)`;
+        }
+        const hosts = p.constraints?.allowedHosts;
+        if (hosts !== undefined) {
+          const h = checkHost(url, { permitHosts: hosts, trustedOrigins: [url.origin] });
+          if (!h.allowed) return `permit_constraint_violated: ${h.reason}`;
+        }
+        // freshness: the call that runs the command was validated before it started (a mutating effect); its writes are part
+        // of that one decision — re-validating each write mid-run would cut a test run in half on any concurrent change
+        return undefined;
+      }
+
+      /** (E[2]) What the egress relay of this call's sandboxed commands ledgers their writes for. */
+      function egressContext(): EgressCallContext {
+        const ctx: EgressCallContext = {
+          runId: request.runId,
+          workItemId: request.workItemId,
+          agentId: request.agentId,
+          invocationId: request.invocationId,
+          eventContext: evCtx,
+          artifacts,
+          environments: deps.environments,
+          recordEvidence: recordEvTo(relayed),
+          within: (fn) => runMetered(meter, fn),
+          occurrences: new Map(),
+          logger,
+        };
+        if (deps.sideEffects) ctx.gateway = deps.sideEffects;
+        ctx.authorize = authorizeEgressWrite;
+        ctx.refused = refusedEgress;
+        if (request.commitGuard) ctx.commitGuard = request.commitGuard;
+        if (request.egressGuard) ctx.egressGuard = request.egressGuard;
+        if (request.experimentId !== undefined) ctx.experimentId = request.experimentId;
+        return ctx;
+      }
+
       function makeCtx(signal: AbortSignal, operationId?: string): ToolContext {
         const ctx: ToolContext = {
           runId: request.runId,
@@ -639,9 +796,12 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
           leaseOwner,
         };
         if (request.claim) ctx.claim = { ...request.claim };
+        if (operationId !== undefined) ctx.operationId = operationId;
         if (request.experimentId !== undefined) ctx.experimentId = request.experimentId;
         if (request.snapshot) ctx.snapshot = request.snapshot;
         if (deps.sideEffects) ctx.sideEffects = spec!.sideEffect ? deps.sideEffects : observeOnly(deps.sideEffects);
+        // (review) a tool mints only the brokered credentials this call declared — and the capability and permit authorized
+        if (deps.secrets) ctx.secrets = callScopedSecrets(deps.secrets, credentialScopes, request.runId, request.invocationId);
         return ctx;
       }
     },
@@ -658,6 +818,25 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
       }
       // everything the call does (processes, puts) is attributed to this meter — concurrent calls never mix
       return runMetered(meter, () => pipeline.execute(request, meter));
+    },
+  };
+}
+
+/**
+ * (review, E[4]) The secret broker a tool call sees: it mints only the credentials whose scopes the call declared
+ * (`ToolSpec.credentialScopes` — what the capability and the permit's credentialScope were checked against), for this run
+ * and invocation only; anything else is refused (permission_denied) — a tool can never mint a credential nobody authorized.
+ */
+function callScopedSecrets(broker: NonNullable<ToolRuntimeDeps['secrets']>, authorized: readonly string[], runId: string, invocationId: string): NonNullable<ToolContext['secrets']> {
+  const allowed = new Set(authorized);
+  return {
+    describe: (environmentId) => broker.describe(environmentId),
+    redact: (text) => broker.redact(text),
+    async mint(req) {
+      const scope = credentialScope(req.environmentId, req.name);
+      if (!allowed.has(scope)) throw new HypertestError('permission_denied', `credential ${scope} was not declared and authorized for this call (authorized: ${[...allowed].join(', ') || 'none'})`);
+      if (req.runId !== runId || req.invocationId !== invocationId) throw new HypertestError('permission_denied', `credential ${scope} is minted for this call only (run ${runId}, invocation ${invocationId})`);
+      return broker.mint(req);
     },
   };
 }
@@ -682,8 +861,14 @@ function applySideEffectOutcome(stage: Stage, outcome: SideEffectOutcome): void 
       return;
     }
     default:
-      stage.status = 'failed';
-      stage.error = { code: outcome.status, message: outcome.reason };
+      // E[0]: refused at the commit point because the caller's work claim is gone — nothing was sent (a denial)
+      if (outcome.status === 'stale_fence' && outcome.reason.startsWith('claim_fenced:')) {
+        stage.status = 'denied';
+        stage.error = { code: 'lease_lost', message: `${outcome.reason}; stop working on this item` };
+      } else {
+        stage.status = 'failed';
+        stage.error = { code: outcome.status, message: outcome.reason };
+      }
       stage.structured = { operationId: outcome.operation.operationId, operationStatus: outcome.operation.status };
   }
 }

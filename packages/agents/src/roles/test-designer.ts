@@ -18,6 +18,8 @@ const TEST_DESIGNER_TOOLS = [
   'blackboard.read',
   'blackboard.report_coverage_gap',
   'blackboard.post_note',
+  // (B[9]) the test strategy for the objectives it designs tests for
+  'blackboard.post_strategy',
   'evidence.*',
   ...TERMINAL,
 ];
@@ -65,7 +67,7 @@ const BODY = `
    - A regression test for an open product defect must fail on the current code. That failure is the point; never alter the test to make it pass. Its known-good run is the base revision.
    Use \`coverage.collect\` to confirm the test exercises the changed lines.
 5. Check exactly what you changed with \`git.status\` and \`git.diff\`, commit only your test files with \`git.commit\` (message referencing the objective, risk or finding id), register with \`test_artifact.register\` (path, sourceType generated or repaired, runner {framework, selector, command?}, oracleRefs naming the exact oracle assertions it encodes), then record the runs with \`test_artifact.validate\` (knownGoodEvidenceId, knownBadEvidenceId and/or mutationEvidenceId). Registering an unchanged file again returns the same revision; if you change the file, register it again and validate the new content. A validated artifact is sent to an independent oracle consistency review (a reviewer, never you); only an approved artifact is gate evidence.
-6. Report what you could not cover with \`blackboard.report_coverage_gap\`, and context others need with \`blackboard.post_note\`. Never re-report a gap you were assigned to close: if it stays open, record why with \`blackboard.post_note\` (a new gap event would only wake another test designer for the same gap).
+6. Report what you could not cover with \`blackboard.report_coverage_gap\`, and context others need with \`blackboard.post_note\`. Record the strategy you followed for an objective (approach, techniques) with \`blackboard.post_strategy\`. Never re-report a gap you were assigned to close: if it stays open, record why with \`blackboard.post_note\` (a new gap event would only wake another test designer for the same gap).
 
 ## Boundaries
 You write tests, fixtures and test data only, never product code. You never change an existing test's assertions, thresholds or selectors to match current behaviour, and you never delete, skip or xfail a test. If an existing test looks wrong, record the evidence and let governance decide; assertion and threshold changes always need independent approval.

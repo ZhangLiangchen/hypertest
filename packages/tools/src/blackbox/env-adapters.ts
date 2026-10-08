@@ -2,7 +2,8 @@ import { HypertestError, hashCanonical, type Logger } from '@hypertest/core';
 import type { DispatchReceipt, ObservationResult, OperationContext, PreparedOperation, SideEffectAdapter, SideEffectCapabilities, VerificationResult } from '@hypertest/operation';
 import type { EnvironmentDescriptor, EnvironmentRegistry } from '../contracts.ts';
 import { CONTROL_TOKEN_HEADER, errorMessage, publicControlTarget, requireEnvironment, runCommand, splitControlTarget, type CommandResult } from './common.ts';
-import { OPERATION_HEADER, normalizeFault, type SupervisorFault, type SupervisorOperation } from './process-supervisor.ts';
+import { mintControlToken } from './secrets.ts';
+import { FENCE_HEADER, OPERATION_HEADER, normalizeFault, type SupervisorFault, type SupervisorOperation } from './process-supervisor.ts';
 
 /**
  * Environment control adapters (restart / deploy / fault injection) as SideEffectAdapters. Operation
@@ -121,7 +122,8 @@ export class ProcessEnvAdapter implements SideEffectAdapter<EnvInput, ProcessEnv
   readonly capabilities: SideEffectCapabilities = {
     supportsNativeIdempotency: true,
     supportsExternalLookupByOperationId: true,
-    supportsFencing: false,
+    // E[0]: the supervisor is a fenced target (X-Hypertest-Fence: the gateway's lease token; stale ⇒ 412, not applied)
+    supportsFencing: true,
     supportsCompensation: false,
     reconciliationClass: 'deterministic',
     riskClass: 'high',
@@ -174,7 +176,10 @@ export class ProcessEnvAdapter implements SideEffectAdapter<EnvInput, ProcessEnv
     const signal = AbortSignal.any([op.signal, AbortSignal.timeout(this.#o.requestTimeoutMs ?? 60_000)]);
     const headers: Record<string, string> = { 'content-type': 'application/json', [OPERATION_HEADER]: op.operation.operationId };
     const token = this.#token(s.environmentId, base.href);
-    if (token !== undefined) headers[CONTROL_TOKEN_HEADER] = token;
+    // E[4]: the long-lived control token never goes over the wire — a short-lived token bound to THIS operation, signed
+    // with it, does (the supervisor verifies signature, expiry and operation)
+    if (token !== undefined) headers[CONTROL_TOKEN_HEADER] = mintControlToken(token, op.operation.operationId, Date.now());
+    if (op.fencingToken !== undefined) headers[FENCE_HEADER] = String(op.fencingToken);
     let res: Response;
     try {
       res = await fetch(controlEndpoint(base, isFault ? 'faults' : 'restart'), { method: 'POST', headers, body: JSON.stringify(body), signal });
@@ -183,7 +188,8 @@ export class ProcessEnvAdapter implements SideEffectAdapter<EnvInput, ProcessEnv
     }
     const text = await res.text();
     // Refused before acting (bad request, unknown endpoint, missing/invalid control token): definitively not applied.
-    if (res.status === 400 || res.status === 401 || res.status === 403 || res.status === 404 || res.status === 413 || res.status === 422) {
+    // 412: the supervisor refused a stale fencing token (another owner was granted the environment): nothing was done
+    if (res.status === 400 || res.status === 401 || res.status === 403 || res.status === 404 || res.status === 412 || res.status === 413 || res.status === 422) {
       return { accepted: false, notAppliedReason: `supervisor rejected the request (HTTP ${res.status}): ${text.slice(0, 500)}`, receipt: text.slice(0, 2000) };
     }
     if (res.status === 409) throw new HypertestError('conflict', `supervisor reports a conflicting operation ${op.operation.operationId}: ${text.slice(0, 500)}`);
@@ -222,7 +228,10 @@ export class ProcessEnvAdapter implements SideEffectAdapter<EnvInput, ProcessEnv
     const environmentId = environmentIdOf(op);
     if (obs.kind === 'fault') {
       if (obs.state === 'active' || obs.state === 'expired' || obs.state === 'cleared') {
-        return { status: 'verified', result: { environmentId, action: 'fault', faultId: obs.faultId ?? null, fault: obs.fault ?? null, expiresAt: obs.expiresAt ?? null, state: obs.state } };
+        const verified: VerificationResult = { status: 'verified', result: { environmentId, action: 'fault', faultId: obs.faultId ?? null, fault: obs.fault ?? null, expiresAt: obs.expiresAt ?? null, state: obs.state } };
+        // E[1]: an active time-boxed fault holds its environment until it expires (the gateway keeps the lease)
+        if (obs.state === 'active' && typeof obs.expiresAt === 'string' && Number.isFinite(Date.parse(obs.expiresAt))) verified.effectUntil = obs.expiresAt;
+        return verified;
       }
       return { status: 'failed', reason: `fault operation in unexpected state ${obs.state}` };
     }

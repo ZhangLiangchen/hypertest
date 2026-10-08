@@ -10,6 +10,7 @@ import type { ControlDeps, ResolvedControlConfig } from './deps.ts';
 import { experimentScope, experimentStopEventId, recordExperimentStop } from './domain-tools/specs.ts';
 import { runScope, workScope } from './work-factory.ts';
 import { event, isTerminalRunStatus, runCtx } from './util.ts';
+import { applyExhaustionPolicy, exhaustionPolicy, experimentWallClockLimit } from './budget-exhaustion.ts';
 
 /**
  * Unit B2 — experiment isolation (conformance-6) and budget leases (conformance-5) of the control plane.
@@ -60,6 +61,163 @@ export async function runExperimentIds(deps: Pick<ControlDeps, 'specs'> & Partia
     }
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------------------------------- effect claims (E[1])
+
+/**
+ * (E[1]) Resource-key namespaces of the environment an action acts on: a write/fault/load call needs an ADMITTED
+ * ResourceClaim on each of its resources in these namespaces (independently of experiments): the systems under test
+ * (`env/`, `url/` — with their aliases) and the load generators (`loadgen/`).
+ */
+export const EFFECT_CLAIM_PREFIXES: readonly string[] = ['env/', 'url/', 'loadgen/'];
+/** Holder ids of per-call effect claims: `effect:<group>:<workItemId>:<invocationId>`. */
+export const EFFECT_HOLDER_PREFIX = 'effect:';
+
+/**
+ * (E[1]) The holder of one call's effect claims. `group`: the experiment the call is attributed to (else its work item):
+ * the claims of one experiment's calls are mutually compatible (except two faults: see admitEffectClaim) and compatible
+ * with the experiment's own claims and its work items' claims.
+ */
+export function effectHolderId(group: string, workItemId: string, invocationId: string): string {
+  return `${EFFECT_HOLDER_PREFIX}${group}:${workItemId}:${invocationId}`;
+}
+
+/** The parts of an effect holder id (groups and work item ids never contain ':'; invocation ids may). */
+export function parseEffectHolder(holderId: string): { group: string; workItemId: string; invocationId: string } | undefined {
+  if (!holderId.startsWith(EFFECT_HOLDER_PREFIX)) return undefined;
+  const [group, workItemId, ...rest] = holderId.slice(EFFECT_HOLDER_PREFIX.length).split(':');
+  const invocationId = rest.join(':');
+  return group && workItemId && invocationId ? { group, workItemId, invocationId } : undefined;
+}
+
+/** (E[1]) The live effect-claim holders of the given groups (optionally only those holding a claim matching `filter`). */
+export async function effectHolders(deps: Pick<ControlDeps, 'admission'>, groups: readonly string[], runId?: string, filter?: (claim: ResourceClaim) => boolean): Promise<string[]> {
+  if (groups.length === 0) return [];
+  const prefixes = groups.map((g) => `${EFFECT_HOLDER_PREFIX}${g}:`);
+  const out = new Set<string>();
+  for (const a of await deps.admission.active(runId)) {
+    if (!prefixes.some((p) => a.holderId.startsWith(p))) continue;
+    if (filter && !filter(a.claim)) continue;
+    out.add(a.holderId);
+  }
+  return [...out].sort();
+}
+
+/**
+ * (E[1]) The holders whose claims a work item's own claims never conflict with: the experiments of its run it runs for
+ * (conformance-6) and the effect claims of its own calls and of those experiments' calls (a running fault or load job of
+ * its experiment never takes the item's resources away).
+ */
+export async function compatibleClaimHolders(deps: Pick<ControlDeps, 'specs' | 'admission'> & Partial<Pick<ControlDeps, 'agents'>>, item: Pick<WorkItem, 'inputRefs' | 'runId'> & Partial<Pick<WorkItem, 'workItemId'>>): Promise<string[]> {
+  const experiments = await runExperimentIds(deps, item);
+  const groups = [...experiments, ...(item.workItemId !== undefined ? [item.workItemId] : [])];
+  return [...new Set([...experiments, ...(await effectHolders(deps, groups, item.runId))])];
+}
+
+/**
+ * (E[1]) How long the effect of a call lasts beyond the call itself (ms), when it is time-boxed: a fault (`env.inject_fault`)
+ * stays in force for its durationMs, a load job (`load.start`) runs for its durationMs. undefined: the effect is
+ * instantaneous (or settles with the call).
+ */
+export function lastingEffectMs(toolId: string, args: Record<string, unknown>): number | undefined {
+  if (toolId !== 'env.inject_fault' && toolId !== 'load.start') return undefined;
+  const d = args['durationMs'];
+  return typeof d === 'number' && Number.isFinite(d) && d > 0 ? d : undefined;
+}
+
+export type EffectClaimVerdict = { ok: true; holderId?: string; claims: ResourceClaim[] } | { ok: false; problem: string };
+
+/**
+ * (E[1]) Every write/fault/load action against an environment needs an ADMITTED ResourceClaim covering its target: one
+ * call-scoped claim per environment resource of the call (EFFECT_CLAIM_PREFIXES, URL aliases included) — `fault_exclusive`
+ * for a fault on a system under test, else `write_exclusive` — admitted atomically through ResourceAdmission (holder
+ * `effect:<group>:<invocationId>`, TTL = the call's timeout + the effect's duration: a time-boxed fault or load job keeps
+ * its resources for its whole window). Compatible: the item itself, the experiments it runs for and the other effect
+ * claims of its group — but never another fault: two overlapping faults on one resource are refused whoever injects them.
+ * Any other live holder (another experiment, another experiment's running fault or load, another work item's claims)
+ * refuses the call with the exact conflict. Admitted again by a replay of the same invocation (idempotent).
+ */
+export async function admitEffectClaim(
+  deps: Pick<ControlDeps, 'admission'> & { environments?: Pick<EnvironmentRegistry, 'list'> },
+  call: { runId: string; workItemId: string; toolId: string; invocationId: string; group: string; experimentIds: readonly string[]; resources: () => string[]; ttlMs: number },
+): Promise<EffectClaimVerdict> {
+  let resources: string[];
+  try {
+    resources = call.resources();
+    if (!Array.isArray(resources) || resources.some((r) => typeof r !== 'string' || r.length === 0)) throw new Error('malformed resources');
+  } catch (e) {
+    return { ok: false, problem: `the resources of ${call.toolId} cannot be determined (${(e as Error).message}); no claim can cover them` };
+  }
+  const fault = FAULT_TOOLS.includes(call.toolId);
+  const claims: ResourceClaim[] = [];
+  for (const r of resources) {
+    if (!EFFECT_CLAIM_PREFIXES.some((p) => r.startsWith(p))) continue;
+    const mode: ResourceClaim['mode'] = fault && !r.startsWith('loadgen/') ? 'fault_exclusive' : 'write_exclusive';
+    for (const key of [r, ...resourceAliases(r, deps.environments)]) {
+      if (!claims.some((c) => c.resourceKey === key)) claims.push({ resourceKey: key, mode });
+    }
+  }
+  if (claims.length === 0) return { ok: true, claims };
+  const holderId = effectHolderId(call.group, call.workItemId, call.invocationId);
+  const peers = await effectHolders(deps, [call.group], undefined, fault ? (c) => c.mode !== 'fault_exclusive' : undefined);
+  // a peer of the group holding a fault on one of these keys is not compatible with another fault
+  const faultPeers = fault ? new Set(await effectHolders(deps, [call.group], undefined, (c) => c.mode === 'fault_exclusive')) : new Set<string>();
+  const compatibleHolders = [...new Set([call.workItemId, ...call.experimentIds, ...peers.filter((p) => p !== holderId && !faultPeers.has(p))])];
+  const r = await deps.admission.admit({ holderId, runId: call.runId, claims, ttlMs: Math.max(1000, Math.ceil(call.ttlMs)), compatibleHolders });
+  if (r.admitted) return { ok: true, holderId, claims };
+  const detail = r.conflicts.map((c) => `${c.requested.mode}(${c.requested.resourceKey}) vs ${c.held.mode}(${c.held.resourceKey}) held by ${c.heldBy}`);
+  return { ok: false, problem: `${call.toolId} needs ${claims.map((c) => `${c.mode}(${c.resourceKey})`).join(', ')}, which conflict${r.conflicts.length === 1 ? 's' : ''} with live claims: ${[...new Set(detail)].join('; ')}` };
+}
+
+/** Operation states in which an effect is certainly over (or never happened). */
+const EFFECT_ENDED: ReadonlySet<string> = new Set(['failed', 'not_applied', 'compensated']);
+
+/**
+ * (E[1]) Gives back the effect claims of a run whose effects are over: the call's operation ended (a load job completed,
+ * failed, was stopped or never applied; a fault was compensated) — a verified fault whose window (`effectUntil`) is still
+ * open keeps its claim until it expires; a claim of a call that never recorded an operation is released once its work item
+ * ended (`runEnded`: once the run ended). Unsettled or manual-review operations keep theirs (the effect may be in force);
+ * every claim expires with its TTL anyway. Returns the released holders.
+ */
+export async function settleEffectClaims(deps: Pick<ControlDeps, 'admission' | 'ledger' | 'blackboard' | 'clock' | 'logger'>, runId: string, runEnded = false): Promise<string[]> {
+  const holders = [...new Set((await deps.admission.active(runId)).map((a) => a.holderId).filter((h) => h.startsWith(EFFECT_HOLDER_PREFIX)))];
+  const released: string[] = [];
+  for (const holder of holders) {
+    const parsed = parseEffectHolder(holder);
+    if (parsed === undefined) continue;
+    const { invocationId, workItemId } = parsed;
+    let over = false;
+    try {
+      const op = await deps.ledger.findByToolInvocation(invocationId);
+      if (op && op.runId === runId) {
+        if (EFFECT_ENDED.has(op.status)) over = true;
+        else if (op.status === 'verified') {
+          const until = op.result !== null && typeof op.result === 'object' ? (op.result as { effectUntil?: unknown }).effectUntil : undefined;
+          over = typeof until !== 'string' || !(Date.parse(until) > deps.clock.nowMs());
+        }
+      } else if (!op) {
+        const item = await deps.blackboard.getWorkItem(workItemId);
+        over = runEnded || !item || isTerminalWorkState(item.state);
+      }
+    } catch (e) {
+      deps.logger.warn('effect claim state unknown: kept until its TTL', { runId, holder, error: (e as Error).message });
+      continue;
+    }
+    if (!over) continue;
+    await deps.admission.release(holder);
+    released.push(holder);
+  }
+  if (released.length > 0) deps.logger.info('effect claims released: their effects are over', { runId, released });
+  return released;
+}
+
+/** (E[1]) Releases the effect claims of one call (any group): its effect ended or never happened. */
+export async function releaseEffectClaims(deps: Pick<ControlDeps, 'admission'>, invocationId: string, runId?: string): Promise<string[]> {
+  const holders = new Set<string>();
+  for (const a of await deps.admission.active(runId)) if (a.holderId.startsWith(EFFECT_HOLDER_PREFIX) && a.holderId.endsWith(`:${invocationId}`)) holders.add(a.holderId);
+  for (const h of holders) await deps.admission.release(h);
+  return [...holders];
 }
 
 function sameClaim(a: ResourceClaim, b: ResourceClaim): boolean {
@@ -224,6 +382,8 @@ export interface ExperimentSync {
   renewed: string[];
   released: string[];
   lapsed: string[];
+  /** (additive, E[1]) Effect-claim holders given back because their effects are over. */
+  effectsReleased?: string[];
 }
 
 /**
@@ -255,6 +415,8 @@ export async function syncExperimentClaims(
   lapseMemo: Map<string, string>,
 ): Promise<ExperimentSync> {
   const out: ExperimentSync = { renewed: [], released: [], lapsed: [] };
+  // E[1]: call-scoped effect claims whose effects are over are given back first (a completed load job, a compensated fault)
+  out.effectsReleased = await settleEffectClaims(deps, run.runId, isTerminalRunStatus(run.status));
   const experiments = (await deps.specs.listExperiments(run.runId)).filter((e) => e.isolation.resourceClaims.length > 0);
   if (experiments.length === 0) return out;
   const byId = new Map(items.map((w) => [w.workItemId, w]));
@@ -280,7 +442,8 @@ export async function syncExperimentClaims(
       deps.logger.info('experiment claims released: no live owner', { runId: run.runId, experimentId: id });
       continue;
     }
-    const r = await deps.admission.admit({ holderId: id, runId: run.runId, claims: spec.isolation.resourceClaims, ttlMs: config.leaseTtlMs, compatibleHolders: [...new Set(owners)] });
+    // E[1]: the experiment's own running effects (a fault in force, a load job) never take its claims away
+    const r = await deps.admission.admit({ holderId: id, runId: run.runId, claims: spec.isolation.resourceClaims, ttlMs: config.leaseTtlMs, compatibleHolders: [...new Set([...owners, ...(await effectHolders(deps, [id, ...owners], run.runId))])] });
     if (r.admitted) {
       lapseMemo.delete(id);
       out.renewed.push(id);
@@ -364,10 +527,12 @@ export async function experimentActionCheck(
     if (v) return { ok: false, code: 'experiment_plan_violation', problem: v };
   }
   const b = spec.budget;
-  if (b?.maxWallClockMs !== undefined && deps.clock.nowMs() - Date.parse(spec.createdAt) > b.maxWallClockMs) {
+  // E[3]: the experiment's wall clock includes every raise of it (budget.raised)
+  const wallClock = b?.maxWallClockMs !== undefined ? await experimentWallClockLimit(deps, spec.runId, id) : undefined;
+  if (wallClock !== undefined && deps.clock.nowMs() - Date.parse(spec.createdAt) > wallClock) {
     const scope = experimentScope(id);
-    await deps.events.append([event(ctx, EVENT_TYPES.budgetExhausted, 'budget', scope, { scope, dimension: 'wallClockMs', limit: b.maxWallClockMs, used: deps.clock.nowMs() - Date.parse(spec.createdAt), reserved: 0, requested: 0, reason: 'experiment_wall_clock', experimentId: id, toolId: call.toolId, invocationId: call.invocationId })]);
-    return { ok: false, code: 'experiment_budget_exhausted', problem: `the wall-clock budget of experiment ${id} (${b.maxWallClockMs} ms) is spent; its actions are refused` };
+    await deps.events.append([event(ctx, EVENT_TYPES.budgetExhausted, 'budget', scope, { scope, dimension: 'wallClockMs', limit: wallClock, used: deps.clock.nowMs() - Date.parse(spec.createdAt), reserved: 0, requested: 0, reason: 'experiment_wall_clock', experimentId: id, toolId: call.toolId, invocationId: call.invocationId })]);
+    return { ok: false, code: 'experiment_budget_exhausted', problem: `the wall-clock budget of experiment ${id} (${wallClock} ms) is spent; its actions are refused` };
   }
   if (b?.maxToolCalls !== undefined) {
     const scope = experimentScope(id);
@@ -491,7 +656,7 @@ export async function releaseStrandedReservations(deps: Pick<ControlDeps, 'budge
  * (conformance-5/6) Everything a finished run still holds for isolation: its experiments' claims and the QPS reservations
  * of its load jobs (a model call still settling keeps its own reservation: it settles to its actual use). Idempotent.
  */
-export async function releaseRunIsolation(deps: ControlDeps, runId: string, ctx: EventContext): Promise<{ experiments: string[]; reservations: string[] }> {
+export async function releaseRunIsolation(deps: ControlDeps, runId: string, ctx: EventContext): Promise<{ experiments: string[]; reservations: string[]; effects: string[] }> {
   const experiments: string[] = [];
   for (const spec of await deps.specs.listExperiments(runId)) {
     if (spec.isolation.resourceClaims.length === 0 || (await heldClaims(deps, spec.experimentId, runId)).length === 0) continue;
@@ -499,13 +664,16 @@ export async function releaseRunIsolation(deps: ControlDeps, runId: string, ctx:
     experiments.push(spec.experimentId);
     await deps.events.append([event(ctx, 'admission.released', 'experiment', spec.experimentId, { experimentId: spec.experimentId, claims: spec.isolation.resourceClaims, reason: 'run_ended' })]);
   }
+  // E[1]: effect claims of calls whose effects are over (an effect still in force — a fault window, a running job — keeps
+  // its claim until it ends or expires: the run's end does not end the effect in the environment)
+  const effects = await settleEffectClaims(deps, runId, true);
   const reservations: string[] = [];
   for (const r of await openQps(deps, runId)) {
     await deps.budget.release(r.reservationId);
     reservations.push(r.reservationId);
   }
-  if (experiments.length + reservations.length > 0) deps.logger.info('run ended: isolation released', { runId, experiments, reservations });
-  return { experiments, reservations };
+  if (experiments.length + reservations.length + effects.length > 0) deps.logger.info('run ended: isolation released', { runId, experiments, reservations, effects });
+  return { experiments, reservations, effects };
 }
 
 // ---------------------------------------------------------------------------------------------------- exhaustion
@@ -525,14 +693,20 @@ export async function onToolBudgetExhausted(
   info: { reason: 'compute' | 'artifact_bytes' | 'external_qps'; toolId: string; invocationId: string },
 ): Promise<'paused' | 'recorded'> {
   await deps.events.append([event(ctx, 'budget.exhausted', 'budget', exhausted.scope, { ...exhausted, ...info })]);
-  if (info.reason === 'external_qps' || exhausted.scope !== runScope(runId) || (deps.config.onBudgetExhausted ?? 'gate') !== 'pause') return 'recorded';
+  if (info.reason === 'external_qps' || exhausted.scope !== runScope(runId)) return 'recorded';
+  const run = await deps.runs.get(runId);
+  // E[3] the run's exhaustion policy: 'gate' ⇒ the convergence monitor sees the exhausted scope at the next tick;
+  // 'pause' / 'approval' ⇒ the run pauses now (for a raise / on a budget-extension approval request)
+  if (!run || exhaustionPolicy(run, deps.config) === 'gate') return 'recorded';
+  let applied: Awaited<ReturnType<typeof applyExhaustionPolicy>>;
   try {
-    const cur = await deps.runs.get(runId);
-    if (cur?.status === 'running') await deps.runs.update(runId, { status: 'paused', pauseReason: 'budget' }, ctx);
+    applied = await applyExhaustionPolicy(deps, run, { kind: 'budget', dimension: exhausted.dimension, scope: exhausted.scope, reason: info.reason, limit: exhausted.limit, used: exhausted.used }, ctx);
   } catch (e) {
     if (!isHypertestError(e, 'conflict') && !isHypertestError(e, 'precondition_failed')) throw e;
+    return 'recorded';
   }
-  deps.logger.warn('run paused: a tool call exhausted the run budget', { runId, ...exhausted, ...info });
+  if (applied.outcome !== 'paused') return 'recorded';
+  deps.logger.warn('run paused: a tool call exhausted the run budget', { runId, ...exhausted, ...info, pauseReason: applied.pauseReason });
   return 'paused';
 }
 

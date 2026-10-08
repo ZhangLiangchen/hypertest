@@ -11,7 +11,7 @@ import { BUILTIN_ROLES, EVIDENCE_PRODUCER_ROLES } from '@hypertest/agents';
 import { PERMISSION_PROFILES } from '@hypertest/policy';
 import type { ToolExecutionRequest, ToolExecutionResult } from '@hypertest/tools';
 import { PRODUCER_ROLES, WorkFactory, claimLeaseOwner, createControlPlane, createToolDispatcher, runReviewRequestEventId, testOutcomeEventId, workScope } from '../src/index.ts';
-import { call, createHarness, drive, items, parsed, type Harness, type RoleBrain } from './harness.ts';
+import { assembleTurn, call, createHarness, drive, items, parsed, turnSnapshot, type Harness, type RoleBrain } from './harness.ts';
 
 const LEAD_OUT: { [k: string]: JsonValue } = { summary: 'lead done', planProposed: false, readyForGate: false, objectives: [] };
 
@@ -142,7 +142,7 @@ describe('H4/H5: tool calls run under the work claim; replays are charged once a
   async function host(item: WorkItem, token: number) {
     const run = (await h.deps.runs.get(item.runId))!;
     const { agent, spec } = await h.control.worker.ensureAgent(item, run, token);
-    return { agent, host: await h.control.worker.buildHost(item, run, agent, spec, token) };
+    return { agent, host: await assembleTurn(await h.control.worker.buildHost(item, run, agent, spec, token), agent.sessionId) };
   }
 
   function intercept(before: (req: ToolExecutionRequest) => Promise<ToolExecutionResult | void>): () => void {
@@ -202,6 +202,7 @@ describe('H4/H5: tool calls run under the work claim; replays are charged once a
       runId: run.runId, workItemId: item.workItemId, agentId: agent.agentId, role: 'lead', invocationId: `${agent.sessionId}:3:dup`,
       eventContext: { runId: run.runId, correlationId: item.workItemId, actorId: agent.agentId, workItemId: item.workItemId, agentId: agent.agentId },
       signal: new AbortController().signal, logger: h.logger, environments: h.deps.environments, claim: { workItemId: item.workItemId, fencingToken: token },
+      snapshot: await turnSnapshot(h, run.runId),
     };
     const input = {
       rationale: 'plan once', objectives: [{ objectiveId: 'o1', description: 'objective', priority: 'P2' }],
@@ -234,7 +235,7 @@ describe('H4/H5: tool calls run under the work claim; replays are charged once a
       capability: { ...spec.capability, tools: [...spec.capability.tools, 'load.start'] }, allow: ['load.start'], deny: [],
       workspace: await h.deps.workspaces.scratch({ runId: run.runId, workItemId: item.workItemId }),
       eventContext: { runId: run.runId, correlationId: item.workItemId, actorId: agent.agentId, workItemId: item.workItemId, agentId: agent.agentId },
-      turnState: {}, fencingToken: dd.fencingToken,
+      turnState: { snapshot: await turnSnapshot(h, run.runId) }, fencingToken: dd.fencingToken,
     });
     try {
       const meta = (n: number) => ({ sessionId: agent.sessionId, turn: 20 + n, invocationId: `${agent.sessionId}:${20 + n}:l`, signal: new AbortController().signal });
@@ -246,6 +247,7 @@ describe('H4/H5: tool calls run under the work claim; replays are charged once a
         runId: run.runId, workItemId: item.workItemId, agentId: agent.agentId, role: 'lead', invocationId: `${agent.sessionId}:19:e`,
         eventContext: { runId: run.runId, correlationId: item.workItemId, actorId: agent.agentId, workItemId: item.workItemId, agentId: agent.agentId },
         signal: new AbortController().signal, logger: h.logger, environments: h.deps.environments, claim: { workItemId: item.workItemId, fencingToken: dd.fencingToken },
+        snapshot: await turnSnapshot(h, run.runId),
       } as never);
       assert.equal(defined.status, 'success', JSON.stringify(defined));
       const over = await d.dispatch({ id: 'l', name: 'load__start', arguments: { method: 'GET', targetUrl: 'http://127.0.0.1:9/', ratePerSecond: 500, durationMs: 1000 } }, meta(1));
@@ -282,7 +284,7 @@ describe('H4/H5: tool calls run under the work claim; replays are charged once a
       capability: { ...spec.capability, tools: [...spec.capability.tools, 'test.run'] }, allow: ['test.run'], deny: [],
       workspace: await h.deps.workspaces.scratch({ runId: plan.run.runId, workItemId: plan.item.workItemId }),
       eventContext: { runId: plan.run.runId, correlationId: plan.item.workItemId, actorId: agent.agentId, workItemId: plan.item.workItemId, agentId: agent.agentId },
-      turnState: {}, fencingToken: plan.token,
+      turnState: { snapshot: await turnSnapshot(h, plan.run.runId) }, fencingToken: plan.token,
     });
     try {
       const meta2 = { sessionId: agent.sessionId, turn: 12, invocationId: `${agent.sessionId}:12:t1`, signal: new AbortController().signal };

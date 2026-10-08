@@ -20,7 +20,7 @@ import { artifactEligibility } from '@hypertest/policy';
 import type { ToolExecutionRequest, ToolExecutionResult } from '@hypertest/tools';
 import { WorkFactory, createToolDispatcher, experimentScope, runScope, workScope } from '../src/index.ts';
 import { recordExperimentStop } from '../src/domain-tools/specs.ts';
-import { call, createHarness, drive, evidenceIds, items, parsed, runItem, type Harness, type RoleBrain } from './harness.ts';
+import { assembleTurn, call, createHarness, drive, evidenceIds, items, parsed, runItem, turnSnapshot, type Harness, type RoleBrain } from './harness.ts';
 import { pricingOracle, pricingRepo } from './fixture.ts';
 
 type Result = { name: string; content: string; isError: boolean };
@@ -458,7 +458,7 @@ async function leadHost(h: Harness, goal: string) {
   const item = (await h.deps.blackboard.getWorkItem(d.workItemId))!;
   const cur = (await h.deps.runs.get(run.runId))!;
   const { agent, spec } = await h.control.worker.ensureAgent(item, cur, d.fencingToken);
-  const host = await h.control.worker.buildHost(item, cur, agent, spec, d.fencingToken);
+  const host = await assembleTurn(await h.control.worker.buildHost(item, cur, agent, spec, d.fencingToken), agent.sessionId);
   let turn = 100;
   const dispatch = (name: string, args: JsonValue) => {
     const n = ++turn;
@@ -498,7 +498,7 @@ async function dispatcherFor(h: Harness, run: TestRun, item: WorkItem, agentId: 
     allow: ['blackboard.read', ...extraTools], deny: [],
     workspace: await h.deps.workspaces.scratch({ runId: run.runId, workItemId: item.workItemId }),
     eventContext: { runId: run.runId, correlationId: item.workItemId, actorId: agentId, workItemId: item.workItemId, agentId },
-    turnState: {},
+    turnState: { snapshot: await turnSnapshot(h, run.runId) },
   });
   let turn = 500;
   return (name: string, args: JsonValue) => {

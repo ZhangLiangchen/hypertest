@@ -151,15 +151,19 @@ export function environmentVersion(env: { generation: number; buildDigest?: stri
   return `${env.generation}:${env.buildDigest ?? ''}`;
 }
 
-/** Default cap of observed entries joining one snapshot (most recent kept). */
-export const DEFAULT_MAX_OBSERVED_ENTRIES = 256;
+/**
+ * (B[0]) Retained for compatibility: there is NO default cap any more — every resource the observer agent observed joins
+ * the read set (a cap that silently dropped the oldest observations let a later write to such a resource pass the
+ * FreshnessGuard unchecked: fail open). `undefined` ⇒ unlimited.
+ */
+export const DEFAULT_MAX_OBSERVED_ENTRIES: number | undefined = undefined;
 
 /**
  * Builds a snapshot from canonical sources. The read set always contains one exact_version entry per run
  * oracle (version = revision) and one for the environment (when given), plus the caller's observed entries.
  * The read set is sorted and de-duplicated so equal observations give equal snapshot ids.
- * (additive) With `input.observer` and an ObservationLog, the observer agent's latest observation of every resource it
- * read or wrote through a tool (at most `maxObservedEntries`) joins the read set.
+ * (additive) With `input.observer` and an ObservationLog, the observer agent's latest observation of EVERY resource it
+ * read or wrote through a tool (or saw in an assembled prompt) joins the read set — none is dropped (B[0]).
  */
 export function createSnapshotBuilder(deps: SnapshotBuilderDeps): SnapshotBuilder {
   const { sources, snapshots, clock } = deps;
@@ -198,8 +202,18 @@ export function createSnapshotBuilder(deps: SnapshotBuilderDeps): SnapshotBuilde
       if (input.observer !== undefined) {
         requireText(input.observer?.agentId, 'input.observer.agentId');
         if (deps.observations) {
-          const limit = deps.maxObservedEntries ?? DEFAULT_MAX_OBSERVED_ENTRIES;
-          for (const o of await deps.observations.latest({ runId: input.runId, agentId: input.observer.agentId, limit })) {
+          // EVERY resource the agent observed (its latest observation of each): nothing is dropped. An explicitly configured
+          // cap that the observations exceed fails the build (closed) instead of silently unpinning the oldest ones.
+          const observed = await deps.observations.latest({ runId: input.runId, agentId: input.observer.agentId });
+          const cap = deps.maxObservedEntries ?? DEFAULT_MAX_OBSERVED_ENTRIES;
+          if (cap !== undefined && observed.length > cap) {
+            throw new HypertestError(
+              'precondition_failed',
+              `agent ${input.observer.agentId} observed ${observed.length} resources, more than maxObservedEntries ${cap}: a snapshot never drops observations (raise or remove the cap)`,
+              { details: { agentId: input.observer.agentId, observed: observed.length, cap } },
+            );
+          }
+          for (const o of observed) {
             entries.push({ resourceType: o.resourceType, resourceId: o.resourceId, observedVersion: o.observedVersion, observedAt: o.observedAt, freshness: o.freshness });
           }
         }

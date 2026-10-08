@@ -285,15 +285,15 @@ test('I1 denial: policy deny ⇒ denied, decision logged with the redacted input
   assert.equal((denied[0]!.payload as { permitDecisionId: string }).permitDecisionId, d[0]!.decisionId);
 });
 
-test('I1 denial: approval_required ⇒ denied with code approval_required and the approval reference', async () => {
+test('I1 denial: approval_required without an approval gate ⇒ denied (approval_required), never executed, and says no approval request could be recorded', async () => {
   const rt = runtimeFor(env, specs(), { policy });
   const req = request('t.approve', {}, ws);
   const r = await rt.execute(req);
   assert.equal(r.status, 'denied');
   assert.equal(r.error?.code, 'approval_required');
   assert.ok(r.permit?.decisionId);
-  assert.match(r.modelText, new RegExp(`approvalId ${r.permit!.decisionId}`));
-  assert.match(r.modelText, /request approval/);
+  assert.equal(r.permit?.approvalId, undefined);
+  assert.match(r.modelText, /no approval request could be recorded \(no approval gate is configured\)/);
   assert.equal(count('t.approve'), 0);
 });
 

@@ -1,7 +1,7 @@
 import { isHypertestError } from '@hypertest/core';
 import { EVENT_TYPES, type EventContext, type ResourceLease, type TestRun, type WorkItem } from '@hypertest/domain';
 import type { ControlDeps, ResolvedControlConfig } from './deps.ts';
-import { releaseRunIsolation, runExperimentIds, settleExternalQps, syncExperimentClaims, type ExperimentSync } from './isolation.ts';
+import { compatibleClaimHolders, releaseRunIsolation, settleExternalQps, syncExperimentClaims, type ExperimentSync } from './isolation.ts';
 import { event, runCtx } from './util.ts';
 
 export function workLeaseKey(workItemId: string): string {
@@ -188,7 +188,7 @@ export function createScheduler(deps: ControlDeps, config: ResolvedControlConfig
         const hasClaims = w.resourceClaims.length > 0;
         if (hasClaims) {
           // (conformance-6) an item that runs for experiments shares their admitted claims (never refused by them)
-          const adm = await admission.admit({ holderId: w.workItemId, runId: run.runId, claims: w.resourceClaims, ttlMs: config.leaseTtlMs, compatibleHolders: await runExperimentIds(deps, w) });
+          const adm = await admission.admit({ holderId: w.workItemId, runId: run.runId, claims: w.resourceClaims, ttlMs: config.leaseTtlMs, compatibleHolders: await compatibleClaimHolders(deps, w) });
           if (!adm.admitted) {
             const conflicts = adm.conflicts.map((c) => `${c.requested.resourceKey}@${c.heldBy}`).sort();
             logger.info('work item not admitted: resource conflict', { workItemId: w.workItemId, conflicts });

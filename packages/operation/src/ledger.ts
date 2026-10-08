@@ -311,6 +311,13 @@ export function createOperationLedger(deps: OperationDeps): OperationLedger {
       const r = await db.query<OperationRow>(`SELECT ${COLUMNS} FROM ht_operations WHERE ${where} ORDER BY created_at, operation_id`, params);
       return r.rows.map(rowToRecord);
     },
+
+    async listByStatus(status: OperationStatus[], limit = 1000): Promise<OperationRecord[]> {
+      if (!Array.isArray(status) || status.length === 0) throw new HypertestError('invalid_argument', 'status must name at least one operation status');
+      const n = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, 10_000) : 1000;
+      const r = await db.query<OperationRow>(`SELECT ${COLUMNS} FROM ht_operations WHERE status = ANY($1::text[]) ORDER BY created_at, operation_id LIMIT ${n}`, [status]);
+      return r.rows.map(rowToRecord);
+    },
   };
   return ledger;
 }

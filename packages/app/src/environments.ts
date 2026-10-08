@@ -46,7 +46,10 @@ const MAX_PERSISTED_BUMPS = 1024;
 
 /** Descriptors for the tools registry: `control.tokenEnv` resolved into the target fragment (a missing variable is reported, never fatal). */
 export function resolveEnvironments(configured: readonly EnvironmentConfig[], env: Record<string, string | undefined>, logger: Logger): EnvironmentDescriptor[] {
-  return configured.map((e) => {
+  return configured.map((e0) => {
+    // E[4]: a descriptor names its brokered credentials only (the secret broker holds their configuration)
+    const { credentials, ...rest } = e0;
+    const e = (credentials && credentials.length > 0 ? { ...rest, brokeredCredentials: credentials.map((c) => (c.grantTo ? { name: c.name, grantTo: [...c.grantTo] } : { name: c.name })) } : rest) as Omit<EnvironmentConfig, 'credentials'> & Pick<EnvironmentDescriptor, 'brokeredCredentials'>;
     if (!e.control || e.control.tokenEnv === undefined) return e as EnvironmentDescriptor;
     const { tokenEnv, ...control } = e.control;
     const token = env[tokenEnv];

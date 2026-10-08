@@ -16,7 +16,7 @@ import type { JsonValue } from '@hypertest/core';
 import type { ActionCapability, ExperimentSpec, TestRun, WorkItem } from '@hypertest/domain';
 import type { ToolExecutionRequest, ToolExecutionResult } from '@hypertest/tools';
 import { WorkFactory, createControlPlane, createToolDispatcher, runScope, workScope } from '../src/index.ts';
-import { call, createHarness, parsed, type Harness, type RoleBrain } from './harness.ts';
+import { assembleTurn, call, createHarness, parsed, turnSnapshot, type Harness, type RoleBrain } from './harness.ts';
 
 const LEAD_OUT: { [k: string]: JsonValue } = { summary: 'lead done', planProposed: false, readyForGate: false, objectives: [] };
 
@@ -38,7 +38,7 @@ async function lead(h: Harness, goal: string, budget: Partial<TestRun['budget']>
   const item = (await h.deps.blackboard.getWorkItem(d.workItemId))!;
   const cur = (await h.deps.runs.get(run.runId))!;
   const { agent, spec } = await h.control.worker.ensureAgent(item, cur, d.fencingToken);
-  const host = await h.control.worker.buildHost(item, cur, agent, spec, d.fencingToken);
+  const host = await assembleTurn(await h.control.worker.buildHost(item, cur, agent, spec, d.fencingToken), agent.sessionId);
   let turn = 100;
   const dispatch = (name: string, args: JsonValue) => {
     const n = ++turn;
@@ -71,7 +71,7 @@ async function dispatcherFor(h: Harness, run: TestRun, item: WorkItem, agentId: 
     allow: ['blackboard.read', 'experiment.define', ...extraTools], deny: [],
     workspace: await h.deps.workspaces.scratch({ runId: run.runId, workItemId: item.workItemId }),
     eventContext: { runId: run.runId, correlationId: item.workItemId, actorId: agentId, workItemId: item.workItemId, agentId },
-    turnState: {},
+    turnState: { snapshot: await turnSnapshot(h, run.runId) },
   });
   let turn = 500;
   return (name: string, args: JsonValue) => {
@@ -214,6 +214,7 @@ describe('conformance-6: experiments are bound to admitted claims', () => {
       runId: l.run.runId, workItemId: l.item.workItemId, agentId: l.agent.agentId, role: 'lead', invocationId: `${l.agent.sessionId}:77:rep`,
       eventContext: { runId: l.run.runId, correlationId: l.item.workItemId, actorId: l.agent.agentId, workItemId: l.item.workItemId, agentId: l.agent.agentId },
       signal: new AbortController().signal, logger: h.logger, environments: h.deps.environments, artifacts: h.deps.artifacts,
+      snapshot: await turnSnapshot(h, l.run.runId),
     };
     const input = { hypothesis: 'replay', environmentId: 'other', faultPlan: [{ kind: 'restart', target: 'other' }], isolation: { mode: 'exclusive_write', resourceClaims: [{ resourceKey: 'service/replay', mode: 'fault_exclusive' }] } };
     const first = await spec.execute(input, ctx as never);
@@ -711,7 +712,7 @@ async function replayableDispatcherFor(h: Harness, run: TestRun, item: WorkItem,
     allow: ['blackboard.read', 'experiment.define', ...extraTools], deny: [],
     workspace: await h.deps.workspaces.scratch({ runId: run.runId, workItemId: item.workItemId }),
     eventContext: { runId: run.runId, correlationId: item.workItemId, actorId: agentId, workItemId: item.workItemId, agentId },
-    turnState: {},
+    turnState: { snapshot: await turnSnapshot(h, run.runId) },
   });
   return (name: string, args: JsonValue, invocationId: string) =>
     d.dispatch({ id: invocationId.split(':').at(-1)!, name: name.replaceAll('.', '__'), arguments: args }, { sessionId, turn: 900, invocationId, signal: new AbortController().signal });
@@ -964,6 +965,7 @@ describe('review B2 — experiment.define keeps a saved experiment admitted acro
       runId: l.run.runId, workItemId: l.item.workItemId, agentId: l.agent.agentId, role: 'lead', invocationId: `${l.agent.sessionId}:78:pd`,
       eventContext: { runId: l.run.runId, correlationId: l.item.workItemId, actorId: l.agent.agentId, workItemId: l.item.workItemId, agentId: l.agent.agentId },
       signal: new AbortController().signal, logger: h.logger, environments: h.deps.environments, artifacts: h.deps.artifacts,
+      snapshot: await turnSnapshot(h, l.run.runId),
     };
     const input = { hypothesis: 'partial', environmentId: 'svc', faultPlan: [{ kind: 'restart', target: 'svc' }] };
     const runs = h.deps.runs;
@@ -1007,10 +1009,11 @@ describe('review B2 — experiment.define: a failed save releases the claims onl
   test('save refused before anything was stored ⇒ claims released; save committed then the call failed ⇒ the existing experiment keeps its claims', async () => {
     const l = await lead(h, 'failing saves');
     const spec = h.deps.registry.get('experiment.define')!;
+    const snapshot = await turnSnapshot(h, l.run.runId);
     const ctxFor = (inv: string) => ({
       runId: l.run.runId, workItemId: l.item.workItemId, agentId: l.agent.agentId, role: 'lead', invocationId: `${l.agent.sessionId}:79:${inv}`,
       eventContext: { runId: l.run.runId, correlationId: l.item.workItemId, actorId: l.agent.agentId, workItemId: l.item.workItemId, agentId: l.agent.agentId },
-      signal: new AbortController().signal, logger: h.logger, environments: h.deps.environments, artifacts: h.deps.artifacts,
+      signal: new AbortController().signal, logger: h.logger, environments: h.deps.environments, artifacts: h.deps.artifacts, snapshot,
     });
     const store = h.deps.specs;
     const original = store.saveExperiment;

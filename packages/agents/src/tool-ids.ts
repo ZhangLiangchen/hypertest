@@ -46,6 +46,8 @@ export const DOMAIN_TOOL_IDS = Object.freeze([
   'blackboard.post_risk',
   'blackboard.post_review',
   'blackboard.post_note',
+  'blackboard.post_strategy',
+  'blackboard.post_decision',
   'plan.propose_revision',
   'plan.read',
   'work.propose',

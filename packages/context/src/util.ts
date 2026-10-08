@@ -130,3 +130,17 @@ export function tokenize(text: string): string[] {
 export function cmpStr(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
+
+/** (B[2]) Finding statuses that WITHDRAW a finding (the design's "相关 Finding 是否已被撤销"). */
+export const FINDING_WITHDRAWN_STATUSES: readonly string[] = ['rejected', 'duplicate'];
+
+/**
+ * (B[2]) Version of a `finding_withdrawal` entry: `active` while the lineage head is not withdrawn, `withdrawn:<status>` once it
+ * is (rejected / duplicate), undefined when the lineage does not exist. Pinned for findings an agent saw (in its prompt or
+ * through a tool); always re-checked before a mutating action (ALWAYS_CHECKED_TYPES).
+ */
+export function findingWithdrawalVersion(head: { payload?: unknown } | undefined): string | undefined {
+  if (!head) return undefined;
+  const status = isRecord(head.payload) && typeof head.payload['status'] === 'string' ? head.payload['status'] : undefined;
+  return status !== undefined && FINDING_WITHDRAWN_STATUSES.includes(status) ? `withdrawn:${status}` : 'active';
+}

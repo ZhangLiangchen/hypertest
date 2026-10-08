@@ -166,6 +166,7 @@ budget:
   maxToolCalls: 1000               # default 2,000
   # maxModelCostUsd: 20
   # maxWorkItems: 200
+  # onExhausted: gate              # gate (default: converge to the gate) | pause (raise with \`hypertest resume --raise-…\`) | approval (a budget-extension request)
 gate:
   requireIndependentReview: true   # without an independent approval the best verdict is \`conditional\`
   failOnUnresolvedSeverity: P1     # unresolved P0/P1 findings fail the gate
@@ -196,6 +197,9 @@ gate:
 # checks the host supports them): no network but their own loopback and the registered environments' / allowlisted
 # endpoints on this host (the SUT); keys, the store and other workspaces hidden. \`network: open\` lets commands reach
 # any host (no egress governance); agents otherwise reach networks only through the governed black-box tools.
+# Where keys, the capability secret and the store cannot be hidden (no PID/mount namespaces, or \`network: open\`),
+# Hypertest refuses to start unless you accept it with \`insecureAllowUnhiddenSecrets: true\`. A command's HTTP write to
+# the SUT is a ledgered operation (\`egressWrites: ledger\`) or refused (\`egressWrites: refuse\`).
 sandbox:
   kind: local
   network: loopback

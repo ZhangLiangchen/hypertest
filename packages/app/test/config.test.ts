@@ -289,6 +289,13 @@ describe('validateConfig', () => {
     assert.deepEqual(validateConfig({ ...defaultConfig(), budget: { maxAgentDepth: 0, maxModelCostUsd: 0.5 } } as unknown as HypertestConfig), []);
   });
 
+  test('E[3] budget.onExhausted selects the exhaustion policy (gate | pause | approval), in the configuration and per run', () => {
+    for (const p of ['gate', 'pause', 'approval']) assert.deepEqual(validateConfig({ ...defaultConfig(), budget: { onExhausted: p } } as unknown as HypertestConfig), [], p);
+    assert.deepEqual(validateConfig({ ...defaultConfig(), budget: { onExhausted: 'downgrade' } } as unknown as HypertestConfig), ['budget.onExhausted must be one of gate, pause, approval, got "downgrade"']);
+    assert.deepEqual(validateRunOverrides({ budget: { onExhausted: 'pause' } }), []);
+    assert.deepEqual(validateRunOverrides({ budget: { onExhausted: 1 } }), ['budget.onExhausted must be one of gate, pause, approval, got 1']);
+  });
+
   test("a run's own gate/budget overrides get the configuration's rules (an unknown severity would silently disable C2)", () => {
     // why: the gate compares severities by order; an unknown threshold makes no finding "at least as severe"
     assert.equal(atLeastAsSevere('P0', 'P9' as never), false);

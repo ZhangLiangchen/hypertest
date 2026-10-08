@@ -4,7 +4,7 @@ import { parse as parseYaml } from 'yaml';
 import { HypertestError, jsonClone, validateJson } from '@hypertest/core';
 import { MODEL_CAPABILITY_PROFILE_SCHEMA, anthropicCompatibilityClass, type ModelCapabilityProfile } from '@hypertest/model';
 import { DEFAULT_POLICY_RULES, POLICY_RULE_SCHEMA, type OracleGovernance } from '@hypertest/policy';
-import { DEFAULT_SHELL_ALLOWLIST } from '@hypertest/tools';
+import { DEFAULT_SHELL_ALLOWLIST, brokeredCredentialProblems, type BrokeredCredentialConfig } from '@hypertest/tools';
 import { BUILTIN_ROLES, RoleCatalog, type RoleOverrides } from '@hypertest/agents';
 import type { HypertestConfig, HypertestConfigInput, LoadConfigOptions, OracleConfig, ProviderConfig, RouteConfig } from './contracts.ts';
 
@@ -56,6 +56,8 @@ export function defaultedRouteFields(route: Partial<ModelCapabilityProfile>): { 
 const TOP_LEVEL_KEYS = new Set([
   'version', 'project', 'store', 'bus', 'durable', 'artifacts', 'models', 'roles', 'budget', 'gate', 'policy', 'bugate', 'engines', 'sandbox',
   'environments', 'tools', 'signing', 'memory', 'observability', 'oracles', 'runtime', 'plugins',
+  // (additive, B[6] / B[7]) L3 retrieval (semantic embedder route) and skills (eval trial revisions)
+  'retrieval', 'skills',
 ]);
 /** Discriminated sections: a patch with another `kind` replaces the section instead of merging into it. */
 const KIND_SECTIONS = new Set(['store', 'bus', 'durable', 'artifacts', 'memory']);
@@ -130,6 +132,7 @@ export function withDerivedPaths(config: HypertestConfig): HypertestConfig {
   if (typeof dataDir !== 'string' || dataDir === '') return out;
   if (out.store?.kind === 'pglite' && out.store.dataDir === undefined) out.store.dataDir = join(dataDir, 'db');
   if (out.artifacts?.kind === 'fs' && out.artifacts.root === undefined) out.artifacts.root = join(dataDir, 'artifacts');
+  if (out.memory?.kind === 'service' && out.memory.dataDir === undefined) out.memory.dataDir = join(dataDir, 'memory');
   return out;
 }
 
@@ -231,6 +234,7 @@ export function resolveConfigPaths(config: HypertestConfig, baseDir: string): Hy
   if (out.project && typeof out.project.dataDir === 'string') out.project.dataDir = abs(out.project.dataDir)!;
   if (out.store?.kind === 'pglite' && out.store.dataDir !== undefined) out.store.dataDir = abs(out.store.dataDir)!;
   if (out.artifacts?.kind === 'fs' && out.artifacts.root !== undefined) out.artifacts.root = abs(out.artifacts.root)!;
+  if (out.memory?.kind === 'service' && out.memory.dataDir !== undefined) out.memory.dataDir = abs(out.memory.dataDir)!;
   if (out.bugate?.path !== undefined) out.bugate.path = abs(out.bugate.path)!;
   if (out.signing?.keyFile !== undefined) out.signing.keyFile = abs(out.signing.keyFile)!;
   if (out.models?.pricesFile !== undefined) out.models.pricesFile = abs(out.models.pricesFile)!;
@@ -595,12 +599,54 @@ function validateSections(errors: Errors, c: Record<string, unknown>): void {
     if (runtime['requireActiveRelease'] !== undefined && typeof runtime['requireActiveRelease'] !== 'boolean') errors.push('runtime.requireActiveRelease must be a boolean');
   }
   const memory = c['memory'];
-  if (memory !== undefined && objectAt(errors, 'memory', memory, false) && oneOf(errors, 'memory.kind', memory['kind'], ['sql', 'powercontext'])) {
+  if (memory !== undefined && objectAt(errors, 'memory', memory, false) && oneOf(errors, 'memory.kind', memory['kind'], ['sql', 'powercontext', 'service'])) {
     if (memory['kind'] === 'sql') unknownKeys(errors, 'memory', memory, ['kind']);
-    else {
+    else if (memory['kind'] === 'service') {
+      // (B[4]) a memory service process Hypertest manages (its own storage under dataDir)
+      unknownKeys(errors, 'memory', memory, ['kind', 'dataDir', 'apiKeyEnv']);
+      if (memory['dataDir'] !== undefined) str(errors, 'memory.dataDir', memory['dataDir'], false);
+      envName(errors, 'memory.apiKeyEnv', memory['apiKeyEnv']);
+    } else {
       unknownKeys(errors, 'memory', memory, ['kind', 'baseUrl', 'apiKeyEnv']);
       httpUrl(errors, 'memory.baseUrl', memory['baseUrl'], true);
       envName(errors, 'memory.apiKeyEnv', memory['apiKeyEnv']);
+    }
+  }
+  validateRetrievalAndSkills(errors, c);
+}
+
+/** (additive, B[6] / B[7]) `retrieval.embedder` (an OpenAI-compatible embeddings route) and `skills.trial` (eval-only). */
+function validateRetrievalAndSkills(errors: Errors, c: Record<string, unknown>): void {
+  const retrieval = c['retrieval'];
+  if (retrieval !== undefined && objectAt(errors, 'retrieval', retrieval, false)) {
+    unknownKeys(errors, 'retrieval', retrieval, ['embedder']);
+    const embedder = retrieval['embedder'];
+    if (embedder !== undefined && objectAt(errors, 'retrieval.embedder', embedder, false)) {
+      unknownKeys(errors, 'retrieval.embedder', embedder, ['provider', 'model', 'dimensions', 'timeoutMs']);
+      str(errors, 'retrieval.embedder.provider', embedder['provider'], true);
+      str(errors, 'retrieval.embedder.model', embedder['model'], true);
+      const dims = embedder['dimensions'];
+      if (typeof dims !== 'number' || !Number.isSafeInteger(dims) || dims < 1 || dims > 16_000) errors.push('retrieval.embedder.dimensions must be an integer between 1 and 16000');
+      const t = embedder['timeoutMs'];
+      if (t !== undefined && (typeof t !== 'number' || !Number.isFinite(t) || t <= 0)) errors.push('retrieval.embedder.timeoutMs must be a positive number');
+      const providers = isPlainObject(c['models']) && Array.isArray(c['models']['providers']) ? (c['models']['providers'] as unknown[]).filter(isPlainObject) : [];
+      const provider = providers.find((p) => p['id'] === embedder['provider']);
+      if (typeof embedder['provider'] === 'string' && !provider) errors.push(`retrieval.embedder.provider ${JSON.stringify(embedder['provider'])} is not a configured models.providers[].id`);
+      else if (provider && (provider['kind'] !== 'openai-compatible' || typeof provider['baseUrl'] !== 'string')) errors.push(`retrieval.embedder.provider ${JSON.stringify(embedder['provider'])} must be an openai-compatible provider with a baseUrl (the /embeddings endpoint)`);
+    }
+  }
+  const skills = c['skills'];
+  if (skills !== undefined && objectAt(errors, 'skills', skills, false)) {
+    unknownKeys(errors, 'skills', skills, ['trial']);
+    const trial = skills['trial'];
+    if (trial !== undefined) {
+      if (!Array.isArray(trial)) errors.push('skills.trial must be an array of skill revisions');
+      else trial.forEach((t, i) => {
+        const at = `skills.trial[${i}]`;
+        if (!objectAt(errors, at, t, true)) return;
+        for (const k of ['skillId', 'name', 'description', 'body', 'digest']) str(errors, `${at}.${k}`, t[k], true);
+        if (typeof t['revision'] !== 'number' || !Number.isSafeInteger(t['revision']) || (t['revision'] as number) < 1) errors.push(`${at}.revision must be a positive integer`);
+      });
     }
   }
 }
@@ -644,7 +690,9 @@ const GATE_KEYS = ['gateId', 'description', 'failOnUnresolvedSeverity', 'conditi
 
 function validateBudget(errors: Errors, budget: unknown, path: string): void {
   if (budget === undefined || !objectAt(errors, path, budget, false)) return;
-  unknownKeys(errors, path, budget, BUDGET_KEYS);
+  unknownKeys(errors, path, budget, [...BUDGET_KEYS, 'onExhausted']);
+  // (E[3]) the exhaustion policy: gate (CONDITIONAL_STOP, default) | pause (PAUSED_BUDGET) | approval (NEEDS_APPROVAL)
+  oneOf(errors, `${path}.onExhausted`, budget['onExhausted'], ['gate', 'pause', 'approval'], false);
   for (const [k, v] of Object.entries(budget)) {
     if (!BUDGET_KEYS.includes(k)) continue;
     const min = INTEGER_BUDGET_KEYS[k];
@@ -837,7 +885,11 @@ function validateRest(errors: Errors, c: Record<string, unknown>): void {
   }
   const sandbox = c['sandbox'];
   if (sandbox !== undefined && objectAt(errors, 'sandbox', sandbox, false)) {
-    unknownKeys(errors, 'sandbox', sandbox, ['kind', 'image', 'network', 'allowedHosts', 'envAllowlist', 'cpuLimit', 'memoryMb']);
+    unknownKeys(errors, 'sandbox', sandbox, ['kind', 'image', 'network', 'allowedHosts', 'envAllowlist', 'cpuLimit', 'memoryMb', 'egressWrites', 'insecureAllowUnhiddenSecrets']);
+    // E[4]: the loud opt-in to run agent commands where the sandbox cannot hide keys, capability secret and store
+    if (sandbox['insecureAllowUnhiddenSecrets'] !== undefined && typeof sandbox['insecureAllowUnhiddenSecrets'] !== 'boolean') errors.push('sandbox.insecureAllowUnhiddenSecrets must be a boolean');
+    // E[2]: what a sandboxed command's state-changing request to the SUT becomes (ledgered operation, or refused)
+    oneOf(errors, 'sandbox.egressWrites', sandbox['egressWrites'], ['ledger', 'refuse'], false);
     oneOf(errors, 'sandbox.kind', sandbox['kind'], ['local', 'oci'], false);
     if (sandbox['kind'] === 'oci') str(errors, 'sandbox.image', sandbox['image'], true);
     oneOf(errors, 'sandbox.network', sandbox['network'], ['none', 'loopback', 'egress_allowlist', 'open'], false);
@@ -857,7 +909,28 @@ function validateRest(errors: Errors, c: Record<string, unknown>): void {
       envs.forEach((e, i) => {
         const at = `environments[${i}]`;
         if (!objectAt(errors, at, e, true)) return;
-        unknownKeys(errors, at, e, ['environmentId', 'environmentClass', 'baseUrl', 'metricsUrl', 'prometheusUrl', 'generation', 'buildDigest', 'control', 'isolation']);
+        unknownKeys(errors, at, e, ['environmentId', 'environmentClass', 'baseUrl', 'metricsUrl', 'prometheusUrl', 'generation', 'buildDigest', 'control', 'isolation', 'honoursIdempotencyKey', 'rawEgress', 'credentials']);
+        // E[4] / coverage[8]: brokered credentials (short-lived, minted per call from a *Env secret; agents only name them)
+        const credentials = e['credentials'];
+        if (credentials !== undefined) {
+          if (!Array.isArray(credentials)) errors.push(`${at}.credentials must be a list`);
+          else {
+            const names = new Set<string>();
+            credentials.forEach((cr: unknown, j: number) => {
+              const cat = `${at}.credentials[${j}]`;
+              if (!objectAt(errors, cat, cr, true)) return;
+              unknownKeys(errors, cat, cr, ['name', 'kind', 'secretEnv', 'header', 'ttlMs', 'audience', 'tokenUrl', 'clientId', 'clientIdEnv', 'scope', 'grantTo']);
+              errors.push(...brokeredCredentialProblems(cr as unknown as BrokeredCredentialConfig, cat));
+              if (cr['clientIdEnv'] !== undefined) envName(errors, `${cat}.clientIdEnv`, cr['clientIdEnv']);
+              if (typeof cr['name'] === 'string') {
+                if (names.has(cr['name'])) errors.push(`${cat}.name: duplicate credential '${cr['name']}'`);
+                names.add(cr['name']);
+              }
+            });
+          }
+        }
+        // stubs[7] / E[2]: operator declarations about the SUT (dedupes by Idempotency-Key; raw sandbox egress accepted)
+        for (const k of ['honoursIdempotencyKey', 'rawEgress']) if (e[k] !== undefined && typeof e[k] !== 'boolean') errors.push(`${at}.${k} must be a boolean`);
         // coverage-13: an operator-declared dedicated environment (experiments with isolation mode dedicated_environment)
         const isolation = e['isolation'];
         if (isolation !== undefined && objectAt(errors, `${at}.isolation`, isolation, false)) {

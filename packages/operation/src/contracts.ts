@@ -97,6 +97,8 @@ export interface OperationLedger {
   list(filter: { runId: string; workItemId?: string; status?: OperationStatus[]; experimentId?: string }): Promise<OperationRecord[]>;
   /** Operations that need reconciliation: dispatching, acknowledged, outcome_unknown, reconciling. */
   listUnsettled(runId?: string): Promise<OperationRecord[]>;
+  /** (additive, optional, stubs[8]) Operations in the given statuses across runs, oldest first (e.g. every manual_review). */
+  listByStatus?(status: OperationStatus[], limit?: number): Promise<OperationRecord[]>;
 }
 
 export interface LeaseService {
@@ -144,7 +146,12 @@ export interface DispatchReceipt {
 
 export type ObservationResult<O> = { state: 'present'; observation: O } | { state: 'absent' } | { state: 'uncertain'; detail: string };
 
-export type VerificationResult = { status: 'verified'; result: unknown } | { status: 'pending'; progress?: unknown } | { status: 'failed'; reason: string };
+/**
+ * (additive, E[1]) `effectUntil` (ISO time): a verified effect that stays in force until then (a time-boxed fault). The
+ * gateway keeps the operation's resource lease until that time (or until the operation is compensated), so overlapping
+ * effects on one resource are refused.
+ */
+export type VerificationResult = { status: 'verified'; result: unknown; effectUntil?: string } | { status: 'pending'; progress?: unknown } | { status: 'failed'; reason: string };
 
 export interface CompensationResult {
   compensated: boolean;
@@ -221,6 +228,22 @@ export interface RunSideEffectRequest<I = unknown> {
   reconcileOnly?: boolean;
   /** (additive, conformance-6) The experiment the call runs for; recorded on a NEW operation (PrepareOperationInput.experimentId). */
   experimentId?: string;
+  /**
+   * (additive, E[0]) The caller's authority re-validated at the COMMIT POINT — e.g. its work claim (fencing token): called
+   * inside the same transaction that records `→ dispatching` (after which the target is contacted), together with the
+   * resource lease fence, and again before every re-dispatch after a reconciliation. A returned reason (or a throw: fail
+   * closed) refuses the dispatch atomically: nothing is sent, a never-dispatched operation is recorded `not_applied`
+   * (lastError `claim_fenced: <reason>`) and the outcome is `stale_fence` with that reason. Reconciliation of an operation
+   * already dispatched is never blocked by it (observing an effect is not a new effect).
+   */
+  commitGuard?: (tx: SqlExecutor) => Promise<string | undefined>;
+  /**
+   * (additive, E[1]) Keep the resource lease for the whole effect window: when the verified operation's result names an
+   * end time (`effectUntil`, see VerificationResult) the lease is held — renewed up to that time — instead of being
+   * released when the operation settles, so a second time-boxed effect (another fault, a load job) on the same resource is
+   * refused as busy until the first one expired or was compensated. Default true for requests with a lease.
+   */
+  holdLeaseForEffect?: boolean;
 }
 
 /**
@@ -274,6 +297,12 @@ export interface ResourceAdmission {
   active(runId?: string): Promise<Array<{ holderId: string; runId: string; claim: ResourceClaim; expiresAt: string }>>;
   /** (additive, optional) The live claims of one holder (across runs); [] when it holds none. */
   held?(holderId: string): Promise<Array<{ runId: string; claim: ResourceClaim; expiresAt: string }>>;
+  /**
+   * (additive, optional, E[1]) Sets every LIVE claim of `holderId` to expire `ttlMs` from now — also earlier than before
+   * (an effect window that turned out shorter than the call's worst case). Returns how many claims were retimed (0: the
+   * holder holds none, nothing is re-admitted).
+   */
+  retime?(holderId: string, ttlMs: number): Promise<number>;
 }
 
 /**

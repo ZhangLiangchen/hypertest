@@ -1,9 +1,9 @@
 import { readFile, realpath } from 'node:fs/promises';
 import { basename, dirname, join, relative, sep } from 'node:path';
-import { sha256Hex, type JsonValue } from '@hypertest/core';
+import { isHypertestError, sha256Hex, type JsonValue, type SqlExecutor } from '@hypertest/core';
 import {
   type ActorRef,
-  EFFECT_ORDER, RISK_ORDER, isTerminalWorkState,
+  EFFECT_ORDER, EVENT_TYPES, RISK_ORDER, isTerminalWorkState,
   type ActionCapability, type ContextSnapshot, type EventContext, type RiskClass, type TestArtifact, type ToolCall, type ToolEffect, type ToolResultMessage, type WorkClaim,
 } from '@hypertest/domain';
 import { categoryDecision, classifyTestChange, holdsProductFix, parseUnifiedDiff, type ApprovalRequest, type SelfHealDecision, type TestChangeClassification } from '@hypertest/policy';
@@ -14,17 +14,34 @@ import type { ControlDeps } from './deps.ts';
 import { roleClassification } from './clearance.ts';
 import type { TurnState } from './context-provider.ts';
 import { TERMINAL_TOOL_IDS } from './domain-tools/index.ts';
+import { approvalWaitOperationId } from './approvals.ts';
 import { diffSections, invertSection, sectionPaths, unifiedDiff } from './diff.ts';
 import { workLeaseKey } from './scheduler.ts';
 import { ControlStore, type WorkspaceQuarantine } from './store.ts';
-import { workScope } from './work-factory.ts';
+import { WorkFactory, workScope } from './work-factory.ts';
 import { clip, event, maxRisk } from './util.ts';
 import { POLICY_FLAGGED_EVENT, createPhaseGovernor, flagEventId, type ActionDescription } from './phases.ts';
 import {
-  EXPERIMENT_EXEMPT_TOOLS, EXPERIMENT_GUARDED_EFFECTS, JOB_MAY_RUN, QPS_REASON_PREFIX, callScopes, declaredExperimentIds, exhaustedScope, experimentActionCheck, experimentClaimsProblem,
-  experimentResourceProblem, onToolBudgetExhausted, qpsJobMayRun, qpsKey, settleExternalQps,
+  EXPERIMENT_EXEMPT_TOOLS, EXPERIMENT_GUARDED_EFFECTS, JOB_MAY_RUN, QPS_REASON_PREFIX, admitEffectClaim, callScopes, declaredExperimentIds, exhaustedScope, experimentActionCheck,
+  experimentClaimsProblem, experimentResourceProblem, lastingEffectMs, onToolBudgetExhausted, qpsJobMayRun, qpsKey, releaseEffectClaims, settleExternalQps,
 } from './isolation.ts';
 import { experimentScope } from './domain-tools/specs.ts';
+
+/** (E[1]) Slack added to an effect claim's TTL beyond the call's timeout (+ the effect's own duration). */
+export const EFFECT_CLAIM_MARGIN_MS = 5_000;
+
+/**
+ * (E[1]) Whether a call's effect claim must outlive the call: a time-boxed effect that started (a fault in force, a load
+ * job), an effect whose outcome is not settled (pending, a timeout, an unsettled or manual-review operation) — the claim
+ * then expires with its TTL. Released at once otherwise (nothing happened, or the effect is complete).
+ */
+export function effectClaimOutlivesCall(execution: { status: string; operationId?: string; structured?: unknown }, lastingMs: number | undefined): boolean {
+  if (execution.status === 'success') return lastingMs !== undefined;
+  if (execution.status === 'pending' || execution.status === 'timeout') return true;
+  if (execution.status !== 'failed') return false;
+  const opStatus = obj(execution.structured)['operationStatus'];
+  return execution.operationId !== undefined && (typeof opStatus !== 'string' || JOB_MAY_RUN.has(opStatus));
+}
 
 /** (review B2) Re-reservations of one load.start invocation's rate before the call is refused (fail closed). */
 const MAX_QPS_REKEYS = 16;
@@ -115,6 +132,35 @@ const DECISION_RANK: Record<SelfHealDecision, number> = { auto_allowed: 0, condi
  */
 export function claimLeaseOwner(workerId: string, workItemId: string, fencingToken: number): string {
   return `${workerId}:${workItemId}:${fencingToken}`;
+}
+
+/**
+ * (E[0], I4) The commit-point check of the external effects of a call made under a work claim — handed to the
+ * SideEffectGateway as `commitGuard` and run INSIDE the transaction that records `→ dispatching`: the run's work-creation
+ * lock (lock order, as the fenced domain tools), then the work item row is locked by a change-free fenced transition (the
+ * claim must still carry the token and the item be claimed/running), then the claim's lease must still be the live one.
+ * A requeue, a takeover or a cancellation that commits first refuses the effect atomically (nothing is sent: 0 successes
+ * for an expired worker); one that commits after it waits for this transaction (the effect was decided while the claim
+ * was held). The exact reason, or undefined while the claim is held.
+ */
+export function claimCommitGuard(deps: ControlDeps, claim: { runId: string; workItemId: string; fencingToken: number }, ctx: EventContext): (tx: SqlExecutor) => Promise<string | undefined> {
+  const factory = new WorkFactory(deps);
+  const { runId, workItemId, fencingToken } = claim;
+  return async (tx) => {
+    await factory.lock(runId, tx);
+    const item = await deps.blackboard.getWorkItem(workItemId);
+    if (!item || item.runId !== runId) return `work item ${workItemId} is not a work item of run ${runId}`;
+    if (!item.claim || item.claim.fencingToken !== fencingToken) return `work item ${workItemId} is no longer held with fencing token ${fencingToken} (current claim: ${item.claim ? `token ${item.claim.fencingToken} of ${item.claim.ownerId}` : 'none'}, state ${item.state})`;
+    if (item.state !== 'claimed' && item.state !== 'running') return `work item ${workItemId} is ${item.state}`;
+    try {
+      await deps.blackboard.transitionWorkItem(workItemId, item.state, {}, { ...ctx, runId, workItemId }, { expectedFencingToken: fencingToken, expectedFrom: ['claimed', 'running'], tx });
+    } catch (e) {
+      if (isHypertestError(e, 'stale_fence') || isHypertestError(e, 'conflict') || isHypertestError(e, 'precondition_failed')) return `work item ${workItemId}: ${e.message}`;
+      throw e;
+    }
+    if (!(await deps.leases.checkFence(workLeaseKey(workItemId), fencingToken))) return `the work lease of ${workItemId} with fencing token ${fencingToken} is no longer the live one (expired or taken over)`;
+    return undefined;
+  };
 }
 
 /** (H5) The deterministic event id of a test.run invocation's `test.passed` / `test.failed` event. */
@@ -737,6 +783,28 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
           qpsReservation = reserved.reservationId;
         }
       }
+      // E[1]: every write/fault/load action against an environment runs under an ADMITTED ResourceClaim covering its target
+      // (call-scoped, independent of experiments), held for the effect's whole window (a time-boxed fault / load job)
+      let effectHolder: string | undefined;
+      let lastingMs: number | undefined;
+      if (effect !== undefined && EXPERIMENT_GUARDED_EFFECTS.has(effect) && !EXPERIMENT_EXEMPT_TOOLS.includes(toolId)) {
+        const spec = registry.get(toolId);
+        lastingMs = lastingEffectMs(toolId, args);
+        const claim = await admitEffectClaim(deps, {
+          runId: input.runId, workItemId: input.workItemId, toolId, invocationId, group: attributed ?? input.workItemId, experimentIds: experiments.all,
+          resources: () => spec?.resources(args as never, { workspace: ws, runId: input.runId, environments: deps.environments }) ?? [],
+          ttlMs: (spec?.timeoutMs ?? 60_000) + (lastingMs ?? 0) + EFFECT_CLAIM_MARGIN_MS,
+        });
+        if (!claim.ok) {
+          if (qpsReservation !== undefined) await budget.release(qpsReservation);
+          await events.append([event(input.eventContext, EVENT_TYPES.admissionRefused, 'tool', invocationId, { toolId, invocationId, phase: 'effect', problem: clip(claim.problem, 2000) })]);
+          return deny(call, toolId, invocationId, 'resource_claim_conflict', `[denied] resource_claim_conflict: ${claim.problem}. ${toolId} was NOT executed; wait until the holder's effect ended (or act on other resources).`);
+        }
+        if (claim.holderId !== undefined) {
+          effectHolder = claim.holderId;
+          await events.append([event(input.eventContext, EVENT_TYPES.admissionGranted, 'tool', invocationId, { toolId, invocationId, phase: 'effect', holderId: claim.holderId, claims: claim.claims, ...(lastingMs !== undefined ? { lastingMs } : {}) })]);
+        }
+      }
       let before: string | undefined;
       if (guarded) {
         if (pendingGuard?.invocationId === invocationId) {
@@ -747,6 +815,7 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
           if (typeof d !== 'string') {
             // fail closed: what the command does to test code could not be checked afterwards
             if (qpsReservation !== undefined) await budget.release(qpsReservation);
+            if (effectHolder !== undefined) await deps.admission.release(effectHolder);
             return deny(call, toolId, invocationId, 'governance_unavailable', `[denied] ${toolId} cannot run: the worktree diff needed for test-change governance is unavailable (${d.message})`);
           }
           before = d;
@@ -791,7 +860,22 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
         request.leaseOwner = claimLeaseOwner(heldClaim?.ownerId ?? deps.config.workerId, input.workItemId, input.fencingToken);
         request.claim = { workItemId: input.workItemId, fencingToken: input.fencingToken, ownerId: heldClaim?.ownerId ?? deps.config.workerId };
         if (heldClaim?.leaseId) request.claim.leaseId = heldClaim.leaseId;
+        // E[0]: every external effect of the call re-validates the claim at the gateway's commit point
+        request.commitGuard = claimCommitGuard(deps, { runId: input.runId, workItemId: input.workItemId, fencingToken: input.fencingToken }, input.eventContext);
       }
+      // E[2]/E[1]: a state-changing request a sandboxed command of this call sends to an environment (relayed and ledgered by
+      // the sandbox) runs under an admitted ResourceClaim on that environment too — the call's holder, released after it
+      let egressHolder: string | undefined;
+      const callTimeout = registry.get(toolId)?.timeoutMs ?? 60_000;
+      request.egressGuard = async (resource) => {
+        const claim = await admitEffectClaim(deps, {
+          runId: input.runId, workItemId: input.workItemId, toolId: 'sandbox.http', invocationId, group: request.experimentId ?? input.workItemId, experimentIds: experiments.all,
+          resources: () => [resource], ttlMs: callTimeout + EFFECT_CLAIM_MARGIN_MS,
+        });
+        if (!claim.ok) return claim.problem;
+        if (claim.holderId !== undefined) egressHolder = claim.holderId;
+        return undefined;
+      };
       let execution: Awaited<ReturnType<typeof toolRuntime.execute>>;
       try {
         execution = await toolRuntime.execute(request);
@@ -800,6 +884,26 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
         // is given back only when no job can run (none prepared, or it ended); a replay reuses (or re-reserves) it
         if (qpsReservation !== undefined && !(await qpsJobMayRun(deps, input.runId, invocationId))) await budget.release(qpsReservation).catch(() => undefined);
         throw e;
+      }
+      // E[1]: the call's claim is given back unless its effect lasts (or its outcome is not settled: then it expires); a
+      // lasting effect that started keeps it for exactly its window (a fault until it expires — `effectUntil` — a load job
+      // for its duration from now: it started before the call returned)
+      if (effectHolder !== undefined) {
+        if (!effectClaimOutlivesCall(execution, lastingMs)) await deps.admission.release(effectHolder);
+        else if (execution.status === 'success' && lastingMs !== undefined && deps.admission.retime) {
+          const until = obj(execution.structured)['effectUntil'];
+          const untilMs = typeof until === 'string' && Number.isFinite(Date.parse(until)) ? Date.parse(until) : deps.clock.nowMs() + lastingMs;
+          const ttl = untilMs - deps.clock.nowMs();
+          if (ttl > 0) await deps.admission.retime(effectHolder, ttl);
+          else await deps.admission.release(effectHolder);
+        }
+      }
+      // relayed writes of sandboxed commands are settled when the call returns (each is a recorded operation)
+      if (egressHolder !== undefined && egressHolder !== effectHolder) await deps.admission.release(egressHolder);
+      // ending a load job frees the resources its load.start claimed for its window
+      if (toolId === 'load.stop' && execution.status === 'success' && typeof args['operationId'] === 'string') {
+        const job = await deps.ledger.get(args['operationId']).catch(() => undefined);
+        if (job?.toolInvocationId !== undefined && job.runId === input.runId) await releaseEffectClaims(deps, job.toolInvocationId, input.runId);
       }
       const budgetNotes = await settleCallBudget(toolId, invocationId, args, execution, { qpsReservation, computeCapMs, experimentScopes: experimentBudgetScopes });
       if (toolId === 'experiment.define' && execution.status === 'success') experimentsCache = undefined;
@@ -826,6 +930,18 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
         result.terminal = structured['terminal'] as TerminalSignal;
       }
       if (execution.status === 'pending' && execution.operationId) result.pendingOperationId = execution.operationId;
+      // stubs[8]: an operation escalated to manual review (its outcome could not be established) ⇒ the item WAITS for a
+      // human's resolution (`hypertest operations resolve`) instead of guessing; it resumes with the resolved outcome
+      if (execution.status === 'failed' && execution.error?.code === 'manual_review' && execution.operationId) {
+        result.pendingOperationId = execution.operationId;
+        result.message = toolMessage(call, `${execution.modelText}\n[waiting for a human manual review of operation ${execution.operationId}: this work item resumes with the outcome they record (do not re-send the action)]`, false);
+      }
+      // E[8]: approval_required with a recorded approval request ⇒ the item WAITS (durably) for the human decision instead
+      // of failing; observeWaiting resumes it when the approval is decided (approved: the same call runs once)
+      if (execution.status === 'denied' && execution.error?.code === 'approval_required' && execution.permit?.approvalId !== undefined) {
+        result.pendingOperationId = approvalWaitOperationId(execution.permit.approvalId);
+        result.message = toolMessage(call, `${execution.modelText}\n[waiting for approval ${execution.permit.approvalId}: this work item resumes once an independent human decides it]`, false);
+      }
       if (execution.status === 'success' && verdict.allowed && verdict.classification?.decision === 'conditional') await markDraft(verdict.paths);
       if (toolId === 'test.run' && execution.status === 'success' && typeof structured['passed'] === 'boolean') {
         const totals = obj(structured['totals']);

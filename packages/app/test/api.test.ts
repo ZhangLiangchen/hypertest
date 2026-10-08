@@ -384,8 +384,8 @@ describe('REST API: model operations (A[0] resume, A[3] model switch, A[4] agent
   function opsFacade() {
     const ht = fakeHypertest();
     return Object.assign(ht, {
-      async resume(runId: string) {
-        ht.calls.push(['resume', [runId]]);
+      async resume(runId: string, options?: Record<string, unknown>) {
+        ht.calls.push(['resume', options && Object.keys(options).length > 0 ? [runId, options] : [runId]]);
         return { releasedPauses: 2 };
       },
       async agents(runId: string) {
@@ -425,6 +425,24 @@ describe('REST API: model operations (A[0] resume, A[3] model switch, A[4] agent
       assert.deepEqual([r.status, r.json().error.code], [401, 'unauthenticated']);
       r = await request(api.url, 'GET', '/runs/run_1/resume', { headers: { authorization: `Bearer ${TOKEN}` } });
       assert.deepEqual([r.status, r.headers['allow']], [405, 'POST']);
+      // E[3] a budget raise before the resume (PAUSED_BUDGET): amounts > 0, the raising human and why
+      r = await request(api.url, 'POST', '/runs/run_1/resume', auth({ raise: { maxModelTokens: 100_000, maxModelCostUsd: 0.5 }, by: 'alice', rationale: 'the suite needs more' }));
+      assert.equal(r.status, 200);
+      assert.deepEqual(ht.calls.findLast((c) => c[0] === 'resume')![1], ['run_1', { raise: { maxModelTokens: 100_000, maxModelCostUsd: 0.5 }, by: 'alice', rationale: 'the suite needs more' }]);
+      const before = ht.calls.filter((c) => c[0] === 'resume').length;
+      for (const [body, message] of [
+        [{ raise: { maxModelTokens: 0 }, by: 'alice', rationale: 'r' }, /raise\.maxModelTokens must be an integer > 0/],
+        [{ raise: { maxBananas: 3 }, by: 'alice', rationale: 'r' }, /raise\.maxBananas: not a raisable budget field/],
+        [{ raise: { maxToolCalls: 3 }, rationale: 'r' }, /by/],
+        [{ raise: { maxToolCalls: 3 }, by: 'alice' }, /rationale/],
+        [{ by: 'alice' }, /only meaningful with a raise/],
+        [{ raise: { maxToolCalls: 3 }, by: 'alice', rationale: 'r', extra: 1 }, /unknown field 'extra'/],
+      ] as const) {
+        const bad = await request(api.url, 'POST', '/runs/run_1/resume', auth(body));
+        assert.equal(bad.status, 400, JSON.stringify(body));
+        assert.match(bad.json().error.message, message);
+      }
+      assert.equal(ht.calls.filter((c) => c[0] === 'resume').length, before, 'an invalid raise never reaches the facade');
     } finally {
       await api.close();
     }
@@ -456,6 +474,62 @@ describe('REST API: model operations (A[0] resume, A[3] model switch, A[4] agent
       assert.deepEqual([r.status, r.json().error.code], [404, 'not_found']);
       r = await request(api.url, 'POST', '/runs/run_1/model-switch', json({ target: 'executor', routeId: 'backup', by: 'mallory' }));
       assert.deepEqual([r.status, r.json().error.code], [401, 'unauthenticated']);
+    } finally {
+      await api.close();
+    }
+  });
+});
+
+describe('REST API: manual review of operations (stubs[8])', () => {
+  const TOKEN = 'operator-token-0123456789';
+  function opsFacade() {
+    const ht = fakeHypertest();
+    return Object.assign(ht, {
+      async listOperations(filter: unknown) {
+        ht.calls.push(['listOperations', [filter]]);
+        return [{ operationId: 'op_1', runId: 'run_1', status: 'manual_review' }];
+      },
+      async resolveOperation(...args: unknown[]) {
+        ht.calls.push(['resolveOperation', args]);
+        if (args[0] === 'op_gone') throw new HypertestError('not_found', 'operation op_gone not found');
+        return { operationId: args[0], runId: 'run_1', status: args[1] === 'succeeded' ? 'verified' : args[1] };
+      },
+    });
+  }
+
+  test('GET /operations lists (default: the facade decides); POST /operations/:id/resolve is a human decision (token), validated', async () => {
+    const ht = opsFacade();
+    const open = await startApiServer(ht as unknown as Hypertest, { port: 0 });
+    try {
+      const list = await request(open.url, 'GET', '/operations?status=manual_review,failed&runId=run_1&limit=5');
+      assert.deepEqual([list.status, list.json().operations.map((o: { operationId: string }) => o.operationId)], [200, ['op_1']]);
+      assert.deepEqual(ht.calls.findLast((c) => c[0] === 'listOperations')![1], [{ runId: 'run_1', status: ['manual_review', 'failed'], limit: 5 }]);
+      const bad = await request(open.url, 'GET', '/operations?status=bogus');
+      assert.deepEqual([bad.status, bad.json().error.message], [400, "unknown operation status 'bogus'"]);
+      // without a token an agent reaching the loopback API could declare its own unknown side effect a success (I1, I4)
+      const r = await request(open.url, 'POST', '/operations/op_1/resolve', json({ outcome: 'succeeded', by: 'agent', note: 'it worked' }));
+      assert.deepEqual([r.status, r.json().error.code], [403, 'token_required']);
+      assert.equal(ht.calls.filter((c) => c[0] === 'resolveOperation').length, 0);
+    } finally {
+      await open.close();
+    }
+    const api = await startApiServer(ht as unknown as Hypertest, { port: 0, token: TOKEN });
+    const auth = (body: unknown) => ({ body: JSON.stringify(body), headers: { 'content-type': 'application/json', authorization: `Bearer ${TOKEN}` } });
+    try {
+      const ok = await request(api.url, 'POST', '/operations/op_1/resolve', auth({ outcome: 'compensated', by: 'alice', note: 'rolled back by hand' }));
+      assert.deepEqual([ok.status, ok.json().ok, ok.json().operation.status], [200, true, 'compensated']);
+      assert.deepEqual(ht.calls.findLast((c) => c[0] === 'resolveOperation')![1], ['op_1', 'compensated', { kind: 'human', id: 'alice' }, 'rolled back by hand']);
+      for (const [body, code] of [
+        [{ outcome: 'maybe', by: 'alice', note: 'n' }, 'invalid_argument'],
+        [{ outcome: 'failed', note: 'n' }, 'invalid_argument'],
+        [{ outcome: 'failed', by: 'alice' }, 'invalid_argument'],
+        [{ outcome: 'failed', by: 'alice', note: 'n', extra: true }, 'invalid_argument'],
+      ] as const) {
+        const r = await request(api.url, 'POST', '/operations/op_1/resolve', auth(body));
+        assert.deepEqual([r.status, r.json().error.code], [400, code], JSON.stringify(body));
+      }
+      const gone = await request(api.url, 'POST', '/operations/op_gone/resolve', auth({ outcome: 'failed', by: 'alice', note: 'n' }));
+      assert.equal(gone.status, 404);
     } finally {
       await api.close();
     }

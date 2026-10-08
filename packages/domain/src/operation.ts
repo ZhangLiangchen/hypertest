@@ -74,7 +74,8 @@ const OP_TRANSITIONS: Record<OperationStatus, readonly OperationStatus[]> = {
   verified: ['compensating'],
   compensating: ['compensated', 'manual_review'],
   compensated: [],
-  manual_review: ['verified', 'not_applied', 'failed'],
+  // (additive, stubs[8]) a human's manual review may also record that the effect was undone (compensated)
+  manual_review: ['verified', 'not_applied', 'failed', 'compensated'],
   failed: [],
 };
 

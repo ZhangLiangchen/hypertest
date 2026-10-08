@@ -21,6 +21,27 @@ const PROPOSAL_STATUSES = ['pending', 'approved', 'rejected'] as const;
  */
 export const SANDBOX_ENV = 'HYPERTEST_SANDBOX';
 
+/**
+ * (review, E[8]) What a human is asked to decide, in one line: for an action approval the exact action it authorizes (tool,
+ * effect/risk, target, environment class, arguments) — never just the opaque digest; for a budget extension the dimension,
+ * its limit and the proposed raise; otherwise the subject as JSON.
+ */
+export function approvalSubjectSummary(a: { kind: string; subject?: unknown }): string {
+  const s = (a.subject ?? null) as Record<string, unknown> | null;
+  if (s && typeof s === 'object' && !Array.isArray(s)) {
+    // an action description (what the approval gate records): the digest alone would tell the decider nothing
+    if (a.kind === 'action' && typeof s['tool'] === 'string' && Array.isArray(s['resources']) && Object.prototype.hasOwnProperty.call(s, 'input')) {
+      const resources = Array.isArray(s['resources']) ? (s['resources'] as unknown[]).join(',') : '';
+      const env = typeof s['environmentClass'] === 'string' ? ` [${s['environmentClass']}]` : '';
+      return `${s['tool']} ${String(s['effect'] ?? '?')}/${String(s['riskClass'] ?? '?')} on ${resources || '(no resource)'}${env} args ${JSON.stringify(s['input'] ?? null)}`;
+    }
+    if (a.kind === 'budget' && s['raise'] !== undefined && s['raise'] !== null && typeof s['raise'] === 'object') {
+      return `extend ${String(s['dimension'] ?? 'the budget')}${s['limit'] !== undefined && s['limit'] !== null ? ` (limit ${String(s['limit'])})` : ''} by ${JSON.stringify(s['raise'])}`;
+    }
+  }
+  return JSON.stringify(a.subject ?? null);
+}
+
 function assertNotSandboxed(env: Record<string, string | undefined>, what: string): void {
   if (env[SANDBOX_ENV]) {
     throw new HypertestError('permission_denied', `${what} is a human decision and cannot be taken from inside a Hypertest sandbox (${SANDBOX_ENV} is set): an agent never decides its own approval or oracle change`);
@@ -58,7 +79,7 @@ export const approvalsCommand: Command = {
         ctx.out(`no ${filter.status ? filter.status.join('/') + ' ' : ''}approvals${runId ? ` for run ${runId}` : ''}`);
         return EXIT_CODES.ok;
       }
-      const rows = approvals.map((a) => [a.approvalId, a.runId, a.kind, a.status, `${a.requestedBy.kind}:${a.requestedBy.id}`, a.createdAt, truncate(JSON.stringify(a.subject), 60)]);
+      const rows = approvals.map((a) => [a.approvalId, a.runId, a.kind, a.status, `${a.requestedBy.kind}:${a.requestedBy.id}`, a.createdAt, truncate(approvalSubjectSummary(a), 160)]);
       for (const l of table(['APPROVAL', 'RUN', 'KIND', 'STATUS', 'REQUESTED BY', 'CREATED', 'SUBJECT'], rows)) ctx.out(l);
       return EXIT_CODES.ok;
     });
@@ -86,6 +107,31 @@ export const approveCommand: Command = {
       const decided = await ht.services.approvals.get(approvalId!);
       if (ctx.global.json) ctx.json({ approvalId, status: decided?.status ?? null, runId: decided?.runId ?? null, decidedBy: `human:${by}` });
       else ctx.out(`approval ${approvalId} ${decided?.status ?? (approve ? 'approved' : 'denied')} by human:${by}${decided ? ` (run ${decided.runId})` : ''}`);
+      return EXIT_CODES.ok;
+    });
+  },
+};
+
+/** (E[8]) `hypertest reject`: deny an approval request as a human (the explicit counterpart of `approve`). */
+export const rejectCommand: Command = {
+  name: 'reject',
+  summary: 'deny an approval request as a human (the action stays refused; a budget extension is not granted)',
+  usage: ['reject <approvalId> --by <name> --reason "<text>"'],
+  notes: [
+    'Same as `approve <approvalId> --deny`. The requester can never decide its own request; the decision is recorded as human:<name>.',
+    `Refused (permission_denied) when $${SANDBOX_ENV} is set: a command an agent runs in a Hypertest sandbox never takes a human decision.`,
+  ],
+  options: { by: { type: 'string' }, reason: { type: 'string' } },
+  async run(ctx, values, args) {
+    const [approvalId] = positionals('reject', args, ['approvalId']);
+    const by = deciderName('reject', values);
+    const reason = required('reject', values, 'reason');
+    assertNotSandboxed(ctx.io.env, 'reject');
+    return withInstance(ctx, { drivesAgents: false }, async ({ ht }) => {
+      await ht.approve(approvalId!, false, { kind: 'human', id: by }, reason);
+      const decided = await ht.services.approvals.get(approvalId!);
+      if (ctx.global.json) ctx.json({ approvalId, status: decided?.status ?? null, runId: decided?.runId ?? null, decidedBy: `human:${by}` });
+      else ctx.out(`approval ${approvalId} ${decided?.status ?? 'denied'} by human:${by}${decided ? ` (run ${decided.runId})` : ''}`);
       return EXIT_CODES.ok;
     });
   },

@@ -571,6 +571,41 @@ describe('TemporalDurableRuntime (Temporal server)', { concurrency: false }, () 
   });
 });
 
+describe('E[8] ApprovalSignal (Temporal server)', { concurrency: false }, () => {
+  test('the run workflow forwards an approval decision to its waiting child: observed at once, not after the observe backoff', temporal, async () => {
+    const s = unique();
+    const runId = `run_${s}`;
+    const A = `wi_${s}_a`;
+    const store = new MemoryWorld();
+    await addRun(store, runId, [{ workItemId: A, turns: 2, waitAfterTurn: 1, waitPolls: 1_000_000 }]);
+    const control = new FakeControl({ instance: 'p1', store });
+    const rt = newRuntime(control, `ht-durable-${s}`, { maxIdleMs: 60_000 });
+    try {
+      await rt.startRun(runId);
+      // backoff 250 → 500 → 1000 → 2000 ms: after the third poll the next one is 2 s away
+      await until(() => control.callsOf('observeWaiting', A).length >= 3, 30_000);
+      const polls = control.callsOf('observeWaiting', A).length;
+      await store.mutate((w) => {
+        const item = w.runs[runId]!.items[A]!;
+        item.waitPolls = item.polls;
+      });
+      const t0 = Date.now();
+      await assert.rejects(rt.signal(runId, { type: 'approval', approvalId: '' }), (e: unknown) => isHypertestError(e, 'invalid_argument'));
+      await rt.signal(runId, { type: 'approval', approvalId: 'appr_t1' });
+      assert.equal((await rt.awaitCompletion(runId, { timeoutMs: 30_000 })).status, 'completed');
+      track(runId, control);
+      assert.ok(Date.now() - t0 < 1900, `observed on the ApprovalSignal (took ${Date.now() - t0} ms; the backoff was 2000 ms)`);
+      assert.equal(control.callsOf('observeWaiting', A).length, polls + 1, 'exactly one more observation');
+      assert.deepEqual(turnsOf(await store.read(), A), [1, 2]);
+      // the child's history records the forwarded signal
+      const history = await client.workflow.getHandle(childIds(control, A)[0]!).fetchHistory();
+      assert.ok(history.events?.some((e) => e.workflowExecutionSignaledEventAttributes?.signalName === 'approval'));
+    } finally {
+      await rt.shutdown();
+    }
+  });
+});
+
 describe('durability-5: the agent-turn activity bound is the runtime\'s (long tools finish; liveness is the heartbeat)', { concurrency: false }, () => {
   test('the default bound exceeds the longest tool timeouts; a turn longer than a configured bound is cut, one within it completes', temporal, async () => {
     const { DEFAULT_TURN_ACTIVITY_TIMEOUT_MS } = await import('../src/temporal/workflows.ts');

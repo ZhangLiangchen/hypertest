@@ -2,7 +2,8 @@ import type { Migration } from '@hypertest/core';
 
 /**
  * Policy schema. `ht_policy_decisions` is an audit log and append-only at the database level (UPDATE,
- * DELETE and TRUNCATE are rejected by triggers). `ht_approvals` rows move pending → approved|denied|expired
+ * DELETE and TRUNCATE are rejected by triggers). `ht_approval_consumptions` (004, E[8]): the single consumption of an
+ * approved action approval (append-only). `ht_approvals` rows move pending → approved|denied|expired
  * exactly once (guarded by a conditional UPDATE in the service and a transition trigger here).
  */
 export const policyMigrations: Migration[] = [
@@ -91,6 +92,32 @@ CREATE TRIGGER ht_approvals_guard_trg BEFORE UPDATE OR DELETE ON ht_approvals
 ALTER TABLE ht_approvals DROP CONSTRAINT IF EXISTS ht_approvals_kind_check;
 ALTER TABLE ht_approvals ADD CONSTRAINT ht_approvals_kind_check
   CHECK (kind IN ('action', 'oracle_change', 'test_change', 'budget', 'manual_review', 'gate_exception'));
+`,
+  },
+  {
+    // E[8]: an approved action approval is consumed EXACTLY ONCE (primary key) by the one action it authorizes; append-only
+    id: 'policy/004-approval-consumptions',
+    sql: `
+CREATE TABLE IF NOT EXISTS ht_approval_consumptions (
+  approval_id  text PRIMARY KEY REFERENCES ht_approvals (approval_id),
+  run_id       text NOT NULL,
+  consumed_by  text NOT NULL,
+  digest       text NOT NULL,
+  consumed_at  timestamptz NOT NULL
+);
+
+CREATE OR REPLACE FUNCTION ht_approval_consumptions_append_only() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE EXCEPTION 'ht_approval_consumptions is append-only (%)', TG_OP USING ERRCODE = '42501';
+END
+$$;
+
+DROP TRIGGER IF EXISTS ht_approval_consumptions_guard ON ht_approval_consumptions;
+CREATE TRIGGER ht_approval_consumptions_guard BEFORE UPDATE OR DELETE ON ht_approval_consumptions
+  FOR EACH ROW EXECUTE FUNCTION ht_approval_consumptions_append_only();
+DROP TRIGGER IF EXISTS ht_approval_consumptions_no_truncate ON ht_approval_consumptions;
+CREATE TRIGGER ht_approval_consumptions_no_truncate BEFORE TRUNCATE ON ht_approval_consumptions
+  FOR EACH STATEMENT EXECUTE FUNCTION ht_approval_consumptions_append_only();
 `,
   },
 ];

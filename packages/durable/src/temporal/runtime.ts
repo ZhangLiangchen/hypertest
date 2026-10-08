@@ -4,11 +4,11 @@ import type { TestRun } from '@hypertest/domain';
 import type { ControlPlane } from '@hypertest/control';
 import type { Client, Connection } from '@temporalio/client';
 import type { NativeConnection, Worker } from '@temporalio/worker';
-import type { DurableRuntime, RunOutcome, TemporalDurableOptions, TemporalWorkerHandle, TemporalWorkerOptions, TemporalWorkflowBundle } from '../contracts.ts';
+import type { DurableRuntime, DurableSignal, RunOutcome, TemporalDurableOptions, TemporalWorkerHandle, TemporalWorkerOptions, TemporalWorkflowBundle } from '../contracts.ts';
 import { errorMessage, isErrorCode } from '../errors.ts';
 import { RESUMABLE_RUN_STATUSES, isTerminalRunStatus, outcomeOf } from '../local.ts';
 import { createTemporalActivities } from './activities.ts';
-import { DEFAULT_MAX_WORKFLOW_ITERATIONS, DEFAULT_WORKFLOW_MAX_IDLE_MS, cancelSignal, runWorkflowId, wakeSignal, type TestRunWorkflowState, type testRunWorkflow } from './workflows.ts';
+import { DEFAULT_MAX_WORKFLOW_ITERATIONS, DEFAULT_WORKFLOW_MAX_IDLE_MS, approvalSignal, cancelSignal, runWorkflowId, wakeSignal, type TestRunWorkflowState, type testRunWorkflow } from './workflows.ts';
 
 export const DEFAULT_TEMPORAL_NAMESPACE = 'default';
 export const DEFAULT_TEMPORAL_TASK_QUEUE = 'hypertest';
@@ -222,15 +222,18 @@ export class TemporalDurableRuntime implements DurableRuntime {
     }
   }
 
-  async signal(runId: string, signal: { type: 'wake' } | { type: 'cancel'; reason: string }): Promise<void> {
+  async signal(runId: string, signal: DurableSignal): Promise<void> {
     if (typeof runId !== 'string' || runId.length === 0) throw new HypertestError('invalid_argument', 'signal: runId must be a non-empty string');
-    if (signal?.type !== 'wake' && signal?.type !== 'cancel') throw new HypertestError('invalid_argument', `signal: unknown signal type ${JSON.stringify((signal as { type?: unknown } | undefined)?.type)}`);
+    if (signal?.type !== 'wake' && signal?.type !== 'cancel' && signal?.type !== 'approval') throw new HypertestError('invalid_argument', `signal: unknown signal type ${JSON.stringify((signal as { type?: unknown } | undefined)?.type)}`);
     if (signal.type === 'cancel' && (typeof signal.reason !== 'string' || signal.reason.trim() === '')) throw new HypertestError('invalid_argument', 'signal cancel: reason is required');
+    if (signal.type === 'approval' && (typeof signal.approvalId !== 'string' || signal.approvalId === '')) throw new HypertestError('invalid_argument', 'signal approval: approvalId is required');
     const { client } = await this.#init();
     const c = await loadClient();
     const handle = client.workflow.getHandle(runWorkflowId(runId));
     try {
       if (signal.type === 'wake') await handle.signal(wakeSignal);
+      // E[8] ApprovalSignal: the run workflow forwards it to its children waiting on approvals
+      else if (signal.type === 'approval') await handle.signal(approvalSignal, signal.approvalId);
       else await handle.signal(cancelSignal, signal.reason);
     } catch (e) {
       if (!(e instanceof c.WorkflowNotFoundError)) throw new HypertestError('unavailable', `could not signal run ${runId}: ${errorMessage(e)}`, { cause: e, details: { runId } });

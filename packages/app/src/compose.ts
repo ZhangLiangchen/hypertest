@@ -7,7 +7,7 @@ import {
   HypertestError, UlidIdGenerator, canonicalJson, isHypertestError, jsonLogger, sha256Hex, systemClock, type EventBus, type JsonValue, type Logger, type Migration,
   type SqlDatabase,
 } from '@hypertest/core';
-import { isTerminalRun, type EventContext, type Finding, type RuntimeManifest, type TestRun } from '@hypertest/domain';
+import { isTerminalRun, type EventContext, type Finding, type OperationStatus, type RuntimeManifest, type TestRun } from '@hypertest/domain';
 import { migrate, openDatabase } from '@hypertest/store';
 import {
   InProcessEventBus, collabMigrations, connectNatsEventBus, createBlackboard, createDecisionRepository, createEventStore, createInbox, createOutboxRelay,
@@ -19,7 +19,7 @@ import {
 } from '@hypertest/operation';
 import { FsArtifactStore, S3ArtifactStore, createEvidenceLedger, evidenceMigrations, verifyEd25519, type ArtifactStore, type EvidenceLedger } from '@hypertest/evidence';
 import {
-  BuiltinPolicyEngine, CompositePolicyEngine, DEFAULT_POLICY_RULES, OpaPolicyEngine, QualityGate, createApprovalService, createOracleGovernance,
+  ApprovalGatedPolicyEngine, BuiltinPolicyEngine, CompositePolicyEngine, DEFAULT_POLICY_RULES, OpaPolicyEngine, QualityGate, createApprovalService, createOracleGovernance,
   createPolicyDecisionLog, policyMigrations, resolveProtocolBinding, type PolicyEngine,
 } from '@hypertest/policy';
 import {
@@ -32,10 +32,11 @@ import {
   environmentResolver, environmentVersion, experimentResolver, leaseResolver, observeToolRuntime, oracleResolver, recordResolver, workspaceFileResolver,
   type DurableMemory, type Embedder, type Retriever, type VectorIndex,
 } from '@hypertest/context';
+import { OpenAICompatibleEmbedder, createCodeToolRetrieval, withExperienceEvents, createFreshnessPassLog, createSkillRegistry, recordTranscriptOnL0, withTrialSkills, type SkillRevision } from '@hypertest/context';
 import {
-  ToolRegistry, builtinSideEffectAdapters, builtinTools, closeBlackboxResources, createEnvironmentRegistry, createLocalSandbox, createOciSandbox,
-  createSqlEnvironmentRegistry, createToolRuntime, createWorkspaceManager, toolsMigrations, type BuiltinToolOptions, type EnvironmentRegistry, type SandboxProfile,
-  type ToolRuntimeDeps,
+  ToolRegistry, builtinSideEffectAdapters, builtinTools, closeBlackboxResources, createEnvironmentRegistry, createLocalSandbox, createOciSandbox, createSecretBroker,
+  createSqlEnvironmentRegistry, createToolRuntime, createWorkspaceManager, networkIsolation, toolsMigrations, type BrokeredCredentialConfig, type BuiltinToolOptions, type EgressEndpointPolicy,
+  type EnvironmentRegistry, type NetworkIsolationOptions, type SandboxProfile, type ToolRuntimeDeps,
 } from '@hypertest/tools';
 import {
   EngineRegistry, NativeEngine, RUNTIME_PACKAGE_VERSION, buildRuntimeManifest, createAgentRepository, createAgentRunner, createEpochManager, createPluginKernel, createRuntimeReleaseRegistry,
@@ -45,6 +46,7 @@ import { PI_AGENT_CORE_VERSION, PiEngine, RUNTIME_PI_PACKAGE_VERSION } from '@hy
 import { DSH_PINS, DshEngine, RUNTIME_DSH_PACKAGE_VERSION } from '@hypertest/runtime-dsh';
 import { BUILTIN_ROLES, RoleCatalog, type RoleCatalogLike } from '@hypertest/agents';
 import { ControlStore, controlMigrations, createControlPlane, createDomainTools, type ControlConfig, type ControlDeps, type ControlPlane, type StartRunInput } from '@hypertest/control';
+import { freshnessChecked } from '@hypertest/control';
 import {
   DEFAULT_TEMPORAL_NAMESPACE, DEFAULT_TEMPORAL_TASK_QUEUE, LocalDurableRuntime, RESUMABLE_RUN_STATUSES, TemporalDurableRuntime, type DurableHooks, type DurableRuntime,
   type RunOutcome, type TemporalDurableOptions,
@@ -57,6 +59,8 @@ import { ENVIRONMENT_STATE_FILE, persistentEnvironmentRegistry, resolveEnvironme
 import { recordedFailureFlipDetector } from './governance.ts';
 import { keysDir, loadCapabilitySecret, loadSigningKeys } from './keys.ts';
 import { acquireDirectoryLock, lockFileFor } from './lock.ts';
+import { providerLocality } from './diagnose.ts';
+import { startMemoryServiceProcess } from './memory-service.ts';
 import {
   agentClassification, condenserPrivacyFloor, createReleaseService, hypertestGitSha, imageDigestFrom, releaseGovernedControlPlane, runtimeReleaseNotes, withRuntimeReleaseNotes,
 } from './releases.ts';
@@ -376,6 +380,24 @@ export function sandboxEgressOrigins(environments: Pick<EnvironmentRegistry, 'li
 }
 
 /**
+ * (E[2]) The egress policy of every relayed endpoint: the registered environments' base URLs (their effects keyed on
+ * `env/<id>`; `rawEgress` / `honoursIdempotencyKey` as the operator declared them) and the operator's http allowlist URLs
+ * (`url/<host>`, HTTP only).
+ */
+export function sandboxEgressPolicies(environments: Pick<EnvironmentRegistry, 'list'>, httpAllowlist: readonly string[] | undefined): EgressEndpointPolicy[] {
+  const out: EgressEndpointPolicy[] = [];
+  for (const e of environments.list()) {
+    if (!e.baseUrl) continue;
+    const p: EgressEndpointPolicy = { origin: e.baseUrl, resource: `env/${e.environmentId}` };
+    if (e.rawEgress === true) p.raw = true;
+    if (e.honoursIdempotencyKey === true) p.honoursIdempotencyKey = true;
+    out.push(p);
+  }
+  for (const a of httpAllowlist ?? []) if (/^https?:\/\//.test(a) && !out.some((p) => p.origin === a)) out.push({ origin: a });
+  return out;
+}
+
+/**
  * H1: what the local sandbox hides from the commands agents run (enforced by its jail where the host supports it): the
  * signing keys and capability secret, the embedded store, the evidence artifacts and the runtime state. A configured
  * path that contains the workspaces directory cannot be hidden (nothing could run) and is reported, never silently
@@ -384,8 +406,12 @@ export function sandboxEgressOrigins(environments: Pick<EnvironmentRegistry, 'li
 export function sandboxHiddenPaths(config: HypertestConfig, dataDir: string, stateDir: string, logger?: Logger): string[] {
   const workspacesDir = resolve(join(dataDir, 'workspaces'));
   const candidates = [keysDir(dataDir), stateDir];
+  // E[4]: an externally configured signing key file is hidden too (a file ⇒ /dev/null in the jail)
+  if (config.signing?.keyFile) candidates.push(config.signing.keyFile);
   if (config.store.kind === 'pglite' && config.store.dataDir) candidates.push(config.store.dataDir);
   if (config.artifacts?.kind === 'fs' && config.artifacts.root) candidates.push(config.artifacts.root);
+  // (B[4]) the memory service's own store: agent commands never read or rewrite (approved) experience behind its API
+  if (config.memory?.kind === 'service' && config.memory.dataDir) candidates.push(config.memory.dataDir);
   const out: string[] = [];
   for (const c of candidates.map((p) => resolve(p))) {
     if (workspacesDir === c || workspacesDir.startsWith(c.endsWith(sep) ? c : c + sep)) {
@@ -397,9 +423,36 @@ export function sandboxHiddenPaths(config: HypertestConfig, dataDir: string, sta
   return out;
 }
 
+/**
+ * (E[4]) Refuses a local sandbox that cannot hide the signing keys, the capability secret and the store from the commands
+ * agents run — `network: open` (no namespaces at all) or a host without the PID/mount jail (python3 + namespaces) — unless
+ * the operator opted in with `sandbox.insecureAllowUnhiddenSecrets: true` (then a loud warning at every start).
+ */
+export async function assertSecretsHidden(config: HypertestConfig, profile: SandboxProfile, isolationOptions: NetworkIsolationOptions | undefined, logger: Logger): Promise<void> {
+  let why: string | undefined;
+  if (profile.network === 'open') why = 'sandbox.network is open: commands run without namespaces';
+  else {
+    const iso = await networkIsolation(isolationOptions ?? {});
+    if (!iso.available) why = `no namespace isolation on this host (${iso.reason})`;
+    else if (!iso.jail) why = `the host's isolation strategy ${iso.strategy} has no PID/mount jail (needs python3 and PID/mount namespaces)`;
+  }
+  if (why === undefined) return;
+  if (config.sandbox?.insecureAllowUnhiddenSecrets === true) {
+    logger.warn('INSECURE: the local sandbox does NOT hide the signing keys, the capability secret and the store from the commands agents run (sandbox.insecureAllowUnhiddenSecrets)', { why });
+    return;
+  }
+  throw new HypertestError(
+    'precondition_failed',
+    `the local sandbox cannot hide the signing keys, the capability secret and the store from the commands agents run: ${why}. ` +
+      'Use the OCI sandbox (sandbox.kind: oci), or a host with python3 and user/PID/mount namespaces, or — accepting that agent commands can read those secrets — set sandbox.insecureAllowUnhiddenSecrets: true',
+    { details: { why } },
+  );
+}
+
 /** The local sandbox profile: loopback network, minimal environment allowlist, merged with `config.sandbox`. */
 export function sandboxProfile(config: HypertestConfig): SandboxProfile {
-  return { kind: 'local', network: 'loopback', envAllowlist: [...DEFAULT_ENV_ALLOWLIST], ...(config.sandbox ?? {}) } as SandboxProfile;
+  const { egressWrites: _w, insecureAllowUnhiddenSecrets: _i, ...profile } = config.sandbox ?? {};
+  return { kind: 'local', network: 'loopback', envAllowlist: [...DEFAULT_ENV_ALLOWLIST], ...profile } as SandboxProfile;
 }
 
 /** Exact search answers single-line queries only; multi-line prose (e.g. a work item objective) goes to the symbol index. */
@@ -414,21 +467,63 @@ function singleLineOnly(inner: Retriever): Retriever {
  * Per-root L3 retrievers — symbol graph + exact search + semantic vectors, RRF-fused — cached so the symbol index and
  * the vector corpus are built once per root (the vector corpus again when the root's commit changes). Vectors live in
  * pgvector when the store has it (feature-detected once, lazily: `sharedIndex`), else in memory per corpus.
+ * (B[6] privacy) `restricted` roots — agents whose context is classified restricted — embed with `restrictedEmbedder` (the
+ * local hashing embedder when the configured embedder's provider is off-host) into in-memory corpora of their own. The symbol
+ * index takes the private Go helper directory (`goHelperDir`, hidden from sandboxed commands).
  */
-function cachedRetrievers(logger: Logger, vectors: { embedder: Embedder; sharedIndex: () => Promise<VectorIndex | undefined> }): (root: string) => Retriever {
+export function cachedRetrievers(
+  logger: Logger,
+  vectors: { embedder: Embedder; sharedIndex: () => Promise<VectorIndex | undefined>; restrictedEmbedder?: Embedder },
+  goHelperDir?: string,
+): (root: string, options?: { restricted?: boolean }) => Retriever {
   const cache = new Map<string, Retriever>();
   // at most 8 workspace corpora in this process (LRU), whatever the number of parallel worktrees
   const corpora = new VectorCorpusCache({ maxCorpora: 8, logger });
-  return (root) => {
-    let r = cache.get(root);
+  // (B[6] privacy) restricted agents' corpora: embedded locally only, kept apart (in memory, never in the shared pgvector index)
+  const restrictedCorpora = new VectorCorpusCache({ maxCorpora: 4, logger });
+  return (root, options) => {
+    const restricted = options?.restricted === true && vectors.restrictedEmbedder !== undefined;
+    const key = `${restricted ? 'restricted' : 'default'}\u0000${root}`;
+    let r = cache.get(key);
     if (!r) {
-      const vector = new WorkspaceVectorRetriever({ root, embedder: vectors.embedder, sharedIndex: vectors.sharedIndex, cache: corpora, logger });
-      r = new HybridRetriever([new SymbolIndex({ root }), singleLineOnly(new ExactSearch({ root })), vector], { logger });
-      cache.set(root, r);
+      const vector = restricted
+        ? new WorkspaceVectorRetriever({ root, embedder: vectors.restrictedEmbedder!, cache: restrictedCorpora, logger })
+        : new WorkspaceVectorRetriever({ root, embedder: vectors.embedder, sharedIndex: vectors.sharedIndex, cache: corpora, logger });
+      r = new HybridRetriever([new SymbolIndex(goHelperDir !== undefined ? { root, goHelperDir } : { root }), singleLineOnly(new ExactSearch({ root })), vector], { logger });
+      cache.set(key, r);
       if (cache.size > 64) cache.delete(cache.keys().next().value!);
     }
     return r;
   };
+}
+
+/**
+ * (B[6]) The `retrieval.embedder` route: an OpenAI-compatible `/embeddings` endpoint of a configured provider (its baseUrl,
+ * apiKeyEnv, headers; the fetch override applies). Undefined when not configured — or, fail closed, when the provider's
+ * credential is missing (no request is sent; the hashing embedder is used and the reason logged).
+ */
+function semanticEmbedder(config: HypertestConfig, env: Record<string, string | undefined>, overrides: HypertestOverrides, logger: Logger): { embedder: Embedder; local: boolean } | undefined {
+  const route = config.retrieval?.embedder;
+  if (!route) return undefined;
+  const provider = config.models.providers.find((p) => p.id === route.provider);
+  if (!provider || provider.kind !== 'openai-compatible' || !provider.baseUrl) {
+    throw invalid(`retrieval.embedder.provider ${route.provider} must be an openai-compatible models.providers[] entry with a baseUrl`, { provider: route.provider });
+  }
+  const apiKey = provider.apiKeyEnv ? env[provider.apiKeyEnv] : undefined;
+  if (provider.apiKeyEnv && (apiKey === undefined || apiKey.trim() === '')) {
+    logger.warn('retrieval.embedder: the provider credential is missing; semantic embeddings are off (hashing embedder in use, no request is sent)', { provider: provider.id, apiKeyEnv: provider.apiKeyEnv });
+    return undefined;
+  }
+  // (B[6] privacy) where the code goes: a provider outside this host / private network never embeds restricted agents' code
+  const { local, where } = providerLocality(provider);
+  logger.info('L3 vectors: semantic embeddings through an OpenAI-compatible /embeddings route', { provider: provider.id, model: route.model, dimensions: route.dimensions, where });
+  const embedder = new OpenAICompatibleEmbedder({
+    baseUrl: provider.baseUrl, model: route.model, dimensions: route.dimensions,
+    ...(apiKey ? { apiKey } : {}), ...(provider.headers ? { headers: { ...provider.headers } } : {}),
+    ...(route.timeoutMs !== undefined ? { timeoutMs: route.timeoutMs } : provider.timeoutMs !== undefined ? { timeoutMs: provider.timeoutMs } : {}),
+    ...(overrides.fetch ? { fetch: overrides.fetch } : {}),
+  });
+  return { embedder, local };
 }
 
 /** pgvector when the store offers the extension (PGlite with `vector`, PostgreSQL with pgvector), else undefined (in memory). */
@@ -698,9 +793,11 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
     const budget = createBudgetLedger({ ...base, db, events });
 
     // ---- governance
-    const policy = await policyEngine(config, capabilitySecret, { clock, newId: () => ids.next('pdec'), logger });
-    const decisionLog = createPolicyDecisionLog({ ...base, db, events });
     const approvals = createApprovalService({ ...base, db, events });
+    // E[8]: approval_required actions wait for an independent human decision; an approval bound to the exact action is
+    // consumed exactly once by the one call it authorizes (ApprovalGatedPolicyEngine around the rules + OPA)
+    const policy: PolicyEngine = new ApprovalGatedPolicyEngine(await policyEngine(config, capabilitySecret, { clock, newId: () => ids.next('pdec'), logger }), { approvals, clock });
+    const decisionLog = createPolicyDecisionLog({ ...base, db, events });
     // SpecRepository.saveOracleProposal already emits oracle.change_* events: no `events` here (no double emission)
     const oracles = createOracleGovernance({
       ...base,
@@ -754,6 +851,8 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
       leaseResolver((key) => leases.current(key)),
     ]);
     const freshness = createFreshnessGuard({ ...base, db, events, snapshots, resolvers, observations });
+    // (B[1]) record-effect tool calls that passed the guard and took effect (a durable replay is never refused by its own write)
+    const freshnessPasses = createFreshnessPassLog({ ...base, db });
     const snapshotBuilder = createSnapshotBuilder({
       ...base,
       db,
@@ -772,13 +871,36 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
     let memory: DurableMemory;
     if (config.memory?.kind === 'powercontext') {
       const apiKey = config.memory.apiKeyEnv ? env[config.memory.apiKeyEnv] : undefined;
-      memory = new PowerContextClient({ baseUrl: config.memory.baseUrl, timeoutMs: 10_000, logger, ...(apiKey ? { apiKey } : {}) });
+      // (B[4]) the service is the authority; its accepted decisions are recorded in this deployment's L0 too
+      memory = withExperienceEvents(new PowerContextClient({ baseUrl: config.memory.baseUrl, timeoutMs: 10_000, logger, ...(apiKey ? { apiKey } : {}) }), { events });
+    } else if (config.memory?.kind === 'service') {
+      // (B[4]) L4 as a separate service process with its own storage, started and stopped with this instance
+      const apiKey = config.memory.apiKeyEnv ? env[config.memory.apiKeyEnv] : undefined;
+      if (config.memory.apiKeyEnv && !apiKey) throw new HypertestError('precondition_failed', `memory.apiKeyEnv names ${config.memory.apiKeyEnv}, which is not set`);
+      const service = await startMemoryServiceProcess({ dataDir: config.memory.dataDir ?? join(dataDir, 'memory'), logger, ...(apiKey ? { apiKey } : {}) });
+      pending.push({ name: 'memory service', close: () => service.close() });
+      memory = withExperienceEvents(new PowerContextClient({ baseUrl: service.url, apiKey: service.apiKey, timeoutMs: 10_000, logger }), { events });
     } else {
       memory = createExperienceStore({ ...base, db, events });
     }
+    // (B[7]) the Skill Registry (store-enforced: only eval-validated revisions are published; only published skills reach
+    // prompts); an eval arm may add `skills.trial` revisions to the prompts of its own trial instances
+    const skillRegistry = createSkillRegistry({ ...base, db, events, experiences: memory });
+    // `skills.trial` is an EVALUATION setting (the eval arm bound to a candidate revision): its revisions reach this instance's
+    // prompts without being published, so an instance carrying it says so loudly at every start
+    if ((config.skills?.trial ?? []).length > 0) {
+      logger.warn('skills.trial: candidate skill revisions that are NOT published are shown (marked as candidates under evaluation) to the agents of this instance — an evaluation setting, never for production runs', {
+        trial: (config.skills?.trial ?? []).map((t) => `${t.skillId} r${t.revision}`),
+      });
+    }
     const provenance = createProvenanceService({ evidence, events, records: blackboard });
-    // L3 semantic retrieval: deterministic feature-hashing embeddings (no provider embedding route is configured)
-    const vectorEmbedder = new HashEmbedder();
+    // L3 semantic retrieval: (B[6]) the `retrieval.embedder` route (an OpenAI-compatible /embeddings provider) when configured,
+    // else deterministic feature-hashing embeddings
+    const semantic = semanticEmbedder(config, env, overrides, logger);
+    const vectorEmbedder = semantic?.embedder ?? new HashEmbedder();
+    // (B[6] privacy) agents whose context is `restricted` (local_private) never have their workspace embedded by a provider
+    // outside this host / private network: their retrieval embeds with the local hashing embedder
+    const restrictedEmbedder = semantic && !semantic.local ? new HashEmbedder() : undefined;
 
     // ---- tools
     const profile = sandboxProfile(config);
@@ -786,11 +908,29 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
     const workspaces = createWorkspaceManager({ ...base, baseDir: workspacesDir, defaultSandbox: profile });
     // file read-set entries (`workspace/<id>/<path>`, sha256) of the workspaces this process opened
     resolvers.register(workspaceFileResolver((workspaceId) => workspaces.get(workspaceId)?.root));
+    // E[4]: the LLM never receives a long-lived static credential — where the local sandbox cannot hide the signing keys,
+    // the capability secret and the store from the commands agents run, the composition is refused (fail closed) unless
+    // the operator opted in, loudly (sandbox.insecureAllowUnhiddenSecrets)
+    if (profile.kind === 'local') await assertSecretsHidden(config, profile, overrides.sandboxIsolation, logger);
     const sandbox =
       profile.kind === 'oci'
         ? createOciSandbox({ image: profile.image! })
-        : createLocalSandbox({ hiddenPaths: sandboxHiddenPaths(config, dataDir, stateDir, logger), workspacesDir, egress: () => sandboxEgressOrigins(environments, config.tools?.httpAllowlist) });
+        : createLocalSandbox({
+          ...(overrides.sandboxIsolation ? { networkIsolation: overrides.sandboxIsolation } : {}),
+          ...(config.sandbox?.insecureAllowUnhiddenSecrets === true ? { allowUnhiddenPaths: true } : {}),
+          hiddenPaths: sandboxHiddenPaths(config, dataDir, stateDir, logger),
+          workspacesDir,
+          // E[2]: HTTP-aware relays: safe methods pass, writes become ledgered operations (or are refused), raw traffic only
+          // where the environment's operator allowed it
+          egress: () => sandboxEgressPolicies(environments, config.tools?.httpAllowlist),
+          egressWrites: config.sandbox?.egressWrites ?? 'ledger',
+        });
     const toolOptions: BuiltinToolOptions = { sandbox, workspaces, stateDir };
+    // (B[6]) code.symbols / code.references answer from the syntax-tree symbol graph (definitions, classified writes / calls)
+    // the Go `go/ast` helper lives under the state directory, which every sandboxed command finds hidden (it runs outside
+    // the sandbox: an agent-writable helper path would be a sandbox escape)
+    const parserHelperDir = join(stateDir, 'parsers');
+    toolOptions.retrieval = createCodeToolRetrieval({ logger, goHelperDir: parserHelperDir });
     if (config.tools?.shellAllowlist) toolOptions.shellAllowlist = [...config.tools.shellAllowlist];
     if (config.tools?.httpAllowlist) toolOptions.httpAllowlist = [...config.tools.httpAllowlist];
     if (config.tools?.enableBrowser) {
@@ -814,6 +954,14 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
       runtimeManifestId: 'rm_pending',
       workerId,
       capabilitySecret,
+      // E[4] / coverage[8]: brokered credentials (short-lived, scoped, minted per call); outputs redacted with it
+      secrets: createSecretBroker({
+        credentials: (config.environments ?? []).flatMap((e) => (e.credentials ?? []).map((c) => ({ ...c, environmentId: e.environmentId }) as BrokeredCredentialConfig)),
+        env,
+        clock,
+        logger,
+        ...(overrides.credentialFetch ? { fetch: overrides.credentialFetch } : {}),
+      }),
     };
     // every tool result feeds the observation log before it returns (tool results → read-set entries)
     const toolRuntime = observeToolRuntime(createToolRuntime(toolDeps), {
@@ -827,7 +975,9 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
     });
 
     // ---- agent runtime
-    const sessions = createSessionStore({ ...base, db, events });
+    // (B[8]) every transcript entry a session commits is also appended to L0 (ht_events) in the same transaction: L0 is the
+    // root of context reconstruction (rebuildWorkingContext)
+    const sessions = recordTranscriptOnL0(createSessionStore({ ...base, db, events }), { db, events, logger });
     const agents = createAgentRepository({ ...base, db, events });
     const epochs = createEpochManager({ ...base, db, events, sessions });
     const engineList: AgentEngine[] = [new NativeEngine({ ...base, sessions, events }), ...plugins.engines({ ...base, sessions, events })];
@@ -859,6 +1009,8 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
       defaultEngineKind,
     };
     if (config.budget) controlConfig.defaultBudget = { ...config.budget };
+    // E[3] the exhaustion policy (every run carries it in its budget; this is the control plane's fallback)
+    if (config.budget?.onExhausted) controlConfig.onBudgetExhausted = config.budget.onExhausted;
     if (config.gate) controlConfig.defaultGate = { ...config.gate };
     const deps: ControlDeps = {
       ...base,
@@ -868,7 +1020,9 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
       policy, decisionLog, approvals, oracles, gate: new QualityGate(), protocol,
       // the condenser of a restricted agent's context routes with that agent's classification (local_private stays local)
       router: condenserPrivacyFloor(router, agentClassification({ controlStore: new ControlStore(db), agents, roles })), catalog,
-      snapshots, snapshotBuilder, freshness, resolvers, workingContext: createWorkingContextManager(), retrieverFactory: cachedRetrievers(logger, { embedder: vectorEmbedder, sharedIndex: pgVectorProbe(db, vectorEmbedder, logger) }), memory, provenance,
+      snapshots, snapshotBuilder, freshness, resolvers, workingContext: createWorkingContextManager(), retrieverFactory: cachedRetrievers(logger, { embedder: vectorEmbedder, sharedIndex: pgVectorProbe(db, vectorEmbedder, logger), ...(restrictedEmbedder ? { restrictedEmbedder } : {}) }, parserHelperDir), memory, provenance,
+      // (B[0]/B[1]/B[2]/B[7]) prompt deliveries are pinned in the observation log; record tools' freshness passes; published skills
+      observations, freshnessPasses, skills: withTrialSkills(skillRegistry, (config.skills?.trial ?? []) as SkillRevision[]),
       toolRuntime, registry, workspaces, environments,
       sessions, agents, epochs, engines, subagents, runner, roles,
       config: controlConfig,
@@ -884,7 +1038,8 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
         const owner = plugins.capabilities.owner(`tool:${t.id}`) ?? 'a plugin';
         throw new HypertestError('conflict', `plugin ${owner}: tool ${t.id} is already a built-in or domain tool; a plugin may not replace a governed tool`, { details: { toolId: t.id, pluginId: owner } });
       }
-      registry.register(t);
+      // (B[1]) a plugin tool with a record effect is freshness-checked like the domain tools (the runtime checks the others)
+      registry.register(freshnessChecked(deps, t));
     }
     const engineAdapters = [{ provider: 'engine:native', package: '@hypertest/runtime', version: RUNTIME_PACKAGE_VERSION }];
     if (engines.has('pi')) {
@@ -974,7 +1129,7 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
     const services: HypertestServices = {
       db, bus, relay, events, runs, blackboard, specs, decisions, operations: ledger, artifacts, evidence, signer, publicKeys: keys.publicKeys,
       policy, decisionLog, approvals, oracles, protocol, providers, catalog, router, memory, provenance, tools: registry, environments, roles, workerId, logger, clock, ids,
-      adapters, toolRuntime, workspaces, plugins,
+      adapters, toolRuntime, workspaces, plugins, skills: skillRegistry,
     };
     const releases = createReleaseService({
       db, registry: releaseRegistry, manifest, runs, events, blackboard, leases, ledger, reconciler, agents, control: plane, durable,
@@ -1101,7 +1256,24 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
         const approval = await approvals.get(approvalId);
         if (!approval) throw new HypertestError('not_found', `approval ${approvalId} not found`);
         await approvals.decide(approvalId, approve, actor, rationale, ctx(approval.runId, `${actor.kind}:${actor.id}`, approvalId));
-        await wake(approval.runId);
+        // E[3] NEEDS_APPROVAL: a decided budget extension is applied now (approved ⇒ raised + resumed; rejected ⇒ resumed
+        // to converge to the gate) — the run's loop applies it too (idempotent), this covers a run no loop drives now
+        if (approval.kind === 'budget') {
+          try {
+            await control.resolveBudgetApproval?.(approval.runId);
+          } catch (e) {
+            logger.warn('could not apply the budget-extension decision now; the run applies it at its next tick', { runId: approval.runId, approvalId, error: (e as Error).message });
+          }
+        }
+        // E[8] ApprovalSignal (it also wakes the run loop): the waiting work observes the decision now. A signal that could
+        // not be delivered only delays it (the waits poll); a plain wake is tried instead.
+        try {
+          const run = await runs.get(approval.runId);
+          if (run && !isTerminalRun(run.status)) await durable.signal(approval.runId, { type: 'approval', approvalId });
+        } catch (e) {
+          logger.warn('could not signal the approval decision; the waiting work observes it on its next poll', { runId: approval.runId, approvalId, error: (e as Error).message });
+          await wake(approval.runId);
+        }
       },
       async decideOracleProposal(proposalId, approve, actor, rationale) {
         const proposal = await specs.getOracleProposal(proposalId);
@@ -1112,6 +1284,21 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
       listRuns: (filter = {}) => runs.list(filter),
       events: (runId, options = {}) => events.read(runId, options),
       listApprovals: (filter = {}) => approvals.list(filter),
+      async listOperations(filter = {}) {
+        const status = filter.status && filter.status.length > 0 ? filter.status : (['manual_review'] as OperationStatus[]);
+        if (filter.runId !== undefined) return ledger.list({ runId: filter.runId, status });
+        if (!ledger.listByStatus) throw new HypertestError('unsupported', 'this operation ledger cannot list across runs');
+        return ledger.listByStatus(status, filter.limit);
+      },
+      async resolveOperation(operationId, outcome, actor, note) {
+        if (closing) throw new HypertestError('unavailable', 'this Hypertest instance is closed');
+        if (actor?.kind !== 'human') throw new HypertestError('permission_denied', 'only a human resolves a manual review');
+        if (!control.resolveOperation) throw new HypertestError('unsupported', 'this control plane cannot resolve operations');
+        const resolved = await control.resolveOperation(operationId, outcome, actor.id, note);
+        // the work waiting on the operation observes the resolution now (a lost wake only delays it: the waits poll)
+        await wake(resolved.runId);
+        return resolved;
+      },
       async cancel(runId, reason) {
         const run = await runs.get(runId);
         if (!run) throw new HypertestError('not_found', `run ${runId} not found`);
@@ -1130,12 +1317,20 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
         return out;
       },
       agents: (runId) => inspectAgents({ agents, engines, epochs }, runId),
-      async resume(runId) {
+      async resume(runId, options) {
         if (closing) throw new HypertestError('unavailable', 'this Hypertest instance is closed');
         const run = await runs.get(runId);
         if (!run) throw new HypertestError('not_found', `run ${runId} not found`);
         if (isTerminalRun(run.status)) throw new HypertestError('conflict', `run ${runId} is already ${run.status}`, { details: { runId, status: run.status } });
         if (run.runtimeManifestId !== manifest.manifestId) throw pinViolation(run, manifest.manifestId);
+        if (options?.raise !== undefined) {
+          // E[3] PAUSED_BUDGET: an operator raises the budget, then resumes (audited: budget.raised by human:<by>)
+          const by = options.by?.trim();
+          if (!by) throw new HypertestError('invalid_argument', 'a budget raise needs the name of the human who raises it (by)');
+          if (!options.rationale?.trim()) throw new HypertestError('invalid_argument', 'a budget raise needs a rationale');
+          if (!control.raiseBudget) throw new HypertestError('unsupported', 'this control plane cannot raise run budgets');
+          await control.raiseBudget(runId, options.raise, by, options.rationale);
+        }
         // a paused run is resumed FIRST, through the release-governed control plane: a quarantined or migrating run is
         // refused before anything changes (its model pauses stay as they are). That resume releases the run's model
         // pauses itself, so the pauses still waiting are listed before it to report what was released.

@@ -14,6 +14,8 @@ import { createConvergenceMonitor, type ConvergenceMonitor } from './convergence
 import { createDomainTools } from './domain-tools/index.ts';
 import type { ModelSwitchRequest } from '@hypertest/runtime';
 import { releaseStrandedReservations } from './isolation.ts';
+import { resolveManualReview } from '@hypertest/operation';
+import { BUDGET_EXHAUSTION_POLICIES, applyExhaustionPolicy, budgetExtensionApprovals, budgetRaiseProblems, exhaustionPolicy, raiseRunBudget, resolveBudgetApproval, type BudgetRaise } from './budget-exhaustion.ts';
 import { createReactorService, REACTOR_CONSUMER, REACTOR_SUBJECTS, type ReactorService } from './reactors.ts';
 import { createReportBuilder } from './report.ts';
 import { createScheduler, workLeaseKey, type Scheduler } from './scheduler.ts';
@@ -193,6 +195,8 @@ export function createControlPlane(deps: ControlDeps): ControlPlaneInternals {
     idle.delete(run.runId);
     // conformance-5/6: nor claims or reservations (idempotent; covers a crash between the gate and the release)
     await scheduler.releaseRun?.(run.runId);
+    // item 11: nor model pauses
+    await closeModelPauses(run.runId, `run_${run.status}`);
     if (issued.size > 0) for (const w of await blackboard.listWorkItems({ runId: run.runId })) forgetClaims(w.workItemId);
     const decision = run.decisionId ? await decisions.get(run.decisionId) : undefined;
     const partial: Partial<TickResult> & { convergence: ConvergenceState; idleMs: number } = { convergence: { state: 'drained', reason: 'ready_for_gate' }, final: true, idleMs: 0 };
@@ -256,6 +260,24 @@ export function createControlPlane(deps: ControlDeps): ControlPlaneInternals {
     return released;
   }
 
+  /**
+   * (item 11) An ended run (cancelled, or decided) keeps no model pause: its agents will never route again, so their
+   * pauses are closed (rows removed; L0 `model.pauses_released` with `closed: true`). `hypertest status` of the run then
+   * shows no model-paused agent. Idempotent (nothing left ⇒ nothing recorded).
+   */
+  async function closeModelPauses(runId: string, by: string): Promise<string[]> {
+    const { listModelPauses, clearModelPause } = deps.epochs;
+    if (!listModelPauses || !clearModelPause) return [];
+    const pauses = await listModelPauses.call(deps.epochs, runId);
+    if (pauses.length === 0) return [];
+    for (const p of pauses) await clearModelPause.call(deps.epochs, p.sessionId);
+    const sessions = pauses.map((p) => p.sessionId).sort();
+    const routes = [...new Set(pauses.flatMap((p) => p.routes))].sort();
+    await events.append([event(runCtx(runId, config.workerId), EVENT_TYPES.modelPausesReleased, 'run', runId, { sessions, by, routes, probedCircuits: [], closed: true })]);
+    logger.info('model pauses closed: the run ended', { runId, sessions: sessions.length, by });
+    return sessions;
+  }
+
   async function doTick(runId: string, options: TickOptions = {}): Promise<TickResult> {
     await ensureSubscribed();
     let run = await mustRun(runId);
@@ -266,6 +288,12 @@ export function createControlPlane(deps: ControlDeps): ControlPlaneInternals {
       return result(run, { convergence: { state: 'active', runnable: 0, running: 0, waiting: 0, pendingEvents: 0 }, idleMs: nextIdle(runId, false) });
     }
     if (run.status === 'created') run = await runs.update(runId, { status: 'running' }, runCtx(runId, config.workerId));
+    if (run.status === 'paused' && run.pauseReason === 'approval') {
+      // E[3] NEEDS_APPROVAL: a decided budget-extension request is applied (approved ⇒ raised + resumed; rejected or
+      // expired ⇒ resumed to converge to the gate) — idempotent, also applied by the approve() path itself
+      const resolved = await resolveBudgetApproval(deps, runId, runCtx(runId, config.workerId));
+      if (resolved === 'raised' || resolved === 'gate') run = await mustRun(runId);
+    }
     if (run.status === 'paused') {
       return result(run, { convergence: { state: 'active', runnable: 0, running: 0, waiting: 0, pendingEvents: 0 }, idleMs: nextIdle(runId, false) });
     }
@@ -276,8 +304,21 @@ export function createControlPlane(deps: ControlDeps): ControlPlaneInternals {
     }
 
     let progressed = false;
-    // b exhaustion (wall clock / run budget): stop admitting; pending work is cancelled; active work finishes
-    const exhausted = await convergence.exhaustion(run);
+    // b exhaustion (wall clock / run budget): the run's policy decides (E[3]) — `gate`: stop admitting, pending work is
+    //   cancelled, active work finishes, the gate decides; `pause` / `approval`: the run pauses (for a raise / for a
+    //   budget-extension approval) and nothing is cancelled
+    let exhausted = await convergence.exhaustion(run);
+    if (exhaustionPolicy(run, config) !== 'gate') {
+      const detail = await convergence.exhaustionDetail?.(run, { caps: true });
+      if (detail) {
+        const applied = await applyExhaustionPolicy(deps, run, detail, runCtx(runId, config.workerId));
+        if (applied.outcome === 'paused') {
+          run = await mustRun(runId);
+          return result(run, { convergence: { state: 'active', runnable: 0, running: 0, waiting: 0, pendingEvents: 0 }, idleMs: nextIdle(runId, true) });
+        }
+        if (applied.outcome === 'gate') exhausted = detail.kind;
+      }
+    }
     // c reactors
     const caught = await reactors.catchUp(runId);
     if (caught.created.length > 0) progressed = true;
@@ -338,7 +379,10 @@ export function createControlPlane(deps: ControlDeps): ControlPlaneInternals {
       }
       const g = await convergence.gate(run);
       idle.delete(runId);
-      if (g.final) await scheduler.releaseRun?.(runId);
+      if (g.final) {
+        await scheduler.releaseRun?.(runId);
+        await closeModelPauses(runId, `run_${g.run.status}`);
+      }
       return result(g.run, { convergence: state, ...(g.decision ? { decision: g.decision } : {}), final: g.final, idleMs: g.abandoned ? nextIdle(runId, false) : 0, replanScheduled: replan.scheduled });
     }
     if (state.state === 'exhausted' && !exhausted) state = { state: 'active', runnable: 0, running: 0, waiting: 0, pendingEvents };
@@ -401,8 +445,9 @@ export function createControlPlane(deps: ControlDeps): ControlPlaneInternals {
     for (let pass = 0; pass < 10; pass++) {
       const open = (await blackboard.listWorkItems({ runId })).filter((w) => !isTerminalWorkState(w.state));
       if (open.length === 0) {
-        // conformance-5/6: a cancelled run holds no experiment claims or budget reservations
+        // conformance-5/6: a cancelled run holds no experiment claims or budget reservations; item 11: nor model pauses
         await scheduler.releaseRun?.(runId);
+        await closeModelPauses(runId, 'run_cancelled');
         return;
       }
       for (const w of open) {
@@ -446,6 +491,10 @@ export function createControlPlane(deps: ControlDeps): ControlPlaneInternals {
       for (const k of ['maxModelCostUsd', 'maxComputeMinutes', 'maxExternalQps', 'maxArtifactBytes'] as const) {
         const v = budgetEnvelope[k];
         if (v !== undefined && !(typeof v === 'number' && Number.isFinite(v) && v >= 0)) throw new HypertestError('invalid_argument', `startRun: budget.${k} must be a finite number ≥ 0 (got ${String(v)})`, { details: { field: k } });
+      }
+      // E[3] the run's exhaustion policy (configuration budget.onExhausted ⊕ the run's own override)
+      if (budgetEnvelope.onExhausted !== undefined && !BUDGET_EXHAUSTION_POLICIES.includes(budgetEnvelope.onExhausted)) {
+        throw new HypertestError('invalid_argument', `startRun: budget.onExhausted must be one of ${BUDGET_EXHAUSTION_POLICIES.join(', ')} (got ${JSON.stringify(budgetEnvelope.onExhausted)})`, { details: { field: 'onExhausted' } });
       }
       const baseGate = mergeDefined<GateSpec>(DEFAULT_GATE_SPEC, config.defaultGate);
       const gateSpec = mergeDefined<GateSpec>(baseGate, input.gate);
@@ -678,12 +727,45 @@ export function createControlPlane(deps: ControlDeps): ControlPlaneInternals {
     },
 
     async resumeRun(runId) {
-      const run = await mustRun(runId);
+      let run = await mustRun(runId);
+      if (run.status === 'paused' && run.pauseReason === 'approval') {
+        // E[3]: a run waiting for a budget-extension decision resumes through that decision, never around it
+        const resolved = await resolveBudgetApproval(deps, runId, runCtx(runId, config.workerId));
+        if (resolved === 'pending') {
+          const open = (await budgetExtensionApprovals(deps, runId)).filter((a) => a.status === 'pending').map((a) => a.approvalId);
+          throw new HypertestError('precondition_failed', `run ${runId} waits for the budget-extension approval ${open.join(', ') || '(pending)'}: decide it first (hypertest approve|reject)`, { details: { runId, approvals: open } });
+        }
+        run = await mustRun(runId);
+      }
       // an operator resume also lets agents paused for model unavailability try their routes again (A[0])
       await releaseModelPauses(runId, 'operator:resume');
       if (run.status !== 'paused') return;
       await runs.update(runId, { status: 'running' }, runCtx(runId, config.workerId));
       idle.delete(runId);
+    },
+
+    async raiseBudget(runId, raise, by, rationale) {
+      const problems = budgetRaiseProblems(raise);
+      if (problems.length > 0) throw new HypertestError('invalid_argument', `invalid budget raise: ${problems.join('; ')}`, { details: { problems } });
+      const actor = { kind: 'human' as const, id: by };
+      const ctx = { ...runCtx(runId, config.workerId), actorId: `human:${by}` };
+      const raised = await raiseRunBudget(deps, runId, raise as BudgetRaise, actor, rationale, ctx);
+      idle.delete(runId);
+      return raised;
+    },
+
+    resolveBudgetApproval(runId) {
+      return resolveBudgetApproval(deps, runId, runCtx(runId, config.workerId));
+    },
+
+    async resolveOperation(operationId, outcome, by, note) {
+      const op = await deps.ledger.get(operationId);
+      if (!op) throw new HypertestError('not_found', `operation ${operationId} not found`);
+      const ctx = { ...runCtx(op.runId, config.workerId), actorId: `human:${by}`, correlationId: operationId, ...(op.workItemId ? { workItemId: op.workItemId } : {}) };
+      const resolved = await resolveManualReview({ db, ledger: deps.ledger, events, leases: deps.leases }, operationId, { outcome, by: { kind: 'human', id: by }, note }, ctx);
+      idle.delete(op.runId);
+      logger.info('operation resolved by manual review', { runId: op.runId, operationId, outcome, by });
+      return resolved;
     },
 
     releaseModelPauses(runId, by) {

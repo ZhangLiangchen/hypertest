@@ -8,11 +8,13 @@ import { evidenceTools } from './evidence.ts';
 import { planTools } from './plan.ts';
 import { specTools } from './specs.ts';
 import { workTools } from './work.ts';
+import { ensureFreshnessResolvers, freshnessChecked } from './freshness.ts';
 
 export { findingFingerprint, CONFIRMING_ROLES, EVIDENCE_REQUIRED_CATEGORIES, RESOLVING_FINDING_STATUSES } from './blackboard.ts';
 export { acceptedPlanCount } from './plan.ts';
 export { delegationOperationId, parseDelegationOperationId } from './work.ts';
 export { artifactContent } from './specs.ts';
+export { FRESHNESS_CHECKED, freshnessChecked, isFreshnessChecked, ensureFreshnessResolvers } from './freshness.ts';
 
 /** Ids of the tools that end a work item; the dispatcher reads their structured `terminal` signal. */
 export const TERMINAL_TOOL_IDS: readonly string[] = ['complete_work', 'fail_work'];
@@ -26,7 +28,9 @@ export const TERMINAL_TOOL_IDS: readonly string[] = ['complete_work', 'fail_work
  * tool results the model can react to — never thrown faults.
  */
 export function createDomainTools(deps: ControlDeps): ToolSpec[] {
-  return [...blackboardTools(deps), ...planTools(deps), ...specTools(deps), ...evidenceTools(deps), ...workTools(deps)].map((spec) => claimFenced(deps, spec));
+  // (B[1]) every record-effect domain tool passes the FreshnessGuard inside its (claim-fenced) write transaction
+  ensureFreshnessResolvers(deps);
+  return [...blackboardTools(deps), ...planTools(deps), ...specTools(deps), ...evidenceTools(deps), ...workTools(deps)].map((spec) => claimFenced(deps, freshnessChecked(deps, spec)));
 }
 
 /**

@@ -39,6 +39,7 @@ const TOOL_MAX_EFFECT: Record<KnownToolId, ToolEffect> = {
   'browser.navigate': 'external', 'browser.click': 'external', 'browser.fill': 'external', 'browser.screenshot': 'external', 'browser.text': 'external',
   'blackboard.read': 'read', 'blackboard.post_finding': 'record', 'blackboard.post_hypothesis': 'record', 'blackboard.report_coverage_gap': 'record',
   'blackboard.post_risk': 'record', 'blackboard.post_review': 'record', 'blackboard.post_note': 'record',
+  'blackboard.post_strategy': 'record', 'blackboard.post_decision': 'record',
   'plan.propose_revision': 'record', 'plan.read': 'read', 'work.propose': 'record', 'system_model.record': 'record',
   'oracle.get': 'read', 'oracle.list': 'read', 'oracle.propose_change': 'record', 'experiment.define': 'record', 'experiment.stop': 'record',
   'test_artifact.register': 'record', 'test_artifact.validate': 'execute',

@@ -81,6 +81,9 @@ export class PowerContextClient implements DurableMemory {
     if (ctx) {
       headers['x-hypertest-run-id'] = ctx.runId;
       headers['x-correlation-id'] = ctx.correlationId;
+      // (B[4]) the calling actor (URI-encoded: a header is Latin-1): the service re-checks reviewer ≠ creator against it too
+      headers['x-hypertest-actor-id'] = encodeURIComponent(ctx.actorId);
+      if (ctx.agentId) headers['x-hypertest-agent-id'] = encodeURIComponent(ctx.agentId);
     }
     const ctrl = new AbortController();
     // The deadline covers the whole exchange (headers AND body): a server that answers headers and then stalls

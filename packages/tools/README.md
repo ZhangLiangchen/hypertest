@@ -625,3 +625,45 @@ node --test packages/tools/test/blackbox-docker.int.test.ts                 # re
 docker/kubectl are exercised with fake CLIs (shell scripts in a temp dir, passed as the adapters' binary
 path). Browser tests use `/opt/pw-browsers/chromium` (or `HYPERTEST_CHROMIUM_PATH`) and skip with a reason
 when Chromium cannot launch. The MCP test server is `test/blackbox-mcp-server.mjs`.
+
+## Side-effect governance (audit wave 2, additive)
+
+- **E[2] protocol-aware egress relay** (`whitebox/egress-relay.ts`): the local sandbox relays SUT endpoints into the
+  namespace through HTTP-aware relays. Safe methods (GET/HEAD/OPTIONS) pass; any other request of a sandboxed command is
+  a ledgered `sandbox.http` operation of the tool call it runs for (operation id, `Idempotency-Key`, `api-response`
+  evidence named in the tool's model text; a replay of the call answers from the record and never re-sends) — or, with
+  `LocalSandboxOptions.egressWrites: 'refuse'`, a 403 with the exact reason. Outside a governed call writes are refused.
+  Non-HTTP traffic is refused unless the endpoint policy allows `raw` (`EnvironmentDescriptor.rawEgress`).
+  `ToolExecutionRequest.commitGuard?/egressGuard?` let the control plane fence and claim those operations.
+- **E[0]/E[1]** `ProcessEnvAdapter` is a fenced target (`X-Hypertest-Fence`; the supervisor refuses an older token, 412
+  ⇒ not applied) and reports `effectUntil` for an active fault window.
+- **E[9]/stubs[7]** `http.request` sends `Idempotency-Key: <operationId>` (`ToolContext.operationId`).
+- **E[8]** `approval_required` with a recorded approval: the result names it ("issue exactly the same call again once
+  it is approved"); `ToolExecutionRequest.approvalId?` reaches the policy.
+- **E[4]/coverage[8] secret broker** (`blackbox/secrets.ts`): `createSecretBroker({ credentials, env, clock?, fetch? })`
+  mints a short-lived credential per call — `jwt_hs256` (JWT signed with the `secretEnv` secret, `ttlMs`, bound to run
+  and invocation) or `oauth2_client_credentials` (cached access token) — and `redact`s secrets and minted values.
+  `http.request` input `credential` (needs `environmentId`); `ToolSpec.credentialScopes?` reach the capability check and
+  the permit's `credentialScope` constraint (`permit_constraint_violated`); `ToolRuntimeDeps.secrets?` /
+  `ToolContext.secrets?`; tool outputs are redacted with it. `mintControlToken`: env.process sends a per-operation
+  control token (JWT, audience `hypertest-supervisor`, `op` claim); the supervisor accepts it only for that operation
+  while it is valid (and the raw token from operators). `LocalSandboxOptions.allowUnhiddenPaths?`: without it a command
+  that could read `hiddenPaths` (no jail strategy, or `network: open`) is refused (fail closed).
+  `EnvironmentDescriptor.brokeredCredentials?` lists credential names (never values).
+- (review) A relayed write is AUTHORIZED like a tool call of its own before any claim or ledger record
+  (`EgressCallContext.authorize`, set by the ToolRuntime): the capability bounds the CALL — its tool grant, its own effect,
+  the risk ceiling and the environment's class (an agent confined to local/sandbox never writes to staging through its
+  commands; the capability's effects/scopes need not name `external`/`env/**`: exercising the SUT is what the commands of
+  test.run/shell.exec do — `ActionRequest.relayedWrite`); the policy judges the external effect on that environment class
+  (decision logged; `approval_required` refuses it with a 403 and files no approval request — `noApprovalRequest` — a write
+  that needs one goes through `http.request`); the permit's allowedHosts apply. Freshness: the call was validated before
+  the command started; its writes are not re-decided one by one (a concurrent change never cuts a test run in half). A
+  durable replay of a write already dispatched only settles its operation (recorded response, never re-sent). A call one
+  of whose writes was refused or left unsettled ends as a tool FAULT (`failed`, code `egress_refused`, each refusal
+  listed) — never as an outcome of the system under test (no fake FAIL from governance). A method-override header (`X-HTTP-Method-Override`, `X-HTTP-Method`, `X-Method-Override`) on a safe method
+  makes the request a write; the environment-control namespace (`/__hypertest…`) is refused for every method.
+- (review) `ToolContext.secrets` is scoped to the call: a tool mints only the credentials its call declared
+  (`ToolSpec.credentialScopes`, checked against the capability and the permit) for its own run and invocation —
+  anything else is `permission_denied`.
+- Tests: `test/side-effect-governance.test.ts`, `test/secret-broker.test.ts`, `test/blackbox-supervisor.test.ts` (E[0], E[1],
+  env.deploy after approval), `test/blackbox-http.test.ts`, `test/sandbox.test.ts`.

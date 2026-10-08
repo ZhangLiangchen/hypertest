@@ -29,7 +29,17 @@ export interface BudgetEnvelope {
   maxWorkItems: number;
   maxAgentDepth: number;
   maxPlanRevisions: number;
+  /**
+   * (additive, E[3]) What the run does when its budget is exhausted (never a silent downgrade): `gate` (CONDITIONAL_STOP,
+   * the default) converges to the QualityGate; `pause` (PAUSED_BUDGET) pauses the run until an operator raises the budget
+   * and resumes it; `approval` (NEEDS_APPROVAL) pauses it on a budget-extension approval request — approved ⇒ the budget is
+   * extended by the approved amount and the run resumes, rejected/expired ⇒ the run converges to the gate.
+   */
+  onExhausted?: BudgetExhaustionPolicy;
 }
+
+/** (additive, E[3]) The budget exhaustion policy of a run (BudgetEnvelope.onExhausted). */
+export type BudgetExhaustionPolicy = 'gate' | 'pause' | 'approval';
 
 export const DEFAULT_BUDGET: BudgetEnvelope = {
   maxWallClockMs: 4 * 60 * 60 * 1000,

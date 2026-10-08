@@ -6,6 +6,7 @@ import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { HypertestError, noopLogger, sleep, type Logger } from '@hypertest/core';
 import { CONTROL_PATH_PREFIX, CONTROL_TOKEN_HEADER, errorMessage } from './common.ts';
+import { CONTROL_TOKEN_AUDIENCE, verifyJwtHs256 } from './secrets.ts';
 
 /**
  * A tiny reusable process supervisor for local black-box environments (tests and PoC fixtures).
@@ -39,6 +40,12 @@ export const SUPERVISOR_CONTROL_PREFIX = CONTROL_PATH_PREFIX;
  */
 export const PROCESS_SUPERVISOR_CLI_PATH: string = fileURLToPath(new URL('./process-supervisor-cli.ts', import.meta.url));
 export const OPERATION_HEADER = 'x-hypertest-operation';
+/**
+ * (E[0]) `X-Hypertest-Fence: <fencing token>` of the gateway's lease on this environment: the supervisor (a fenced target)
+ * accepts a mutating request only when its token is ≥ the highest token it accepted before (412 otherwise) — a stale worker
+ * that wakes up after another one was granted the environment is refused by the target itself.
+ */
+export const FENCE_HEADER = 'x-hypertest-fence';
 export { CONTROL_TOKEN_HEADER };
 const CONTROL_TOKEN_RE = /^[A-Za-z0-9_-]{16,256}$/;
 
@@ -220,6 +227,8 @@ class Supervisor implements ProcessSupervisor {
   #childPort: number | undefined;
   #childRunning = false;
   #generation = 0;
+  /** (E[0]) Highest fencing token a mutating control request carried (stale tokens are refused with 412). */
+  #highestFence = 0;
   #counter = 0;
   #queue: Promise<unknown> = Promise.resolve();
   #closed = false;
@@ -316,11 +325,24 @@ class Supervisor implements ProcessSupervisor {
     }
   }
 
+  /**
+   * A mutating control request is authorized by (E[4]) a short-lived control token minted for ITS operation (a JWT HS256
+   * signed with the control token: audience hypertest-supervisor, unexpired, `op` = the request's operation id) — what the
+   * env.process adapter sends, so the long-lived token never travels — or by the control token itself (an operator).
+   */
   #authorized(req: http.IncomingMessage): boolean {
     const raw = req.headers[CONTROL_TOKEN_HEADER];
-    const given = Buffer.from(Array.isArray(raw) ? (raw[0] ?? '') : (raw ?? ''), 'utf8');
+    const value = Array.isArray(raw) ? (raw[0] ?? '') : (raw ?? '');
+    const given = Buffer.from(value, 'utf8');
     const expected = Buffer.from(this.#token, 'utf8');
-    return given.byteLength === expected.byteLength && timingSafeEqual(given, expected);
+    if (given.byteLength === expected.byteLength && timingSafeEqual(given, expected)) return true;
+    if (value.split('.').length !== 3) return false;
+    const verified = verifyJwtHs256(value, this.#token, Date.now(), { audience: CONTROL_TOKEN_AUDIENCE });
+    if (!verified.ok) return false;
+    const op = req.headers[OPERATION_HEADER];
+    const operationId = Array.isArray(op) ? op[0] : op;
+    // bound to one operation: a minted token never authorizes a request for another operation (or none)
+    return typeof operationId === 'string' && verified.claims['op'] === operationId;
   }
 
   #enqueue<T>(fn: () => Promise<T>): Promise<T> {
@@ -557,6 +579,20 @@ class Supervisor implements ProcessSupervisor {
     if (method !== 'GET' && method !== 'HEAD' && !this.#authorized(req)) {
       req.resume();
       return sendJson(res, 401, { error: `missing or invalid ${CONTROL_TOKEN_HEADER}` });
+    }
+    if (method !== 'GET' && method !== 'HEAD') {
+      // E[0] fenced target: a request carrying an older fencing token than one already accepted is refused (nothing done)
+      const raw = req.headers[FENCE_HEADER];
+      const text = Array.isArray(raw) ? raw[0] : raw;
+      if (text !== undefined && text !== '') {
+        const token = Number(text);
+        if (!Number.isSafeInteger(token) || token <= 0) throw new BadRequest(`invalid ${FENCE_HEADER} header`);
+        if (token < this.#highestFence) {
+          req.resume();
+          return sendJson(res, 412, { error: `stale fencing token ${token}: token ${this.#highestFence} was already accepted for this environment` });
+        }
+        this.#highestFence = token;
+      }
     }
     if (method === 'GET' && path === '/status') {
       return sendJson(res, 200, { generation: this.#generation, childPid: this.childPid ?? null, childPort: this.#childPort ?? null, childRunning: this.#childRunning, faults: this.#activeFaults() });

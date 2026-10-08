@@ -172,6 +172,23 @@ filterable with `list({ experimentId })`); a deduplicated prepare keeps the firs
   unless the patch supplies them; `prepare` also treats a different `adapterId` as a `conflict`; the
   gateway emits `operation.late_receipt` audit events for receipts the ledger cannot store.
 
+## Side-effect governance (audit wave 2, additive)
+
+- **E[0] commit-point fencing.** `RunSideEffectRequest.commitGuard?(tx)`: runs INSIDE the transaction that records
+  `dispatching`; a reason (or a throw) refuses the dispatch — the operation is `not_applied` with
+  `claim_fenced: <reason>; nothing was dispatched` and the outcome is `stale_fence`. The control plane passes the
+  caller's work claim (lease owner + fencing token), so a worker whose claim was revoked after its pre-dispatch check
+  never reaches the target (`test/commit-guard.test.ts`).
+- **E[1] effect windows.** `VerificationResult.effectUntil?` (a time-boxed fault, a running load job): the gateway keeps
+  the operation's resource lease until then (`effectHoldUntil`), so an overlapping effect of another owner is
+  `resource_busy`; compensation releases it. `RunSideEffectRequest.holdLeaseForEffect?` (default true).
+  `ResourceAdmission.retime?(holderId, ttlMs)` re-times a holder's live claims (the control plane's call-scoped claims).
+- **stubs[8] manual review resolution.** `resolveManualReview(deps, operationId, { outcome: succeeded|failed|compensated,
+  by: human, note }, ctx)` ⇒ verified / failed / compensated, audited (`operation.resolved` + the transition event),
+  the effect's lease released; non-human actors are `permission_denied`; repeat = no-op, another outcome = refused.
+  The domain state machine gained `manual_review → compensated`. `OperationLedger.listByStatus?(status[], limit?)`
+  lists across runs (the manual review queue).
+
 ## Testing
 
 ```bash

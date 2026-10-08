@@ -128,6 +128,9 @@ function recordEventPayload(rec: BlackboardRecord<unknown>, previousStatus: stri
     case 'decision':
       Object.assign(base, { title: str(p['topic']) });
       break;
+    case 'test_strategy':
+      Object.assign(base, { title: str(p['description'])?.slice(0, 200), approach: str(p['approach']) });
+      break;
     default:
       break;
   }

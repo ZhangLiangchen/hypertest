@@ -18,7 +18,8 @@ import { RUNTIME_PACKAGE_VERSION, toolCatalogRevision, verifyRuntimeManifest } f
 import { PI_AGENT_CORE_VERSION, RUNTIME_PI_PACKAGE_VERSION } from '@hypertest/runtime-pi';
 import { tempDir } from '@hypertest/testkit';
 import type { RunOutcome } from '@hypertest/durable';
-import { createHypertest, hypertestGitSha, startApiServer, type HypertestConfig, type HypertestInstance } from '../src/index.ts';
+import { ApprovalGatedPolicyEngine, createRootCapability } from '@hypertest/policy';
+import { CAPABILITY_SECRET_FILE, createHypertest, hypertestGitSha, keysDir, startApiServer, type HypertestConfig, type HypertestInstance } from '../src/index.ts';
 import { FULL_ROUTE, roleRouter, scriptedConfig, sumRepo, testStore, tinyRunBrains, type BrainView } from './helpers.ts';
 
 const ROOT = join(import.meta.dirname, '..', '..', '..');
@@ -209,7 +210,7 @@ describe('composition failures fail fast and leave nothing open', () => {
     await assert.rejects(createHypertest(bad, { scriptedBrains: {} }), (e: unknown) => {
       assert.ok(e instanceof HypertestError && e.code === 'invalid_argument');
       assert.deepEqual((e.details as { errors: string[] }).errors, [
-        "unknown configuration key 'bogus' (expected one of version, project, store, bus, durable, artifacts, models, roles, budget, gate, policy, bugate, engines, sandbox, environments, tools, signing, memory, observability, oracles, runtime, plugins)",
+        "unknown configuration key 'bogus' (expected one of version, project, store, bus, durable, artifacts, models, roles, budget, gate, policy, bugate, engines, sandbox, environments, tools, signing, memory, observability, oracles, runtime, plugins, retrieval, skills)",
         'engines.default: "openhands" is not a registered engine (native, pi, dsh)',
       ]);
       return true;
@@ -476,6 +477,73 @@ describe('facade operations: cancel, approvals, oracle decisions', () => {
     assert.deepEqual([decided.status, decided.decidedBy, decided.rationale], ['approved', { kind: 'human', id: 'alice' }, 'looks safe']);
     assert.deepEqual((await ht.listApprovals({ runId: run!.runId })).map((a) => a.approvalId), [requested.approvalId]);
     await assert.rejects(ht.approve('apr_missing', true, { kind: 'human', id: 'alice' }, 'x'), (e: unknown) => e instanceof HypertestError && e.code === 'not_found');
+  });
+
+  test('E[8] the composed policy is approval-gated: approval_required ⇒ an action approval bound to the call; approve() sends the ApprovalSignal; the gate consumes it once', async () => {
+    assert.ok(ht.services.policy instanceof ApprovalGatedPolicyEngine, 'compose wraps the policy in the approval gate');
+    const run = await ht.start({ goal: 'approval loop', target: {} }); // its lead blocks until the suite ends: a live run
+    const secret = readFileSync(join(keysDir(dir.path), CAPABILITY_SECRET_FILE), 'utf8').trim();
+    const capability = createRootCapability({ runId: run.runId, subjectAgentId: 'ag_env', workItemId: 'wi_env', profile: 'environment_operator', expiresAt: '2099-01-01T00:00:00.000Z' }, secret);
+    const request = (requestId: string) => ({
+      requestId, runId: run.runId, workItemId: 'wi_env', agentId: 'ag_env', role: 'environment', tool: 'env.deploy', effect: 'destructive' as const, riskClass: 'critical' as const,
+      resources: ['env/staging-1'], environmentClass: 'local', capability, input: { environmentId: 'staging-1', buildRef: 'registry.local/app@sha256:1' }, phase: 'before_action' as const,
+    });
+    const first = await ht.services.policy.evaluate(request('sess:1:c1'));
+    assert.equal(first.decision, 'approval_required');
+    const approval = (await ht.services.approvals.get(first.approvalId!))!;
+    assert.deepEqual([approval.kind, approval.status, (approval.subject as Record<string, unknown>)['tool']], ['action', 'pending', 'env.deploy']);
+    const signals: unknown[] = [];
+    const original = ht.durable.signal.bind(ht.durable);
+    ht.durable.signal = async (runId, signal) => {
+      signals.push([runId, signal]);
+      return original(runId, signal);
+    };
+    try {
+      await assert.rejects(ht.approve(first.approvalId!, true, { kind: 'human', id: 'ag_env' }, 'self'), (e: unknown) => e instanceof HypertestError && e.code === 'permission_denied');
+      await ht.approve(first.approvalId!, true, { kind: 'human', id: 'alice' }, 'deploy it');
+    } finally {
+      ht.durable.signal = original;
+    }
+    assert.deepEqual(signals, [[run.runId, { type: 'approval', approvalId: first.approvalId }]]);
+    const allowed = await ht.services.policy.evaluate(request('sess:2:c1'));
+    assert.deepEqual([allowed.decision, allowed.approvalId], ['allow', first.approvalId]);
+    const again = await ht.services.policy.evaluate(request('sess:3:c1'));
+    assert.equal(again.decision, 'approval_required', 'consumed exactly once');
+    assert.notEqual(again.approvalId, first.approvalId);
+  });
+
+  test('E[3] budget.onExhausted per run: pause ⇒ resume with an audited raise; approval ⇒ the run waits, approve() extends it and resumes', async () => {
+    const statusOf = async (runId: string) => (await ht.status(runId))!;
+    const until = async (runId: string, pred: (r: Awaited<ReturnType<typeof statusOf>>) => boolean) => {
+      for (let i = 0; i < 200; i++) {
+        const r = await statusOf(runId);
+        if (pred(r)) return r;
+        await new Promise((res) => setTimeout(res, 50));
+      }
+      throw new Error(`run ${runId} never reached the expected state (now ${(await statusOf(runId)).status})`);
+    };
+    // PAUSED_BUDGET: the lead's first model call does not fit 6000 tokens
+    const paused = await ht.start({ goal: 'tight budget', target: {}, budget: { maxModelTokens: 6000, onExhausted: 'pause' } });
+    assert.equal((await until(paused.runId, (r) => r.status === 'paused')).pauseReason, 'budget');
+    await assert.rejects(ht.resume(paused.runId, { raise: { maxModelTokens: 1000 } }), (e: unknown) => e instanceof HypertestError && e.code === 'invalid_argument' && /by/.test(e.message));
+    await assert.rejects(ht.resume(paused.runId, { raise: { maxModelTokens: -1 }, by: 'alice', rationale: 'r' }), (e: unknown) => e instanceof HypertestError && e.code === 'invalid_argument');
+    await ht.resume(paused.runId, { raise: { maxModelTokens: 200_000 }, by: 'alice', rationale: 'the plan needs room' });
+    const resumed = await statusOf(paused.runId);
+    assert.equal(resumed.budget.maxModelTokens, 206_000);
+    assert.notEqual(resumed.status, 'paused');
+    const raised = (await ht.events(paused.runId, { types: ['budget.raised'] })).map((e) => e.payload as Record<string, unknown>);
+    assert.deepEqual(raised.map((p) => [p['by'], p['rationale']]), [['human:alice', 'the plan needs room']]);
+
+    // NEEDS_APPROVAL: the run waits on a budget-extension request; a resume cannot bypass it; approve() applies it
+    const waiting = await ht.start({ goal: 'needs approval', target: {}, budget: { maxModelTokens: 6000, onExhausted: 'approval' } });
+    assert.equal((await until(waiting.runId, (r) => r.status === 'paused')).pauseReason, 'approval');
+    const [request] = await ht.listApprovals({ runId: waiting.runId, status: ['pending'] });
+    assert.equal(request?.kind, 'budget');
+    await assert.rejects(ht.resume(waiting.runId), (e: unknown) => e instanceof HypertestError && e.code === 'precondition_failed');
+    await ht.approve(request!.approvalId, true, { kind: 'human', id: 'alice' }, 'extend once');
+    const extended = await statusOf(waiting.runId);
+    assert.notEqual(extended.status, 'paused');
+    assert.equal(extended.budget.maxModelTokens, 6000 + (request!.subject as { raise: { maxModelTokens: number } }).raise.maxModelTokens);
   });
 
   test('decideOracleProposal(): human approval creates a revision; a change flipping a recorded failure needs a human (agents refused)', async () => {

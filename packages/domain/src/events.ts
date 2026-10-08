@@ -41,7 +41,9 @@ export type AggregateType =
   | 'context'
   | 'budget'
   | 'approval'
-  | 'experience';
+  | 'experience'
+  /** (additive, B[7]) the skill registry */
+  | 'skill';
 
 /** Event catalog. Payload shapes are documented next to each producer; names are stable API. */
 export const EVENT_TYPES = {
@@ -143,6 +145,15 @@ export const EVENT_TYPES = {
   approvalRequested: 'approval.requested',
   approvalGranted: 'approval.granted',
   approvalDenied: 'approval.denied',
+  /** (additive, E[8]) A pending approval whose validity window ended (`{ approvalId, kind, expiresAt }`). */
+  approvalExpired: 'approval.expired',
+  /** (additive, E[8]) An approved action approval consumed by the one action it authorizes (`{ approvalId, requestId, digest }`). */
+  approvalConsumed: 'approval.consumed',
+  /**
+   * (additive, stubs[8]) A human resolved an operation under manual review (`{ operationId, outcome, to, by, note }`): the
+   * only way out of manual_review; agents never resolve operations.
+   */
+  operationResolved: 'operation.resolved',
 
   findingCreated: 'finding.created',
   findingUpdated: 'finding.updated',
@@ -210,9 +221,26 @@ export const EVENT_TYPES = {
    * `{ turn, sessionId, scope, dimension, allowanceTokens, estimateBefore, estimateAfter, viewBudgetCap }`.
    */
   contextBudgetCondensed: 'context.budget_condensed',
+  /**
+   * (additive, B[8]) L0 as the root of context reconstruction: one event per transcript entry an agent session commits
+   * `{ sessionId, agentId, ordinal, turn, message }` (aggregate session), written in the transaction of the session write.
+   */
+  contextTranscriptRecorded: 'context.transcript_recorded',
+  /** (additive, B[7]) The skill registry: `{ skillId, revision, digest, status, … }` (aggregate skill). */
+  skillProposed: 'skill.proposed',
+  skillValidated: 'skill.validated',
+  skillValidationFailed: 'skill.validation_failed',
+  skillPublished: 'skill.published',
+  skillRetired: 'skill.retired',
+  skillRejected: 'skill.rejected',
 
   budgetReserved: 'budget.reserved',
   budgetExhausted: 'budget.exhausted',
+  /**
+   * (additive, E[3]) A run budget was raised (`{ raise, before, after, by, rationale, approvalId? }`): by an operator
+   * (`hypertest resume --raise-…`, POST /runs/:id/resume) or by an approved budget-extension request.
+   */
+  budgetRaised: 'budget.raised',
 
   /**
    * (additive, durability-2) Resource admission of a work item (ResourceClaims): `granted` `{ workItemId, claims }` when

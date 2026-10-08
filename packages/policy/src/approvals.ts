@@ -1,6 +1,6 @@
 import { HypertestError, fromJsonColumn, toIso, type JsonValue, type SqlExecutor, type SqlParam } from '@hypertest/core';
 import { EVENT_TYPES, eventFrom, type ActorRef, type EventContext } from '@hypertest/domain';
-import type { ApprovalRequest, ApprovalService, PolicyDeps } from './contracts.ts';
+import type { ApprovalConsumption, ApprovalRequest, ApprovalService, PolicyDeps } from './contracts.ts';
 import { agentIndependenceViolation } from './independence.ts';
 import { storable, storableString } from './storable.ts';
 
@@ -24,6 +24,19 @@ const KINDS: ReadonlySet<string> = new Set(['action', 'oracle_change', 'test_cha
  */
 const HUMAN_OR_SYSTEM_KINDS: ReadonlySet<string> = new Set(['action', 'budget', 'manual_review']);
 const STATUSES: ReadonlySet<string> = new Set(['pending', 'approved', 'denied', 'expired']);
+
+interface ConsumptionRow {
+  approval_id: string;
+  run_id: string;
+  consumed_by: string;
+  digest: string;
+  consumed_at: unknown;
+}
+const CONSUMPTION_SELECT = 'SELECT approval_id, run_id, consumed_by, digest, consumed_at FROM ht_approval_consumptions';
+
+function toConsumption(r: ConsumptionRow): ApprovalConsumption {
+  return { approvalId: r.approval_id, runId: r.run_id, consumedBy: r.consumed_by, digest: r.digest, consumedAt: toIso(r.consumed_at) };
+}
 const SELECT = 'SELECT approval_id, run_id, kind, subject, requested_by, status, decided_by, rationale, created_at, decided_at FROM ht_approvals';
 
 function toApproval(row: ApprovalRow): ApprovalRequest {
@@ -116,6 +129,12 @@ export function createApprovalService(deps: PolicyDeps): ApprovalService {
         const current = await getWith(tx, approvalId);
         if (!current) throw new HypertestError('not_found', `approval ${approvalId} not found`);
         if (current.status !== 'pending') throw new HypertestError('precondition_failed', `approval ${approvalId} is already ${current.status}`);
+        // (E[8], E[3]) an action or budget-extension request past its decision window can no longer be decided (the gate
+        // denies the action / the run converges to the gate). (A gate_exception's expiresAt is the waiver's own validity.)
+        const until = current.kind === 'action' || current.kind === 'budget' ? (current.subject as { expiresAt?: unknown } | null)?.expiresAt : undefined;
+        if (typeof until === 'string' && Number.isFinite(Date.parse(until)) && Date.parse(until) <= clock.nowMs()) {
+          throw new HypertestError('precondition_failed', `approval ${approvalId} expired at ${until}; it can no longer be decided`, { details: { rule: 'expired' } });
+        }
         if (current.requestedBy.id === decidedBy.id) {
           throw new HypertestError('permission_denied', `requester ${decidedBy.id} cannot decide their own approval ${approvalId}`, { details: { rule: 'self_decision' } });
         }
@@ -155,6 +174,54 @@ export function createApprovalService(deps: PolicyDeps): ApprovalService {
 
     get(approvalId: string) {
       return getWith(db, approvalId);
+    },
+
+    async consume(approvalId, consumer, ctx: EventContext) {
+      if (!consumer || typeof consumer.requestId !== 'string' || consumer.requestId === '' || typeof consumer.digest !== 'string' || consumer.digest === '') {
+        throw new HypertestError('invalid_argument', 'consume: requestId and digest are required');
+      }
+      return db.transaction(async (tx) => {
+        const current = await getWith(tx, approvalId);
+        if (!current) throw new HypertestError('not_found', `approval ${approvalId} not found`);
+        if (current.status !== 'approved') throw new HypertestError('precondition_failed', `approval ${approvalId} is ${current.status}, not approved: it cannot be consumed`);
+        const at = clock.isoNow();
+        const ins = await tx.query(
+          'INSERT INTO ht_approval_consumptions (approval_id, run_id, consumed_by, digest, consumed_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (approval_id) DO NOTHING',
+          [approvalId, current.runId, consumer.requestId, consumer.digest, at],
+        );
+        const row = (await tx.query<ConsumptionRow>(`${CONSUMPTION_SELECT} WHERE approval_id = $1`, [approvalId])).rows[0]!;
+        const consumption = toConsumption(row);
+        if ((ins.rowCount ?? 0) === 0) {
+          // consumed before: by this very request (a durable replay of the same action), or by another one
+          return consumption.consumedBy === consumer.requestId ? { consumed: true as const, consumption } : { consumed: false as const, consumption };
+        }
+        if (events) {
+          await events.emit([eventFrom(ctx, EVENT_TYPES.approvalConsumed, 'approval', approvalId, { approvalId, kind: current.kind, requestId: consumer.requestId, digest: consumer.digest })], tx);
+        }
+        logger.info('approval consumed', { approvalId, requestId: consumer.requestId });
+        return { consumed: true as const, consumption };
+      });
+    },
+
+    async consumption(approvalId: string) {
+      const r = await db.query<ConsumptionRow>(`${CONSUMPTION_SELECT} WHERE approval_id = $1`, [approvalId]);
+      return r.rows[0] ? toConsumption(r.rows[0]) : undefined;
+    },
+
+    async expire(approvalId: string, ctx: EventContext) {
+      return db.transaction(async (tx) => {
+        const current = await getWith(tx, approvalId);
+        if (!current) throw new HypertestError('not_found', `approval ${approvalId} not found`);
+        if (current.status !== 'pending') return current;
+        const upd = await tx.query(`UPDATE ht_approvals SET status = 'expired', decided_at = $2 WHERE approval_id = $1 AND status = 'pending'`, [approvalId, clock.isoNow()]);
+        if ((upd.rowCount ?? 0) === 0) return (await getWith(tx, approvalId)) ?? current;
+        const expiresAt = (current.subject as { expiresAt?: unknown } | null)?.expiresAt;
+        if (events) {
+          await events.emit([eventFrom(ctx, EVENT_TYPES.approvalExpired, 'approval', approvalId, { approvalId, kind: current.kind, ...(typeof expiresAt === 'string' ? { expiresAt } : {}) })], tx);
+        }
+        logger.info('approval expired', { approvalId, kind: current.kind });
+        return (await getWith(tx, approvalId))!;
+      });
     },
 
     async list(filter): Promise<ApprovalRequest[]> {

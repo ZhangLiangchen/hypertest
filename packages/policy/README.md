@@ -216,6 +216,36 @@ and `src/experiments.ts` (table above). Behaviour: criteria C10–C12 (all fail-
 in force. (The control plane re-pins a run to a newly approved oracle revision before gating — D-10 — so the
 conformance-4 "superseded" C0 detail remains only as a guard for a gate input assembled without re-pinning.)
 
+## Approval gate and credential scopes (audit wave 2, additive)
+
+- **E[8] `ApprovalGatedPolicyEngine(inner, { approvals, clock, approvalTtlMs? })`** wraps the composed engine (revision =
+  the inner engine's). A `before_action` request the inner engine sends to `approval_required` becomes: `allow` when an
+  approval of kind `action` bound to the exact action (`actionDigest`: run, work item, tool, effect, risk, resources,
+  environment class, digest of the redacted input) is approved by an independent human/system actor, unexpired, and
+  can be CONSUMED by this request (exactly once: append-only `ht_approval_consumptions`, migration
+  `policy/004-approval-consumptions`; a replay of the same request finds its own consumption); `deny` when the latest
+  decision on that action is a denial or the request expired (no silent re-request); else `approval_required` with the
+  `approvalId` of the pending request (created when none is pending, `subject.expiresAt` = now + TTL, default 24 h).
+  `ActionRequest.approvalId?` names an approval; one of another action is refused (`approval_mismatch`).
+  `ApprovalService.consume?/consumption?/expire?` (events `approval.consumed`, `approval.expired`); `decide` refuses
+  an expired request.
+- **coverage[8]** `ActionRequest.credentialScopes?` reach the capability check (`credential_scope_not_permitted`).
+- `PERMISSION_PROFILES.environment_operator.maxRiskClass` is `critical` (env.deploy is reachable; every critical
+  external/destructive action still needs a human approval through `approve-critical-risk`).
+- (review) An approval authorizes only the action its subject DESCRIBES: `subjectActionDigest(approval)` re-digests the
+  subject's tool, effect, risk, resources, work item, environment class and arguments (what the decider was shown) and
+  the gate honours an approval only when that equals its `actionDigest` and it has a decision window
+  (`subject.expiresAt`). An approval filed with a forged digest (e.g. an agent's `request_approval` showing a harmless GET
+  while carrying the digest of a deploy) neither authorizes nor blocks anything; named explicitly it is refused
+  (`approval_mismatch … does not describe the action it is bound to`). `actionDigest` is computed over the stored form of
+  the arguments (U+0000 → U+FFFD), so an approval re-verifies after the round trip through the store.
+- (review) `ActionRequest.noApprovalRequest?`: a caller that cannot wait for a human decision (a sandboxed command's
+  relayed write) gets `approval_required` without an approval request being filed.
+- (review) `ActionRequest.relayedWrite?: { callEffect }`: the effect is a write a sandboxed command of the call sends to a
+  relayed SUT endpoint; `checkCapability` then bounds the CALL (tool, `callEffect`, risk, environment class — required —
+  and expiry) instead of `effect`/`resources`, while the rules judge the external effect on the environment class as for
+  any call (staging ⇒ approval, production ⇒ deny).
+
 ## Testing
 
 ```bash

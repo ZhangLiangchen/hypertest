@@ -12,7 +12,8 @@ import {
   CONTROL_TOKEN_HEADER, EnvControlAdapter, ProcessEnvAdapter, blackboxTools, builtinSideEffectAdapters, createEnvironmentRegistry, envDeployTool, envRestartTool, httpRequestTool, loadStartTool,
   PROCESS_SUPERVISOR_CLI_PATH, startProcessSupervisor, type EnvInput, type ProcessSupervisor, type SupervisorOperation, type ToolSpec,
 } from '../src/index.ts';
-import { CrashAfterDispatch, fakeContext, newGateway, newRuntime, nextInvocationId, openBlackboxEnv, sideEffectRequest, structuredOf, tempDir, toolRequest, waitFor, type BlackboxEnv } from './blackbox-helpers.ts';
+import { ApprovalGatedPolicyEngine, createApprovalService } from '@hypertest/policy';
+import { CrashAfterDispatch, RUN, fakeContext, newGateway, newRuntime, nextInvocationId, openBlackboxEnv, sideEffectRequest, structuredOf, tempDir, toolRequest, waitFor, type BlackboxEnv } from './blackbox-helpers.ts';
 
 const CHILD = `
 import http from 'node:http';
@@ -180,28 +181,56 @@ test('CRASH between the generation bump and the ledger\'s verified: the resumed 
   assert.equal(env.environments.bumpGeneration('env_proc').generation, envGen + 4);
 });
 
-test('env.deploy: critical risk needs approval through the runtime; the verified deploy sets BUILD_REF and bumps buildDigest', async () => {
+test('E[8] env.deploy: critical risk waits for an independent human approval bound to the exact call; once approved, the SAME call runs through the ToolRuntime exactly once (verified deploy sets BUILD_REF, bumps buildDigest)', async () => {
   const d = await tempDir('ht-bb-sup-deploy-');
   try {
     const adapters = builtinSideEffectAdapters({ stateDir: d.path, environments: env.environments });
-    const { gateway } = newGateway(env, adapters);
-    const runtime = newRuntime(env, blackboxTools({ stateDir: d.path }), gateway);
+    const { gateway, ledger } = newGateway(env, adapters);
+    const approvals = createApprovalService({ ...env.deps, db: env.db, events: env.events });
+    const gated = new ApprovalGatedPolicyEngine(env.policy, { approvals, clock: env.deps.clock });
+    const runtime = newRuntime({ ...env, policy: gated }, blackboxTools({ stateDir: d.path }), gateway);
+    const input = { environmentId: 'env_proc', buildRef: 'registry.local/app@sha256:abc123' };
     const supGen = sup.generation;
-    const gated = await runtime.execute(toolRequest('env.deploy', { environmentId: 'env_proc', buildRef: 'registry.local/app@sha256:abc123' }));
-    assert.equal(gated.status, 'denied');
-    assert.equal(gated.error?.code, 'approval_required');
-    assert.equal(sup.generation, supGen, 'nothing was deployed without approval');
-
     const envGen = env.environments.get('env_proc')!.generation;
-    const out = await gateway.run(sideEffectRequest(envDeployTool() as ToolSpec, { environmentId: 'env_proc', buildRef: 'registry.local/app@sha256:abc123' }, env.environments, nextInvocationId()));
-    assert.equal(out.status, 'verified');
-    const result = out.result as Record<string, unknown>;
+
+    const first = await runtime.execute(toolRequest('env.deploy', input));
+    assert.equal(first.status, 'denied');
+    assert.equal(first.error?.code, 'approval_required');
+    assert.equal(sup.generation, supGen, 'nothing was deployed without approval');
+    const pending = (await approvals.list({ runId: RUN })).filter((a) => a.kind === 'action' && a.status === 'pending' && (a.subject as { tool?: string }).tool === 'env.deploy');
+    assert.equal(pending.length, 1);
+    const approvalId = pending[0]!.approvalId;
+    assert.match(first.modelText, new RegExp(`waits for an independent human decision on approval ${approvalId}`));
+    // a retry before the decision: still not executed, no second request
+    const retry = await runtime.execute(toolRequest('env.deploy', input));
+    assert.equal(retry.error?.code, 'approval_required');
+    assert.equal((await approvals.list({ runId: RUN })).filter((a) => a.kind === 'action' && a.status === 'pending').length, 1);
+    // agents (any role) never decide action approvals; the requester never decides its own
+    await assert.rejects(approvals.decide(approvalId, true, { kind: 'agent', id: 'agent_reviewer', role: 'reviewer' }, 'lgtm', { runId: RUN, correlationId: 'c', actorId: 'agent:agent_reviewer' }), (e: unknown) => isHypertestError(e, 'permission_denied'));
+    await approvals.decide(approvalId, true, { kind: 'human', id: 'ops-oncall' }, 'deploy the fixed build', { runId: RUN, correlationId: 'c', actorId: 'human:ops-oncall' });
+
+    const out = await runtime.execute(toolRequest('env.deploy', input));
+    assert.equal(out.status, 'success', out.modelText);
+    const result = structuredOf(out);
     assert.equal(result['action'], 'deploy');
     assert.equal(result['buildDigest'], 'registry.local/app@sha256:abc123');
     const desc = env.environments.get('env_proc')!;
     assert.equal(desc.generation, envGen + 1);
     assert.equal(desc.buildDigest, 'registry.local/app@sha256:abc123');
     assert.equal((await getJson(`${sup.url}/`)).body.buildRef, 'registry.local/app@sha256:abc123');
+    assert.equal((await ledger.get(out.operationId!))!.status, 'verified');
+    assert.ok((await approvals.consumption!(approvalId)), 'the approval was consumed by the deploy');
+    const deployedGen = sup.generation;
+
+    // the approval is spent: the same call once more is a NEW approval request, never a second deploy
+    const again = await runtime.execute(toolRequest('env.deploy', input));
+    assert.equal(again.error?.code, 'approval_required');
+    assert.equal(sup.generation, deployedGen);
+    // a call naming the approval for OTHER arguments is refused with the exact reason
+    const other = await runtime.execute(toolRequest('env.deploy', { environmentId: 'env_proc', buildRef: 'registry.local/app@sha256:fff' }, { approvalId }));
+    assert.equal(other.status, 'denied');
+    assert.match(other.error?.message ?? '', /approval_mismatch: approval .* authorizes another action/);
+    // input validation still happens inside the adapter (a shell-like ref is refused)
     await assert.rejects(
       gateway.run(sideEffectRequest(envDeployTool() as ToolSpec, { environmentId: 'env_proc', buildRef: '-rf /' }, env.environments, nextInvocationId())),
       (e: unknown) => isHypertestError(e, 'invalid_argument'),
@@ -368,4 +397,60 @@ test('supervisor state file is written synchronously and in order: a completed r
     await d.cleanup();
   }
   await assert.rejects(startProcessSupervisor({ command: [process.execPath, childScript], controlToken: 'short' }), (e: unknown) => isHypertestError(e, 'invalid_argument'));
+});
+
+test('E[0] fenced target: the supervisor refuses a mutating request whose X-Hypertest-Fence is older than one it accepted (412), and env.process maps it to not applied', async () => {
+  const s2 = await startProcessSupervisor({ command: [process.execPath, childScript], readyTimeoutMs: 10_000, killGraceMs: 1000 });
+  const envs = createEnvironmentRegistry([{ environmentId: 'env_fenced', environmentClass: 'local', generation: 1, baseUrl: s2.url, control: { kind: 'process', target: s2.controlUrl } }]);
+  try {
+    const post = (id: string, fence: number) =>
+      fetch(`${s2.controlBaseUrl}/restart`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-hypertest-operation': id, 'x-hypertest-fence': String(fence), [CONTROL_TOKEN_HEADER]: s2.controlToken }, body: '{}' });
+    const gen0 = s2.generation;
+    assert.equal((await post('op_fence_new', 7)).status, 200);
+    assert.equal(s2.generation, gen0 + 1);
+    const stale = await post('op_fence_old', 6);
+    assert.equal(stale.status, 412);
+    assert.match(((await stale.json()) as { error: string }).error, /stale fencing token 6: token 7 was already accepted/);
+    assert.equal(s2.generation, gen0 + 1, 'the stale worker\'s restart was never applied');
+    // the adapter sends the gateway's lease token and reports a refusal as definitively not applied
+    const adapter = new ProcessEnvAdapter({ environments: envs });
+    assert.equal(adapter.capabilities.supportsFencing, true);
+    const ctx: OperationContext = { operation: { operationId: 'op_fence_adapter', operationType: 'env.restart', target: { resourceKey: 'env/env_fenced', kind: 'environment' } } as OperationRecord, fencingToken: 3, signal: new AbortController().signal };
+    const prepared = await adapter.prepare(ctx, { environmentId: 'env_fenced', reason: 'stale' });
+    const receipt = await adapter.dispatch(prepared, ctx);
+    assert.equal(receipt.accepted, false);
+    assert.match(receipt.notAppliedReason ?? '', /HTTP 412/);
+    assert.equal(s2.generation, gen0 + 1);
+    assert.equal((await adapter.dispatch(prepared, { ...ctx, fencingToken: 8 })).accepted, true, 'the current token is accepted');
+  } finally {
+    await s2.close();
+  }
+});
+
+test('E[1] effect window: an active time-boxed fault holds env/<id> until it expires — an overlapping fault of another owner is refused busy (never sent), then admitted after expiry', async () => {
+  const d = await tempDir('ht-bb-sup-window-');
+  const s2 = await startProcessSupervisor({ command: [process.execPath, childScript], readyTimeoutMs: 10_000, killGraceMs: 1000 });
+  try {
+    env.environments.register({ environmentId: 'env_window', environmentClass: 'local', generation: 1, baseUrl: s2.url, control: { kind: 'process', target: s2.controlUrl } });
+    const { gateway, leases } = newGateway(env, builtinSideEffectAdapters({ stateDir: d.path, environments: env.environments }));
+    const runtime = newRuntime(env, blackboxTools({ stateDir: d.path }), gateway);
+    const first = await runtime.execute(toolRequest('env.inject_fault', { environmentId: 'env_window', kind: 'latency', params: { ms: 1 }, durationMs: 1500 }, { leaseOwner: 'worker:item-a:1' }));
+    assert.equal(first.status, 'success', first.modelText);
+    const until = structuredOf(first)['effectUntil'];
+    assert.equal(until, structuredOf(first)['expiresAt'], 'the window is the fault\'s expiry');
+    const held = await leases.current('env/env_window');
+    assert.equal(held?.owner, 'worker:item-a:1', 'the lease outlives the settled operation');
+    assert.ok(held && Math.abs(Date.parse(held.expiresAt) - Date.parse(String(until))) <= 50, `held until the fault expires (${held?.expiresAt} vs ${String(until)})`);
+    const second = await runtime.execute(toolRequest('env.inject_fault', { environmentId: 'env_window', kind: 'error_rate', params: { rate: 1 }, durationMs: 500 }, { leaseOwner: 'worker:item-b:1' }));
+    assert.equal(second.status, 'failed');
+    assert.equal(second.error?.code, 'failed');
+    assert.match(second.error?.message ?? '', /resource_busy/);
+    assert.equal((await getJson(`${s2.url}/z`)).status, 200, 'the overlapping error_rate fault never reached the supervisor');
+    await waitFor(async () => (await leases.current('env/env_window')) === undefined, 5000, 50, 'the fault window to end');
+    const third = await runtime.execute(toolRequest('env.inject_fault', { environmentId: 'env_window', kind: 'error_rate', params: { rate: 1 }, durationMs: 300 }, { leaseOwner: 'worker:item-b:1' }));
+    assert.equal(third.status, 'success', third.modelText);
+  } finally {
+    await s2.close();
+    await d.cleanup();
+  }
 });

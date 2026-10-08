@@ -97,13 +97,20 @@ export async function diagnose(input: HypertestConfig, options: DiagnoseOptions 
     else add('sandbox', ok ? 'ok' : 'warn', `OCI sandbox (${profile.image})${ok ? '' : ': not probed'}`);
   } else {
     const allow = `env allowlist ${profile.envAllowlist.join(', ') || '(none)'}`;
-    if (profile.network === 'open') add('sandbox', 'warn', `local sandbox, network open (commands agents run reach any host: no egress governance), ${allow}`);
+    // E[4]: where the sandbox cannot hide keys, capability secret and store, Hypertest refuses to start (fail closed)
+    // unless sandbox.insecureAllowUnhiddenSecrets: true — then a warning, never ok
+    const optedIn = config.sandbox?.insecureAllowUnhiddenSecrets === true;
+    const unhidden = (what: string) =>
+      optedIn
+        ? add('sandbox', 'warn', `${what}; INSECURE (sandbox.insecureAllowUnhiddenSecrets): keys, capability secret and store are NOT hidden from commands agents run, ${allow}`)
+        : add('sandbox', 'error', `${what}: keys, capability secret and store would NOT be hidden from commands agents run, so Hypertest refuses to start — use the OCI sandbox or a host with python3 and PID/mount namespaces, or accept it with sandbox.insecureAllowUnhiddenSecrets: true`);
+    if (profile.network === 'open') unhidden('local sandbox, network open (commands agents run reach any host: no egress governance, no namespaces)');
     else {
       // security-2: every other profile runs commands in a network namespace; without one the sandbox refuses them
       const iso = await networkIsolation();
       if (iso.available && iso.jail) add('sandbox', 'ok', `local sandbox, network ${profile.network} (enforced: ${iso.strategy}, private loopback; keys, store and other workspaces hidden), ${allow}`);
-      else if (iso.available) add('sandbox', 'warn', `local sandbox, network ${profile.network} (enforced: ${iso.strategy}${iso.loopback ? ', private loopback' : ', no loopback'}); keys, store and other workspaces are NOT hidden from commands agents run (needs python3 and PID/mount namespaces), ${allow}`);
-      else add('sandbox', 'error', `local sandbox, network ${profile.network} cannot be enforced on this host (${iso.reason}): every command agents run would be refused — use the OCI sandbox, or set sandbox.network: open to accept an unrestricted network`);
+      else if (iso.available) unhidden(`local sandbox, network ${profile.network} (enforced: ${iso.strategy}${iso.loopback ? ', private loopback' : ', no loopback'}; no PID/mount jail)`);
+      else add('sandbox', 'error', `local sandbox, network ${profile.network} cannot be enforced on this host (${iso.reason}): every command agents run would be refused — use the OCI sandbox`);
     }
   }
 

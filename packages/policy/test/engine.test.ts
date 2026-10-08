@@ -278,3 +278,30 @@ test('an engine keeps a private immutable copy of its rules (neither the input a
   }, TypeError);
   assert.equal((await e.evaluate(request())).decision, 'deny');
 });
+
+test('(review E[2]) a relayed write of a sandboxed command: the capability bounds the CALL (tool, its own effect, risk, environment class); the rules judge the external effect', async () => {
+  const author = signCapability(cap({ tools: ['test.run'], allowedEffects: ['read', 'record', 'write_workspace', 'execute'], resourceScopes: ['workspace/**', 'run/**'], environmentClasses: ['local', 'sandbox'], maxRiskClass: 'medium' }), SECRET);
+  const operator = signCapability(cap({ tools: ['shell.exec'], allowedEffects: ['read', 'record', 'execute', 'external', 'destructive'], resourceScopes: ['workspace/**', 'env/**'], environmentClasses: ['local', 'sandbox', 'staging'], maxRiskClass: 'critical' }), SECRET);
+  const relayed = (o: Partial<ActionRequest>): ActionRequest => request({ tool: 'test.run', effect: 'external', riskClass: 'medium', resources: ['env/bank'], environmentClass: 'local', capability: author, relayedWrite: { callEffect: 'execute' }, ...o });
+  const gated = () => new BuiltinPolicyEngine(DEFAULT_POLICY_RULES, 'builtin@1', { ...options(), capabilitySecret: SECRET });
+  // a test author's regression run may exercise a local SUT (rule allow-external-local-sandbox)
+  const local = await gated().evaluate(relayed({}));
+  assert.equal(local.decision, 'allow', local.reasons.join('; '));
+  // the same request NOT marked as relayed is an external effect the author's capability does not grant
+  const direct = await gated().evaluate(relayed({ relayedWrite: undefined as never }));
+  assert.equal(direct.decision, 'deny');
+  assert.match(direct.reasons.join('; '), /capability_denied: effect_not_permitted: external/);
+  // the capability still bounds WHICH environments: staging is not the author's class
+  const staging = await gated().evaluate(relayed({ environmentClass: 'staging', resources: ['env/stg'] }));
+  assert.equal(staging.decision, 'deny');
+  assert.match(staging.reasons.join('; '), /capability_denied: environment_not_permitted: staging/);
+  // the operator may act on staging, where the rules require a human approval; production is denied by the rules
+  const opStaging = await gated().evaluate(relayed({ tool: 'shell.exec', capability: operator, environmentClass: 'staging', resources: ['env/stg'] }));
+  assert.equal(opStaging.decision, 'approval_required');
+  assert.ok(opStaging.reasons.some((r) => r.startsWith('rule:approve-external-staging')));
+  // the call's own grant: another tool, a risk above the ceiling, an unknown class, a malformed marker — refused
+  assert.match((await gated().evaluate(relayed({ tool: 'shell.exec' }))).reasons.join('; '), /capability_denied: tool_not_permitted: shell\.exec/);
+  assert.match((await gated().evaluate(relayed({ riskClass: 'high' }))).reasons.join('; '), /capability_denied: risk_exceeds_capability/);
+  assert.match((await gated().evaluate(relayed({ environmentClass: undefined as never }))).reasons.join('; '), /a relayed write needs the environment class of its target/);
+  assert.match((await gated().evaluate(relayed({ relayedWrite: { callEffect: 'teleport' as never } }))).reasons.join('; '), /relayedWrite\.callEffect must be a tool effect/);
+});

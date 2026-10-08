@@ -163,5 +163,8 @@ per run and deletes the stream afterwards.
   `UPDATE … SET sent_at WHERE sent_at IS NULL` and pruned sent rows. Proven by `test/append-only.test.ts` (tamper test,
   PGlite and PostgreSQL).
 
+- (context-learning, B[9]) The record events of a `test_strategy` record (posted by control's `blackboard.post_strategy`)
+  carry its `title` (the description, clipped to 200 characters) and `approach`, like the other typed records.
+
 Event types emitted that are not (yet) in `@hypertest/domain` `EVENT_TYPES`: `run.gating`, `run.updated`,
 `work.blocked`, `work.updated`.

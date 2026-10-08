@@ -4,7 +4,8 @@ export {
 } from './capabilities.ts';
 export { globToRegExp, intersectPatterns, matchesGlob, matchesPattern, matchesResourcePattern, matchesToolPattern, patternCovers, resourcePatternCovers, toolPatternCovers } from './patterns.ts';
 export {
-  BuiltinPolicyEngine, CompositePolicyEngine, DEFAULT_POLICY_RULES, PERMIT_CONSTRAINTS_SCHEMA, POLICY_RULE_SCHEMA, intersectConstraints, mostRestrictive, ruleMatches,
+  ApprovalGatedPolicyEngine, BuiltinPolicyEngine, CompositePolicyEngine, DEFAULT_ACTION_APPROVAL_TTL_MS, DEFAULT_POLICY_RULES, PERMIT_CONSTRAINTS_SCHEMA, POLICY_RULE_SCHEMA, actionDigest,
+  approvalActionDigest, intersectConstraints, mostRestrictive, ruleMatches, subjectActionDigest,
 } from './engine.ts';
 export { OpaPolicyEngine } from './opa.ts';
 export { createPolicyDecisionLog, policyRequestHash } from './decision-log.ts';

@@ -71,7 +71,8 @@ test('an analyst\'s "Relevant code" includes the document section only the vecto
   assert.equal(outcome.status, 'completed');
   const first = analystViews.find((v) => v.step === 0);
   assert.ok(first, 'the analyst ran');
-  const section = /## Relevant code\n([\s\S]*?)(?:\n## |$)/.exec(first.userText)?.[1] ?? '';
+  // (B[5]) the section heading names its sources: `## Relevant code (retrieval: symbols, exact search, vectors)`
+  const section = /## Relevant code \(retrieval: symbols, exact search, vectors\)\n([\s\S]*?)(?:\n## |$)/.exec(first.userText)?.[1] ?? '';
   // the objective names no identifier and no literal line of the README: semantic retrieval found its section
   assert.match(section, /^- README\.md:5 — /m, first.userText);
   // the fs.read of turn 1 is recorded and pinned by the analyst's next snapshot

@@ -96,6 +96,11 @@ run of the candidate's PRODUCT source naming only its own file, the independent 
 reviewer's prompt describes that review (`blackboard.post_review` on subjectRef `test_artifact`). Catalog revision
 changes (prompts and tool lists). Tests: `test/roles.test.ts`, `test/tools.test.ts`.
 
+(context-learning, B[9]) `DOMAIN_TOOL_IDS` gains `blackboard.post_strategy` and `blackboard.post_decision` (62 known tool
+ids with `request_approval`): the lead holds both, the test designer `blackboard.post_strategy`, and their prompts say
+what they record (a test approach per objective; a planning decision — context, never a verdict). The lead prompt was
+tightened to stay within the 1200-word limit. Catalog revision changes. Tests: `test/roles.test.ts`, `test/tools.test.ts`.
+
 (runtime-roles unit) Two built-in roles (catalog revision changes): `vision_gui` and `local_private` (above), their
 output contracts `GUI_OUTPUT_SCHEMA` (`{summary, checks: [{check, method: dom|api|visual, outcome: passed|failed|error|
 not_run, expected, actual, evidenceIds ≥ 1}], findings, screenshots}`) and `PRIVATE_OUTPUT_SCHEMA` (`{summary,

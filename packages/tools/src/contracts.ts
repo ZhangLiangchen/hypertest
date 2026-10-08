@@ -1,4 +1,4 @@
-import type { BaseDeps, Clock, JsonSchema, JsonValue, Logger, SqlDatabase } from '@hypertest/core';
+import type { BaseDeps, Clock, JsonSchema, JsonValue, Logger, SqlDatabase, SqlExecutor } from '@hypertest/core';
 import type { ActionCapability, DataClassification, ArtifactRef, ContextSnapshot, DomainEventSink, EventContext, EvidenceInput, EvidenceRecord, EvidenceType, Provenance, ResourceRef, RiskClass, ToolDefinition, ToolEffect } from '@hypertest/domain';
 import type { ArtifactStore, EvidenceLedger } from '@hypertest/evidence';
 import type { SideEffectAdapter, SideEffectGateway } from '@hypertest/operation';
@@ -84,6 +84,72 @@ export interface ToolContext {
   claim?: ToolClaim;
   /** (additive, conformance-6) `ToolExecutionRequest.experimentId`. */
   experimentId?: string;
+  /**
+   * (additive, E[9]) The Operation Ledger id of THIS execution when the call runs as a ledgered operation (a record-effect
+   * call: http.request POST, browser.click, mcp.*). Targets that accept a client id receive it (`Idempotency-Key`):
+   * idempotencyKey = operationId, so the ledger's key finds the effect at the target. Undefined for unledgered calls.
+   */
+  operationId?: string;
+  /**
+   * (additive, E[4] / coverage[8]) The secret broker: tools that need a credential (http.request authenticating to the SUT,
+   * env control) get a short-lived, scoped one minted for THIS call — the long-lived secret never reaches the agent, its
+   * prompt or the tool output (`redact`).
+   */
+  secrets?: SecretBroker;
+}
+
+// ----------------------------------------------------------------------------- (additive, E[4]) secret broker
+
+/** The credential scope a capability / permit grants for brokered credential `name` of environment `environmentId`. */
+export type CredentialScope = `credential:${string}/${string}`;
+
+/**
+ * (additive, E[4] / coverage[8]) A brokered credential of an environment, as the operator configures it. Only its NAME is
+ * visible to agents (EnvironmentDescriptor.brokeredCredentials); the secret is read from the variable `secretEnv` at mint time.
+ *  - `jwt_hs256`: a JWT (HS256) signed with the secret — `{ iss: 'hypertest', aud, sub: run, scope: name, iat, exp, jti:
+ *    invocation }`, valid `ttlMs` — sent as `<header>: Bearer <jwt>`; the SUT verifies it with the shared secret;
+ *  - `oauth2_client_credentials`: an access token from `tokenUrl` (client id + secret from the environment, `scope`),
+ *    cached until shortly before it expires — sent as `<header>: Bearer <token>`.
+ */
+export interface BrokeredCredentialConfig {
+  environmentId: string;
+  name: string;
+  kind: 'jwt_hs256' | 'oauth2_client_credentials';
+  /** The variable holding the long-lived secret (jwt: the HMAC key; oauth2: the client secret). */
+  secretEnv: string;
+  /** Header the credential is sent in (default `authorization`). */
+  header?: string;
+  /** Lifetime of a minted JWT (default 300000 ms; at most 3600000). */
+  ttlMs?: number;
+  /** jwt: the `aud` claim (default the environment id). */
+  audience?: string;
+  /** oauth2: token endpoint, client id (inline or by variable) and requested scope. */
+  tokenUrl?: string;
+  clientId?: string;
+  clientIdEnv?: string;
+  scope?: string;
+  /** Permission profiles whose agents may use it (default test_executor, environment_operator). */
+  grantTo?: string[];
+}
+
+/** (additive, E[4]) A credential minted for one call. */
+export interface MintedCredential {
+  /** Header name (lower case) and value. */
+  header: string;
+  value: string;
+  scope: CredentialScope;
+  kind: BrokeredCredentialConfig['kind'];
+  expiresAt: string;
+}
+
+/** (additive, E[4] / coverage[8]) Mints short-lived scoped credentials; agents never see the long-lived secrets. */
+export interface SecretBroker {
+  /** The brokered credentials of an environment (names and scopes only — never values). */
+  describe(environmentId: string): Array<{ name: string; scope: CredentialScope; kind: BrokeredCredentialConfig['kind']; grantTo: string[] }>;
+  /** Mints a credential for one call (`invocationId`); not_found / unavailable with the exact reason otherwise. */
+  mint(request: { environmentId: string; name: string; runId: string; invocationId: string; signal?: AbortSignal }): Promise<MintedCredential>;
+  /** Replaces every long-lived secret and every credential minted by this broker that occurs in `text`. */
+  redact(text: string): string;
 }
 
 /** (additive) A work-item claim a tool call runs under: the claim lease's fencing token (and lease id / holder). */
@@ -139,6 +205,11 @@ export interface ToolSpec<I = any, O = JsonValue> {
    * re-sent once instead of going to manual review. Ignored at risk `high` or above.
    */
   resendable?(input: I, ctx: Pick<ToolContext, 'environments'>): boolean;
+  /**
+   * (additive, E[4]) The brokered credential scopes the call uses (e.g. http.request `credential`): checked against the
+   * capability's credentialScopes and the permit's `credentialScope` constraint before anything runs.
+   */
+  credentialScopes?(input: I, ctx: Pick<ToolContext, 'environments'>): string[];
   timeoutMs: number;
   /** Bytes of model-visible text before offloading to an artifact (default 16 KiB). */
   maxInlineBytes?: number;
@@ -202,6 +273,25 @@ export interface ToolExecutionRequest {
    * put that would exceed it is refused (`budget_exhausted`), nothing is stored.
    */
   limits?: { maxArtifactBytes?: number };
+  /**
+   * (additive, E[0]) Re-validates the caller's work claim at the commit point of every external effect of the call: handed
+   * to the SideEffectGateway (`RunSideEffectRequest.commitGuard`) for bound and record-effect tools, and called inside the
+   * transaction that records `dispatching`. A refusal sends nothing: the call ends `denied` (`lease_lost`) with the exact
+   * reason. Set by the control plane's dispatcher for calls made under a work claim.
+   */
+  commitGuard?: (tx: SqlExecutor) => Promise<string | undefined>;
+  /**
+   * (additive, E[2]/E[1]) Admits the call's ResourceClaim on an environment resource a sandboxed command of the call writes
+   * to through the egress relay (`env/<id>` / `url/<host>`); a returned reason refuses that write (403 to the command).
+   * Set by the control plane's dispatcher.
+   */
+  egressGuard?: (resource: string) => Promise<string | undefined>;
+  /**
+   * (additive, E[8]) The action approval the call relies on (`ActionRequest.approvalId`): the policy's approval gate verifies
+   * it (same action, independent decider, not expired) and consumes it once. Without it the gate finds the exact action's
+   * approval by digest.
+   */
+  approvalId?: string;
 }
 
 /** (additive, conformance-5) Resources a call consumed: sandbox process wall time and bytes stored (distinct objects). */
@@ -256,6 +346,8 @@ export interface ToolRuntimeDeps extends BaseDeps {
   workerId: string;
   /** Secret used to verify capability signatures. */
   capabilitySecret: string;
+  /** (additive, E[4]) The secret broker handed to tools (ToolContext.secrets); tool outputs are redacted with it. */
+  secrets?: SecretBroker;
 }
 
 export interface ToolRuntime {
@@ -375,12 +467,23 @@ export interface EnvironmentDescriptor {
    */
   honoursIdempotencyKey?: boolean;
   /**
+   * (additive, E[2]) Operator opt-in: sandboxed commands may send NON-HTTP traffic (a TLS handshake to an https endpoint, a
+   * database protocol) to this environment's relayed endpoints — as raw bytes, unledgered. Default false: only HTTP is
+   * relayed (safe methods as is, state-changing requests ledgered or refused per `sandbox.egressWrites`).
+   */
+  rawEgress?: boolean;
+  /**
    * (additive, coverage-13) The environment's isolation as registered by its operator (never claimed by an agent):
    * `dedicated` — the environment (and the namespace / database / account named here) serves one experiment at a time.
    * Only a dedicated environment admits an experiment with isolation mode `dedicated_environment`; the experiment records
    * these fields in its IsolationPlan.
    */
   isolation?: { dedicated: boolean; namespace?: string; database?: string; account?: string };
+  /**
+   * (additive, E[4]) The brokered credentials of the environment — NAMES only (the secret broker holds the configuration;
+   * agents name a credential, e.g. http.request `credential`, never a value) and the permission profiles they are granted to.
+   */
+  brokeredCredentials?: Array<{ name: string; grantTo?: string[] }>;
 }
 
 export interface EnvironmentRegistry {
@@ -546,6 +649,12 @@ export interface LocalSandboxOptions {
    * jail strategy (`networkIsolation().jail`); a hidden path containing the workspace is refused.
    */
   hiddenPaths?: string[];
+  /**
+   * (additive, E[4]) Run commands even where `hiddenPaths` cannot be hidden (no jail strategy on the host, or a profile with
+   * `network: 'open'`). Default false: such a command is refused (fail closed) — the composition sets it only when the
+   * operator opted in with `sandbox.insecureAllowUnhiddenSecrets`.
+   */
+  allowUnhiddenPaths?: boolean;
   /** (additive, H1) Directory holding every workspace: a jailed command sees only its own root and temp dir in it. */
   workspacesDir?: string;
   /**
@@ -553,7 +662,29 @@ export interface LocalSandboxOptions {
    * reach — typically the registered environments' base URLs and the operator's http allowlist. Only this host's
    * loopback endpoints can be relayed into the namespace (jail strategy); everything else stays unreachable.
    */
-  egress?: (ws: WorkspaceHandle) => readonly string[] | Promise<readonly string[]>;
+  egress?: (ws: WorkspaceHandle) => readonly (string | EgressEndpointPolicy)[] | Promise<readonly (string | EgressEndpointPolicy)[]>;
+  /**
+   * (additive, E[2]) What a sandboxed command's state-changing HTTP request (any method but GET/HEAD/OPTIONS) to a relayed
+   * endpoint becomes: `ledger` (default) — an operation of the Operation Ledger (operation id, `Idempotency-Key`, evidence,
+   * replays answered from the record), `refuse` — refused with 403 and the exact reason (stricter). Non-HTTP traffic is
+   * refused unless the endpoint's policy allows `raw`.
+   */
+  egressWrites?: EgressWritePolicy;
+}
+
+/** (additive, E[2]) What a sandboxed command's non-safe HTTP request to the SUT becomes: a ledgered operation or a refusal. */
+export type EgressWritePolicy = 'ledger' | 'refuse';
+
+/** (additive, E[2]) One endpoint relayed into the sandbox namespace and how its traffic is governed. */
+export interface EgressEndpointPolicy {
+  /** `http(s)://host:port` of the endpoint (an environment's base URL, an allowlisted origin). */
+  origin: string;
+  /** The resource key its effects are ledgered and claimed on (`env/<id>`, else `url/<host>`). */
+  resource?: string;
+  /** (operator, explicit) Relay non-HTTP traffic to it as raw bytes — unledgered. Default false: refused. */
+  raw?: boolean;
+  /** The SUT deduplicates resends by `Idempotency-Key`: an interrupted ledgered write may be re-sent once. */
+  honoursIdempotencyKey?: boolean;
 }
 
 /** (additive) Options of createOciSandbox(). */

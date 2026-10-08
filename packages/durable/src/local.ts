@@ -1,7 +1,7 @@
 import { HypertestError, Semaphore, type Logger } from '@hypertest/core';
 import type { TestRun } from '@hypertest/domain';
 import type { ControlPlane, TickResult, TurnOutcome } from '@hypertest/control';
-import type { DurableRuntime, LocalDurableOptions, RunOutcome } from './contracts.ts';
+import type { DurableRuntime, DurableSignal, LocalDurableOptions, RunOutcome } from './contracts.ts';
 import { errorMessage, faultCode, isRetryableFault } from './errors.ts';
 
 /** Run statuses resumeIncomplete() drives again (a paused run waits for an operator's resumeRun). */
@@ -232,10 +232,17 @@ export class LocalDurableRuntime implements DurableRuntime {
     loop.done = this.#drive(loop);
   }
 
-  async signal(runId: string, signal: { type: 'wake' } | { type: 'cancel'; reason: string }): Promise<void> {
+  async signal(runId: string, signal: DurableSignal): Promise<void> {
     if (typeof runId !== 'string' || runId.length === 0) throw new HypertestError('invalid_argument', 'signal: runId must be a non-empty string');
     const loop = this.#runs.get(runId);
     const live = loop && !loop.finished ? loop : undefined;
+    if (signal?.type === 'approval') {
+      if (typeof signal.approvalId !== 'string' || signal.approvalId === '') throw new HypertestError('invalid_argument', 'signal approval: approvalId is required');
+      // E[8]: an approval was decided — the run loop ticks and every waiting item observes now (not after its backoff)
+      live?.waker.wake();
+      live?.observeWaker.pulse();
+      return;
+    }
     if (signal?.type === 'wake') {
       live?.waker.wake();
       live?.observeWaker.pulse();

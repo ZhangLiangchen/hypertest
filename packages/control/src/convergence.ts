@@ -15,6 +15,8 @@ import { acceptedPlanCount } from './domain-tools/plan.ts';
 import { createPhaseGovernor } from './phases.ts';
 import { ControlStore, type GateFeedback, type ReplanState } from './store.ts';
 import { WorkFactory, runScope } from './work-factory.ts';
+import { experimentWallClockLimit, type RunExhaustion } from './budget-exhaustion.ts';
+import { experimentScope } from './domain-tools/specs.ts';
 import { CRITICAL_FINDING_REPLAN_CONSUMER, criticalFindingTriggers } from './reactors.ts';
 import { authorizedGateWeakenings, clip, compact, event, gateReference, runCtx, workBudgetFor } from './util.ts';
 
@@ -70,6 +72,13 @@ class GateAbandoned extends Error {
 export interface ConvergenceMonitor {
   /** Budget/wall-clock exhaustion of the run (never a silent downgrade: the run converges to the gate). */
   exhaustion(run: TestRun): Promise<'budget' | 'wall_clock' | undefined>;
+  /**
+   * (additive, E[3] / item 10) WHICH budget dimension is exhausted (scope, dimension, limit, used): every run dimension —
+   * model tokens and USD (a refused call at the current limit included), tool calls, compute, artifact bytes, wall clock.
+   * `caps` adds the work-item cap and the experiments' own budgets (a refusal at the current limit): those refuse the call
+   * under the `gate` policy (the run goes on with the work it has) and pause the run under `pause` / `approval`.
+   */
+  exhaustionDetail?(run: TestRun, options?: { caps?: boolean }): Promise<RunExhaustion | undefined>;
   /** Replan triggers: plan drained (latest plan not readyForGate) or pending gate feedback; at most one active lead item. */
   maybeReplan(run: TestRun, items: WorkItem[]): Promise<ReplanOutcome>;
   /** Classifies the run's state after a tick's scheduling steps. */
@@ -106,27 +115,66 @@ export function createConvergenceMonitor(deps: ControlDeps, config: ResolvedCont
   const workerId = config.workerId;
 
   async function exhaustion(run: TestRun): Promise<'budget' | 'wall_clock' | undefined> {
-    if (clock.nowMs() - Date.parse(run.createdAt) > run.budget.maxWallClockMs) return 'wall_clock';
-    const usage = await budget.usage(runScope(run.runId));
+    return (await exhaustionDetail(run))?.kind;
+  }
+
+  async function exhaustionDetail(run: TestRun, options: { caps?: boolean } = {}): Promise<RunExhaustion | undefined> {
+    const scope = runScope(run.runId);
+    const elapsed = clock.nowMs() - Date.parse(run.createdAt);
+    if (elapsed > run.budget.maxWallClockMs) return { kind: 'wall_clock', dimension: 'wallClockMs', scope, reason: 'wall_clock', limit: run.budget.maxWallClockMs, used: elapsed };
+    const usage = await budget.usage(scope);
     if (!usage) return undefined;
     // conformance-5: sandbox compute and stored artifact bytes are consumable run budgets too (never a silent overrun)
     for (const d of ['tokens', 'costUsd', 'toolCalls', 'computeMs', 'artifactBytes'] as const) {
       const limit = usage.limits[d];
-      if (limit !== undefined && (usage.used[d] ?? 0) >= limit) return 'budget';
+      if (limit !== undefined && (usage.used[d] ?? 0) >= limit) return { kind: 'budget', dimension: d, scope, reason: `${d}_spent`, limit, used: usage.used[d] ?? 0 };
     }
     // No model call fits any more: even the output reserve of one call exceeds what is left. Reservations of calls in
     // flight are NOT subtracted: they settle to their actual use, so they make room scarce only transiently — and this
     // verdict is permanent (pending work is cancelled).
     const tokens = usage.limits.tokens;
-    if (tokens !== undefined && tokens - (usage.used.tokens ?? 0) < config.maxOutputTokens) return 'budget';
-    // a model call was refused by the run scope at the current limit while no other call held a reservation (an
-    // operator raising the limit clears it; a refusal caused by concurrent reservations is transient)
-    if (tokens !== undefined) {
-      const refused = (await events.read(run.runId, { types: ['budget.exhausted'] })).some((e) => {
-        const p = (e.payload ?? {}) as { scope?: string; reason?: string; limit?: number; reservedByOthers?: number };
-        return p.scope === runScope(run.runId) && p.reason === 'model_tokens' && typeof p.limit === 'number' && tokens <= p.limit && (p.reservedByOthers ?? 0) === 0;
-      });
-      if (refused) return 'budget';
+    if (tokens !== undefined && tokens - (usage.used.tokens ?? 0) < config.maxOutputTokens) {
+      return { kind: 'budget', dimension: 'tokens', scope, reason: 'model_tokens', limit: tokens, used: usage.used.tokens ?? 0, requested: config.maxOutputTokens };
+    }
+    // item 10: a model call was refused by the run scope at the CURRENT limit of its dimension — tokens or USD — while no
+    // other call held a reservation (an operator raising that limit clears it; a refusal caused by concurrent
+    // reservations is transient). A USD-exhausted run ($0.99 of $1 spent, the next call needs more) is exhausted.
+    const markers = await events.read(run.runId, { types: ['budget.exhausted'] });
+    for (const e of markers) {
+      const p = (e.payload ?? {}) as { scope?: string; reason?: string; dimension?: string; limit?: number; used?: number; requested?: number; reservedByOthers?: number; policyKey?: string };
+      if (p.scope !== scope || p.policyKey !== undefined || typeof p.limit !== 'number' || (p.reservedByOthers ?? 0) !== 0) continue;
+      const d = p.reason === 'model_tokens' ? 'tokens' : p.reason === 'model_cost' ? 'costUsd' : undefined;
+      if (!d) continue;
+      const current = usage.limits[d];
+      if (current !== undefined && current <= p.limit) {
+        const out: RunExhaustion = { kind: 'budget', dimension: d, scope, reason: p.reason!, limit: current, used: usage.used[d] ?? 0 };
+        if (typeof p.requested === 'number') out.requested = p.requested;
+        return out;
+      }
+    }
+    if (!options.caps) return undefined;
+    // the work-item cap: a creation was refused at the current cap (after the last raise)
+    const raisedAt = Math.max(0, ...(await events.read(run.runId, { types: [EVENT_TYPES.budgetRaised] })).map((e) => e.seq ?? 0));
+    const cap = usage.limits.workItems;
+    if (cap !== undefined && (usage.used.workItems ?? 0) >= cap) {
+      const refused = markers.some((e) => (e.seq ?? 0) > raisedAt && (e.payload as { scope?: string; dimension?: string; policyKey?: string } | undefined)?.dimension === 'workItems' && (e.payload as { scope?: string }).scope === scope && (e.payload as { policyKey?: string }).policyKey === undefined);
+      if (refused) return { kind: 'budget', dimension: 'workItems', scope, reason: 'work_item_cap', limit: cap, used: usage.used.workItems ?? 0 };
+    }
+    // the experiments' own budgets: a call of the experiment was refused at its CURRENT limit (a raise clears it)
+    for (const e of markers) {
+      const p = (e.payload ?? {}) as { reason?: string; experimentId?: string; policyKey?: string; limit?: number };
+      if (p.policyKey !== undefined || typeof p.experimentId !== 'string' || typeof p.limit !== 'number') continue;
+      if (p.reason === 'experiment_tool_calls') {
+        const u = await budget.usage(experimentScope(p.experimentId));
+        const limit = u?.limits.toolCalls;
+        if (limit !== undefined && limit <= p.limit && (u?.used.toolCalls ?? 0) >= limit) return { kind: 'budget', dimension: 'experiment.toolCalls', scope: experimentScope(p.experimentId), reason: p.reason, limit, used: u?.used.toolCalls ?? 0, experimentId: p.experimentId };
+      } else if (p.reason === 'experiment_wall_clock') {
+        const spec = await specs.getExperiment(p.experimentId);
+        const limit = await experimentWallClockLimit(deps, run.runId, p.experimentId);
+        if (spec && limit !== undefined && limit <= p.limit && clock.nowMs() - Date.parse(spec.createdAt) > limit) {
+          return { kind: 'budget', dimension: 'experiment.wallClockMs', scope: experimentScope(p.experimentId), reason: p.reason, limit, used: clock.nowMs() - Date.parse(spec.createdAt), experimentId: p.experimentId };
+        }
+      }
     }
     return undefined;
   }
@@ -730,6 +778,7 @@ export function createConvergenceMonitor(deps: ControlDeps, config: ResolvedCont
 
   return {
     exhaustion,
+    exhaustionDetail,
     maybeReplan,
     evaluate,
     gateReady,

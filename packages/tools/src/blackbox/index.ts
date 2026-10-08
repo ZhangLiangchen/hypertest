@@ -122,3 +122,8 @@ export {
   type BrowserToolOptions, type BrowserManagerOptions, type BrowserNavigateInput, type BrowserEgressGuard, type BlockedRequest,
 } from './browser.ts';
 export { McpToolBridge, mcpToolId, sanitizeMcpSegment, normalizeMcpSchema, type McpServerConfig, type McpToolBridgeOptions } from './mcp.ts';
+// (E[4] / coverage[8]) the secret broker: short-lived, scoped credentials minted per call; long-lived secrets never reach agents
+export {
+  CONTROL_TOKEN_AUDIENCE, CONTROL_TOKEN_TTL_MS, CREDENTIAL_SCOPE_PREFIX, DEFAULT_CREDENTIAL_TTL_MS, MAX_CREDENTIAL_TTL_MS, brokeredCredentialProblems, createSecretBroker, credentialScope,
+  mintControlToken, signJwtHs256, verifyJwtHs256, type SecretBrokerOptions,
+} from './secrets.ts';

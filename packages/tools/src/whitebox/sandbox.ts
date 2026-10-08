@@ -6,10 +6,11 @@ import { tmpdir } from 'node:os';
 import { connect, createServer, type Server, type Socket } from 'node:net';
 import { join, relative, resolve, sep } from 'node:path';
 import { HypertestError } from '@hypertest/core';
-import type { LocalSandboxOptions, OciSandboxOptions, ProcessResult, SandboxProfile, SandboxRunner, WorkspaceHandle } from '../contracts.ts';
+import type { EgressEndpointPolicy, EgressWritePolicy, LocalSandboxOptions, OciSandboxOptions, ProcessResult, SandboxProfile, SandboxRunner, WorkspaceHandle } from '../contracts.ts';
 import { DEFAULT_KILL_GRACE_MS, DEFAULT_MAX_OUTPUT_BYTES, spawnProcess } from './process.ts';
 import { confineExisting } from './paths.ts';
 import { networkIsolation, resolveProgram, type IsolationSpec, type NetworkIsolation } from './netns.ts';
+import { createEgressHttpServer, currentEgressContext, type EgressCallContext } from './egress-relay.ts';
 
 /** Variables every sandboxed process gets regardless of the allowlist (values chosen by the sandbox). */
 export const SANDBOX_BASE_ENV = ['PATH', 'HOME', 'LANG', 'TMPDIR'] as const;
@@ -103,9 +104,22 @@ export function createLocalSandbox(options: LocalSandboxOptions = {}): SandboxRu
         };
         let argv = command;
         const network = ws.sandbox?.network;
+        // E[4]: paths this sandbox must hide (keys, capability secret, store) are hidden only by the jail strategy; a command
+        // that would see them runs only when its owner explicitly accepted that (allowUnhiddenPaths) — never silently
+        const mustHide = (options.hiddenPaths?.length ?? 0) > 0 && options.allowUnhiddenPaths !== true;
+        if (mustHide && network === 'open') {
+          throw new HypertestError('precondition_failed', `the local sandbox cannot hide ${options.hiddenPaths!.join(', ')} from a command with an open network (no namespaces): refused (fail closed)`, {
+            details: { workspaceId: ws.workspaceId, network },
+          });
+        }
         if (network !== 'open') {
           // fail closed: every profile but an explicitly open network (and a workspace without a profile) is isolated
           const iso = await isolation();
+          if (iso.available && !iso.jail && mustHide) {
+            throw new HypertestError('precondition_failed', `the local sandbox cannot hide ${options.hiddenPaths!.join(', ')} from commands on this host (strategy ${iso.strategy} has no PID/mount jail): refused (fail closed)`, {
+              details: { workspaceId: ws.workspaceId, strategy: iso.strategy },
+            });
+          }
           if (!iso.available) {
             throw new HypertestError(
               'precondition_failed',
@@ -120,9 +134,11 @@ export function createLocalSandbox(options: LocalSandboxOptions = {}): SandboxRu
             const spec = isolationSpec(ws, cwd, options);
             // allowlisted egress (the SUT's loopback endpoints) for every profile but `none` — jail strategy only
             if (network !== 'none' && network !== undefined && iso.jail && options.egress) {
-              const endpoints = loopbackEndpoints(await options.egress(ws));
+              const endpoints = loopbackEndpointPolicies(await options.egress(ws));
               if (endpoints.length > 0) {
-                const fw = await startEgressForwarders(endpoints);
+                // E[2]: HTTP-aware relays — safe methods pass, writes are ledgered (or refused), raw traffic refused unless
+                // the environment allows it; the tool call the command runs for is captured now
+                const fw = await startEgressForwarders(endpoints, options.egressWrites ?? 'ledger', currentEgressContext());
                 cleanups.push(fw.close);
                 spec.egress = fw.list;
               }
@@ -153,14 +169,20 @@ interface LoopbackEndpoint {
  * allowlist): only this host's loopback can be relayed into a namespace; any other host stays unreachable.
  */
 export function loopbackEndpoints(origins: readonly string[]): LoopbackEndpoint[] {
-  const out: LoopbackEndpoint[] = [];
-  const add = (e: LoopbackEndpoint) => {
+  return loopbackEndpointPolicies(origins).map(({ bind, host, port }) => ({ bind, host, port }));
+}
+
+/** (E[2]) loopbackEndpoints with each endpoint's egress policy (a plain origin string: HTTP-aware, no raw traffic). */
+export function loopbackEndpointPolicies(origins: readonly (string | EgressEndpointPolicy)[]): Array<LoopbackEndpoint & { policy: EgressEndpointPolicy }> {
+  const out: Array<LoopbackEndpoint & { policy: EgressEndpointPolicy }> = [];
+  const add = (e: LoopbackEndpoint & { policy: EgressEndpointPolicy }) => {
     if (!out.some((o) => o.bind === e.bind && o.port === e.port)) out.push(e);
   };
-  for (const o of origins) {
+  for (const entry of origins) {
+    const policy: EgressEndpointPolicy = typeof entry === 'string' ? { origin: entry } : entry;
     let url: URL;
     try {
-      url = new URL(o);
+      url = new URL(policy.origin);
     } catch {
       continue;
     }
@@ -168,20 +190,26 @@ export function loopbackEndpoints(origins: readonly string[]): LoopbackEndpoint[
     const port = url.port !== '' ? Number(url.port) : url.protocol === 'https:' ? 443 : 80;
     const host = url.hostname.replace(/^\[|\]$/g, '');
     if (host === 'localhost') {
-      add({ bind: '127.0.0.1', host: '127.0.0.1', port });
-      add({ bind: '::1', host: '::1', port });
+      add({ bind: '127.0.0.1', host: '127.0.0.1', port, policy });
+      add({ bind: '::1', host: '::1', port, policy });
     } else if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host) || host === '::1') {
-      add({ bind: host, host, port });
+      add({ bind: host, host, port, policy });
     }
   }
   return out;
 }
 
 /**
- * Serves each endpoint on a unix socket (a short private directory under the system temp dir, visible inside the jail):
- * a connection is relayed to the real endpoint. `close()` stops the servers and their connections.
+ * Serves each endpoint on a unix socket (a short private directory under the system temp dir, visible inside the jail).
+ * (E[2]) An HTTP-aware relay (createEgressHttpServer: safe methods forwarded, writes ledgered or refused, non-HTTP traffic
+ * refused); only an endpoint whose policy allows `raw` traffic gets a byte relay to the real endpoint. `close()` stops
+ * the servers and their connections.
  */
-async function startEgressForwarders(endpoints: readonly LoopbackEndpoint[]): Promise<{ list: Array<{ host: string; port: number; socket: string }>; close: () => Promise<void> }> {
+async function startEgressForwarders(
+  endpoints: ReadonlyArray<LoopbackEndpoint & { policy: EgressEndpointPolicy }>,
+  writes: EgressWritePolicy,
+  call: EgressCallContext | undefined,
+): Promise<{ list: Array<{ host: string; port: number; socket: string }>; close: () => Promise<void> }> {
   const dir = await mkdtemp(join(tmpdir(), 'hte-'));
   const servers: Server[] = [];
   const sockets = new Set<Socket>();
@@ -189,6 +217,20 @@ async function startEgressForwarders(endpoints: readonly LoopbackEndpoint[]): Pr
   try {
     for (const [i, e] of endpoints.entries()) {
       const path = join(dir, `${i}.sock`);
+      if (e.policy.raw !== true) {
+        const http = createEgressHttpServer(e, writes, call);
+        http.on('connection', (s: Socket) => {
+          sockets.add(s);
+          s.once('close', () => sockets.delete(s));
+        });
+        await new Promise<void>((resolveListen, rejectListen) => {
+          http.once('error', rejectListen);
+          http.listen(path, () => resolveListen());
+        });
+        servers.push(http as unknown as Server);
+        list.push({ host: e.bind, port: e.port, socket: path });
+        continue;
+      }
       const server = createServer((inner) => {
         const outer = connect({ host: e.host, port: e.port });
         for (const s of [inner, outer]) {

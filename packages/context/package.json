@@ -8,6 +8,7 @@
     "@hypertest/core": "0.3.0-dev",
     "@hypertest/domain": "0.3.0-dev",
     "@hypertest/collab": "0.3.0-dev",
-    "@hypertest/evidence": "0.3.0-dev"
+    "@hypertest/evidence": "0.3.0-dev",
+    "typescript": "5.9.3"
   }
 }

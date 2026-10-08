@@ -1,14 +1,14 @@
 import type { Clock, EventBus, IdGenerator, JsonValue, Logger, SqlDatabase } from '@hypertest/core';
-import type { BudgetEnvelope, DomainEvent, GateSpec, ModelPolicy, OracleAssertion, OracleSpec, RuntimeEpoch, RuntimeManifest, TestRun } from '@hypertest/domain';
+import type { BudgetEnvelope, DomainEvent, GateSpec, ModelPolicy, OperationRecord, OracleAssertion, OracleSpec, RuntimeEpoch, RuntimeManifest, TestRun } from '@hypertest/domain';
 import type { ModelCapabilityProfile, ModelCatalog, ModelRouter, PriceCeiling, ProviderRegistry, ScriptedBrain } from '@hypertest/model';
 import type { ApprovalRequest, ApprovalService, OracleGovernance, PolicyDecisionLog, PolicyEngine, PolicyRule, ResolvedProtocol } from '@hypertest/policy';
-import type { EnvironmentDescriptor, EnvironmentRegistry, SandboxProfile, ToolRegistryLike, ToolRuntime, WorkspaceManager } from '@hypertest/tools';
+import type { BrokeredCredentialConfig, EnvironmentDescriptor, EnvironmentRegistry, NetworkIsolationOptions, SandboxProfile, ToolRegistryLike, ToolRuntime, WorkspaceManager } from '@hypertest/tools';
 import type { RoleCatalogLike, RoleOverrides } from '@hypertest/agents';
-import type { ControlPlane, RunReport, StartRunInput } from '@hypertest/control';
+import type { BudgetRaiseInput, ControlPlane, RunReport, StartRunInput } from '@hypertest/control';
 import type { DurableRuntime, RunOutcome } from '@hypertest/durable';
 import type { Blackboard, DecisionRepository, EventStore, OutboxRelay, RunRepository, SpecRepository } from '@hypertest/collab';
 import type { ArtifactStore, EvidenceLedger, Signer } from '@hypertest/evidence';
-import type { DurableMemory, ProvenanceService } from '@hypertest/context';
+import type { DurableMemory, ProvenanceService, SkillRegistry, SkillRevision } from '@hypertest/context';
 import type { AdapterRegistry, OperationLedger } from '@hypertest/operation';
 import type {
   AgentView, CanarySelection, CompatibilitySuiteResult, ModelSwitchRequest, PluginKernel, PromotionResult, RecordSuiteInput, RollbackResult, RuntimeRelease, RuntimeReleaseRegistry, SchemaMigrationAllowance,
@@ -84,12 +84,40 @@ export interface HypertestConfig {
   bugate?: { path?: string };
   /** The default AgentEngine. `dsh` (the pinned DeepSeek Harness adapter, experimental) is registered only when selected here. */
   engines?: { default: 'native' | 'pi' | 'dsh' | (string & {}) };
-  sandbox?: Partial<SandboxProfile>;
+  /**
+   * The sandbox profile of agent commands. (additive, E[2]) `egressWrites`: what a sandboxed command's state-changing HTTP
+   * request to a relayed SUT endpoint becomes — `ledger` (default: an Operation Ledger operation with an Idempotency-Key and
+   * evidence; durable replays answered from the record) or `refuse` (stricter: 403 with the exact reason).
+   */
+  /**
+   * (additive) `egressWrites` (E[2]); `insecureAllowUnhiddenSecrets` (E[4]): the LOUD opt-in to run agent commands with
+   * the local sandbox where it cannot hide the signing keys, capability secret and store from them (no PID/mount jail on
+   * this host, or `network: open`). Without it such a composition is refused (fail closed) and doctor reports an ERROR.
+   */
+  sandbox?: Partial<SandboxProfile> & { egressWrites?: 'ledger' | 'refuse'; insecureAllowUnhiddenSecrets?: boolean };
   /** (additive: `control.tokenEnv`) Environments registered at startup; see EnvironmentConfig. */
   environments?: EnvironmentConfig[];
   tools?: { shellAllowlist?: string[]; httpAllowlist?: string[]; enableBrowser?: boolean };
   signing?: { keyFile?: string };
-  memory?: { kind: 'sql' } | { kind: 'powercontext'; baseUrl: string; apiKeyEnv?: string };
+  /**
+   * L4 durable memory. `sql`: in this process's store (embedded deployments, tests). `powercontext`: a separate context
+   * service at `baseUrl` (its own process and storage — e.g. `hypertest memory serve`). (additive, B[4]) `service`: a memory
+   * service process Hypertest starts and stops itself (`dataDir`, default `<dataDir>/memory`; its own PGlite store), reached
+   * over the same HTTP API as `powercontext`.
+   */
+  memory?: { kind: 'sql' } | { kind: 'powercontext'; baseUrl: string; apiKeyEnv?: string } | { kind: 'service'; dataDir?: string; apiKeyEnv?: string };
+  /**
+   * (additive, B[6]) L3 retrieval. `embedder`: semantic embeddings through an OpenAI-compatible `/embeddings` endpoint of a
+   * configured `openai-compatible` provider (`models.providers[].id`; its baseUrl and apiKeyEnv) instead of the default feature-hashing
+   * embedder; `dimensions` is the vector size the model returns (verified on every answer). Code leaves the machine to that
+   * provider: configure a local endpoint for private code.
+   */
+  retrieval?: { embedder?: { provider: string; model: string; dimensions: number; timeoutMs?: number } };
+  /**
+   * (additive, B[7]) Skills. `trial`: candidate skill revisions under evaluation, shown (marked as candidates) in the prompts of
+   * THIS instance only — set by `hypertest skill validate` on the eval arm bound to the revision (skillArmId); never published.
+   */
+  skills?: { trial?: SkillRevision[] };
   observability?: { logLevel?: 'debug' | 'info' | 'warn' | 'error' };
   /**
    * (additive, conformance-1) Oracles established by a named human authority at composition (OracleGovernance.establish;
@@ -161,6 +189,13 @@ export interface HypertestOverrides {
   bus?: EventBus;
   /** (additive, e2e[3]) The fetch the HTTP model providers use (tests prove that no request leaves the process). */
   fetch?: typeof fetch;
+  /**
+   * (additive, E[4]) Programs the local sandbox isolates commands with (default `unshare` + `python3` from PATH); tests
+   * point them elsewhere to exercise the fail-closed composition on a host without the jail.
+   */
+  sandboxIsolation?: NetworkIsolationOptions;
+  /** (additive, E[4]) The fetch the secret broker's oauth2 token exchange uses (tests inject one). */
+  credentialFetch?: typeof fetch;
 }
 
 export interface Hypertest {
@@ -202,8 +237,13 @@ export interface Hypertest {
  * the supervisor's control token (`tokenEnv`). The token is attached to the control target at composition; an inline
  * token (`control.target` with `#token=`) is a validation error.
  */
-export type EnvironmentConfig = Omit<EnvironmentDescriptor, 'control'> & {
+export type EnvironmentConfig = Omit<EnvironmentDescriptor, 'control' | 'brokeredCredentials'> & {
   control?: NonNullable<EnvironmentDescriptor['control']> & { tokenEnv?: string };
+  /**
+   * (additive, E[4] / coverage[8]) Brokered credentials of the environment: the secret broker mints a short-lived
+   * credential per call from the secret in `secretEnv` (agents only name the credential: http.request `credential`).
+   */
+  credentials?: Array<Omit<BrokeredCredentialConfig, 'environmentId'>>;
 };
 
 /** (additive) One configured route: routeId, provider and model plus any capability-profile field (defaults fill the rest). */
@@ -266,6 +306,8 @@ export interface HypertestServices {
   toolRuntime?: ToolRuntime;
   workspaces?: WorkspaceManager;
   plugins?: PluginKernel;
+  /** (additive, optional, B[7]) The Skill Registry (candidate → eval-validated → published; `hypertest skill …`). */
+  skills?: SkillRegistry;
 }
 
 /** (additive) What createHypertest returns: the Hypertest facade with every optional member present. */
@@ -275,6 +317,17 @@ export interface HypertestInstance extends Hypertest {
   listRuns(filter?: { status?: TestRun['status'][]; limit?: number }): Promise<TestRun[]>;
   events(runId: string, options?: { afterSeq?: number; limit?: number; types?: string[] }): Promise<DomainEvent<unknown>[]>;
   listApprovals(filter?: { runId?: string; status?: ApprovalRequest['status'][] }): Promise<ApprovalRequest[]>;
+  /**
+   * (additive, stubs[8]) Operations by status (default: those awaiting a human manual review), of one run or of all runs
+   * (`hypertest operations list`, GET /operations).
+   */
+  listOperations(filter?: { runId?: string; status?: OperationRecord['status'][]; limit?: number }): Promise<OperationRecord[]>;
+  /**
+   * (additive, stubs[8]) A human resolves an operation under manual review (`hypertest operations resolve`, POST
+   * /operations/:id/resolve): succeeded ⇒ verified, failed ⇒ failed, compensated ⇒ compensated; audited on L0
+   * (`operation.resolved`); the work waiting on it resumes. Agents never resolve operations.
+   */
+  resolveOperation(operationId: string, outcome: 'succeeded' | 'failed' | 'compensated', actor: { kind: 'human'; id: string }, note: string): Promise<OperationRecord>;
   cancel(runId: string, reason: string): Promise<void>;
   readonly releases: RuntimeReleaseService;
   /**
@@ -288,7 +341,19 @@ export interface HypertestInstance extends Hypertest {
    * (additive, A[0]) Operator resume of one run (`hypertest resume <runId>`, POST /runs/:id/resume): releases its model
    * pauses (their open circuits probe now), resumes it when paused, and drives it in this process.
    */
-  resume(runId: string): Promise<{ releasedPauses: string[] }>;
+  resume(runId: string, options?: ResumeRunOptions): Promise<{ releasedPauses: string[] }>;
+}
+
+/**
+ * (additive, E[3]) Options of an operator resume: `raise` extends the run's budget first (amounts ADDED to its limits;
+ * audited on L0 `budget.raised` as `human:<by>` with the rationale) — a PAUSED_BUDGET run is resumable after a raise.
+ */
+export interface ResumeRunOptions {
+  raise?: BudgetRaiseInput;
+  /** The human who raises (required with `raise`). */
+  by?: string;
+  /** Why (required with `raise`). */
+  rationale?: string;
 }
 
 /** (additive) A runtime release as `hypertest runtime list` shows it. */

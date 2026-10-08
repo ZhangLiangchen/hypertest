@@ -105,6 +105,17 @@ export function createResourceAdmission(deps: OperationDeps): ResourceAdmission 
       });
     },
 
+    async retime(holderId: string, ttlMs: number): Promise<number> {
+      if (typeof holderId !== 'string' || holderId.length === 0) throw new HypertestError('invalid_argument', 'holderId must be a non-empty string');
+      if (!Number.isFinite(ttlMs) || ttlMs <= 0) throw new HypertestError('invalid_argument', 'ttlMs must be positive');
+      const nowMs = clock.nowMs();
+      return db.transaction(async (tx) => {
+        await tx.query('SELECT lock_id FROM ht_admission_lock WHERE lock_id = 1 FOR UPDATE');
+        const r = await tx.query('UPDATE ht_resource_claims SET expires_at = $3 WHERE holder_id = $1 AND expires_at > $2', [holderId, new Date(nowMs).toISOString(), new Date(nowMs + ttlMs).toISOString()]);
+        return r.rowCount ?? 0;
+      });
+    },
+
     async held(holderId: string): Promise<Array<{ runId: string; claim: ResourceClaim; expiresAt: string }>> {
       if (typeof holderId !== 'string' || holderId.length === 0) throw new HypertestError('invalid_argument', 'holderId must be a non-empty string');
       const r = await db.query<ClaimRow>(`SELECT ${CLAIM_COLUMNS} FROM ht_resource_claims WHERE holder_id = $1 AND expires_at > $2 ORDER BY created_at, claim_id`, [holderId, clock.isoNow()]);

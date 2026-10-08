@@ -170,6 +170,15 @@ over the same world are two processes over the same database.
 - An operator's *terminate* of a run workflow, or of a child carried across continueAsNew, is not seen by workflow code:
   a waiting item whose carried child was terminated is re-observed only after the next restart of the run workflow.
 
+## ApprovalSignal (audit wave 2, additive)
+
+`DurableRuntime.signal(runId, { type: 'approval', approvalId })` (`DurableSignal`): a human decided an approval. The
+local runtime wakes the run loop and pulses the observers of waiting items (an item waiting on `approval:<id>` is
+observed at once instead of after its backoff); the Temporal runtime signals the run workflow (`approvalSignal`), which
+forwards it to its child workflows before its next tick — a waiting child ends its backoff (`condition`) and observes.
+Lost signals only delay: the waits keep polling. Tests: `test/local.test.ts` and `test/temporal.int.test.ts`
+("ApprovalSignal").
+
 ## How to run
 
 ```bash

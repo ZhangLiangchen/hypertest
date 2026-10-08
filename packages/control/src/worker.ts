@@ -23,7 +23,9 @@ import {
   unreadMessages,
 } from './delegation.ts';
 import { workLeaseKey, yieldWorkClaim } from './scheduler.ts';
-import { runExperimentIds } from './isolation.ts';
+import { compatibleClaimHolders } from './isolation.ts';
+import { approvalOutcomeLine, approvalPending, parseApprovalWaitOperationId } from './approvals.ts';
+import { applyExhaustionPolicy, exhaustionPolicy, type RunExhaustion } from './budget-exhaustion.ts';
 import { ControlStore, type AgentHostSpec, type Delegation, type WorkspaceRecipe } from './store.ts';
 import { runScope, workScope } from './work-factory.ts';
 import { KeyedMutex, assertRunPinned, clip, event, failureReason, itemCtx, jsonBlock, notFound, systemActor, tightenModelPolicy } from './util.ts';
@@ -62,6 +64,18 @@ export const BLACKBOX_SCOPES: readonly string[] = Object.freeze(['env/**', 'load
 /** The black-box scopes a permission profile covers (an agent is granted exactly those beyond its workspace and run). */
 export function blackboxScopes(profile: Pick<PermissionProfile, 'resourceScopes'>): string[] {
   return BLACKBOX_SCOPES.filter((scope) => profile.resourceScopes.some((s) => resourcePatternCovers(s, scope)));
+}
+
+/** Default permission profiles a brokered credential is granted to (BrokeredCredentialConfig.grantTo). */
+const DEFAULT_CREDENTIAL_GRANT: readonly string[] = ['test_executor', 'environment_operator'];
+
+/** (E[4]) The brokered credential scopes (`credential:<environmentId>/<name>`) the environments grant to `profileName`. */
+export function brokeredCredentialScopes(environments: ReadonlyArray<{ environmentId: string; brokeredCredentials?: Array<{ name: string; grantTo?: string[] }> }>, profileName: string): string[] {
+  const out: string[] = [];
+  for (const e of environments) {
+    for (const c of e.brokeredCredentials ?? []) if ((c.grantTo ?? DEFAULT_CREDENTIAL_GRANT).includes(profileName)) out.push(`credential:${e.environmentId}/${c.name}`);
+  }
+  return out;
 }
 
 function resolveProfile(name: string): PermissionProfile {
@@ -265,6 +279,9 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
       // are sandboxes never carries a staging- or production-capable token
       const registeredClasses = new Set(['local', ...deps.environments.list().map((e) => e.environmentClass)]);
       const environmentClasses = profile.environmentClasses.filter((c) => registeredClasses.has(c));
+      // E[4] / coverage[8]: the brokered credentials the operator granted to this role's permission profile (the scope
+      // only — the secret broker mints a short-lived credential per call; the agent never holds a value)
+      const credentialScopes = [...new Set([...profile.credentialScopes, ...brokeredCredentialScopes(deps.environments.list(), role.permissionProfile)])].sort();
       const expiresAt = new Date(clock.nowMs() + item.budget.maxWallClockMs).toISOString();
       const ctx = itemCtx(item, workerActor);
       // I2: … ∩ WORK ITEM requirements (baseline: its own workspace and the run's records) ∩ environment policy
@@ -293,14 +310,14 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
           // I2: a child is attenuated from its parent's recorded capability, never granted a root one:
           // parent ∩ role ∩ work item ∩ environment policy
           const roleC: CapabilityConstraints = {
-            tools: allow, resourceScopes: scopes, allowedEffects: profile.allowedEffects, environmentClasses: profile.environmentClasses, credentialScopes: profile.credentialScopes,
+            tools: allow, resourceScopes: scopes, allowedEffects: profile.allowedEffects, environmentClasses: profile.environmentClasses, credentialScopes,
             maxRiskClass: profile.maxRiskClass, expiresAt,
           };
           granted = attenuateCapability(parentCapability, [roleC, ...(workItemC ? [workItemC] : []), environmentC], { subjectAgentId: agentId, workItemId: item.workItemId }, { secret: config.capabilitySecret });
         } else {
           // root: role profile ∩ environment policy, then ∩ work item (narrowed in place: a root has no parent grant)
           const root = createRootCapability(
-            { runId: run.runId, subjectAgentId: agentId, workItemId: item.workItemId, profile: { ...profile, name: role.permissionProfile as PermissionProfileName, resourceScopes: scopes, environmentClasses }, tools: allow, expiresAt },
+            { runId: run.runId, subjectAgentId: agentId, workItemId: item.workItemId, profile: { ...profile, name: role.permissionProfile as PermissionProfileName, resourceScopes: scopes, environmentClasses, credentialScopes }, tools: allow, expiresAt },
             config.capabilitySecret,
           );
           granted = workItemC ? narrowRoot(root, workItemC, config.capabilitySecret) : root;
@@ -703,7 +720,7 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
   async function renewResourceClaims(item: WorkItem, ctx: EventContext, phase: string): Promise<boolean> {
     if (item.resourceClaims.length === 0) return true;
     // (conformance-6) an item that runs for experiments shares their admitted claims
-    const r = await admission.admit({ holderId: item.workItemId, runId: item.runId, claims: item.resourceClaims, ttlMs: config.leaseTtlMs, compatibleHolders: await runExperimentIds(deps, item) });
+    const r = await admission.admit({ holderId: item.workItemId, runId: item.runId, claims: item.resourceClaims, ttlMs: config.leaseTtlMs, compatibleHolders: await compatibleClaimHolders(deps, item) });
     if (r.admitted) return true;
     const conflicts = r.conflicts.map((c) => `${c.requested.resourceKey}@${c.heldBy}`).sort();
     logger.warn('resource claims of a held work item could not be renewed (taken by another holder); the item stops', { workItemId: item.workItemId, conflicts, phase });
@@ -916,14 +933,20 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
           // the exact reason (e.g. no configured route may serve the role: a missing credential, a capability) — fail closed
           const message = failedInvocation?.message ?? `model boundary ${result.boundary}`;
           const marker = reason === 'budget_exhausted' ? await budgetMarker(run, workItemId, failedInvocation?.budget) : undefined;
+          let markerRecorded = false;
           if (marker?.runBound) {
             // The RUN refused the call, not the item's own budget. Calls of other agents still hold reservations that may
-            // settle lower: the item waits for room (no failure). Otherwise the run's exhaustion policy applies — under
-            // 'pause' the item keeps its agent and session and waits for the run to be resumed (never failed).
+            // settle lower: the item waits for room (no failure). Otherwise the run's exhaustion policy applies (E[3]) —
+            // under 'pause' / 'approval' the item keeps its agent and session and waits for the run to be resumed (after
+            // a raise / an approved extension), never failed; under 'gate' (or once the policy decided for the gate) it
+            // fails with the exact reason and the run converges to the gate.
             if (marker.contention) return await pauseItemForBudget(item, agent, marker, message, fencingToken, agentCtx, false);
-            if (config.onBudgetExhausted === 'pause') {
+            if (exhaustionPolicy(run, config) !== 'gate') {
               await events.append([event(agentCtx, 'budget.exhausted', 'budget', marker.scope, marker.payload)]);
-              return await pauseItemForBudget(item, agent, marker, message, fencingToken, agentCtx, true);
+              markerRecorded = true;
+              const applied = await applyExhaustionPolicy(deps, run, markerExhaustion(marker), agentCtx);
+              if (applied.outcome === 'raised') return { status: 'continue', workItemId, turn: result.turn };
+              if (applied.outcome === 'paused') return await pauseItemForBudget(item, agent, marker, message, fencingToken, agentCtx, true, applied.pauseReason);
             }
           }
           await settleAgentFailed(agent, { reason, message }, agentCtx);
@@ -931,7 +954,7 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
           // Which scope and dimension refused the reservation (the ledger's typed refusal): a run-scope refusal while other
           // calls held no reservation means no model call fits at this limit any more (convergence reads the marker; a
           // raised limit clears it).
-          if (marker) await events.append([event(agentCtx, 'budget.exhausted', 'budget', marker.scope, marker.payload)]);
+          if (marker && !markerRecorded) await events.append([event(agentCtx, 'budget.exhausted', 'budget', marker.scope, marker.payload)]);
           return { status: 'failed', workItemId };
         }
         case 'interrupted': {
@@ -1002,6 +1025,17 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
     return { status: 'waiting', workItemId: item.workItemId, operationIds: [op] };
   }
 
+  /** (E[3]) The run exhaustion a refused model reservation stands for (the policy's input). */
+  function markerExhaustion(marker: BudgetMarker): RunExhaustion {
+    const x: RunExhaustion = { kind: 'budget', dimension: marker.dimension, scope: marker.scope, reason: String(marker.payload['reason'] ?? `model_${marker.dimension}`) };
+    const limit = marker.payload['limit'];
+    if (typeof limit === 'number') x.limit = limit;
+    const used = marker.payload['used'];
+    if (typeof used === 'number') x.used = used;
+    if (marker.requested > 0) x.requested = marker.requested;
+    return x;
+  }
+
   interface BudgetMarker {
     scope: string;
     runBound: boolean;
@@ -1045,7 +1079,7 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
    * budget, in the same transaction) with its claim, agent and session intact; `pauseRun` (onBudgetExhausted 'pause' and
    * no call in flight could free room) also pauses the run for an operator.
    */
-  async function pauseItemForBudget(item: WorkItem, agent: AgentInstance, marker: BudgetMarker, message: string, token: number, ctx: EventContext, pauseRun: boolean): Promise<TurnOutcome> {
+  async function pauseItemForBudget(item: WorkItem, agent: AgentInstance, marker: BudgetMarker, message: string, token: number, ctx: EventContext, pauseRun: boolean, runPauseReason: 'budget' | 'approval' = 'budget'): Promise<TurnOutcome> {
     const op = budgetWaitOperationId(item.runId);
     await fenced(() =>
       db.transaction(async (tx) => {
@@ -1062,10 +1096,10 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
       }),
     );
     if (pauseRun) {
-      const cur = await runs.get(item.runId);
-      if (cur?.status === 'running') await runs.update(item.runId, { status: 'paused', pauseReason: 'budget' }, ctx);
-      logger.warn('run paused: its budget refused a model call (onBudgetExhausted pause); the item waits for the run to be resumed', { runId: item.runId, workItemId: item.workItemId, message });
-      return { status: 'paused', workItemId: item.workItemId, reason: 'budget' };
+      // the run itself was paused by its exhaustion policy (applyExhaustionPolicy: pauseReason budget, or approval while a
+      // budget-extension request waits for its decision)
+      logger.warn('run paused: its budget refused a model call; the item waits for the run to be resumed', { runId: item.runId, workItemId: item.workItemId, message, pauseReason: runPauseReason });
+      return { status: 'paused', workItemId: item.workItemId, reason: runPauseReason };
     }
     logger.info('model call waits for budget room: calls in flight hold reservations', { runId: item.runId, workItemId: item.workItemId, message });
     return { status: 'waiting', workItemId: item.workItemId, operationIds: [op] };
@@ -1107,18 +1141,21 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
         remaining: room, reservedByOthers: 0,
       },
     };
-    if (!paused?.runPaused && config.onBudgetExhausted === 'pause') {
-      // the contention wait became a genuine exhaustion: the run pauses for an operator, and the item's pause is now a
-      // RUN pause on L0 (runPaused) — so a resume without room ends it with the exact reason instead of pausing again
-      await events.append([
-        event(ctx, 'budget.exhausted', 'budget', marker.scope, marker.payload),
-        event(ctx, EVENT_TYPES.workPaused, 'work_item', workItemId, {
-          workItemId, agentId: agent.agentId, pauseReason: 'budget', scope: marker.scope, dimension, requested, contention: false, runPaused: true, reason: paused?.reason ?? 'model budget exhausted',
-        }),
-      ]);
-      const cur = await runs.get(run.runId);
-      if (cur?.status === 'running') await runs.update(run.runId, { status: 'paused', pauseReason: 'budget' }, ctx);
-      return { status: 'paused', workItemId, reason: 'budget' };
+    if (!paused?.runPaused && exhaustionPolicy(run, config) !== 'gate') {
+      // the contention wait became a genuine exhaustion: the run's policy applies (pause for a raise / a budget-extension
+      // approval), and the item's pause is now a RUN pause on L0 (runPaused) — so a resume without room ends it with the
+      // exact reason instead of pausing again
+      await events.append([event(ctx, 'budget.exhausted', 'budget', marker.scope, marker.payload)]);
+      const applied = await applyExhaustionPolicy(deps, run, markerExhaustion(marker), ctx);
+      if (applied.outcome === 'raised') return { status: 'waiting', workItemId, operationIds: item.waitingOn };
+      if (applied.outcome === 'paused') {
+        await events.append([
+          event(ctx, EVENT_TYPES.workPaused, 'work_item', workItemId, {
+            workItemId, agentId: agent.agentId, pauseReason: 'budget', scope: marker.scope, dimension, requested, contention: false, runPaused: true, reason: paused?.reason ?? 'model budget exhausted',
+          }),
+        ]);
+        return { status: 'paused', workItemId, reason: applied.pauseReason };
+      }
     }
     const message = paused?.runPaused
       ? `the run was resumed but its budget still has no room for the model call (${dimension}: ${room} left, ${requested} needed): ${paused.reason ?? 'budget exhausted'}`
@@ -1236,6 +1273,24 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
     let settled = true;
     const pending: string[] = [];
     for (const op of item.waitingOn) {
+      // E[8]: an action waiting for a human approval decision (durable: the wait is the item's state)
+      const approvalId = parseApprovalWaitOperationId(op);
+      if (approvalId !== undefined) {
+        let a = await deps.approvals.get(approvalId);
+        if (!a) {
+          lines.push(`- approval ${approvalId}: not found (the action must not run)`);
+          continue;
+        }
+        if (approvalPending(a, clock.nowMs())) {
+          settled = false;
+          pending.push(op);
+          continue;
+        }
+        // its validity window ended undecided: recorded as expired (the action is denied from now on)
+        if (a.status === 'pending' && deps.approvals.expire) a = await deps.approvals.expire(approvalId, ctx);
+        lines.push(approvalOutcomeLine(a, clock.nowMs()));
+        continue;
+      }
       const childId = parseDelegationOperationId(op);
       if (childId !== undefined) {
         const child = await blackboard.getWorkItem(childId);
@@ -1261,7 +1316,8 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
         );
       } else {
         const outcome = await gateway.observe(op, ctx, signal ?? new AbortController().signal);
-        if (outcome.status === 'pending') {
+        // stubs[8]: an operation under manual review waits for a human's resolution (verified / failed / compensated)
+        if (outcome.status === 'pending' || outcome.status === 'manual_review') {
           settled = false;
           pending.push(op);
           continue;

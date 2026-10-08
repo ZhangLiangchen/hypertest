@@ -12,7 +12,7 @@
  */
 import {
   ActivityFailure, ApplicationFailure, CancellationScope, ContinueAsNew, ParentClosePolicy, TemporalFailure, condition, continueAsNew, defineSignal,
-  getExternalWorkflowHandle, isCancellation, log, proxyActivities, setHandler, sleep, startChild, workflowInfo,
+  getExternalWorkflowHandle, isCancellation, log, proxyActivities, setHandler, startChild, workflowInfo,
 } from '@temporalio/workflow';
 import type { TickResult, TurnOutcome } from '@hypertest/control';
 import type { RunOutcome } from '../contracts.ts';
@@ -87,6 +87,11 @@ export interface WakePayload {
 
 export const wakeSignal = defineSignal<[WakePayload?]>('wake');
 export const cancelSignal = defineSignal<[string]>('cancel');
+/**
+ * (additive, E[8]) ApprovalSignal: a human decided the approval (id). The run workflow wakes and forwards it to its
+ * children: a work item waiting on an approval observes it at once instead of after its backoff.
+ */
+export const approvalSignal = defineSignal<[string]>('approval');
 
 /** State carried by continueAsNew (never business state: that is in SQL). */
 export interface TestRunWorkflowState {
@@ -185,6 +190,19 @@ export async function testRunWorkflow(runId: string, state: TestRunWorkflowState
     cancelReason ??= typeof reason === 'string' && reason.length > 0 ? reason : 'cancelled';
     wakePending = true;
   });
+  /** (E[8]) Approvals decided since the last forward to the children. */
+  const approvalsDecided: string[] = [];
+  setHandler(approvalSignal, (approvalId: string) => {
+    if (typeof approvalId === 'string' && approvalId.length > 0) approvalsDecided.push(approvalId);
+    wakePending = true;
+  });
+  async function forwardApprovals(): Promise<void> {
+    if (approvalsDecided.length === 0) return;
+    const decided = approvalsDecided.splice(0);
+    for (const workflowId of [...children.values()]) {
+      for (const id of decided) await getExternalWorkflowHandle(workflowId).signal(approvalSignal, id).catch(() => undefined); // closed: nothing to wake
+    }
+  }
 
   function nextState(recovered: boolean): TestRunWorkflowState {
     const next: TestRunWorkflowState = { recovered, children: [...children].map(([workItemId, workflowId]) => ({ workItemId, workflowId })), maxIterations };
@@ -256,6 +274,7 @@ export async function testRunWorkflow(runId: string, state: TestRunWorkflowState
         await cancelRunIfSignalled();
         if (iteration >= maxIterations) return await continueAsNew<typeof testRunWorkflow>(runId, nextState(true));
         wakePending = false;
+        await forwardApprovals();
         r = await control.tick(runId);
       } catch (e) {
         // the control plane's store stayed down beyond the retry policy: stand by (every maxIdleMs, bounded history via
@@ -303,7 +322,7 @@ export async function testRunWorkflow(runId: string, state: TestRunWorkflowState
 
 /**
  * workItemWorkflow: executeTurn while it continues (each call names the expected turn: an activity retried after a
- * crash never advances twice); waiting ⇒ sleep(backoff 250 ms → 2 s) + observeWaiting until the item resumes (a
+ * crash never advances twice); waiting ⇒ wait(backoff 250 ms → 2 s, ended early by an ApprovalSignal) + observeWaiting until the item resumes (a
  * `lease_lost` observation — another worker still holds the waiting item's lease — keeps polling); once resumed, the
  * turns continue under the claim this worker holds now (observeWaiting may have re-taken it under a new token), or
  * the child ends `no_claim`. Ends on completed/failed/cancelled/paused/lease_lost and signals the parent `wake` —
@@ -318,6 +337,11 @@ export async function workItemWorkflow(input: WorkItemWorkflowInput): Promise<Wo
   let phase: 'turn' | 'observe' = input.phase ?? (token === undefined ? 'observe' : 'turn');
   let backoff = input.backoffMs ?? WORKFLOW_OBSERVE_BACKOFF_MIN_MS;
   const turns = turnActivities(input.turnTimeoutMs);
+  /** (E[8]) An ApprovalSignal ends the current observe backoff at once (the decision is observed now). */
+  let approvalWoken = false;
+  setHandler(approvalSignal, () => {
+    approvalWoken = true;
+  });
 
   async function drive(): Promise<WorkItemWorkflowResult> {
     for (let iteration = 0; ; iteration++) {
@@ -349,7 +373,8 @@ export async function workItemWorkflow(input: WorkItemWorkflowInput): Promise<Wo
         // lease_lost: the claim is gone (requeued or taken over): whoever holds the item now drives it — never adopted
         return { workItemId, status: o.status };
       }
-      await sleep(backoff);
+      if (!approvalWoken) await condition(() => approvalWoken, backoff);
+      approvalWoken = false;
       const o = await control.observeWaiting(workItemId);
       if (o.status === 'continue') {
         // Resolved right after the resume (the lease was just renewed or re-taken, so it cannot have been requeued and

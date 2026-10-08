@@ -4,7 +4,8 @@ import { resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { HypertestError, isHypertestError } from '@hypertest/core';
 import { isTerminalRun, type QualityDecision, type TargetRef, type TestRun } from '@hypertest/domain';
-import type { HypertestConfig, HypertestInstance } from '@hypertest/app';
+import type { HypertestConfig, HypertestInstance, ResumeRunOptions } from '@hypertest/app';
+import { SANDBOX_ENV, approvalSubjectSummary } from './decide.ts';
 import { UsageError, flag, int, list, positionals, required, str } from '../args.ts';
 import type { Command } from '../command.ts';
 import { aborted, pause, withInstance, type CommandContext } from '../context.ts';
@@ -149,22 +150,21 @@ async function printEvents(ctx: CommandContext, ht: HypertestInstance, runId: st
 }
 
 async function watch(ctx: CommandContext, ht: HypertestInstance, runId: string, follow: boolean, progress: { lastSeq: number }, stop: AbortSignal): Promise<void> {
-  let noticed = false;
+  /** Approvals already announced (each pending request is shown once). */
+  const noticed = new Set<string>();
   while (!stop.aborted) {
     try {
       if (follow) await printEvents(ctx, ht, runId, progress);
-      if (!noticed) {
+      // E[8]: work waiting for a human decision (an action approval_required, a budget extension, a manual review) — the
+      // run itself may be running (its other work goes on) or paused (budget approval)
+      const fresh = (await ht.listApprovals({ runId, status: ['pending'] })).filter((a) => !noticed.has(a.approvalId));
+      if (fresh.length > 0) {
+        for (const a of fresh) noticed.add(a.approvalId);
         const run = await ht.status(runId);
-        if (run?.status === 'paused' && run.pauseReason === 'approval') {
-          const pending = await ht.listApprovals({ runId, status: ['pending'] });
-          if (pending.length > 0) {
-            noticed = true;
-            ctx.err(`run ${runId} is waiting for a human decision:`);
-            for (const a of pending) ctx.err(`  approval ${a.approvalId} (${a.kind}) requested by ${a.requestedBy.kind}:${a.requestedBy.id}`);
-            ctx.err('  decide with `hypertest approve <approvalId> [--deny] --by <name> --reason "<text>"`');
-            if (ht.config.store.kind === 'pglite') ctx.err('  (the embedded store admits one process: stop this command first — the run stays resumable — then approve and `hypertest resume`)');
-          }
-        }
+        ctx.err(`run ${runId}${run?.status === 'paused' ? ` is paused (${run.pauseReason ?? 'operator'}) and` : ''} is waiting for a human decision:`);
+        for (const a of fresh) ctx.err(`  approval ${a.approvalId} (${a.kind}) requested by ${a.requestedBy.kind}:${a.requestedBy.id}${a.subject !== undefined && a.subject !== null ? `: ${approvalSubjectSummary(a).slice(0, 300)}` : ''}`);
+        ctx.err('  decide with `hypertest approve <approvalId> --by <name> --reason "<text>"` or `hypertest reject <approvalId> --by <name> --reason "<text>"`');
+        if (ht.config.store.kind === 'pglite') ctx.err('  (the embedded store admits one process: stop this command first — the run stays resumable — then decide and `hypertest resume`)');
       }
     } catch {
       // progress is best effort; the outcome comes from the durable runtime
@@ -207,7 +207,7 @@ const TARGET_OPTIONS = {
 export const runCommand: Command = {
   name: 'run',
   summary: 'start a testing run for a goal and wait for its verdict',
-  usage: ['run "<goal>" [--repo <path>] [--commit <sha>] [--base <sha>] [--url <sutUrl>] [--environment <id>] [--config <file>] [--detach] [--follow]'],
+  usage: ['run "<goal>" [--repo <path>] [--commit <sha>] [--base <sha>] [--url <sutUrl>] [--environment <id>] [--on-budget-exhausted gate|pause|approval] [--config <file>] [--detach] [--follow]'],
   optionHelp: [
     ['--repo <path>', 'repository under test (white-box); --commit/--base are resolved to full SHAs in it'],
     ['--commit <ref>', 'commit under test'],
@@ -217,13 +217,14 @@ export const runCommand: Command = {
     ['--description <text>', 'target description'],
     ['--label k=v', 'run label (repeatable)'],
     ['--run-id <id>', 'caller-chosen run id'],
+    ['--on-budget-exhausted <policy>', 'this run\'s budget exhaustion policy (overrides budget.onExhausted): gate (converge to the gate) | pause (raise with `hypertest resume --raise-…`) | approval (a budget-extension request)'],
     ['--timeout-ms <n>', 'stop waiting after n ms (the run stays resumable)'],
     ['--follow', 'print the run\'s events to stderr while waiting'],
     ['--detach', 'start the run and return: the Temporal workers drive it (durable.kind temporal only; this process hosts no worker and needs no brains)'],
     ['--scripted-brains <module>', 'brains for scripted providers (tests, eval, demos)'],
   ],
   notes: ['Exit code: pass 0, fail 3, conditional 4, inconclusive 5; 1 when the run ends without a verdict; 130 when interrupted (the run stays resumable; interrupted during startup, no run is created).'],
-  options: { ...TARGET_OPTIONS, label: { type: 'string', multiple: true }, 'run-id': { type: 'string' }, 'timeout-ms': { type: 'string' }, detach: { type: 'boolean' }, follow: { type: 'boolean' } },
+  options: { ...TARGET_OPTIONS, label: { type: 'string', multiple: true }, 'run-id': { type: 'string' }, 'timeout-ms': { type: 'string' }, detach: { type: 'boolean' }, follow: { type: 'boolean' }, 'on-budget-exhausted': { type: 'string' } },
   longRunning: (values) => values['detach'] !== true,
   async run(ctx, values, args) {
     const [goal] = positionals('run', args, ['goal']);
@@ -233,6 +234,9 @@ export const runCommand: Command = {
     const runId = str(values, 'run-id');
     const timeoutMs = int('run', values, 'timeout-ms', { min: 1 });
     const detach = flag(values, 'detach');
+    // (E[3]) the run's own budget exhaustion policy (per-run override of budget.onExhausted)
+    const onExhausted = str(values, 'on-budget-exhausted');
+    if (onExhausted !== undefined && !['gate', 'pause', 'approval'].includes(onExhausted)) throw new UsageError(`--on-budget-exhausted must be gate, pause or approval (got ${JSON.stringify(onExhausted)})`, 'run');
     // a detached run is driven by the Temporal workers: this process only starts it
     return withInstance(ctx, { drivesAgents: !detach, ...(detach ? { adjust: detachable('run') } : {}) }, async ({ ht }) => {
       // interrupted while the instance was being composed: the run the user abandoned is never created (a later
@@ -242,7 +246,7 @@ export const runCommand: Command = {
         if (ctx.global.json) ctx.json({ runId: null, status: null, verdict: null, interrupted: true, runtimeManifestId: ht.manifest.manifestId, exitCode: EXIT_CODES.interrupted });
         return EXIT_CODES.interrupted;
       }
-      const run = await ht.start({ goal: goal!, target, ...(labels ? { labels } : {}), ...(runId ? { runId } : {}) });
+      const run = await ht.start({ goal: goal!, target, ...(labels ? { labels } : {}), ...(runId ? { runId } : {}), ...(onExhausted !== undefined ? { budget: { onExhausted: onExhausted as 'gate' | 'pause' | 'approval' } } : {}) });
       if (detach) {
         if (ctx.global.json) ctx.json({ runId: run.runId, status: run.status, detached: true, runtimeManifestId: run.runtimeManifestId });
         else ctx.out(`run ${run.runId} started (detached; follow it with \`hypertest status ${run.runId}\`)`);
@@ -261,25 +265,67 @@ export const runCommand: Command = {
   },
 };
 
+type BudgetRaiseInput = NonNullable<ResumeRunOptions['raise']>;
+
+/** (E[3]) The `--raise-…` options of `resume` as a budget raise (undefined: none given). */
+function budgetRaise(values: Parameters<typeof str>[0]): BudgetRaiseInput | undefined {
+  const out: Record<string, number> = {};
+  const fields: Array<[string, string, boolean]> = [
+    ['raise-tokens', 'maxModelTokens', true], ['raise-cost-usd', 'maxModelCostUsd', false], ['raise-tool-calls', 'maxToolCalls', true], ['raise-wall-clock-ms', 'maxWallClockMs', true],
+    ['raise-work-items', 'maxWorkItems', true], ['raise-compute-minutes', 'maxComputeMinutes', false], ['raise-artifact-bytes', 'maxArtifactBytes', true],
+  ];
+  for (const [option, field, integral] of fields) {
+    const v = str(values, option);
+    if (v === undefined) continue;
+    const n = integral ? (/^\d+$/.test(v.trim()) ? Number(v.trim()) : Number.NaN) : (/^\d+(\.\d+)?$/.test(v.trim()) ? Number(v.trim()) : Number.NaN);
+    if (!Number.isFinite(n) || n <= 0 || (integral && !Number.isSafeInteger(n))) throw new UsageError(`--${option} must be ${integral ? 'an integer' : 'a number'} > 0 (got ${JSON.stringify(v)})`, 'resume');
+    out[field] = n;
+  }
+  return Object.keys(out).length > 0 ? (out as BudgetRaiseInput) : undefined;
+}
+
 export const resumeCommand: Command = {
   name: 'resume',
   summary: 'resume the incomplete runs pinned to this runtime (after a crash or an interruption)',
-  usage: ['resume [<runId>] [--detach] [--follow] [--timeout-ms <n>]'],
+  usage: [
+    'resume [<runId>] [--detach] [--follow] [--timeout-ms <n>]',
+    'resume <runId> --raise-tokens <n> | --raise-cost-usd <x> | --raise-tool-calls <n> | --raise-wall-clock-ms <n> | --raise-work-items <n> | --raise-compute-minutes <x> | --raise-artifact-bytes <n> --by <name> --reason "<text>"',
+  ],
   optionHelp: [
     ['--detach', 'only (re)start the durable workflows (durable.kind temporal only; this process hosts no worker)'],
     ['--follow', 'print the runs\' events to stderr while waiting'],
     ['--timeout-ms <n>', 'stop waiting after n ms'],
+    ['--raise-<dimension> <amount>', 'raise the run budget by amount before resuming (tokens, cost-usd, tool-calls, wall-clock-ms, work-items, compute-minutes, artifact-bytes)'],
+    ['--by <name> --reason "<text>"', 'who raises the budget and why (required with a raise; audited on L0 as budget.raised)'],
   ],
   notes: [
     'With <runId>: that run only — its agents paused for model unavailability resume now (their routes\' open circuits probe), and a paused run is resumed. Without: every incomplete run pinned to this runtime (model pauses are released too).',
+    'A run paused because its budget is exhausted (budget.onExhausted: pause) resumes after a raise; resumed without one it converges to the gate. A run waiting for a budget-extension approval (onExhausted: approval) resumes through `hypertest approve|reject <approvalId>`.',
+    `A raise is a human decision: refused (permission_denied) when $${SANDBOX_ENV} is set.`,
     'Exit code: 0 when every resumed run completed with a verdict, 1 otherwise; 130 when interrupted.',
   ],
-  options: { detach: { type: 'boolean' }, follow: { type: 'boolean' }, 'timeout-ms': { type: 'string' } },
+  options: {
+    detach: { type: 'boolean' }, follow: { type: 'boolean' }, 'timeout-ms': { type: 'string' },
+    'raise-tokens': { type: 'string' }, 'raise-cost-usd': { type: 'string' }, 'raise-tool-calls': { type: 'string' }, 'raise-wall-clock-ms': { type: 'string' },
+    'raise-work-items': { type: 'string' }, 'raise-compute-minutes': { type: 'string' }, 'raise-artifact-bytes': { type: 'string' }, by: { type: 'string' }, reason: { type: 'string' },
+  },
   longRunning: (values) => values['detach'] !== true,
   async run(ctx, values, args) {
     const [only] = positionals('resume', args, [], ['runId']);
     const detach = flag(values, 'detach');
     const timeoutMs = int('resume', values, 'timeout-ms', { min: 1 });
+    const raise = budgetRaise(values);
+    let raiseBy: string | undefined;
+    let raiseReason: string | undefined;
+    if (raise) {
+      if (only === undefined) throw new UsageError('a budget raise needs <runId>', 'resume');
+      raiseBy = required('resume', values, 'by').trim();
+      if (!/^[\p{L}\p{N}._@+-][\p{L}\p{N}._@+\- ]{0,127}$/u.test(raiseBy)) throw new UsageError(`--by must be a person's name or handle (letters, digits, . _ @ + -), got ${JSON.stringify(raiseBy)}`, 'resume');
+      raiseReason = required('resume', values, 'reason');
+      if (ctx.io.env[SANDBOX_ENV]) {
+        throw new HypertestError('permission_denied', `raising a run budget is a human decision and cannot be taken from inside a Hypertest sandbox (${SANDBOX_ENV} is set)`);
+      }
+    } else if (str(values, 'by') !== undefined || str(values, 'reason') !== undefined) throw new UsageError('--by/--reason are only meaningful with a --raise-… option', 'resume');
     return withInstance(ctx, { drivesAgents: !detach, ...(detach ? { adjust: detachable('resume') } : {}) }, async ({ ht }) => {
       if (ctx.signal.aborted) {
         ctx.err('interrupted before any run was resumed');
@@ -288,7 +334,8 @@ export const resumeCommand: Command = {
       }
       let ids: string[];
       if (only !== undefined) {
-        const r = await ht.resume(only);
+        const r = await ht.resume(only, raise ? { raise, by: raiseBy!, rationale: raiseReason! } : undefined);
+        if (raise && !ctx.global.json) ctx.err(`raised the budget of run ${only} by ${Object.entries(raise).map(([k, v]) => `${k} +${v}`).join(', ')} (human:${raiseBy})`);
         if (!ctx.global.json && r.releasedPauses.length > 0) ctx.err(`released ${r.releasedPauses.length} model pause(s) of run ${only}`);
         ids = [only];
       } else ids = await ht.resumeIncomplete();

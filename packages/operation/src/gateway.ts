@@ -1,4 +1,4 @@
-import { HypertestError, abortReason, hashCanonical, isHypertestError, sleep, throwIfAborted, toHypertestError } from '@hypertest/core';
+import { HypertestError, abortReason, hashCanonical, isHypertestError, sleep, throwIfAborted, toHypertestError, type SqlExecutor } from '@hypertest/core';
 import { RISK_ORDER, eventFrom, isTerminalOperation, type EventContext, type OperationRecord, type OperationStatus, type ResourceLease } from '@hypertest/domain';
 import type {
   CompensationResult,
@@ -36,6 +36,34 @@ interface Flow {
   redispatchesLeft: number;
   /** Lease this drive keeps alive while it polls (run() with a lease request): id, ttl and current expiry. */
   renewal?: { leaseId: string; ttlMs: number; expiresAtMs: number };
+  /** (E[0]) The caller's authority re-checked at the commit point (RunSideEffectRequest.commitGuard). */
+  commitGuard?: (tx: SqlExecutor) => Promise<string | undefined>;
+  /** (E[1]) false: release the lease when the operation settles even when its effect lasts (default: hold it). */
+  holdLease?: boolean;
+}
+
+/** (E[0]) The commit-point authority check refused the dispatch (rolled back inside the dispatching transaction). */
+class CommitRefused extends Error {
+  readonly reason: string;
+  readonly kind: 'claim' | 'lease';
+  constructor(kind: 'claim' | 'lease', reason: string) {
+    super(reason);
+    this.kind = kind;
+    this.reason = reason;
+  }
+}
+
+/**
+ * (E[1]) The end of a verified operation's effect window (`effectUntil` its verification declared, recorded in its
+ * result), when it is still in force at `nowMs`.
+ */
+export function effectHoldUntil(op: Pick<OperationRecord, 'status' | 'result'>, nowMs: number): string | undefined {
+  if (op.status !== 'verified') return undefined;
+  const r = op.result;
+  const until = r !== null && typeof r === 'object' && !Array.isArray(r) ? (r as { effectUntil?: unknown }).effectUntil : undefined;
+  if (typeof until !== 'string') return undefined;
+  const t = Date.parse(until);
+  return Number.isFinite(t) && t > nowMs ? until : undefined;
 }
 
 /** Another actor moved the operation first (optimistic concurrency); converted to a passive outcome. */
@@ -357,6 +385,8 @@ class SideEffectEngine {
     if (fence) flow.fence = fence;
     if (lease && req.lease) flow.renewal = { leaseId: lease.leaseId, ttlMs: req.lease.ttlMs, expiresAtMs: Date.parse(lease.expiresAt) };
     if (prepared) flow.prepared = prepared;
+    if (req.commitGuard) flow.commitGuard = req.commitGuard;
+    if (req.holdLeaseForEffect === false) flow.holdLease = false;
     const timeout = req.dispatchTimeoutMs ?? this.#deps.dispatchTimeoutMs;
     if (timeout !== undefined) flow.dispatchTimeoutMs = timeout;
 
@@ -377,7 +407,7 @@ class SideEffectEngine {
     } finally {
       this.#inFlight.delete(op.operationId);
       if (fence) this.#leaseUsers.delete(fence.leaseId);
-      if (outcome && fence) await this.#releaseIfSettled(outcome.operation, fence);
+      if (outcome && fence) await this.#releaseIfSettled(outcome.operation, fence, flow.holdLease !== false);
     }
   }
 
@@ -399,9 +429,33 @@ class SideEffectEngine {
    * another drive in this process still uses the lease; `release` deletes only this very lease (a superseded one is
    * untouched). A failed release is logged, never surfaced: the operation's outcome is already recorded.
    */
-  async #releaseIfSettled(op: OperationRecord, lease: LeaseRef): Promise<void> {
+  async #releaseIfSettled(op: OperationRecord, lease: LeaseRef, hold = true): Promise<void> {
     if (!isTerminalOperation(op.status)) return;
+    // (E[1]) a verified effect that lasts (a time-boxed fault) keeps its resource until its window ends: the lease was
+    // extended to that time when the operation was verified, and it simply expires then (or is released on compensation)
+    if (hold && effectHoldUntil(op, this.#deps.clock.nowMs()) !== undefined) {
+      this.#deps.logger.debug('side-effect lease held for the effect window', { operationId: op.operationId, resourceKey: lease.resourceKey, until: effectHoldUntil(op, this.#deps.clock.nowMs()) });
+      return;
+    }
     await this.#releaseLeaseIfUnused(lease, op.runId, op.operationId);
+  }
+
+  /**
+   * (E[1]) Sets the live lease of a verified operation to expire exactly at the end of its effect window: until then
+   * another owner is refused as busy on the resource; afterwards it is free without a release. A lease that is no longer
+   * the live one is left alone.
+   */
+  async #holdLeaseUntil(op: OperationRecord, until: string): Promise<void> {
+    if (!op.lease) return;
+    try {
+      const live = await this.#deps.leases.current(op.lease.resourceKey);
+      if (!live || live.leaseId !== op.lease.leaseId) return;
+      const ttl = Date.parse(until) - this.#deps.clock.nowMs();
+      if (ttl > 0) await this.#deps.leases.renew(live.leaseId, ttl);
+    } catch (e) {
+      const err = toHypertestError(e);
+      this.#deps.logger.warn('side-effect lease could not be held for the effect window', { operationId: op.operationId, leaseId: op.lease.leaseId, until, code: err.code, error: err.message });
+    }
   }
 
   /**
@@ -584,16 +638,15 @@ class SideEffectEngine {
         });
       }
     }
-    if (!(await this.#fenceOk(flow))) return this.#stale(op, flow);
-
-    // Persist the intent to dispatch BEFORE touching the external system.
+    // (E[0]) The COMMIT POINT: the caller's authority (its work claim: commitGuard) and the resource lease fence are
+    // re-validated in the SAME transaction that persists the intent to dispatch, before the external system is touched. A
+    // claim revoked (or a lease superseded) before this commit is refused here, atomically: nothing reaches the target.
     try {
-      op = await this.#move(op, 'dispatching', {}, flow);
+      const current = op;
+      op = await this.#deps.db.transaction((tx) => this.#commitDispatch(current, flow, tx));
     } catch (e) {
-      // A caller refused as busy marked the never-dispatched operation not_applied meanwhile (same attempt: nothing was
-      // sent). This drive holds the live lease (fence checked above), so it is the rightful dispatcher: go on from there.
-      if (!(e instanceof Superseded) || op.status !== 'prepared' || e.current.status !== 'not_applied' || e.current.attempt !== op.attempt) throw e;
-      op = await this.#move(e.current, 'dispatching', {}, flow);
+      if (e instanceof CommitRefused) return e.kind === 'lease' ? this.#stale(op, flow) : this.#claimFenced(op, flow, e.reason);
+      throw e;
     }
     const dispatching = op;
     let receipt: DispatchReceipt;
@@ -622,6 +675,52 @@ class SideEffectEngine {
       throw e;
     }
     return this.#attach(op, flow);
+  }
+
+  /**
+   * (E[0]) Inside the dispatching transaction: the caller's commit guard, then the resource fence, then `→ dispatching`.
+   * A refusal throws CommitRefused (the transaction rolls back: nothing was recorded or sent).
+   */
+  async #commitDispatch(op: OperationRecord, flow: Flow, tx: SqlExecutor): Promise<OperationRecord> {
+    if (flow.commitGuard) {
+      let reason: string | undefined;
+      try {
+        reason = await flow.commitGuard(tx);
+      } catch (e) {
+        // fail closed: an authority that cannot be verified is not held
+        const err = toHypertestError(e);
+        reason = `the caller's authority could not be verified (${err.code}): ${err.message}`;
+      }
+      if (reason !== undefined) throw new CommitRefused('claim', reason);
+    }
+    if (!(await this.#fenceOk(flow))) throw new CommitRefused('lease', 'stale resource fence');
+    try {
+      return await this.#move(op, 'dispatching', {}, flow);
+    } catch (e) {
+      // A caller refused as busy marked the never-dispatched operation not_applied meanwhile (same attempt: nothing was
+      // sent). This drive holds the live lease (fence checked above), so it is the rightful dispatcher: go on from there.
+      if (!(e instanceof Superseded) || op.status !== 'prepared' || e.current.status !== 'not_applied' || e.current.attempt !== op.attempt) throw e;
+      return await this.#move(e.current, 'dispatching', {}, flow);
+    }
+  }
+
+  /**
+   * (E[0]) The commit guard refused: the caller lost its authority (e.g. its work claim was revoked while the call was in
+   * flight). Nothing was dispatched; a never-dispatched operation is recorded `not_applied` with the exact reason (a new
+   * holder of the work may dispatch it again after its own decision); the outcome is `stale_fence`.
+   */
+  async #claimFenced(op: OperationRecord, flow: Flow, reason: string): Promise<SideEffectOutcome> {
+    const why = `claim_fenced: ${reason}; nothing was dispatched`;
+    this.#deps.logger.warn('side-effect refused at the commit point: the caller no longer holds its claim', { operationId: op.operationId, reason });
+    if (op.status === 'prepared') {
+      try {
+        op = await this.#deps.ledger.transition(op.operationId, 'not_applied', { lastError: why }, flow.ctx, { expectedFrom: ['prepared'], expectedAttempt: op.attempt });
+      } catch (e) {
+        if (!isHypertestError(e, 'conflict')) throw e;
+        op = (await this.#deps.ledger.get(op.operationId)) ?? op;
+      }
+    }
+    return { status: 'stale_fence', operation: op, reason: why };
   }
 
   /** Crash/timeout/lost response between dispatch and receipt: `outcome_unknown`, never `failed`. */
@@ -759,7 +858,11 @@ class SideEffectEngine {
       return pending(op, { reason: 'verify_failed', error: err.message });
     }
     if (v.status === 'verified') {
-      const done = await this.#move(op, 'verified', { result: v.result }, flow);
+      // (E[1]) a lasting effect records its window with its result: its lease is held until then
+      const until = typeof v.effectUntil === 'string' && Number.isFinite(Date.parse(v.effectUntil)) ? v.effectUntil : undefined;
+      const result = until !== undefined && v.result !== null && typeof v.result === 'object' && !Array.isArray(v.result) ? { ...(v.result as Record<string, unknown>), effectUntil: until } : v.result;
+      const done = await this.#move(op, 'verified', { result }, flow);
+      if (until !== undefined && flow.holdLease !== false && effectHoldUntil(done, this.#deps.clock.nowMs()) !== undefined) await this.#holdLeaseUntil(done, until);
       return { status: 'verified', operation: done, result: done.result };
     }
     if (v.status === 'failed') {
@@ -880,6 +983,7 @@ class SideEffectEngine {
           if (obs.state === 'uncertain') return await this.#toManualReview(op, flow, `compensation state uncertain: ${obs.detail}`);
           if (obs.state === 'absent') {
             const done = await this.#move(op, 'compensated', {}, flow);
+            if (done.lease) await this.#releaseLeaseIfUnused(done.lease, done.runId, done.operationId);
             return { status: 'not_applied', operation: done, reason: 'compensated' };
           }
           return await this.#runCompensation(op, flow);
@@ -909,6 +1013,8 @@ class SideEffectEngine {
     }
     if (!res || res.compensated !== true) return this.#toManualReview(op, flow, `compensation not confirmed: ${res?.detail ?? 'no detail'}`);
     const done = await this.#move(op, 'compensated', res.detail !== undefined ? { lastError: `compensated: ${res.detail}` } : {}, flow);
+    // (E[1]) the effect was undone: the resource held for its window is free again
+    if (done.lease) await this.#releaseLeaseIfUnused(done.lease, done.runId, done.operationId);
     return { status: 'not_applied', operation: done, reason: 'compensated' };
   }
 

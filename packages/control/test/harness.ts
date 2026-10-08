@@ -4,7 +4,7 @@
  * system prompt, tools are the real ToolRuntime with the built-in tools plus the control domain tools.
  */
 import { MemoryLogger, SequentialIdGenerator, FixedClock, type EventBus, type JsonValue, type SqlDatabase } from '@hypertest/core';
-import type { ChatMessage, EventContext, TestRun, WorkItem } from '@hypertest/domain';
+import type { ChatMessage, ContextSnapshot, EventContext, TestRun, WorkItem } from '@hypertest/domain';
 import {
   collabMigrations, createBlackboard, createDecisionRepository, createEventStore, createInbox, createRunRepository, createSpecRepository,
 } from '@hypertest/collab';
@@ -20,7 +20,7 @@ import {
 import { ModelCatalog, ProviderRegistry, ScriptedProvider, createModelRouter, type ModelCallRequest, type ModelCapabilityProfile, type ScriptedBrain, type ScriptedReply } from '@hypertest/model';
 import {
   ExactSearch, contextMigrations, createExperienceStore, createFreshnessGuard, createProvenanceService, createResolverRegistry, createSnapshotBuilder,
-  createSnapshotStore, createWorkingContextManager,
+  createSnapshotStore, createWorkingContextManager, recordTranscriptOnL0,
 } from '@hypertest/context';
 import { ToolRegistry, builtinTools, createEnvironmentRegistry, createLocalSandbox, createToolRuntime, createWorkspaceManager, recordEffectAdapters, type EnvironmentDescriptor, type ToolRuntimeDeps } from '@hypertest/tools';
 import {
@@ -164,6 +164,8 @@ export interface HarnessOptions {
   bus?: EventBus;
   /** Database kind (default: HYPERTEST_TEST_DB, else PGlite). */
   dbKind?: 'pglite' | 'postgres';
+  /** (B[8]) Record every committed transcript entry on L0 (as @hypertest/app composes it): context rebuildable from L0. */
+  transcriptL0?: boolean;
 }
 
 export interface Harness {
@@ -257,7 +259,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
     capabilitySecret: SECRET,
   };
   const toolRuntime = createToolRuntime(toolDeps);
-  const sessions = createSessionStore({ ...base, db, events });
+  const sessions = options.transcriptL0 ? recordTranscriptOnL0(createSessionStore({ ...base, db, events }), { db, events, logger }) : createSessionStore({ ...base, db, events });
   const agents = createAgentRepository({ ...base, db, events });
   const epochs = createEpochManager({ ...base, db, events, sessions });
   const engines = new EngineRegistry([new NativeEngine({ ...base, sessions, events })]);
@@ -394,6 +396,24 @@ export async function drive(h: Harness, runId: string, maxTicks = 60): Promise<D
     if (t.dispatched.length === 0 && t.waiting.length === 0 && t.convergence.state === 'active' && t.idleMs > 0 && i > maxTicks / 2) break;
   }
   return out;
+}
+
+/**
+ * (B[1]) A turn snapshot of the run, as the context provider fixes one at every turn start: tool calls a test makes by hand
+ * (a dispatcher with its own turnState, a domain tool's execute) carry it — every mutating call, record effects included, is
+ * validated by the FreshnessGuard against its turn snapshot and refused without one (fail closed).
+ */
+export async function turnSnapshot(h: Harness, runId: string): Promise<ContextSnapshot> {
+  return h.deps.snapshotBuilder.build({ runId }, h.ctx(runId));
+}
+
+/**
+ * (B[1]) Assembles the context of a hand-built EngineHost once (as an engine turn does before it dispatches anything): it fixes
+ * the turn snapshot every later mutating call of the host is validated against.
+ */
+export async function assembleTurn<H extends { context: { assemble(input: { sessionId: string; turn: number; transcript: []; compactions: []; signal: AbortSignal }): Promise<unknown> } }>(host: H, sessionId: string, turn = 100): Promise<H> {
+  await host.context.assemble({ sessionId, turn, transcript: [], compactions: [], signal: new AbortController().signal });
+  return host;
 }
 
 export async function items(h: Harness, runId: string): Promise<WorkItem[]> {

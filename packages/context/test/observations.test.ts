@@ -8,6 +8,8 @@ import { eventCtx, tempDir } from '@hypertest/testkit';
 import {
   ABSENT_VERSION,
   DEFAULT_METRIC_WINDOW_MS,
+  UNVERIFIED_VERSION_PREFIX,
+  planResourceId,
   contextMigrations,
   createFreshnessGuard,
   createObservationLog,
@@ -122,7 +124,13 @@ test('observationsOf: tool results become read-set entries (files, records, metr
   const read = await observationsOf(call('blackboard.read', { recordType: 'finding' }), ok({ records: [{ recordId: 'rec_2', lineageId: 'rec_1', recordType: 'finding' }, { recordId: 'rec_9', lineageId: 'rec_9', recordType: 'risk' }] }), { now });
   assert.deepEqual(read.map((e) => [e.kind, e.resourceType, e.resourceId, e.observedVersion]), [['read', 'finding', 'rec_1', 'rec_2'], ['read', 'record', 'rec_9', 'rec_9']]);
   const posted = await observationsOf(call('blackboard.post_finding', { title: 't' }), ok({ recordId: 'rec_3', lineageId: 'rec_1', version: 3 }), { now });
-  assert.deepEqual(posted.map((e) => [e.kind, e.resourceType, e.resourceId, e.observedVersion]), [['write', 'finding', 'rec_1', 'rec_3']]);
+  // (B[2]) a posted finding also records its own withdrawal state (`active`; `withdrawn:<status>` when it rejects one)
+  assert.deepEqual(posted.map((e) => [e.kind, e.resourceType, e.resourceId, e.observedVersion]), [['write', 'finding', 'rec_1', 'rec_3'], ['write', 'finding_withdrawal', 'rec_1', 'active']]);
+  const rejecting = await observationsOf(call('blackboard.post_finding', { title: 't', status: 'rejected', updatesRecordId: 'rec_3' }), ok({ recordId: 'rec_4', lineageId: 'rec_1', version: 4 }), { now });
+  assert.deepEqual(rejecting.map((e) => [e.resourceType, e.observedVersion]), [['finding', 'rec_4'], ['finding_withdrawal', 'withdrawn:rejected']]);
+  // a finding read IN FULL refreshes its withdrawal state too
+  const readFull = await observationsOf(call('blackboard.read', { lineageId: 'rec_1' }), ok({ records: [{ recordId: 'rec_4', lineageId: 'rec_1', recordType: 'finding', payload: { status: 'duplicate' } }] }), { now });
+  assert.deepEqual(readFull.map((e) => [e.resourceType, e.observedVersion]), [['finding', 'rec_4'], ['finding_withdrawal', 'withdrawn:duplicate']]);
   assert.deepEqual((await observationsOf(call('blackboard.post_note', { text: 'n' }), ok({ recordId: 'rec_5', lineageId: 'rec_5' }), { now })).map((e) => e.resourceType), ['record']);
   // metric windows: max_age from the query window, one window per queried target (the latest metric data of it)
   const range = await observationsOf(call('metrics.query', { environmentId: 'kv', query: 'up', range: { start: 1_700_000_000, end: 1_700_000_600, step: 15 } }), ok({ evidenceId: 'ev_m1', series: [] }), { now });
@@ -146,6 +154,54 @@ test('observationsOf: tool results become read-set entries (files, records, metr
     assert.deepEqual(await observationsOf(call('fs.read', { path: 'src/a.ts' }), { status, structured: { path: 'src/a.ts', sha256: sha } }, { now }), [], status);
   }
   assert.deepEqual(await observationsOf(call('test.run', {}), ok({ passed: true }), { now }), []);
+});
+
+test('(B[0]) every read the agent observes is pinned: search / symbol / reference hits and blame lines (content-verified), working-tree diffs (current version), evidence, the plan and oracles', async () => {
+  const content = 'export function total(cents) {\n  return cents * 2;\n}\n';
+  const sha = await put('src/total.ts', content);
+  const call = (toolId: string, input: Record<string, unknown>) => ({ toolId, input, runId: 'run_more', agentId: 'ag_1', invocationId: `inv_${toolId}`, workspace: WS });
+  const now = () => '2026-01-01T00:00:00.000Z';
+  const ok = (structured: unknown) => ({ status: 'success', structured });
+  const pins = (entries: ObservedEntry[]) => entries.map((e) => [e.resourceType, e.resourceId, e.observedVersion]);
+  // fs.search: the shown lines still read the same ⇒ the file at its current sha; a line that no longer matches ⇒ UNVERIFIED
+  assert.deepEqual(pins(await observationsOf(call('fs.search', { pattern: 'cents' }), ok({ matches: [{ path: 'src/total.ts', line: 1, text: 'export function total(cents) {' }, { path: 'src/total.ts', line: 2, text: '  return cents * 2;' }] }), { now })), [['file', fileId('src/total.ts'), sha]]);
+  assert.deepEqual(pins(await observationsOf(call('fs.search', { pattern: 'cents' }), ok({ matches: [{ path: 'src/total.ts', line: 2, text: '  return cents * 3;' }] }), { now })), [['file', fileId('src/total.ts'), `${UNVERIFIED_VERSION_PREFIX}inv_fs.search`]]);
+  assert.deepEqual(pins(await observationsOf(call('fs.search', { pattern: 'x' }), ok({ matches: [{ path: 'gone.ts', line: 1, text: 'x' }] }), { now })), [['file', fileId('gone.ts'), `${UNVERIFIED_VERSION_PREFIX}inv_fs.search`]], 'a hit in a file that is gone is unverified');
+  // code.symbols (retrieval snippet or regex definition name) and code.references
+  assert.deepEqual(pins(await observationsOf(call('code.symbols', { query: 'total' }), ok({ engine: 'retrieval', symbols: [{ path: 'src/total.ts', line: 1, snippet: 'export function total(cents) {', score: 1 }] }), { now })), [['file', fileId('src/total.ts'), sha]]);
+  assert.deepEqual(pins(await observationsOf(call('code.symbols', { query: 'total' }), ok({ engine: 'regex', symbols: [{ name: 'total', kind: 'function', path: 'src/total.ts', line: 1 }] }), { now })), [['file', fileId('src/total.ts'), sha]]);
+  assert.deepEqual(pins(await observationsOf(call('code.references', { symbol: 'cents' }), ok({ engine: 'regex', references: [{ path: 'src/total.ts', line: 2, text: 'return cents * 2;', isDefinition: false }] }), { now })), [['file', fileId('src/total.ts'), sha]]);
+  // (B[6]) a symbol-graph row shows its line behind a `⟦usage in Owner.method⟧ ` annotation: the line itself is verified
+  assert.deepEqual(pins(await observationsOf(call('code.references', { symbol: 'cents' }), ok({ engine: 'retrieval', references: [{ path: 'src/total.ts', line: 2, text: '⟦read in total⟧ return cents * 2;', score: 0.5 }] }), { now })), [['file', fileId('src/total.ts'), sha]]);
+  assert.deepEqual(await observationsOf(call('code.references', { symbol: 'cents' }), ok({ engine: 'retrieval', references: [{ path: 'src/total.ts', line: 2, text: '⟦read in total⟧ return cents * 5;', score: 0.5 }] }), { now }), []);
+  // a hit of an index that lags the working tree pins nothing (it never overrides what the agent knows, e.g. its own write)
+  assert.deepEqual(await observationsOf(call('code.references', { symbol: 'cents' }), ok({ engine: 'retrieval', references: [{ path: 'src/total.ts', line: 2, text: 'return cents * 7;', score: 1 }] }), { now }), []);
+  // git.blame: current lines pin the file; a blame at another revision whose lines differ claims nothing
+  assert.deepEqual(pins(await observationsOf(call('git.blame', { path: 'src/total.ts', startLine: 2, endLine: 2 }), ok({ path: 'src/total.ts', lines: [{ line: 2, commit: 'c', author: 'a', date: 'd', summary: 's', content: '  return cents * 2;' }] }), { now })), [['file', fileId('src/total.ts'), sha]]);
+  assert.deepEqual(await observationsOf(call('git.blame', { path: 'src/total.ts', startLine: 2, endLine: 2, rev: 'HEAD~3' }), ok({ path: 'src/total.ts', lines: [{ line: 2, commit: 'c', author: 'a', date: 'd', summary: 's', content: '  return cents;' }] }), { now }), []);
+  // git.diff of the working tree shows the current changes: its files are pinned at their current version (gone ⇒ absent);
+  // a diff between revisions is history
+  assert.deepEqual(pins(await observationsOf(call('git.diff', {}), ok({ files: ['src/total.ts', 'src/gone.ts'], bytes: 10 }), { now })), [['file', fileId('src/total.ts'), sha], ['file', fileId('src/gone.ts'), ABSENT_VERSION]]);
+  assert.deepEqual(await observationsOf(call('git.diff', { base: 'HEAD~1' }), ok({ files: ['src/total.ts'], bytes: 10 }), { now }), []);
+  // evidence reads: immutable pins
+  const ev = await observationsOf(call('evidence.query', {}), ok({ evidence: [{ evidenceId: 'ev_1' }, { evidenceId: 'ev_2' }], count: 2 }), { now });
+  assert.deepEqual(ev.map((e) => [e.resourceType, e.resourceId, e.freshness.kind]), [['evidence', 'ev_1', 'immutable'], ['evidence', 'ev_2', 'immutable']]);
+  assert.deepEqual(pins(await observationsOf(call('evidence.get', { evidenceId: 'ev_1' }), ok({ evidenceId: 'ev_1' }), { now })), [['evidence', 'ev_1', 'ev_1']]);
+  // plan: the latest accepted revision read (a compare-and-set for plan.propose_revision), own write of an accepted revision
+  assert.deepEqual(pins(await observationsOf(call('plan.read', {}), ok({ plan: { revision: 2 }, revisions: [{ revision: 1, status: 'superseded' }, { revision: 2, status: 'accepted' }, { revision: 3, status: 'rejected' }] }), { now })), [['plan', planResourceId('run_more'), '2']]);
+  assert.deepEqual(pins(await observationsOf(call('plan.read', {}), ok({ plan: null, revisions: [] }), { now })), [['plan', planResourceId('run_more'), '0']]);
+  assert.deepEqual(await observationsOf(call('plan.read', { revision: 1 }), ok({ plan: { revision: 1 }, revisions: [{ revision: 1, status: 'superseded' }, { revision: 2, status: 'accepted' }] }), { now }), [], 'an old revision claims nothing');
+  assert.deepEqual(pins(await observationsOf(call('plan.propose_revision', {}), ok({ accepted: true, revision: 3 }), { now })), [['plan', planResourceId('run_more'), '3']]);
+  assert.deepEqual(await observationsOf(call('plan.propose_revision', {}), ok({ accepted: false, revision: 3 }), { now }), []);
+  // an experiment this agent defined (own write of its revision)
+  assert.deepEqual(pins(await observationsOf(call('experiment.define', { hypothesis: 'h' }), ok({ experimentId: 'exp_1', revision: 2 }), { now })), [['experiment', 'exp_1', '2']]);
+  // oracles
+  assert.deepEqual(pins(await observationsOf(call('oracle.get', { oracleId: 'or_1' }), ok({ oracle: { oracleId: 'or_1', revision: 4 } }), { now })), [['oracle', 'or_1', '4']]);
+  // (review) an explicitly requested revision the run does not use is history: pinning it (oracle is always re-checked) would
+  // refuse every later action of the agent for good; the run's own revision read explicitly is pinned
+  assert.deepEqual(await observationsOf(call('oracle.get', { oracleId: 'or_1', revision: 2 }), ok({ oracle: { oracleId: 'or_1', revision: 2 }, pinnedByRun: false }), { now }), []);
+  assert.deepEqual(pins(await observationsOf(call('oracle.get', { oracleId: 'or_1', revision: 4 }), ok({ oracle: { oracleId: 'or_1', revision: 4 }, pinnedByRun: true }), { now })), [['oracle', 'or_1', '4']]);
+  assert.deepEqual(pins(await observationsOf(call('oracle.list', {}), ok({ pinned: [{ oracleId: 'or_1', revision: 4 }], otherApproved: [{ oracleId: 'or_2', revision: 1 }] }), { now })), [['oracle', 'or_1', '4'], ['oracle', 'or_2', '1']]);
 });
 
 test('ObservationLog: latest observation per resource (newest first), per snapshot, bounded; validated; append-only', async () => {
@@ -172,7 +228,7 @@ test('ObservationLog: latest observation per resource (newest first), per snapsh
   assert.equal((await log.latest({ runId, agentId: 'ag_1' }))[0]!.observedVersion, 'v2');
 });
 
-test('the NEXT turn\'s snapshot includes what the agent observed (latest per resource, capped); other agents\' observations stay out', async () => {
+test('the NEXT turn\'s snapshot includes what the agent observed (latest per resource, none dropped); other agents\' observations stay out', async () => {
   const runId = 'run_build';
   const sha = await put('src/build.ts', 'one');
   await observe(runId, 'ag_1', 'fs.read', { path: 'src/build.ts' }, { path: 'src/build.ts', sha256: sha });
@@ -183,10 +239,44 @@ test('the NEXT turn\'s snapshot includes what the agent observed (latest per res
   assert.deepEqual((await builder({ observations: log }).build({ runId }, eventCtx(runId))).readSet, []);
   assert.deepEqual((await builder().build({ runId, observer: { agentId: 'ag_1' } }, eventCtx(runId))).readSet, []);
   await rejectsWith(builder({ observations: log }).build({ runId, observer: { agentId: '' } }, eventCtx(runId)), 'invalid_argument');
-  // the cap keeps the most recent observations
+  // (B[0]) an explicit cap never drops observations: a build whose observer observed more resources fails closed
   await observe(runId, 'ag_1', 'fs.read', { path: 'src/c.ts' }, { path: 'src/c.ts', sha256: 'c1' }, undefined, 'inv_c');
-  const capped = await builder({ observations: log, max: 1 }).build({ runId, observer: { agentId: 'ag_1' } }, eventCtx(runId));
-  assert.deepEqual(capped.readSet.map((e) => e.resourceId), [fileId('src/c.ts')]);
+  const refused = await rejectsWith(builder({ observations: log, max: 1 }).build({ runId, observer: { agentId: 'ag_1' } }, eventCtx(runId)), 'precondition_failed');
+  assert.match(refused.message, /observed 2 resources, more than maxObservedEntries 1/);
+  const both = await builder({ observations: log, max: 2 }).build({ runId, observer: { agentId: 'ag_1' } }, eventCtx(runId));
+  assert.deepEqual(both.readSet.map((e) => e.resourceId), [fileId('src/build.ts'), fileId('src/c.ts')]);
+});
+
+test('(B[0] audit reproduction) 300 observations: the snapshot pins ALL of them, so a write to the OLDEST one is still re-checked', async () => {
+  const runId = 'run_cap300';
+  const N = 300;
+  for (let i = 0; i < N; i++) {
+    await log.record({ runId, agentId: 'ag_1', toolId: 'fs.read', invocationId: `inv_cap_${i}` }, [
+      { kind: 'read', resourceType: 'file', resourceId: `workspace/w/f${i}.ts`, observedVersion: 'v1', observedAt: '2026-01-01T00:00:00.000Z', freshness: { kind: 'exact_version' } },
+    ]);
+  }
+  const current = new Map<string, string>();
+  const resolvers = createResolverRegistry([{ resourceType: 'file', currentVersion: async (id: string) => current.get(id) ?? 'v1' }]);
+  const snap = await createSnapshotBuilder({
+    ...env.deps, snapshots: store, resolvers, observations: log,
+    sources: {
+      getRun: async () => ({ runtimeManifestId: 'rm_1', policyRevision: 'p1', currentPlanRevision: 1, oracleRevisions: {} }),
+      lastEventSeq: async () => 1, blackboardRevision: async () => 1, evidenceRoot: async () => ({ rootHash: 'root' }), experimentRevisions: async () => ({}),
+    },
+  }).build({ runId, observer: { agentId: 'ag_1' } }, eventCtx(runId));
+  const pinned = new Set(snap.readSet.map((e) => e.resourceId));
+  assert.equal(snap.readSet.length, N, 'every observed resource is pinned (no silent cap)');
+  assert.ok(pinned.has('workspace/w/f0.ts') && pinned.has('workspace/w/f299.ts'));
+  // another agent changes the oldest and the newest file the agent read
+  current.set('workspace/w/f0.ts', 'v2');
+  current.set('workspace/w/f299.ts', 'v2');
+  const g = createFreshnessGuard({ ...env.deps, events: new InMemoryEventSink(), snapshots: store, resolvers, observations: log });
+  const ctx = eventCtx(runId, { agentId: 'ag_1' });
+  for (const f of ['f0', 'f299']) {
+    const r = await g.validate(snap, { tool: 'fs.write', mutating: true, resources: [`workspace/w/${f}.ts`] }, ctx);
+    assert.equal(r.fresh, false, `a write to ${f} after another agent changed it is stale`);
+    assert.equal(r.checked, 1);
+  }
 });
 
 /** Turn N: the agent reads; turn N+1: the snapshot pins what it read. */

@@ -1,6 +1,7 @@
-import { HypertestError } from '@hypertest/core';
+import { HypertestError, toIso } from '@hypertest/core';
 import { eventFrom, EVENT_TYPES, type ContextSnapshot, type EventContext, type ReadSetEntry } from '@hypertest/domain';
-import type { ContextDeps, FreshnessGuard, FreshnessResult, ObservationLog, ProposedAction, ResolverRegistry, SnapshotStore, StaleEntry } from './contracts.ts';
+import type { ContextDeps, FreshnessGuard, FreshnessPass, FreshnessPassLog, FreshnessResult, ObservationLog, ProposedAction, ResolverRegistry, SnapshotStore, StaleEntry } from './contracts.ts';
+import { requireText } from './util.ts';
 import { ABSENT_VERSION } from './observations.ts';
 import { createResolverRegistry } from './resolvers.ts';
 import { environmentVersion, snapshotIdFor } from './snapshots.ts';
@@ -9,8 +10,10 @@ import { environmentVersion, snapshotIdFor } from './snapshots.ts';
  * Types always re-validated before a mutating action (the "world moved under you" set).
  * (conformance-3) `finding` entries — the heads of the findings a work item acts on, pinned by the control plane — are
  * re-checked too: a fix or test built on a finding that was rejected or superseded meanwhile is stale.
+ * (B[2]) `finding_withdrawal` entries — every finding the agent was shown (prompt summaries included) — are re-checked for
+ * withdrawal (rejected / duplicate) before every mutating action.
  */
-export const ALWAYS_CHECKED_TYPES: ReadonlySet<string> = new Set(['environment', 'build', 'oracle', 'experiment', 'lease', 'finding']);
+export const ALWAYS_CHECKED_TYPES: ReadonlySet<string> = new Set(['environment', 'build', 'oracle', 'experiment', 'lease', 'finding', 'finding_withdrawal']);
 
 function idMatches(id: string, resource: string): boolean {
   return resource === id || resource.startsWith(id + '/') || id.startsWith(resource + '/');
@@ -183,6 +186,41 @@ export function createFreshnessGuard(deps: FreshnessGuardDeps): FreshnessGuard {
       // Deterministic order regardless of resolver latency.
       stale.sort((a, b) => (a.resourceType + '\u0000' + a.resourceId < b.resourceType + '\u0000' + b.resourceId ? -1 : a.resourceType + '\u0000' + a.resourceId > b.resourceType + '\u0000' + b.resourceId ? 1 : 0));
       return reject(snapshotId, snapshot.runId, action, checked, stale, ctx);
+    },
+  };
+}
+
+/**
+ * (B[1]) The FreshnessPassLog on ht_context_freshness_passes (migration context/004): `record` writes through the caller's
+ * transaction when one is active (the store's AsyncLocalStorage), so the pass commits with — and only with — the tool's
+ * effect. Recording a known invocation again is a no-op (the first pass stands).
+ */
+export function createFreshnessPassLog(deps: ContextDeps): FreshnessPassLog {
+  const { db, clock } = deps;
+  return {
+    async record(pass) {
+      requireText(pass?.invocationId, 'pass.invocationId');
+      requireText(pass.runId, 'pass.runId');
+      requireText(pass.agentId, 'pass.agentId');
+      requireText(pass.toolId, 'pass.toolId');
+      if (!Number.isSafeInteger(pass.checked) || pass.checked < 0) throw new HypertestError('invalid_argument', 'pass.checked must be an integer >= 0');
+      await db.query(
+        `INSERT INTO ht_context_freshness_passes (invocation_id, run_id, agent_id, tool_id, snapshot_id, checked, passed_at) VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (invocation_id) DO NOTHING`,
+        [pass.invocationId, pass.runId, pass.agentId, pass.toolId, pass.snapshotId ?? null, pass.checked, clock.isoNow()],
+      );
+    },
+    async get(invocationId) {
+      if (typeof invocationId !== 'string' || invocationId.length === 0) return undefined;
+      const r = await db.query<{ invocation_id: string; run_id: string; agent_id: string; tool_id: string; snapshot_id: string | null; checked: number; passed_at: unknown }>(
+        'SELECT invocation_id, run_id, agent_id, tool_id, snapshot_id, checked, passed_at FROM ht_context_freshness_passes WHERE invocation_id = $1',
+        [invocationId],
+      );
+      const row = r.rows[0];
+      if (!row) return undefined;
+      const pass: FreshnessPass & { passedAt: string } = { invocationId: row.invocation_id, runId: row.run_id, agentId: row.agent_id, toolId: row.tool_id, checked: Number(row.checked), passedAt: toIso(row.passed_at) };
+      if (row.snapshot_id !== null) pass.snapshotId = row.snapshot_id;
+      return pass;
     },
   };
 }

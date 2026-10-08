@@ -3,6 +3,7 @@ import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { HypertestError, sha256Hex } from '@hypertest/core';
 import type { ResolverRegistry, ResourceVersionResolver } from './contracts.ts';
 import { environmentVersion } from './snapshots.ts';
+import { findingWithdrawalVersion } from './util.ts';
 
 type MaybePromise<T> = T | Promise<T>;
 
@@ -128,5 +129,28 @@ export function workspaceFileResolver(getRoot: (workspaceId: string) => MaybePro
     const root = await getRoot(m[1]!);
     if (!root) throw new HypertestError('not_found', `workspace ${m[1]} is not open in this process`);
     return fileResolver(root).currentVersion(m[2]!);
+  });
+}
+
+/**
+ * (B[2]) `finding_withdrawal`: version = `active` while the finding lineage's head is not withdrawn, `withdrawn:<status>` once
+ * it is rejected or marked duplicate (FINDING_WITHDRAWN_STATUSES); undefined when the lineage does not exist. Fits
+ * Blackboard.head(lineageId).
+ */
+export function findingWithdrawalResolver(getHead: (lineageId: string) => MaybePromise<{ payload?: unknown } | undefined>): ResourceVersionResolver {
+  return functionResolver('finding_withdrawal', async (id) => findingWithdrawalVersion(await getHead(id)));
+}
+
+/**
+ * (B[1]) `plan`: resourceId `run/<runId>/plan`, version = String(revision of the latest ACCEPTED plan), '0' before any —
+ * a plan revision proposed on a plan view that another proposal superseded meanwhile is stale (compare-and-set).
+ * Fits Blackboard.latestAcceptedPlan(runId).
+ */
+export function planResolver(getLatestAccepted: (runId: string) => MaybePromise<{ revision: number } | undefined>): ResourceVersionResolver {
+  return functionResolver('plan', async (id) => {
+    const m = /^run\/(.+)\/plan$/.exec(id);
+    if (!m) throw new HypertestError('invalid_argument', `plan resource ids must be run/<runId>/plan: ${id}`);
+    const plan = await getLatestAccepted(m[1]!);
+    return String(plan?.revision ?? 0);
   });
 }

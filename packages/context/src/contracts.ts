@@ -91,10 +91,13 @@ export interface SnapshotBuilderDeps extends ContextDeps {
   resolvers: ResolverRegistry;
   /**
    * Additive: what agents OBSERVED through their tool calls. When a build names an `observer`, that agent's latest
-   * observation of every resource (at most `maxObservedEntries`, most recent first) joins the read set.
+   * observation of EVERY resource joins the read set (none is dropped).
    */
   observations?: ObservationLog;
-  /** Additive: cap of observed entries per snapshot (default 256, most recent kept). */
+  /**
+   * Additive: an optional upper bound on the observed resources of one snapshot. Default: none. (B[0]) It never drops
+   * observations: a build whose observer observed more resources fails with `precondition_failed` (fail closed).
+   */
   maxObservedEntries?: number;
 }
 
@@ -199,6 +202,28 @@ export interface FreshnessGuard {
    * replace the snapshot's entries of the same resource and add the resources it observed since.
    */
   validate(snapshot: ContextSnapshot | string, action: ProposedAction, ctx: EventContext): Promise<FreshnessResult>;
+}
+
+/** (B[1], additive) A record-effect tool call that passed the FreshnessGuard and took effect. */
+export interface FreshnessPass {
+  invocationId: string;
+  runId: string;
+  agentId: string;
+  toolId: string;
+  snapshotId?: string;
+  /** Read-set entries the guard checked. */
+  checked: number;
+}
+
+/**
+ * (B[1], additive) Durable record of freshness passes (`ht_context_freshness_passes`, append-only), written in the SAME
+ * transaction as the tool's effect: a durable replay of the invocation (crash after its effect committed, before the call
+ * settled) is recognised, so its own write never makes it stale — it returns its recorded outcome instead of inviting a
+ * duplicate. `createFreshnessPassLog(deps)`.
+ */
+export interface FreshnessPassLog {
+  record(pass: FreshnessPass): Promise<void>;
+  get(invocationId: string): Promise<(FreshnessPass & { passedAt: string }) | undefined>;
 }
 
 // ----------------------------------------------------------------------------- L1 prompt assembly
@@ -341,6 +366,12 @@ export interface SymbolIndexOptions {
   languages?: SymbolLanguage[];
   maxFileBytes?: number;
   defaultLimit?: number;
+  /**
+   * (additive, B[6]) PRIVATE directory of the compiled Go `go/ast` helper — one agent commands can neither read nor write
+   * (the composition passes one under its state directory, hidden from every sandboxed command). Without it Go files use the
+   * regex fallback: the helper runs outside the sandbox, so it is never cached at a shared, predictable temp path.
+   */
+  goHelperDir?: string;
 }
 
 export type SymbolKind = 'function' | 'class' | 'interface' | 'type' | 'enum' | 'const_object' | 'variable' | 'method' | 'struct';
@@ -355,9 +386,11 @@ export interface SymbolDefinition {
   /** Enclosing class (TS/JS/Python) or receiver type (Go) for methods. */
   container?: string;
   signature: string;
+  /** (additive, B[6]) Last line of the definition's syntax-tree node (absent from the regex fallback): the enclosing span. */
+  endLine?: number;
 }
 
-/** Additive: how a reference uses the name (regex classification of its line, no parser). */
+/** Additive: how a reference uses the name — from the file's syntax tree (B[6]), or the regex line classifier as fallback. */
 export type SymbolUsage = 'import' | 'write' | 'call' | 'read';
 
 /** Additive: one word-boundary occurrence of a name that is not its definition. */
@@ -444,6 +477,102 @@ export interface DurableMemory {
   review(experienceId: string, decision: ExperienceDecision, reviewer: string, ctx: EventContext): Promise<ExperienceItem>;
   retrieve(query: { text: string; scope?: ExperienceItem['scope']; limit?: number }): Promise<ExperienceItem[]>;
   list(filter: { status?: ExperienceStatus[]; sourceRunId?: string }): Promise<ExperienceItem[]>;
+}
+
+// ----------------------------------------------------------------------------- skills (B[7], additive)
+
+/**
+ * Lifecycle of a skill revision (technology-selection §Learning: Approved Experience → Candidate Skill → Validation →
+ * Published Skill): `candidate` (distilled from approved experience) → `validated` (a passing eval run bound to this exact
+ * revision) → `published` (the active registry; injected into L1 prompts) → `retired`. `rejected`: a human refused it.
+ */
+export type SkillStatus = 'candidate' | 'validated' | 'published' | 'retired' | 'rejected';
+
+/** One immutable revision of a skill (Agent Skills standard: a name, a description and the SKILL.md body). */
+export interface SkillRevision {
+  skillId: string;
+  revision: number;
+  /** Lowercase, hyphenated (Agent Skills `name`). */
+  name: string;
+  description: string;
+  /** SKILL.md body: the procedure, in markdown. */
+  body: string;
+  scope: { project?: string; role?: string; topic?: string };
+  /** sha256 of the canonical {name, description, body, scope}: what an eval validates and what is published. */
+  digest: string;
+  status: SkillStatus;
+  /** The approved/published experience items it was distilled from (never a candidate). */
+  sourceExperienceIds: string[];
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+  publishedBy?: string;
+  retiredBy?: string;
+}
+
+/** The part of an eval SuiteResult a skill validation judges (structurally an @hypertest/eval SuiteResult). */
+export interface SkillEvalResult {
+  suiteId: string;
+  revision: string;
+  trials: Array<{ taskId: string; armId: string; trial: number; result: string }>;
+}
+
+/** One recorded validation of a skill revision by an eval run (append-only). */
+export interface SkillValidation {
+  validationId: string;
+  skillId: string;
+  revision: number;
+  digest: string;
+  suiteId: string;
+  suiteRevision: string;
+  /** The eval arm bound to the revision: skillArmId(revision). */
+  armId: string;
+  trials: number;
+  passes: number;
+  passRate: number;
+  baselineArmId?: string;
+  baselinePassRate?: number;
+  minPassRate: number;
+  minTrials: number;
+  passed: boolean;
+  reasons: string[];
+  /** sha256 of the canonical eval result the validation was computed from. */
+  resultDigest: string;
+  recordedBy: string;
+  recordedAt: string;
+}
+
+export interface SkillValidationOptions {
+  recordedBy: string;
+  /** Pass rate the skill arm needs (default 1). */
+  minPassRate?: number;
+  /** Graded trials the skill arm needs (default 1). */
+  minTrials?: number;
+  /** The cold-track arm (no skill) the skill arm must not be worse than (default: the result's only other arm, if any). */
+  baselineArmId?: string;
+}
+
+/**
+ * The Hypertest Skill Registry (store-enforced): a candidate skill is distilled from APPROVED experience only, enters the
+ * ACTIVE registry (`published`) only with a passing eval validation bound to its exact revision digest — enforced by the
+ * registry AND by database triggers — and only published skills reach L1 prompts (forPrompt).
+ */
+export interface SkillRegistry {
+  /** A new candidate skill (or a new revision of `skillId`): every source experience must be approved or published. */
+  propose(input: { skillId?: string; name: string; description: string; body: string; scope?: SkillRevision['scope']; sourceExperienceIds: string[]; createdBy: string }, ctx: EventContext): Promise<SkillRevision>;
+  /** Records the eval validation of a candidate/validated revision from an eval result whose skill arm is bound to it. */
+  recordValidation(skillId: string, revision: number, result: SkillEvalResult, options: SkillValidationOptions, ctx: EventContext): Promise<SkillValidation>;
+  /** validated (a passing validation of this exact revision) → published; publisher ≠ creator; a previously published revision is retired. */
+  publish(skillId: string, revision: number, publisher: string, ctx: EventContext): Promise<SkillRevision>;
+  /** published → retired (the skill leaves the active registry). */
+  retire(skillId: string, retiredBy: string, ctx: EventContext): Promise<SkillRevision>;
+  /** candidate/validated → rejected (by a human ≠ creator). */
+  reject(skillId: string, revision: number, rejectedBy: string, ctx: EventContext): Promise<SkillRevision>;
+  get(skillId: string, revision?: number): Promise<SkillRevision | undefined>;
+  list(filter?: { status?: SkillStatus[]; skillId?: string }): Promise<SkillRevision[]>;
+  validations(skillId: string, revision?: number): Promise<SkillValidation[]>;
+  /** The ACTIVE registry: published revisions only, scope-matched for the role, most relevant first. */
+  forPrompt(query: { role?: string; text?: string; limit?: number }): Promise<SkillRevision[]>;
 }
 
 // ----------------------------------------------------------------------------- L5 provenance

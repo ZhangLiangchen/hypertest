@@ -18,6 +18,9 @@ import {
   leaseResolver,
   oracleResolver,
   recordResolver,
+  findingWithdrawalResolver,
+  planResolver,
+  planResourceId,
   type FreshnessGuard,
   type ResourceVersionResolver,
   type SnapshotStore,
@@ -251,6 +254,83 @@ test('built-in resolvers over real ports: oracle revision, superseded finding, l
   } finally {
     await dir.cleanup();
   }
+});
+
+test('(B[2]) before a side effect the guard re-checks EVERY state the design lists, one by one: build digest, environment generation, oracle upgrade, withdrawn finding, lease owner, metric window', async () => {
+  const runId = 'run_b2_items';
+  const ctx = eventCtx(runId);
+  const events = createEventStore(env.deps);
+  const board = createBlackboard({ ...env.deps, events });
+  const envs = new Map([['env-1', { generation: 3, buildDigest: 'sha256:b1' }]]);
+  const oracles = new Map([['or-1', 2]]);
+  let lease: { owner: string; fencingToken: number } | undefined = { owner: 'worker-a', fencingToken: 7 };
+  const finding = await board.postRecord({ runId, recordType: 'finding', createdBy: 'agent-x', payload: { title: 't', description: 'd', severity: 'P1', category: 'product_defect', status: 'open', fingerprint: 'fp-b2' } }, ctx);
+  const g = createFreshnessGuard({
+    ...env.deps,
+    events: sink,
+    snapshots: store,
+    resolvers: createResolverRegistry([
+      environmentResolver((id) => envs.get(id)),
+      oracleResolver(async (id) => (oracles.has(id) ? { revision: oracles.get(id)! } : undefined)),
+      findingWithdrawalResolver((lineage) => board.head(lineage)),
+      leaseResolver(async () => lease),
+    ]),
+  });
+  const action = { tool: 'env.deploy', resources: ['env/env-1'], mutating: true };
+  const staleOf = async (snap: ContextSnapshot) => {
+    const r = await g.validate(snap, action, ctx);
+    return r.fresh ? [] : r.stale.map((x) => `${x.resourceType}:${x.reason}`);
+  };
+  // each item on its own snapshot, so each change is attributed to exactly one check
+  const build = await snapshot(runId, [entry('environment', 'env-1', '3:sha256:b1')]);
+  const generation = await snapshot(`${runId}-g`, [entry('environment', 'env-1', '3:sha256:b1')]);
+  const oracle = await snapshot(runId, [entry('oracle', 'or-1', '2')]);
+  const withdrawn = await snapshot(runId, [entry('finding_withdrawal', finding.lineageId, 'active')]);
+  const owner = await snapshot(runId, [entry('lease', 'env/env-1', 'worker-a:7')]);
+  const metric = await snapshot(runId, [entry('metric_window', 'env/env-1/metrics', 'ev_m', { kind: 'max_age', milliseconds: 60_000 }, env.deps.clock.isoNow())]);
+  for (const snap of [build, generation, oracle, withdrawn, owner, metric]) assert.deepEqual(await staleOf(snap), [], 'fresh before anything changed');
+
+  // build digest: a new build at the SAME generation
+  envs.set('env-1', { generation: 3, buildDigest: 'sha256:b2' });
+  assert.deepEqual(await staleOf(build), ['environment:version_changed']);
+  // environment generation: a redeploy
+  envs.set('env-1', { generation: 4, buildDigest: 'sha256:b2' });
+  assert.deepEqual(await staleOf(generation), ['environment:version_changed']);
+  // oracle upgrade
+  oracles.set('or-1', 3);
+  assert.deepEqual(await staleOf(oracle), ['oracle:version_changed']);
+  // a finding update that does not withdraw it keeps `finding_withdrawal` fresh; rejecting it (withdrawal) is stale
+  const confirmed = await board.postRecord({ runId, recordType: 'finding', createdBy: 'agent-y', supersedes: finding.recordId, payload: { title: 't', description: 'd', severity: 'P1', category: 'product_defect', status: 'confirmed', fingerprint: 'fp-b2' } }, ctx);
+  assert.deepEqual(await staleOf(withdrawn), []);
+  await board.postRecord({ runId, recordType: 'finding', createdBy: 'agent-y', supersedes: confirmed.recordId, payload: { title: 't', description: 'd', severity: 'P1', category: 'product_defect', status: 'rejected', fingerprint: 'fp-b2' } }, ctx);
+  const w = await g.validate(withdrawn, action, ctx);
+  assert.equal(w.fresh, false);
+  assert.deepEqual(w.fresh ? [] : w.stale.map((x) => [x.resourceType, x.currentVersion]), [['finding_withdrawal', 'withdrawn:rejected']]);
+  // lease owner: another owner took the resource lease over
+  lease = { owner: 'worker-b', fencingToken: 8 };
+  assert.deepEqual(await staleOf(owner), ['lease:version_changed']);
+  // metric window: the metric data is older than its window
+  env.deps.clock.advance(60_001);
+  assert.deepEqual(await staleOf(metric), ['metric_window:expired']);
+  // every rejection is on L0 (context.stale_rejected)
+  assert.ok(sink.ofType('context.stale_rejected').length >= 6);
+});
+
+test('(B[1]) plan resolver: the latest ACCEPTED plan revision (0 before any); malformed ids fail closed', async () => {
+  const plans = new Map<string, number>([['run_p', 2]]);
+  const r = planResolver((runId) => (plans.has(runId) ? { revision: plans.get(runId)! } : undefined));
+  assert.equal(await r.currentVersion(planResourceId('run_p')), '2');
+  assert.equal(await r.currentVersion(planResourceId('run_none')), '0');
+  await rejectsWith(r.currentVersion('plan/run_p'), 'invalid_argument');
+  const g = createFreshnessGuard({ ...env.deps, events: sink, snapshots: store, resolvers: createResolverRegistry([r]) });
+  const snap = await snapshot('run_p', [entry('plan', planResourceId('run_p'), '2')]);
+  const propose = { tool: 'plan.propose_revision', resources: [planResourceId('run_p')], mutating: true };
+  assert.deepEqual(await g.validate(snap, propose, eventCtx('run_p')), { fresh: true, checked: 1 });
+  assert.deepEqual(await g.validate(snap, { ...propose, tool: 'blackboard.post_note', resources: ['run/run_p/blackboard'] }, eventCtx('run_p')), { fresh: true, checked: 0 }, 'only an action naming the plan checks it');
+  plans.set('run_p', 3);
+  const stale = await g.validate(snap, propose, eventCtx('run_p'));
+  assert.equal(stale.fresh, false);
+  assert.deepEqual(stale.fresh ? [] : stale.stale.map((x) => [x.resourceType, x.currentVersion]), [['plan', '3']]);
 });
 
 test('registry rejects malformed resolvers and replaces by type', () => {

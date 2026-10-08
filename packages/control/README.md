@@ -216,8 +216,9 @@ every boundary for `independentFromRoles`); the governed **ToolDispatcher** (bel
 snapshot per turn (`snapshotBuilder.build` with the model epoch and the target environment), system prompt whose
 FIRST line is `[hypertest role=<role> work_item=<id> kind=<kind> run=<runId>]` followed by the role prompt with the
 prepared BUGate protocol context; sections Task (required), Plan & objectives (lead, reviewer), Blackboard digest +
-full input records, Relevant code (analysis/design roles, `retrieverFactory(root)`), Approved experience, Evidence
-of this item, Oracles; the L2 view (`maxInlineContextTokens` or route window × 0.6). **HARD** pressure ⇒ mandatory
+full input records, Relevant code (every role, `retrieverFactory(root)`), Skills (published only), Evidence of this
+item, Durable memory (approved experience), Oracles, Available tools — each with its own token budget
+(`SECTION_BUDGETS`; see "Context and learning" below); the L2 view (`maxInlineContextTokens` or route window × 0.6). **HARD** pressure ⇒ mandatory
 condensation: LLM condenser (role `condenser` through the router; deterministic summarizer on any failure; its call is
 charged to the run budget with its tokens AND its USD cost) ⇒ `sessions.addCompaction` ⇒ `context.compacted` (with its
 level). **SOFT** pressure ⇒ deferrable condensation, only when
@@ -662,6 +663,72 @@ item's agent defined when `deps.agents` is given. `ReplanReason` gains `critical
 Behaviour changes (each the correct behaviour per the audit; the tests that encoded the old one were rewritten): a
 write/fault/load call needs an active experiment; validation evidence must be bound; a run needs a SystemModel to pass
 (gate C12, unless `requireContracts: false`).
+
+## Side-effect governance (audit wave 2, additive)
+
+- **E[0]** `claimCommitGuard`: the dispatcher hands the gateway a commit guard that re-checks the caller's work claim
+  inside the dispatching transaction (external effects and record-effect tools).
+- **E[1] effect claims** (`isolation.ts`: `admitEffectClaim`, `settleEffectClaims`, `lastingEffectMs`): every
+  write/fault/load call against an environment is admitted a call-scoped ResourceClaim (`fault_exclusive` for a fault,
+  else `write_exclusive`; holder `effect:<group>:<workItemId>:<invocationId>`) before it runs — overlapping faults are
+  refused (`resource_claim_conflict`); a time-boxed effect keeps its claim for its window.
+- **E[8] approval loop** (`approvals.ts`): a call denied `approval_required` with a recorded approval makes the item WAIT
+  on `approval:<id>`; `observeWaiting` resumes it once decided (approved: issue the same call again; denied/expired:
+  must not run). Durable: the wait is SQL state.
+- **E[3] budget exhaustion policy** (`budget-exhaustion.ts`): `exhaustionPolicy(run, config)` = the run's
+  `budget.onExhausted` ⊕ `ControlConfig.onBudgetExhausted` (now `'gate' | 'pause' | 'approval'`). `applyExhaustionPolicy`
+  pauses the run (`budget`), or requests a budget extension and pauses (`approval`), or converges to the gate; a resume
+  without a raise converges to the gate. `ControlPlane.raiseBudget?(runId, raise, by, rationale)` (amounts ADDED; L0
+  `budget.raised`), `resolveBudgetApproval?(runId)`; `resumeRun` refuses to bypass a pending extension.
+  (review) Only extension requests the control plane filed itself (requester `system:budget`, `BUDGET_EXTENSION_REQUESTER`)
+  count: an agent's look-alike `budget` approval (request_approval with the same subject and another raise) — even
+  approved — never extends the budget nor ends the wait.
+  `ConvergenceMonitor.exhaustionDetail?(run, { caps? })`: every dimension, USD refusals included (item 10); `caps` adds
+  the work-item cap and experiments' own budgets.
+- **item 11** a cancelled (or decided) run closes its model pauses (`model.pauses_released` with `closed: true`).
+- **stubs[8]** `ControlPlane.resolveOperation?(opId, outcome, by, note)`; a call that ended in manual review makes its
+  item wait until a human resolves it.
+- **coverage[8]** `brokeredCredentialScopes(environments, profile)`: capabilities carry the credential scopes granted to
+  the role's permission profile.
+- Tests: `test/side-effect-governance.test.ts`, `test/approval-loop.test.ts`, `test/budget-exhaustion.test.ts`,
+  `test/manual-review.test.ts`.
+
+## Context and learning (unit context-learning, additive)
+
+- **B[1] every mutating call is freshness-checked.** The ToolRuntime skips the guard for `record` effects, so
+  `createDomainTools` wraps every record-effect domain tool with `freshnessChecked(deps, spec)` (inside `claimFenced`'s
+  transaction): the call's snapshot is validated against the resources it changes (`plan` `run/<id>/plan` for
+  `plan.propose_revision` — a compare-and-set against the plan revision the lead saw —, `record:` / `finding:` /
+  `finding_withdrawal:` of a superseded lineage for `blackboard.post_*`, plus every always-checked type) and a stale
+  call is refused `stale_context` with each stale resource, its reason and current version, and a refresh hint. A pass
+  is logged (`deps.freshnessPasses`) so a replayed invocation is not re-judged. `@hypertest/app` wraps plugin record
+  tools the same way. `FRESHNESS_CHECKED` lists the wrapped tools; `test/freshness-coverage.test.ts` enumerates every
+  mutating tool of the built-in + domain catalog and fails when one is neither runtime-checked nor wrapped.
+- **B[5] L1 sections with budgets.** `SECTION_BUDGETS` (tokens): plan 2500, blackboard 3000, code 1500, experience 800,
+  skills 2000, evidence 1000, oracles 800, tools 700; a section is present exactly when its source has something for the
+  agent (`test/l1-sections.test.ts`). Every prompt's deliveries are recorded as observations (`PROMPT_OBSERVER_TOOL_ID`
+  = `context.assemble`) under the turn snapshot, so what reached the agent only through its prompt (records, plan,
+  code lines, skills, environments) is pinned; a "Changed since you last saw them" notice names what moved since. A
+  finding merely LISTED among the open records is pinned as `record` (checked for actions naming its lineage) plus
+  `finding_withdrawal` (always checked); the always-checked `finding` version only for a finding the agent acts on (an
+  input record, or one it read in full or posted) — review: otherwise a confirmation of any listed finding refused every
+  mutating action of every agent that saw the list (`test/freshness-coverage.test.ts`). A `restricted` context
+  (local_private, or `modelPolicy.privacyClass: restricted`) asks `retrieverFactory(root, {restricted: true})`: no
+  off-host embedding route. Stale refusals of record tools carry refresh hints for records, plans, files, metric windows,
+  oracles, environments and leases.
+- **B[7] skills.** `deps.skills.forPrompt` (the registry's active, published revisions; plus `skills.trial` in an eval
+  arm) fills the Skills section.
+- **B[8] compaction on L0.** `recordCompaction` stores the compaction and its `context.compacted` event (with the summary)
+  atomically; with the app's L0 transcript recording an agent's context is rebuilt from L0 alone
+  (`test/l0-context.test.ts`).
+- **B[9] strategies and decisions.** `blackboard.post_strategy` (TestStrategy: objectiveIds of the accepted plan,
+  approach, techniques, description; `updatesRecordId` revises its lineage) and `blackboard.post_decision` (DecisionNote:
+  topic, decision, rationale, evidence) — capability-checked like every domain tool, evidence-checked, versioned with
+  lineage (`test/strategy-decision.test.ts`). Held by the lead (both) and the test designer (strategy).
+- **Row 155 test.recovered.** The reactors (consumer `reactors:test-recovery`, inbox-deduped) append `test.recovered`
+  (deterministic id `testRecoveredEventId`) when a test (framework + selector) that last failed in the run passes on later
+  evidence — never for a known-good pass on the BASE revision — citing both events, their evidence and invocations
+  (`test/test-recovery.test.ts`).
 
 ## Notes for integrators
 

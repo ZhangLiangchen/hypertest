@@ -171,9 +171,11 @@ describe('hypertest run → status / report / events / evidence verify on the fi
     const ctx = { runId: run.runId, correlationId: run.runId, actorId: 'agent:ag_requester' };
     let first: string;
     let second: string;
+    let third: string;
     try {
       first = (await ht.services.approvals.request({ runId: run.runId, kind: 'action', subject: { tool: 'env.restart', target: 'staging' }, requestedBy: { kind: 'agent', id: 'ag_requester', role: 'environment' }, rationale: 'restart staging' }, ctx)).approvalId;
       second = (await ht.services.approvals.request({ runId: run.runId, kind: 'action', subject: { tool: 'env.deploy', target: 'staging' }, requestedBy: { kind: 'agent', id: 'ag_requester', role: 'environment' }, rationale: 'deploy staging' }, ctx)).approvalId;
+      third = (await ht.services.approvals.request({ runId: run.runId, kind: 'action', subject: { tool: 'env.inject_fault', target: 'staging' }, requestedBy: { kind: 'agent', id: 'ag_requester', role: 'environment' }, rationale: 'fault staging' }, ctx)).approvalId;
     } finally {
       await ht.close();
     }
@@ -181,7 +183,7 @@ describe('hypertest run → status / report / events / evidence verify on the fi
     assert.equal(listed.code, 0);
     const rows = listed.stdout.trimEnd().split('\n');
     assert.match(rows[0]!, /^APPROVAL\s+RUN\s+KIND\s+STATUS\s+REQUESTED BY\s+CREATED\s+SUBJECT$/);
-    assert.equal(rows.length, 3);
+    assert.equal(rows.length, 4);
     const firstRow = rows.find((r) => r.startsWith(first))!;
     assert.match(firstRow, new RegExp(`^${first}\\s+${run.runId}\\s+action\\s+pending\\s+agent:ag_requester\\s+\\S+\\s+\\{.*"tool":"env\\.restart".*\\}$`));
 
@@ -197,6 +199,11 @@ describe('hypertest run → status / report / events / evidence verify on the fi
     assert.equal(deny.code, 0);
     assert.deepEqual(parseJson(deny), { approvalId: second, status: 'denied', runId: run.runId, decidedBy: 'human:bob' });
 
+    // E[8] `reject` is the explicit counterpart of `approve --deny`
+    const rejected = await cli(['reject', third, '--by', 'dave', '--reason', 'change freeze'], { cwd: dir.path, env });
+    assert.deepEqual([rejected.code, rejected.stdout, rejected.stderr], [0, `approval ${third} denied by human:dave (run ${run.runId})\n`, '']);
+    const rejectSelf = await cli(['reject', first, '--by', 'ag_requester', '--reason', 'x', '--json'], { cwd: dir.path, env });
+    assert.equal(rejectSelf.code, 1);
     const again = await cli(['approve', first, '--deny', '--by', 'carol', '--reason', 'changed my mind'], { cwd: dir.path, env });
     assert.equal(again.code, 1);
     assert.equal(again.stderr, `hypertest approve: approval ${first} is already approved [precondition_failed]\n`);
@@ -209,9 +216,55 @@ describe('hypertest run → status / report / events / evidence verify on the fi
     assert.deepEqual(all.map((a) => [a.approvalId, a.status, `${a.decidedBy.kind}:${a.decidedBy.id}`, a.rationale]).sort(), [
       [first, 'approved', 'human:alice', 'maintenance window agreed'],
       [second, 'denied', 'human:bob', 'not now'],
+      [third, 'denied', 'human:dave', 'change freeze'],
     ].sort());
     const denied = parseJson<unknown[]>(await cli(['approvals', '--status', 'denied', '--json'], { cwd: dir.path, env }));
-    assert.equal(denied.length, 1);
+    assert.equal(denied.length, 2);
+  });
+
+  test('stubs[8] operations list / resolve: a human resolves a manual review (audited on L0); agents cannot; decisions are final', async () => {
+    // an operation escalated to manual review in the run (reconciliation could not establish its outcome)
+    const config = await loadConfig(project.configPath, { env: { ...process.env, ...env } });
+    const ht = await createHypertest(config, { env: { ...process.env, ...env }, scriptedBrains: { sim: () => ({ text: 'unused' }) }, logger: new MemoryLogger() });
+    let opId: string;
+    try {
+      const ctx = { runId: run.runId, correlationId: run.runId, actorId: 'system:test' };
+      const op = await ht.services.operations.prepare(
+        { runId: run.runId, workItemId: 'wi_review', operationType: 'env.restart', adapterId: 'env.control', target: { resourceKey: 'env/staging', kind: 'environment' }, desiredStateHash: 'h', inputHash: 'i', toolInvocationId: 'sess_review:1:c1' },
+        ctx,
+      );
+      let cur = op;
+      for (const to of ['dispatching', 'outcome_unknown', 'reconciling', 'manual_review'] as const) cur = await ht.services.operations.transition(op.operationId, to, { lastError: 'restart lookup uncertain' }, ctx, { expectedFrom: [cur.status] });
+      opId = op.operationId;
+      // agents never resolve operations (the facade refuses any actor that is not a human)
+      await assert.rejects(ht.resolveOperation(opId, 'succeeded', { kind: 'agent', id: 'ag_1' } as unknown as { kind: 'human'; id: string }, 'it worked'), (e: unknown) => (e as { code?: string }).code === 'permission_denied');
+    } finally {
+      await ht.close();
+    }
+    const listed = await cli(['operations', 'list'], { cwd: dir.path, env });
+    assert.equal(listed.code, 0, listed.stderr);
+    const rows = listed.stdout.trimEnd().split('\n');
+    assert.match(rows[0]!, /^OPERATION\s+RUN\s+TYPE\s+TARGET\s+STATUS\s+ATTEMPT\s+REASON$/);
+    assert.match(rows.find((r) => r.startsWith(opId))!, new RegExp(`^${opId}\\s+${run.runId}\\s+env\\.restart\\s+env/staging\\s+manual_review\\s+1\\s+restart lookup uncertain$`));
+
+    const ok = await cli(['operations', 'resolve', opId, '--outcome', 'compensated', '--by', 'alice', '--note', 'restarted by hand, state restored'], { cwd: dir.path, env });
+    assert.equal(ok.code, 0, ok.stderr);
+    assert.equal(ok.stdout, `operation ${opId} resolved compensated (now compensated) by human:alice (run ${run.runId})\n`);
+    // the same resolution again is a no-op; another outcome is refused (decisions are final)
+    assert.equal((await cli(['operations', 'resolve', opId, '--outcome', 'compensated', '--by', 'alice', '--note', 'again'], { cwd: dir.path, env })).code, 0);
+    const other = await cli(['operations', 'resolve', opId, '--outcome', 'succeeded', '--by', 'bob', '--note', 'no'], { cwd: dir.path, env });
+    assert.deepEqual([other.code, other.stderr], [1, `hypertest operations: operation ${opId} is compensated, not under manual review [precondition_failed]\n`]);
+    assert.equal((await cli(['operations', 'list'], { cwd: dir.path, env })).stdout, 'no manual_review operations\n');
+    const all = parseJson<Array<{ operationId: string; status: string; lastError: string }>>(await cli(['operations', 'list', '--all', '--json', '--run', run.runId], { cwd: dir.path, env }));
+    const resolved = all.find((o) => o.operationId === opId)!;
+    assert.equal(resolved.status, 'compensated');
+    assert.match(resolved.lastError, /^manual review by human:alice: compensated — restarted by hand, state restored$/);
+    const unknown = await cli(['operations', 'resolve', 'op_nope', '--outcome', 'failed', '--by', 'alice', '--note', 'x'], { cwd: dir.path, env });
+    assert.deepEqual([unknown.code, unknown.stderr], [1, 'hypertest operations: operation op_nope not found [not_found]\n']);
+    const ndjson = await cli(['events', run.runId, '--json'], { cwd: dir.path, env });
+    const events = ndjson.stdout.trim().split('\n').map((l) => JSON.parse(l) as { eventType: string; payload: Record<string, unknown> });
+    const audit = events.filter((e) => e.eventType === 'operation.resolved');
+    assert.deepEqual(audit.map((e) => [e.payload['operationId'], e.payload['outcome'], e.payload['by'], e.payload['to']]), [[opId, 'compensated', 'human:alice', 'compensated']]);
   });
 
   test('oracle proposals / decide: none pending; an unknown proposal is not_found (exit 1)', async () => {
@@ -366,6 +419,14 @@ describe('verdict-aware exit codes of hypertest run', () => {
     const r = await cli(['run', GOAL, '--repo', repoPath, '--commit', 'HEAD', '--scripted-brains', BRAINS, '--timeout-ms', '120000', ...args], { cwd, env: { ...project.env, HT_CLI_SCENARIO: scenario } });
     return { r, cwd, env: { ...project.env } };
   }
+
+  test('(review, E[3]) --on-budget-exhausted overrides the configured policy for this run only (recorded in the run budget)', async () => {
+    const { r, cwd, env } = await runScenario('policy-override', 'pass', good.path, { budget: { onExhausted: 'gate' } }, ['--on-budget-exhausted', 'approval', '--json']);
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    const runId = parseJson<{ runId: string }>(r).runId;
+    const s = await cli(['status', runId, '--json'], { cwd, env });
+    assert.equal(parseJson<{ run: TestRun }>(s).run.budget.onExhausted, 'approval');
+  });
 
   test('fail ⇒ 3: a failing suite and an unresolved P1 product defect (--follow streams the events to stderr)', async () => {
     const { r } = await runScenario('fail', 'fail', bad.path, {}, ['--follow']);

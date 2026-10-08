@@ -51,10 +51,13 @@ export const PERMISSION_PROFILES: Readonly<Record<PermissionProfileName, Permiss
     environmentClasses: ['local', 'sandbox'],
     credentialScopes: [],
   },
+  // (E[8]) critical actions (env.deploy) are within the operator's reach, but never without a human: the default rule
+  // approve-critical-risk (always composed in, most restrictive) sends every critical external/destructive action to
+  // approval_required, and the approval gate lets it run once only after an independent human approval of that exact call.
   environment_operator: {
     name: 'environment_operator',
     allowedEffects: ['read', 'record', 'execute', 'external', 'destructive'],
-    maxRiskClass: 'high',
+    maxRiskClass: 'critical',
     resourceScopes: ['workspace/**', 'run/**', 'env/**', 'loadgen/**', 'loadjob/**'],
     environmentClasses: ['local', 'sandbox', 'staging'],
     credentialScopes: [],

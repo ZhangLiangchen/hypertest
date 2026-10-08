@@ -15,7 +15,8 @@
 | 分布式 | PostgreSQL | NATS JetStream | Temporal，`workerMode: external` | N 个 `hypertest worker` 进程加客户端（`run --detach`、`status`、`approve` 等） | 多主机、长时间运行 | 是（一个 worker） |
 
 可选组件：OPA 策略（已验证）、带 Object Lock 的 S3 artifact 存储（已实现；未在真实端点上运行）、PowerContext 记忆
-（已实现；未在真实服务上运行）。
+（已实现；未在真实服务上运行）、Hypertest 记忆服务（`memory: { kind: service }` 或 `hypertest memory serve`：拥有独立存储的
+独立进程；已验证）、通过 OpenAI 兼容 embeddings 端点的语义检索（仅在模拟端点上验证）。
 
 ### 本地
 
@@ -100,17 +101,50 @@ artifacts: { kind: s3, region: eu-central-1, bucket: hypertest-evidence, prefix:
 设置 `objectLockDays` 后，每个 artifact 都以 `ObjectLockMode=COMPLIANCE` 写入（存储桶必须启用 Object Lock）。不设置时，
 以及使用默认 `fs` 存储时，证据是可发现篡改的（哈希链、封存），但不是 WORM。
 
+### 记忆服务、语义检索与技能
+
+L4 持久记忆（已批准的经验）可以放在拥有独立存储的单独服务中：
+
+```yaml
+memory: { kind: service }                       # Hypertest 以子进程启动该服务（存储在 <dataDir>/memory），close 时停止
+# 或者使用自行运行的服务（`hypertest memory serve --port 7430 --api-key-env HYPERTEST_MEMORY_API_KEY`）：
+memory: { kind: powercontext, baseUrl: "http://127.0.0.1:7430", apiKeyEnv: HYPERTEST_MEMORY_API_KEY }
+```
+
+该服务保持存储的规则（只检索已批准/已发布的经验；创建者永远不能评审自己的经验），其决定也会记录到本部署的 L0。
+`memory serve` 在非回环地址上必须配置至少 16 个字符的令牌，否则拒绝启动。每个存储目录只允许一个服务进程。
+
+通过 OpenAI 兼容的 `/embeddings` 端点进行语义代码检索（默认：特征哈希 embedding，不会有请求离开主机）：
+
+```yaml
+models:
+  providers:
+    - { id: local-embed, kind: openai-compatible, baseUrl: "http://127.0.0.1:11434/v1" }
+retrieval: { embedder: { provider: local-embed, model: nomic-embed-text, dimensions: 768 } }
+```
+
+代码片段会发送到该端点：私有代码请使用本地端点。缺少凭据时不会发送任何请求（改用哈希 embedder 并记录警告）。
+上下文分级为 `restricted` 的 Agent（local_private）的工作区绝不会被本机或私有网络之外的端点做 embedding：它们使用本地哈希
+embedder。代码工具（`code.symbols`、`code.references`）和提示中的代码段使用语法树符号（TypeScript 编译器 API；安装了 python3 和 Go
+时也使用它们，否则对单个文件回退到正则提取）。Go 辅助程序编译在 `<dataDir>/state/parsers` 中，沙箱内的命令看不到该目录。
+
+技能：`hypertest skill propose --from <已批准经验> …` → `skill validate <id> --suite <suite> --by <name>`（一次 eval 运行，
+其中一个 arm 绑定该修订）→ `skill publish <id> --by <另一个人>` → `skill retire`。只有已发布的技能会进入 Agent 提示；
+数据库拒绝发布没有针对该确切修订的通过验证的技能（`--min-pass-rate` 必须大于 0；结论与自身数值矛盾的验证记录会被数据库拒绝）。
+`skill validate --result <file>` 评判你提供的 SuiteResult 文件而不是运行 eval：该文件按原样被信任。配置键 `skills.trial`
+由 `skill validate` 在其自己的 eval 实例上设置；带该配置启动的实例会向其 Agent 展示这些未发布的修订并记录警告——切勿在生产部署中设置。
+
 ## 2. 安全
 
 | 控制项 | 默认值 | 建议 |
 |---|---|---|
-| Agent 命令沙箱 | `sandbox: { kind: local, network: loopback }` | 在支持非特权用户命名空间且有 python3 的 Linux 上，每条命令都运行在独立的 user、network、PID 与 mount 命名空间中。它只能访问自身 loopback，以及被中继的已注册环境与 `tools.httpAllowlist` 端点；密钥、存储、artifact 与其他工作区都被隐藏；命令参数不能指向工作区之外的路径。不支持命名空间的主机会拒绝这些配置。**残留风险：** 命令以同一 OS 用户运行，能读取主机其余文件系统。 |
+| Agent 命令沙箱 | `sandbox: { kind: local, network: loopback }` | 在支持非特权用户命名空间且有 python3 的 Linux 上，每条命令都运行在独立的 user、network、PID 与 mount 命名空间中。它只能访问自身 loopback，以及被中继的已注册环境与 `tools.httpAllowlist` 端点；密钥、存储、artifact 与其他工作区都被隐藏；命令参数不能指向工作区之外的路径。不支持命名空间的主机会拒绝这些配置。若沙箱无法隐藏密钥、能力密钥与存储（没有 PID/mount 隔离——例如缺少 python3——或 `network: open`），Hypertest 拒绝启动，`doctor` 报告 ERROR，除非用 `sandbox.insecureAllowUnhiddenSecrets: true` 显式接受（每次启动都会记录 INSECURE 告警）。命令向被中继的 SUT 端点发出的改变状态的 HTTP 请求会成为记账的 `sandbox.http` 操作（operation id、`Idempotency-Key`、证据；重放从记录应答），或在 `sandbox.egressWrites: refuse` 下返回 403；非 HTTP 流量除非环境设置 `rawEgress: true` 否则被拒绝。这类写入像独立的工具调用一样被授权：环境类别必须在 Agent 能力允许的范围内，策略必须允许在该环境产生外部效果（需要审批的写入——例如在 `staging` 上——返回 403：请改用会等待审批的 `http.request`）；只要有一次写入被拒绝，该调用就以工具故障（`egress_refused`）结束，绝不作为测试结果；GET 上的方法覆盖头（`X-HTTP-Method-Override` 等）使其成为写入；命令永远无法访问环境控制路径 `/__hypertest`。**残留风险：** 命令以同一 OS 用户运行，能读取主机其余文件系统。 |
 | 不受信任的模型或代码 | – | 使用 `sandbox: { kind: oci, image: <含工具链的镜像>, network: none, cpuLimit, memoryMb }`（docker，`--cap-drop ALL`，禁止提升权限）。`network: open` 会取消本地沙箱的出站控制，只在可以接受的主机上使用。 |
-| 密钥与凭据 | 文件中没有 | `*Env` 字段指定环境变量名；内联的密钥、令牌、密码与凭据请求头都是配置错误。沙箱中的命令只获得 `sandbox.envAllowlist`（默认 PATH、HOME、LANG、LC_ALL、TMPDIR）。`doctor` 只打印变量名，从不打印值。 |
+| 密钥与凭据 | 文件中没有 | `*Env` 字段指定环境变量名；内联的密钥、令牌、密码与凭据请求头都是配置错误。沙箱中的命令只获得 `sandbox.envAllowlist`（默认 PATH、HOME、LANG、LC_ALL、TMPDIR）。`doctor` 只打印变量名，从不打印值。Agent 永远拿不到长期凭据：按环境声明 SUT 凭据（`credentials: [{ name, kind: jwt_hs256 \| oauth2_client_credentials, secretEnv, header?, ttlMs?, audience?, tokenUrl?, clientId?/clientIdEnv?, scope?, grantTo? }]`）；Agent 只指名凭据（`http.request` 的 `credential`），由 secret broker 为该次调用签发短期凭据（有效期 `ttlMs`、默认 5 分钟的 JWT HS256，或 OAuth2 client-credentials 令牌）。其范围 `credential:<environmentId>/<name>` 必须授予 Agent 的权限配置（`grantTo`，默认 test_executor 与 environment_operator）并被许可的 `credentialScope` 允许。密钥与签发值会从工具输出与证据中脱敏。env.process 发送按操作签发的控制令牌：supervisor 的控制令牌不会出现在网络上。 |
 | 数据目录 | `.hypertest/`（0700） | 存放数据库、artifact、`keys/`（0600）与工作区。不要提交到 git（`init` 会把它加入 `.gitignore`）。 |
 | REST API | `127.0.0.1`，无令牌 | 始终在 `HYPERTEST_API_TOKEN` 中设置至少 16 个字符的令牌（或用 `--token-env` 指定其他变量）。非 loopback 的 `--host` 必须有令牌。通过 API 做人工决定始终需要令牌，因为 Agent 能访问 loopback 服务。远程使用时请在前面加 TLS。 |
-| 人工决定 | CLI 或 API | `approve`、`oracle establish`、`oracle decide`、`waive`、`experience review` 以及运行时发布决定（`runtime register`、`record-suite`、`promote`、`rollback`、`migrate`）需要 `--by <name>`（命令要求时还需 `--reason`），并记录为 `human:<name>`（由 CI 执行的发布步骤使用 `--by ci:<pipeline>`）。请求者永远不能决定自己的请求。设置了 `HYPERTEST_SANDBOX` 时这些命令全部被拒绝，而两种沙箱都会在每条命令中设置它，因此 Agent 永远无法晋级评判它自己的运行时。 |
-| 许可 | 内置规则 | 允许读取与记录；写入与执行只允许在工作区内。外部效果在 `local`/`sandbox` 环境中允许，在 `staging` 需要批准。破坏性效果在 `staging` 需要批准，在 `sandbox` 上高风险时需要批准，任何环境中的关键风险都需要批准。`production` 上高于读取的操作一律拒绝，Agent 永远不能决定审批或 oracle 变更。可通过 `policy.rules` 或 OPA 收紧。 |
+| 人工决定 | CLI 或 API | `approve`、`reject`、`operations resolve`、`resume --raise-…`、`oracle establish`、`oracle decide`、`waive`、`experience review`、`skill propose|validate|publish|reject|retire` 以及运行时发布决定（`runtime register`、`record-suite`、`promote`、`rollback`、`migrate`）需要 `--by <name>`（命令要求时还需 `--reason`），并记录为 `human:<name>`（由 CI 执行的发布步骤使用 `--by ci:<pipeline>`）。请求者永远不能决定自己的请求。设置了 `HYPERTEST_SANDBOX` 时这些命令全部被拒绝，而两种沙箱都会在每条命令中设置它，因此 Agent 永远无法晋级评判它自己的运行时。 |
+| 许可 | 内置规则 | 允许读取与记录；写入与执行只允许在工作区内。外部效果在 `local`/`sandbox` 环境中允许，在 `staging` 需要批准。破坏性效果在 `staging` 需要批准，在 `sandbox` 上高风险时需要批准，任何环境中的关键风险都需要批准。`production` 上高于读取的操作一律拒绝，Agent 永远不能决定审批或 oracle 变更。需要审批的动作不会执行：系统记录一条绑定到该精确调用（工具、参数、目标、风险、运行、工作项）的审批请求，工作项等待——先 `hypertest approvals`，再 `hypertest approve <approvalId> --by <name> --reason …` 或 `hypertest reject …`（或带令牌的 `POST /approvals/:id`）；批准后同一调用恰好执行一次；拒绝或过期（24 小时）则该调用被拒绝。审批只授权其请求所描述的动作（所展示的工具、参数与目标与其绑定动作不符的审批不授权任何动作）。可通过 `policy.rules` 或 OPA 收紧。 |
 | 环境 | 无 | 在 `environments:` 中注册黑盒目标并设置 `environmentClass`。控制面令牌来自 `control.tokenEnv`，从不写入文件。对环境的写入、负载与故障只能在工作项的实验下执行（否则为 `experiment_required`）。用 `isolation: { dedicated: true, namespace?, database?, account? }` 注册只属于你的环境：只有这样，实验才能使用隔离模式 `dedicated_environment`（它独占整个环境，并记录 namespace/database/account）。 |
 | 模型凭据 | 失败即关闭 | `apiKeyEnv` 指定的环境变量未设置或为空的提供方不可用：其路由永远不会被选中，也不会发出任何请求。若某运行的角色没有其他路由，运行会在启动时以确切原因被拒绝；`doctor` 会报告该提供方。 |
 | 内核插件 | 无 | `plugins:` 加载以 `digest: sha256:<hex>` 固定的本地 ES 模块；文件被改动则拒绝启动（插件的任何部分都不会被加载）。插件工具与内置工具一样经过能力检查、策略许可、操作台账与证据。插件工具不得复用内置工具或领域工具的 id（否则拒绝启动）。摘要只固定入口文件：请把插件打包为单个文件发布（它导入的模块不被固定）。固定摘要前请审查插件代码：它运行在 Hypertest 进程中。 |
@@ -126,14 +160,16 @@ artifacts: { kind: s3, region: eu-central-1, bucket: hypertest-evidence, prefix:
 | Temporal worker 退出 | Activity 会发送心跳；同一部署的其他 worker 约一分钟内重试 | 用相同的代码与配置重启 worker |
 | 重启时有进行中的副作用 | `verified` 操作返回已记录的结果；`dispatching`、`acknowledged` 与 `outcome_unknown` 操作先观察并对账，再决定是否重新派发；外部压测任务按 operation id 重新挂接；过期租约获得新的 fencing token；泄漏的预算预留被释放 | 无需操作。报告中的 “Recovery log” 会列出对账与重跑的内容 |
 | 出现指明持锁者的 `precondition_failed`（PGlite） | 本机已退出进程留下的锁会被自动接管 | 如果持锁者在另一台已下线的主机上，删除 `<dataDir>/db.lock` |
-| 某个操作进入 `manual_review` | 永不自动重试：其结果无法确认，或该操作不可重复 | `hypertest events <runId> --types operation.manual_review,operation.late_receipt`；用 operation id（即幂等键与任务标签）检查目标系统；手工清理；发起新运行。台账条目作为审计记录保留 |
+| 某个操作进入 `manual_review` | 永不自动重试：其结果无法确认，或该操作不可重复；发起它的工作项等待你的决议（受其墙钟时间限制） | `hypertest operations list`（或 `GET /operations`）；用 operation id（即幂等键与任务标签）检查目标系统；然后 `hypertest operations resolve <opId> --outcome succeeded\|failed\|compensated --by <name> --note "你检查了什么"`（或带令牌的 `POST /operations/:id/resolve`）。等待中的工作以该结果恢复；决议记录在 L0（`operation.resolved`）。Agent 永远不能决议操作 |
 | 已批准一个会翻转已记录失败的 oracle 变更 | 依赖旧修订的决定被标记；历史不会被改写 | `hypertest status <runId>` 会显示重新评估标记；发起新运行，它会固定新修订 |
 | 运行期间固定的 oracle 被取代 | 运行以追加方式重新固定到新批准的修订（`run.oracle_repinned`），之前的决定被标记为需要重新评估，lead 重规划（`oracle_changed`）以定义新实验；门禁按新修订判定 | 无需操作；`hypertest events <runId> --types run.oracle_repinned,replan.triggered` 显示变更 |
 | 运行为 `inconclusive`，且 C12 domain_contracts 为 unknown | 运行没有记录 SystemModel，或某个写入/故障/负载动作不属于任何 ExperimentSpec | 确保 lead 记录被测系统（`system_model.record`）且写入在实验下执行；`gate: { requireContracts: false }` 是一次被记录、需授权的放宽（`gateOverrideBy`） |
 | 某个 oracle 修订被证实有误 | – | `hypertest oracle invalidate <oracleId> --revision <n> --by <name> --reason "…"`：追加一个 `invalid` 修订；基于它的决定被标记为需要重新评估；固定到它的运行在修正后的修订经 `oracle decide` 批准之前至多为 `inconclusive`（C0），批准后运行被重新固定并重规划。在旧修订下运行的实验不再计入：其准则在新实验重跑之前保持未证明 |
 | 生成的测试已通过，C3 仍为 unknown（`… neither satisfy nor violate a critical assertion`） | 生成的测试只有在完成整个生命周期、其已知正确运行在**基线**修订上（`test.run` revision "base"）且敏感度在产品代码上得到证明之后，才能支持或违反 P0/P1 断言；已知正确只在候选本身上通过、或记录了“已知正确不可用”原因的测试不参与 P0/P1 判定 | 查看 `hypertest report <runId>`（被忽略的证据）以及该资产的各阶段；为运行提供 `target.baseCommit`，使回归测试能在基线修订上验证 |
-| 运行预算耗尽 | 运行带着已有证据进入门禁（绝不静默降级）；证据缺口使结论为 `inconclusive` | 在配置（或 `POST /runs`）中提高 `budget`，发起新运行 |
-| 运行处于暂停状态 `budget`（`onBudgetExhausted: pause`） | 运行预算拒绝了一次模型调用；等待中的工作项保留其 Agent 与会话（`budget.exhausted` 指明作用域与维度：`model_tokens` 或 `model_cost`） | 提高限额并执行 `hypertest resume <runId>`：同一个 Agent 继续。若未留出余量就恢复，工作项以确切原因结束，由门禁决定 |
+| 运行预算耗尽（`budget.onExhausted: gate`，默认） | 运行带着已有证据进入门禁（绝不静默降级）；证据缺口使结论为 `inconclusive`。所有维度都计入：模型 token 与美元、工具调用、算力、制品字节、墙钟时间 | 在配置（或 `POST /runs`）中提高 `budget` 并发起新运行，或选择 `pause` / `approval`（配置 `budget.onExhausted`，或单次运行：`hypertest run … --on-budget-exhausted pause\|approval`、`POST /runs` 的 `budget.onExhausted`） |
+| 运行处于暂停状态 `budget`（`budget.onExhausted: pause`） | 运行预算耗尽（`budget.exhausted` 指明作用域与维度）；等待中的工作项保留其 Agent 与会话；不取消任何工作 | `hypertest resume <runId> --raise-tokens <n> \| --raise-cost-usd <x> \| --raise-tool-calls <n> \| --raise-wall-clock-ms <n> \| --raise-work-items <n> … --by <name> --reason "…"`（或带令牌的 `POST /runs/:id/resume` `{ raise, by, rationale }`）：额度被加到限额上（`budget.raised`），同一批 Agent 继续。未提高预算就恢复，运行收敛到门禁 |
+| 运行处于暂停状态 `approval`（`budget.onExhausted: approval`） | 一条预算追加审批请求（kind `budget`）给出建议额度；运行持久等待，`hypertest resume` 拒绝绕过它 | `hypertest approve <approvalId> --by <name> --reason "…"`：预算按该额度追加并恢复运行；`hypertest reject …`（或 24 小时内未决定）：运行收敛到门禁 |
+| 某个工作项在等待动作审批（`approval:<id>`） | 其工具调用需要审批；尚未执行任何内容 | `hypertest approvals` 显示该调用（工具、参数、目标）；`hypertest approve\|reject <approvalId> --by <name> --reason "…"`。批准后 Agent 再次发起同一调用，它只执行一次 |
 | Agent 因模型不可用而暂停（`work.paused`，pauseReason `model_unavailable`） | 当前没有路由能服务它们（熔断打开、重试后仍限流或超时）；它们会在半开时间 / Retry-After / 退避后自行恢复，重启后也是如此。永远不能服务该角色的路由（安全、能力、缺失凭据）则以确切原因失败即关闭 | 等待，或执行 `hypertest resume <runId>`（`POST /runs/:id/resume`，需要 API 令牌）让它们立即重试。`hypertest status <runId>` 显示每个 Agent 的暂停 |
 | 提供方调整了价格 | 设置了 `models.priceGuard.maxIncreasePct` 时，超出该幅度的观测价格会打开该路由的熔断（`model.circuit_opened`，原因 `price_change`）；由其他合格路由服务 | `hypertest model prices set <routeId> --input <usd> --output <usd>`；之后清除或更正（`model prices clear`），熔断会在下一个回合边界关闭 |
 | 某运行的 Agent 应改用另一条模型路由 | – | `hypertest model switch <runId> <角色或 agentId> <routeId> --by <name> --reason "…"`（或携带令牌调用 `POST /runs/:id/model-switch`）：在权限复核后于下一个安全回合边界生效，或被拒绝（`model.switch_refused`） |

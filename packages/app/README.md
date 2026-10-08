@@ -118,7 +118,8 @@ adds `finding`), the observation log (`ht_context_observations`), freshness guar
 PowerContext), provenance (`services.provenance`), working context, per-root L3 retrievers (symbol graph + single-line
 exact search + a workspace vector retriever, RRF-fused; vector corpora built lazily per root and commit, at most 8 per
 process, stored in pgvector when the store has the extension — probed once — else in memory; `HashEmbedder`
-feature-hashing embeddings, no provider embedding route); workspace manager (`<dataDir>/workspaces`), local/OCI
+feature-hashing embeddings unless `retrieval.embedder` routes them through an OpenAI-compatible `/embeddings`
+provider); workspace manager (`<dataDir>/workspaces`), local/OCI
 sandbox, tool registry (built-in tools with `stateDir`, then the control domain tools), tool runtime wrapped by
 `observeToolRuntime` (every tool result feeds the observation log before it returns; a read — `fs.read`, `git.show`,
 `blackboard.read`, `metrics.query`, `metrics.scrape` — whose observation cannot be recorded is returned
@@ -413,3 +414,61 @@ HYPERTEST_TEST_DB=postgres node scripts/run-tests.mjs --package app  # e2e runs 
   experiment of its work item, test artifacts follow the full lifecycle (bound evidence, base-revision known-good,
   independent review), and a run needs a SystemModel to pass (gate C12). Tests: `test/config.test.ts`; the e2e fixtures
   (`test/helpers.ts`) record a SystemModel and declare the configured oracle's judge policy.
+
+## Side-effect governance (audit wave 2, additive)
+
+- The composed policy is `ApprovalGatedPolicyEngine(builtin ⊕ OPA)`; `approve()` sends the run an ApprovalSignal (a
+  plain wake when the signal cannot be delivered) and applies a decided budget extension at once.
+- Configuration: `budget.onExhausted: gate | pause | approval` (also per run); `sandbox.egressWrites: ledger | refuse`;
+  `sandbox.insecureAllowUnhiddenSecrets` (the loud opt-in — without it a local sandbox that cannot hide keys, capability
+  secret and store, or `network: open`, refuses the composition: `assertSecretsHidden`; doctor reports an ERROR);
+  `environments[].credentials` (brokered credentials, validated with `brokeredCredentialProblems`; the registry keeps
+  names only), `environments[].honoursIdempotencyKey`, `environments[].rawEgress`. A configured `signing.keyFile` is
+  hidden from agent commands too.
+- Facade: `resume(runId, { raise?, by?, rationale? })` (`ResumeRunOptions`), `listOperations(filter?)`,
+  `resolveOperation(opId, outcome, actor, note)`. API: `POST /runs/:id/resume` accepts `{ raise, by, rationale }`;
+  `GET /operations`, `POST /operations/:id/resolve` (token). Overrides `sandboxIsolation`, `credentialFetch` (tests).
+- Tests: `test/secrets-governance.test.ts`, `test/api.test.ts`, `test/app.e2e.test.ts` (approval gate, budget policy),
+  `test/config.test.ts`, `test/diagnose.test.ts`.
+
+## Context and learning (unit context-learning, additive)
+
+- **Configuration.** `memory: { kind: service, dataDir?, apiKeyEnv? }` (B[4]): createHypertest starts the L4 memory
+  service as a CHILD PROCESS (`startMemoryServiceProcess`: this package's `memory-service.ts` run by the current node
+  binary, its own PGlite store at `dataDir` — default `<project dataDir>/memory`, held exclusively —, a random per-start
+  bearer token unless `apiKeyEnv` names one, only PATH/HOME/TMPDIR/LANG passed on), talks to it through
+  `PowerContextClient`, and stops it on `close()` (SIGTERM, SIGKILL after 10 s); `memory: { kind: powercontext,
+  baseUrl, apiKeyEnv? }` reaches a service started elsewhere (`hypertest memory serve`, or `serveMemory()`). With either,
+  the experience decisions the service accepted are also on this deployment's L0 (`withExperienceEvents`).
+  `retrieval: { embedder: { provider, model, dimensions, timeoutMs? } }` (B[6]): semantic L3 embeddings through the
+  `/embeddings` endpoint of a configured `openai-compatible` provider (its baseUrl, apiKeyEnv, headers; the `fetch`
+  override applies); every answer's dimensions are verified; a missing credential sends nothing (the hashing embedder is
+  used and a warning logged); another provider kind is a configuration error. pgvector keeps one vector size per
+database: when `ht_vectors` already holds vectors of another size (e.g. from the hashing embedder), the corpora of the
+new embedder stay in memory (logged at startup of the first search). Code leaves the machine to that provider:
+  configure a local endpoint for private code. (review, privacy) An agent whose context is classified `restricted`
+  (local_private, or a work item with `modelPolicy.privacyClass: restricted`) never has its workspace embedded by a
+  provider outside this host / private network (`providerLocality`): its retrieval embeds with the local hashing embedder
+  into in-memory corpora of its own. `skills: { trial: SkillRevision[] }` (B[7], set by `hypertest skill validate` on the
+  eval arm bound to a revision): those candidate revisions — digest-checked — reach this instance's prompts, marked as
+  under evaluation; an instance started with it logs a warning (an evaluation setting, never for production runs).
+- **Composition.** `services.skills` (the store-enforced Skill Registry; L1 shows only published skills, plus the trial
+  ones); the runtime SessionStore wrapped by `recordTranscriptOnL0` (B[8]: every transcript entry on L0 in the same
+  transaction); the freshness pass log; plugin record tools wrapped by `freshnessChecked` (B[1]); the code tools'
+  retrieval port `createCodeToolRetrieval` (B[6]: `code.symbols` / `code.references` answer from the syntax-tree symbol
+  graph, "who writes X" included). The Go `go/ast` helper (it runs in this process, outside the sandbox) is built in
+  `<dataDir>/state/parsers` — inside the state directory every sandboxed command finds hidden — never at a shared temp
+  path (review: a sandboxed command could otherwise replace it and have the host execute it).
+- **Exports.** `cachedRetrievers` (the per-root L3 retrievers, with the restricted path), `serveMemory`, `startMemoryServiceProcess`, `MemoryServiceConfig`, `MemoryServiceProcess`,
+  `RunningMemoryService`; `renderSkillMarkdown`, `skillArmId`, `skillDigest`, `SKILL_NAME_RE`, `SKILL_STATUSES` and the
+  skill types.
+- **Tests.** `test/memory-service.e2e.test.ts` (a real child process: own storage surviving a restart, bearer auth,
+  server-side invariants, one process per data directory; `memory.kind: service` end to end: approved experience from
+  the service in the executor's prompt, decisions on L0, process stopped on close), `test/retrieval.e2e.test.ts`
+  (`retrieval.embedder` through a fake fetch; the lead's `code.references` answered from the symbol graph; missing
+  credential and config errors), `test/context-review.e2e.test.ts` (through createHypertest: a withdrawn prompt-only
+  finding refuses the executor's record call until it is told, a merely confirmed one does not block; every record tool
+  of the composed catalog is freshness-checked; the Go helper in the hidden state directory; a restricted root never
+  reaches an off-host embedder), `test/skills.e2e.test.ts`, `test/event-catalog.e2e.test.ts` (every event type of the
+  typical catalog on a scripted run's L0, `test.recovered` included). Behaviour changes reflected in existing tests: the
+  unknown-key message lists `retrieval` and `skills`; the code section's heading names its retrievers.

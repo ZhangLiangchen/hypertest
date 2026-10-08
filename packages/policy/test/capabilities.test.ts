@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { RISK_ORDER, type ActionCapability, type RiskClass, type ToolEffect } from '@hypertest/domain';
 import {
-  PERMISSION_PROFILES, PRODUCT_FIX_SCOPE, attenuateCapability, capabilityAllows, createRootCapability, holdsProductFix, signCapability,
+  DEFAULT_POLICY_RULES, PERMISSION_PROFILES, PRODUCT_FIX_SCOPE, attenuateCapability, capabilityAllows, createRootCapability, holdsProductFix, signCapability,
   verifyCapability, type CapabilityCheckRequest, type CapabilityConstraints,
 } from '../src/index.ts';
 import { FAR_FUTURE, NOW, SECRET, cap, prng } from './helpers.ts';
@@ -58,7 +58,11 @@ test('permission profiles: effects per profile and no production in any built-in
   assert.deepEqual(PERMISSION_PROFILES.test_executor.allowedEffects, ['read', 'record', 'execute', 'external']);
   assert.deepEqual(PERMISSION_PROFILES.test_executor.environmentClasses, ['local', 'sandbox']);
   assert.deepEqual(PERMISSION_PROFILES.environment_operator.allowedEffects, ['read', 'record', 'execute', 'external', 'destructive']);
-  assert.equal(PERMISSION_PROFILES.environment_operator.maxRiskClass, 'high');
+  // (E[8]) env.deploy (critical) is reachable by the environment operator — every critical external/destructive call still
+  // needs an independent human approval (approve-critical-risk, asserted below): with the old 'high' ceiling it could never run
+  assert.equal(PERMISSION_PROFILES.environment_operator.maxRiskClass, 'critical');
+  assert.ok(DEFAULT_POLICY_RULES.some((r) => r.id === 'approve-critical-risk' && r.decision === 'approval_required' && r.match.minRisk === 'critical'));
+  for (const p of Object.values(PERMISSION_PROFILES)) if (p.name !== 'environment_operator') assert.notEqual(p.maxRiskClass, 'critical', p.name);
   assert.deepEqual(PERMISSION_PROFILES.environment_operator.environmentClasses, ['local', 'sandbox', 'staging']);
   assert.deepEqual(PERMISSION_PROFILES.product_fixer.credentialScopes, [PRODUCT_FIX_SCOPE]);
   for (const p of Object.values(PERMISSION_PROFILES)) assert.equal(p.environmentClasses.includes('production'), false, p.name);

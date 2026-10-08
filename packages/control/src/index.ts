@@ -5,20 +5,20 @@ export { controlMigrations } from './migrations.ts';
 export { createControlPlane, type ControlPlaneInternals } from './control-plane.ts';
 export { validatePlan } from './plan-validator.ts';
 export { createScheduler, runLeaseKey, workLeaseKey, type Dispatch, type Scheduler } from './scheduler.ts';
-export { createReactorService, REACTOR_CONSUMER, REACTOR_SUBJECTS, type CatchUpResult, type ReactorService } from './reactors.ts';
+export { createReactorService, REACTOR_CONSUMER, REACTOR_SUBJECTS, TEST_RECOVERY_CONSUMER, testRecoveredEventId, type CatchUpResult, type ReactorService } from './reactors.ts';
 export {
   createConvergenceMonitor, FEEDBACK_CRITERIA, MAX_GATE_ATTEMPTS, PRODUCER_ROLES, runReviewRequestEventId,
   type ConvergenceMonitor, type GateOutcome, type ReplanOutcome, type ReplanReason,
 } from './convergence.ts';
 export { BLACKBOX_SCOPES, blackboxScopes, createAgentWorker, type AgentWorker, type AgentWorkerHooks } from './worker.ts';
 export {
-  createToolDispatcher, classifyDrift, quarantineLifted, GOVERNED_TOOL_IDS, QUARANTINE_BLOCKED_TOOL_IDS, offeredRisk, claimLeaseOwner, testOutcomeEventId,
+  createToolDispatcher, classifyDrift, quarantineLifted, GOVERNED_TOOL_IDS, QUARANTINE_BLOCKED_TOOL_IDS, offeredRisk, claimLeaseOwner, claimCommitGuard, testOutcomeEventId,
   type DispatcherInput, type DriftVerdict, type GovernanceVerdict,
 } from './dispatcher.ts';
-export { agentHeader, condenserSummarizer, createContextProvider, parseAgentHeader, type ContextProviderInput, type TurnState } from './context-provider.ts';
+export { agentHeader, condenserSummarizer, createContextProvider, parseAgentHeader, PROMPT_OBSERVER_TOOL_ID, SECTION_BUDGETS, type ContextProviderInput, type TurnState } from './context-provider.ts';
 export {
   createDomainTools, claimFenced, TERMINAL_TOOL_IDS, findingFingerprint, CONFIRMING_ROLES, EVIDENCE_REQUIRED_CATEGORIES, RESOLVING_FINDING_STATUSES, acceptedPlanCount,
-  delegationOperationId, parseDelegationOperationId,
+  delegationOperationId, parseDelegationOperationId, FRESHNESS_CHECKED, freshnessChecked, isFreshnessChecked, ensureFreshnessResolvers,
 } from './domain-tools/index.ts';
 export { createReportBuilder } from './report.ts';
 export { diffSections, invertSection, sectionPaths, unifiedDiff } from './diff.ts';
@@ -48,3 +48,16 @@ export {
   delegationChatMessage, delegationSettled, inputWaitOperationId, isAwaitingInput, parseInputWaitOperationId, unreadMessages,
 } from './delegation.ts';
 export { PLAN_PROPOSAL_INPUT_SCHEMA } from './domain-tools/plan.ts';
+// (wave 2, side-effect governance) the human approval loop, effect claims
+export { approvalOutcomeLine, approvalPending, approvalWaitOperationId, parseApprovalWaitOperationId } from './approvals.ts';
+export {
+  EFFECT_CLAIM_PREFIXES, EFFECT_HOLDER_PREFIX, admitEffectClaim, compatibleClaimHolders, effectHolderId, effectHolders, experimentActionCheck, lastingEffectMs, parseEffectHolder, releaseEffectClaims,
+  settleEffectClaims, type EffectClaimVerdict,
+} from './isolation.ts';
+export { EFFECT_CLAIM_MARGIN_MS, effectClaimOutlivesCall } from './dispatcher.ts';
+export { brokeredCredentialScopes } from './worker.ts';
+// (wave 2, side-effect governance) E[3] budget exhaustion policy: gate | pause | approval
+export {
+  BUDGET_EXHAUSTION_POLICIES, DEFAULT_BUDGET_APPROVAL_TTL_MS, DEFAULT_EXTENSION_FACTOR, RAISABLE_BUDGET_FIELDS, budgetExtensionApprovals, budgetRaiseProblems, exhaustionKey, exhaustionPolicy,
+  experimentWallClockLimit, proposedRaise, type BudgetRaise, type ExhaustionOutcome, type RunExhaustion,
+} from './budget-exhaustion.ts';

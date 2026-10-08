@@ -37,10 +37,12 @@ export function flagEventId(invocationId: string): string {
 export const TOOL_EVIDENCE_TYPES: Readonly<Record<string, readonly string[]>> = deepFreeze<Record<string, readonly string[]>>({
   'fs.read': [], 'fs.list': [], 'fs.search': [], 'fs.write': [], 'fs.apply_patch': [],
   'git.status': [], 'git.diff': ['git-diff'], 'git.log': [], 'git.show': [], 'git.blame': [], 'git.commit': [],
-  'shell.exec': ['stdout', 'stderr'],
-  'test.run': ['test-result', 'stdout', 'stderr', 'coverage'],
-  'coverage.collect': ['coverage'],
-  'mutation.run': ['mutation-result'],
+  // (E[2]) a sandboxed command's state-changing request to the SUT is relayed as a ledgered operation whose exchange the
+  // runtime records as `api-response` evidence of the call (never written by the agent)
+  'shell.exec': ['stdout', 'stderr', 'api-response'],
+  'test.run': ['test-result', 'stdout', 'stderr', 'coverage', 'api-response'],
+  'coverage.collect': ['coverage', 'api-response'],
+  'mutation.run': ['mutation-result', 'api-response'],
   'code.symbols': [], 'code.references': [],
   'http.request': ['api-response'],
   'metrics.query': ['metric'], 'metrics.scrape': ['metric'],

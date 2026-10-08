@@ -30,13 +30,20 @@ export interface RunOutcome {
 export interface DurableRuntime {
   readonly kind: 'local' | 'temporal';
   startRun(runId: string): Promise<void>;
-  /** Wake the run loop (new events, approvals) or cancel it. */
-  signal(runId: string, signal: { type: 'wake' } | { type: 'cancel'; reason: string }): Promise<void>;
+  /**
+   * Wake the run loop (new events), cancel it, or (additive, E[8]) deliver an ApprovalSignal: a human decided approval
+   * `approvalId` — the run loop wakes and every work item waiting on an approval observes it at once (local: the observe
+   * loops are pulsed; Temporal: the run workflow forwards the signal to its child workflows, which stop their backoff).
+   */
+  signal(runId: string, signal: DurableSignal): Promise<void>;
   awaitCompletion(runId: string, options?: { timeoutMs?: number }): Promise<RunOutcome>;
   /** Resumes every non-terminal run (called on process start). Returns resumed run ids. */
   resumeIncomplete(): Promise<string[]>;
   shutdown(): Promise<void>;
 }
+
+/** The signals of a run: wake, cancel, (additive, E[8]) approval decided. */
+export type DurableSignal = { type: 'wake' } | { type: 'cancel'; reason: string } | { type: 'approval'; approvalId: string };
 
 /**
  * (additive) Hooks shared by both runtimes. All optional: a runtime works with `control` + `listRuns` alone.

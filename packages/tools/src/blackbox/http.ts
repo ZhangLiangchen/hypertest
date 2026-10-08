@@ -6,10 +6,11 @@ import {
   ENV_ID_SCHEMA, checkEgress, environmentClassForUrl, environmentOrigins, errorMessage, hostSegment, isTextualContentType, joinUrl, parseHttpUrl, readBodyLimited, redactHeaders,
   redactJsonSecrets, redactUrl, requireEnvironment, storableText,
 } from './common.ts';
+import { credentialScope } from './secrets.ts';
 
 export const HTTP_READ_METHODS: readonly string[] = ['GET', 'HEAD', 'OPTIONS'];
 export const HTTP_METHODS: readonly string[] = ['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH', 'DELETE'];
-/** Methods that get an `Idempotency-Key: <invocationId>` header unless the caller sets one. */
+/** Methods that get an `Idempotency-Key: <operationId>` header (the invocation id when unledgered) unless the caller sets one. */
 export const NON_IDEMPOTENT_METHODS: readonly string[] = ['POST', 'PUT', 'PATCH', 'DELETE'];
 
 /** Response body bytes kept inline in the evidence `structured` payload (the artifact holds the full body). */
@@ -33,6 +34,11 @@ export interface HttpRequestInput {
   body?: string;
   timeoutMs?: number;
   expectJson?: boolean;
+  /**
+   * (additive, E[4]) The NAME of a brokered credential of the environment (environmentId required): the secret broker
+   * mints a short-lived credential for this one request and sends it in its header — the agent never sees a value.
+   */
+  credential?: string;
 }
 
 export interface HttpRequestResult {
@@ -68,6 +74,10 @@ export const HTTP_REQUEST_INPUT_SCHEMA: JsonSchema = {
     body: { type: 'string', maxLength: 8 * 1024 * 1024, description: 'Raw request body.' },
     timeoutMs: { type: 'integer', minimum: 1, maximum: 300_000 },
     expectJson: { type: 'boolean', description: 'Parse the response body as JSON even without a JSON content type.' },
+    credential: {
+      type: 'string', pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$',
+      description: 'Name of a brokered credential of the environment (needs environmentId): a short-lived credential is minted for this request and sent in its header. You never see or send credential values yourself.',
+    },
   },
   required: ['method'],
   allOf: [
@@ -138,8 +148,9 @@ export function targetEnvironmentClass(input: { url?: string; environmentId?: st
  * Non-idempotent methods (POST/PUT/PATCH/DELETE) are `external` effects: with a gateway configured the ToolRuntime
  * records the call in the Operation Ledger (record-only adapter, keyed by the invocation id — conformance-7): a
  * durable replay returns the recorded response instead of sending again, and a call interrupted between sending and
- * recording goes to manual review instead of being re-sent. An `Idempotency-Key: <invocationId>` header is added unless
- * the caller sets one (the invocation id is stable across durable retries); for an environment declaring
+ * recording goes to manual review instead of being re-sent. An `Idempotency-Key: <operationId>` header is added unless
+ * the caller sets one (E[9]: the ledger's idempotencyKey; the operation id is stable across durable retries and resends —
+ * the invocation id is used only when the call runs without a gateway); for an environment declaring
  * `honoursIdempotencyKey` such an interrupted call is re-sent once with the same key (`resendable`).
  */
 export function httpRequestTool(options: { httpAllowlist?: string[] }): ToolSpec<HttpRequestInput> {
@@ -157,6 +168,12 @@ export function httpRequestTool(options: { httpAllowlist?: string[] }): ToolSpec
     environmentClass: (input, ctx) => targetEnvironmentClass(input, ctx.environments),
     // a resend carries the same Idempotency-Key (the invocation id, or the caller's own header — same input)
     resendable: (input, ctx) => NON_IDEMPOTENT_METHODS.includes(input.method.toUpperCase()) && input.environmentId !== undefined && ctx.environments.get(input.environmentId)?.honoursIdempotencyKey === true,
+    // E[4]: a brokered credential is a capability scope (`credential:<environmentId>/<name>`), checked before anything runs
+    credentialScopes: (input) => {
+      if (input.credential === undefined) return [];
+      if (input.environmentId === undefined) throw new HypertestError('invalid_argument', 'credential needs environmentId (a brokered credential belongs to a registered environment)');
+      return [credentialScope(input.environmentId, input.credential)];
+    },
     timeoutMs: 300_000,
     async execute(input, ctx) {
       return executeHttpRequest(input, ctx, options.httpAllowlist);
@@ -189,12 +206,30 @@ async function executeHttpRequest(input: HttpRequestInput, ctx: ToolContext, all
   } catch (e) {
     return { status: 'failed', error: { code: 'invalid_argument', message: `invalid header: ${errorMessage(e)}` } };
   }
+  // E[4]: a brokered credential, minted for this request (short-lived, scoped); its value never reaches the model
+  if (input.credential !== undefined) {
+    if (input.environmentId === undefined) return { status: 'failed', error: { code: 'invalid_argument', message: 'credential needs environmentId' } };
+    if (!ctx.secrets) return { status: 'failed', error: { code: 'unavailable', message: `no secret broker is configured: credential ${input.credential} cannot be minted` } };
+    let minted: Awaited<ReturnType<NonNullable<ToolContext['secrets']>['mint']>>;
+    try {
+      minted = await ctx.secrets.mint({ environmentId: input.environmentId, name: input.credential, runId: ctx.runId, invocationId: ctx.invocationId, signal: ctx.signal });
+    } catch (e) {
+      if (isHypertestError(e)) return { status: 'failed', error: { code: e.code, message: e.message } };
+      throw e;
+    }
+    if (headers.has(minted.header)) return { status: 'failed', error: { code: 'invalid_argument', message: `the ${minted.header} header is set by the credential broker (credential ${input.credential}); do not set it yourself` } };
+    headers.set(minted.header, minted.value);
+  }
+  // E[4]: no long-lived secret and no minted credential reaches the evidence or the model (any header name, any echo)
+  const scrub = (t: string): string => (ctx.secrets ? ctx.secrets.redact(t) : t);
   let body: string | undefined = input.body;
   if (input.json !== undefined) {
     body = JSON.stringify(input.json);
     if (!headers.has('content-type')) headers.set('content-type', 'application/json');
   }
-  if (NON_IDEMPOTENT_METHODS.includes(method) && !headers.has('idempotency-key')) headers.set('idempotency-key', ctx.invocationId);
+  // E[9]: idempotencyKey = operationId — the key the Operation Ledger records for this call is the one the target sees (the
+  // invocation id only for a call that runs unledgered, without a gateway); stable across a resend of the same operation
+  if (NON_IDEMPOTENT_METHODS.includes(method) && !headers.has('idempotency-key')) headers.set('idempotency-key', ctx.operationId ?? ctx.invocationId);
   if (!headers.has('user-agent')) headers.set('user-agent', 'hypertest-blackbox/0.3');
 
   const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -207,7 +242,7 @@ async function executeHttpRequest(input: HttpRequestInput, ctx: ToolContext, all
     url: redactUrl(url),
     // the path an oracle names (QualityGate http_expectation.path): environment-relative, without query
     path: requestPath(input, url, ctx.environments),
-    headers: redactHeaders(headers.entries()),
+    headers: Object.fromEntries(Object.entries(redactHeaders(headers.entries())).map(([k, v]) => [k, scrub(v)])),
     ...(evidenceBody !== undefined && body !== undefined ? { body: storableText(truncateUtf8Bytes(evidenceBody, EVIDENCE_BODY_LIMIT)), bodyBytes: Buffer.byteLength(body) } : {}),
   };
   const started = performance.now();
@@ -241,9 +276,12 @@ async function executeHttpRequest(input: HttpRequestInput, ctx: ToolContext, all
   }
   const durationMs = round(performance.now() - started);
   const contentType = res.headers.get('content-type') ?? undefined;
-  const responseHeaders = redactHeaders(res.headers.entries());
+  // E[4]: whatever the SUT echoes back, no long-lived secret and no minted credential reaches the evidence or the model
+  const responseHeaders = Object.fromEntries(Object.entries(redactHeaders(res.headers.entries())).map(([k, v]) => [k, scrub(v)]));
   const textual = isTextualContentType(contentType);
-  const fullText = textual ? Buffer.from(read.bytes).toString('utf8') : '';
+  const rawText = textual ? Buffer.from(read.bytes).toString('utf8') : '';
+  const fullText = scrub(rawText);
+  if (fullText !== rawText) read.bytes = new Uint8Array(Buffer.from(fullText, 'utf8'));
   const evidenceText = textual ? storableText(truncateUtf8Bytes(fullText, EVIDENCE_BODY_LIMIT)) : null;
   const responseRecord = {
     status: res.status,

@@ -3,6 +3,7 @@ import { HypertestError, throwIfAborted } from '@hypertest/core';
 import type { ImportEdge, RetrievalHit, RetrievalQuery, Retriever, SymbolDefinition, SymbolIndexOptions, SymbolKind, SymbolLanguage, SymbolReference, SymbolUsage } from '../contracts.ts';
 import { cmpStr, resolveLimit } from '../util.ts';
 import { compileGlobs, DEFAULT_MAX_FILE_BYTES, kindAllowed, readTextFile, resolveSearchDir, walkFiles } from './files.ts';
+import { parseGoFiles, parsePythonFiles, parseTsJs, type ParsedFile, type ParserEngine } from './parsers.ts';
 
 const LANG_BY_EXT: Record<string, SymbolLanguage> = {
   '.ts': 'ts', '.tsx': 'ts', '.mts': 'ts', '.cts': 'ts',
@@ -165,7 +166,7 @@ export function extractGo(text: string, path: string): SymbolDefinition[] {
   return out;
 }
 
-/** Extracts definitions from one source text. */
+/** Extracts definitions from one source text with the regex extractor (the fallback of the syntax-tree parsers). */
 export function extractSymbols(text: string, path: string, language: SymbolLanguage): SymbolDefinition[] {
   if (language === 'python') return extractPython(text, path);
   if (language === 'go') return extractGo(text, path);
@@ -265,9 +266,12 @@ export function classifyUsage(line: string, name: string, language: SymbolLangua
 const ENCLOSING_KINDS: ReadonlySet<SymbolKind> = new Set(['function', 'method', 'class', 'struct']);
 
 /**
- * L3 symbol retrieval over TS/JS, Python and Go with regex extraction ("tree-lite"): definitions (functions,
- * classes, interfaces, types, enums / enum-like const objects, exported consts, class methods, arrow functions,
- * Python def/class/async def, Go func/methods/struct/interface) and word-boundary references.
+ * L3 symbol retrieval over TS/JS, Python and Go. (B[6]) Definitions and usages come from real syntax trees — the
+ * TypeScript compiler API, python3 `ast`, Go `go/ast` (parsers.ts) — with the regex extractor ("tree-lite") as the per-file
+ * fallback when a parser is unavailable or rejects the file (parserEngines() says which engine parsed each file):
+ * definitions (functions, classes, interfaces, types, enums / enum-like const objects, top-level consts and variables, class
+ * methods and arrow-function properties, Python def/class/async def, Go func/methods/struct/interface) and word-boundary
+ * references classified as import / write / call / read from the tree.
  * search(): exact definition 1.0, prefix 0.7, reference 0.3.
  */
 export class SymbolIndex implements Retriever {
@@ -276,11 +280,16 @@ export class SymbolIndex implements Retriever {
   readonly #languages: ReadonlySet<SymbolLanguage>;
   readonly #maxFileBytes: number;
   readonly #defaultLimit: number;
+  readonly #goHelperDir: string | undefined;
   #files = new Map<string, string[]>();
   #defs = new Map<string, SymbolDefinition[]>();
   /** Definitions per file, sorted by line (enclosing-definition lookup). */
   #fileDefs = new Map<string, SymbolDefinition[]>();
   #imports: ImportEdge[] = [];
+  /** (B[6]) The syntax-tree parse of each file (definitions + identifier usages) and the engine that produced it. */
+  #parsed = new Map<string, ParsedFile>();
+  /** (B[6]) Per-file parse cache keyed by path and validated by the file's text: a rebuild re-parses only changed files. */
+  #parseCache = new Map<string, { text: string; parsed: ParsedFile; imports: Array<Omit<ImportEdge, 'to'>> }>();
   #built: Promise<{ files: number; symbols: number }> | undefined;
   /** Generation of the latest build() call: an older build that finishes later never overwrites a newer index. */
   #generation = 0;
@@ -291,18 +300,25 @@ export class SymbolIndex implements Retriever {
     this.#languages = new Set(options.languages ?? ['ts', 'js', 'python', 'go']);
     this.#maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
     this.#defaultLimit = resolveLimit(options.defaultLimit, 20, 'defaultLimit');
+    this.#goHelperDir = options.goHelperDir;
   }
 
-  /** (Re)builds the index from the files under the root; the latest call wins when builds overlap. */
+  /**
+   * (Re)builds the index from the files under the root; the latest call wins when builds overlap. Incremental: every file is
+   * re-read, but only a file whose text changed since the previous build is parsed again (so callers that need the current
+   * state of a workspace — the code tools — simply call build() before a query).
+   */
   build(signal?: AbortSignal): Promise<{ files: number; symbols: number }> {
     const generation = ++this.#generation;
     this.#built = (async () => {
       const files = new Map<string, string[]>();
       const defs = new Map<string, SymbolDefinition[]>();
       const fileDefs = new Map<string, SymbolDefinition[]>();
+      const parsedFiles = new Map<string, ParsedFile>();
       const rawImports: Array<Omit<ImportEdge, 'to'>> = [];
       const { absRoot } = await resolveSearchDir(this.#root, undefined);
-      let symbols = 0;
+      const byLanguage: Record<'python' | 'go', Array<{ path: string; text: string }>> = { python: [], go: [] };
+      const cache = new Map<string, { text: string; parsed: ParsedFile; imports: Array<Omit<ImportEdge, 'to'>> }>();
       for await (const f of walkFiles(absRoot, absRoot, { maxFileBytes: this.#maxFileBytes, ...(signal ? { signal } : {}) })) {
         const lang = languageOf(f.relPath);
         if (!lang || !this.#languages.has(lang)) continue;
@@ -314,15 +330,42 @@ export class SymbolIndex implements Retriever {
         }
         if (text === undefined) continue;
         files.set(f.relPath, text.split('\n'));
-        const own = extractSymbols(text, f.relPath, lang);
-        fileDefs.set(f.relPath, [...own].sort((a, b) => a.line - b.line));
-        for (const d of own) {
+        const cached = this.#parseCache.get(f.relPath);
+        if (cached && cached.text === text) {
+          cache.set(f.relPath, cached);
+          continue;
+        }
+        const imports = extractImports(text, f.relPath, lang);
+        if (lang === 'python' || lang === 'go') {
+          byLanguage[lang].push({ path: f.relPath, text });
+          cache.set(f.relPath, { text, parsed: regexParsed(text, f.relPath, lang), imports });
+        } else {
+          cache.set(f.relPath, { text, parsed: parseOrFallback(() => parseTsJs(text!, f.relPath, lang), text, f.relPath, lang), imports });
+        }
+      }
+      // python3 `ast` and Go `go/ast` parse their (changed) files in one batch each; a file they cannot parse keeps the regex
+      // fallback set above
+      throwIfAborted(signal);
+      const [py, go] = await Promise.all([parsePythonFiles(byLanguage.python), parseGoFiles(byLanguage.go, this.#goHelperDir !== undefined ? { helperDir: this.#goHelperDir } : {})]);
+      for (const [batch, parsed] of [[byLanguage.python, py], [byLanguage.go, go]] as const) {
+        for (const f of batch) {
+          const p = parsed?.get(f.path);
+          if (p) cache.get(f.path)!.parsed = p;
+        }
+      }
+      for (const [path, c] of cache) {
+        parsedFiles.set(path, c.parsed);
+        rawImports.push(...c.imports);
+      }
+      let symbols = 0;
+      for (const [path, parsed] of parsedFiles) {
+        fileDefs.set(path, [...parsed.definitions].sort((a, b) => a.line - b.line));
+        for (const d of parsed.definitions) {
           const list = defs.get(d.name) ?? [];
           list.push(d);
           defs.set(d.name, list);
           symbols++;
         }
-        rawImports.push(...extractImports(text, f.relPath, lang));
       }
       const known = new Set(files.keys());
       const imports: ImportEdge[] = rawImports.map((e) => {
@@ -334,6 +377,8 @@ export class SymbolIndex implements Retriever {
         this.#defs = defs;
         this.#fileDefs = fileDefs;
         this.#imports = imports;
+        this.#parsed = parsedFiles;
+        this.#parseCache = cache;
       }
       return { files: files.size, symbols };
     })();
@@ -366,7 +411,8 @@ export class SymbolIndex implements Retriever {
   /**
    * "Who writes X?" — assignments, compound assignments, `:=` and ++/-- of `X`. `Type.member` narrows to writes of
    * `member` inside definitions of `Type` (its methods: `this.member = …`, `self.member = …`) or in files that
-   * reference `Type` (e.g. `state.member = …` after importing it). Regex-based (no parser): see classifyUsage.
+   * reference `Type` (e.g. `state.member = …` after importing it). Usages come from the syntax tree of each file (regex
+   * classifyUsage only for a file no parser could handle).
    */
   async writers(target: string, limit = 200): Promise<SymbolReference[]> {
     await this.#ready();
@@ -379,6 +425,21 @@ export class SymbolIndex implements Retriever {
     const filesUsingOwner = new Set(this.#references(owner, Number.MAX_SAFE_INTEGER).map((r) => r.path));
     for (const d of this.#defs.get(owner) ?? []) filesUsingOwner.add(d.path);
     return writes.filter((r) => r.enclosing?.startsWith(`${owner}.`) || r.enclosing === owner || filesUsingOwner.has(r.path)).slice(0, limit);
+  }
+
+  /**
+   * (additive, B[6]) Definitions whose name contains `query` (case-insensitive): exact names first, then by path and line —
+   * the `code.symbols` question.
+   */
+  async definitionsMatching(query: string, limit = 50): Promise<SymbolDefinition[]> {
+    await this.#ready();
+    const q = query.trim().toLowerCase();
+    if (q === '') return [];
+    const out: SymbolDefinition[] = [];
+    for (const [name, list] of this.#defs) if (name.toLowerCase().includes(q)) out.push(...list);
+    return out
+      .sort((a, b) => Number(b.name.toLowerCase() === q) - Number(a.name.toLowerCase() === q) || cmpStr(a.path, b.path) || a.line - b.line)
+      .slice(0, limit);
   }
 
   /** "Who calls X?" — references that call `name` (the call graph edge is `enclosing` → name). */
@@ -399,12 +460,41 @@ export class SymbolIndex implements Retriever {
     return this.#imports.filter((e) => e.to === path).sort((a, b) => cmpStr(a.from, b.from) || a.line - b.line).map((e) => ({ ...e }));
   }
 
+  /**
+   * How a line uses `name`: an import line is `import`; in a file a syntax-tree parser parsed, the strongest usage of that
+   * identifier on the line (assignment / ++ / -- target ⇒ write, callee ⇒ call, else read — a name only in a comment or a
+   * string is a plain read mention); in a regex-fallback file, classifyUsage of the line.
+   */
+  #usage(path: string, line: number, text: string, name: string, language: SymbolLanguage | undefined): SymbolUsage {
+    if (isImportLine(text, language)) return 'import';
+    const parsed = this.#parsed.get(path);
+    if (!parsed || parsed.engine === 'regex-fallback') return classifyUsage(text, name, language);
+    return parsed.usages.get(line)?.get(name) ?? 'read';
+  }
+
+  /** (B[6]) The engine that parsed each indexed file (typescript, python-ast, go-ast, or regex-fallback). */
+  async parserEngines(): Promise<Record<string, ParserEngine>> {
+    await this.#ready();
+    return Object.fromEntries([...this.#parsed].map(([path, p]) => [path, p.engine]).sort((a, b) => cmpStr(a[0] as string, b[0] as string)));
+  }
+
+  /**
+   * The enclosing definition of a line: (B[6]) from syntax-tree spans, the innermost function / method / class / struct whose
+   * span contains the line (its own definition line included); a definition without a span (regex fallback) encloses the
+   * lines after it up to the next one.
+   */
   #enclosing(path: string, line: number): string | undefined {
     const defs = this.#fileDefs.get(path) ?? [];
     let best: SymbolDefinition | undefined;
     for (const d of defs) {
-      if (d.line >= line) break;
-      if (ENCLOSING_KINDS.has(d.kind)) best = d;
+      if (d.line > line) break;
+      if (!ENCLOSING_KINDS.has(d.kind)) continue;
+      if (d.endLine !== undefined) {
+        // spans nest: a later-starting span that still contains the line is the inner one
+        if (d.endLine >= line) best = d;
+      } else if (d.line < line) {
+        best = d;
+      }
     }
     return best ? (best.container ? `${best.container}.${best.name}` : best.name) : undefined;
   }
@@ -420,7 +510,7 @@ export class SymbolIndex implements Retriever {
       const language = languageOf(path);
       for (let i = 0; i < lines.length; i++) {
         if (!re.test(lines[i]!) || defLines.has(`${path}:${i + 1}`)) continue;
-        const kind = classifyUsage(lines[i]!, name, language);
+        const kind = this.#usage(path, i + 1, lines[i]!, name, language);
         if (usage && !usage.includes(kind)) continue;
         const ref: SymbolReference = { name, path, line: i + 1, snippet: lines[i]!.trim().slice(0, 240), usage: kind };
         const enclosing = this.#enclosing(path, i + 1);
@@ -482,5 +572,18 @@ export class SymbolIndex implements Retriever {
       }
     }
     return [...best.values()].sort((a, b) => b.score - a.score || cmpStr(a.path!, b.path!) || a.line! - b.line!).slice(0, limit);
+  }
+}
+
+/** The regex extractor's result as a ParsedFile (no identifier usages: the line classifier applies). */
+function regexParsed(text: string, path: string, language: SymbolLanguage): ParsedFile {
+  return { engine: 'regex-fallback', definitions: extractSymbols(text, path, language), usages: new Map() };
+}
+
+function parseOrFallback(parse: () => ParsedFile, text: string, path: string, language: SymbolLanguage): ParsedFile {
+  try {
+    return parse();
+  } catch {
+    return regexParsed(text, path, language);
   }
 }
