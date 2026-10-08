@@ -22,8 +22,9 @@ import {
   acceptedPlans, analyzeCompleteness, analyzeDefects, analyzePolicy, analyzeSensitivity, analyzeSideEffects, analyzeStaleness, analyzeVerdict, distinctRoleRoutes, expectedVerdicts,
   hintProblems, matchesHints, maxParallelWork, routesByRole, sideEffectCounts,
 } from './analysis.ts';
-import { maxConcurrent, runningIntervals } from './poc-graders.ts';
+import { latestOf, maxConcurrent, reactionsTo, runningIntervals } from './poc-graders.ts';
 import { baselineEquivalence } from './core-graders.ts';
+import { calledTools, faultsOverlap, withinFault } from './extended-graders.ts';
 import { DEFAULT_PACKET_BYTES, JUDGE_ANSWER_SCHEMA, JUDGE_SYSTEM_PROMPT, buildEvidencePacket, groundJudgeAnswer, judgeMessages } from './judge.ts';
 import { canonicalDifferences, canonicalProjection } from './trial-records.ts';
 import { mcnemarExact } from './stats.ts';
@@ -58,6 +59,18 @@ export const GRADER_DEPENDENCIES: Readonly<Record<string, readonly Fn[]>> = Obje
   testChangeGoverned: [],
   recoveryAudit: [analyzeSideEffects],
   insufficientDataNotPassed: [],
+  anomalyReaction: [reactionsTo, latestOf],
+  rcaMetricsExecutorParallel: [maxConcurrent, runningIntervals],
+  blackBoxOnly: [calledTools],
+  uiEvidence: [calledTools],
+  faultTolerance: [withinFault],
+  tamperDetected: [],
+  delegation: [maxConcurrent, runningIntervals],
+  convergence: [],
+  budgetExhaustion: [],
+  competingFaultsIsolated: [calledTools, withinFault, faultsOverlap],
+  unqueryableEscalated: [],
+  providerClassesAudited: [],
   freshnessGuarded: [analyzeStaleness, analyzePolicy],
   modelSwitchContinuity: [],
   injectionContained: [analyzePolicy],
@@ -164,13 +177,16 @@ function ref(t: EvalTrial): string {
  * score change and the score mapping old → new. `discontinuity` is true when any outcome flipped: history graded by the
  * old revision is not comparable to the new one without the mapping.
  */
-export function bridgeCompare(graderId: string, trials: readonly EvalTrial[]): BridgeReport {
+export function bridgeCompare(graderId: string, trials: readonly EvalTrial[], options: { bridgeIsPrevious?: boolean } = {}): BridgeReport {
   const pairs: Array<{ t: EvalTrial; from: { pass: boolean; score: number; revision: string }; to: { pass: boolean; score: number; revision: string } }> = [];
   for (const t of trials) {
     const a = t.graders.find((g) => g.graderId === graderId);
     const b = t.bridge?.find((g) => g.graderId === graderId);
     if (!a || !b) continue;
-    pairs.push({ t, from: { pass: a.pass, score: a.score, revision: a.revision ?? '?' }, to: { pass: b.pass, score: b.score, revision: b.revision ?? '?' } });
+    const recorded = { pass: a.pass, score: a.score, revision: a.revision ?? '?' };
+    const bridged = { pass: b.pass, score: b.score, revision: b.revision ?? '?' };
+    // (F[12]) a RETAINED earlier revision run as the bridge: the report reads old (bridge) → new (recorded)
+    pairs.push(options.bridgeIsPrevious ? { t, from: bridged, to: recorded } : { t, from: recorded, to: bridged });
   }
   if (pairs.length === 0) throw new HypertestError('precondition_failed', `bridgeCompare: no trial was graded by both revisions of ${graderId} (run the suite with HarnessOptions.bridge)`);
   const fromRevisions = [...new Set(pairs.map((p) => p.from.revision))];

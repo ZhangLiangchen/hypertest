@@ -1,7 +1,10 @@
-import { HypertestError, abortReason, isHypertestError, type JsonSchema, type JsonValue } from '@hypertest/core';
+import { HypertestError, abortReason, isHypertestError, sha256Hex, type JsonSchema, type JsonValue } from '@hypertest/core';
+import type { EnvironmentRef, EvidenceRecord } from '@hypertest/domain';
 import type { Browser, BrowserContext, Page, Route, WebSocketRoute } from 'playwright-core';
-import type { ToolContext, ToolOutcome, ToolSpec } from '../contracts.ts';
-import { ENV_ID_SCHEMA, checkEgress, environmentOrigins, errorMessage, requireEnvironment } from './common.ts';
+import type { EnvironmentDescriptor, ToolContext, ToolOutcome, ToolSpec } from '../contracts.ts';
+import {
+  ENV_ID_SCHEMA, checkEgress, environmentForUrl, environmentOrigins, errorMessage, isTextualContentType, redactHeaders, redactUrl, requireEnvironment, storableText,
+} from './common.ts';
 import { resolveTarget, targetEnvironmentClass, targetResources } from './http.ts';
 
 /**
@@ -266,10 +269,105 @@ function assertOnEnvironment(page: Page, environmentId: string | undefined, ctx:
   if (!environmentOrigins(env).includes(origin)) throw new HypertestError('permission_denied', `the page is on ${origin}, not on environment ${environmentId}`);
 }
 
-function sessionResource(input: { sessionId?: string; environmentId?: string }): string[] {
-  const res = [`browser/${input.sessionId ?? 'default'}`];
-  if (input.environmentId !== undefined) res.unshift(`env/${input.environmentId}`);
-  return res;
+/**
+ * (e2e[1]) Resource keys of a session tool: the environment the call names (`env/<id>`, the page must be on it) — the
+ * scope every black-box role's grant covers (`env/**`). The browser session itself is the calling agent's own (keyed by
+ * run + agent, never shared), not a governed resource: a read without environmentId touches nothing beyond the page
+ * browser.navigate already admitted (capability, policy, egress guard), and an interaction (click/fill, an external
+ * effect) must name its environment — so it is classified, claimed and ledgered on it.
+ */
+function sessionResource(input: { environmentId?: string }): string[] {
+  return input.environmentId !== undefined ? [`env/${input.environmentId}`] : [];
+}
+
+/**
+ * (e2e[1]) The registered environment the page is on (evidence provenance): the environment the call names when the page
+ * is on it, else the one environment serving the page's origin; undefined otherwise.
+ */
+function pageEnvironment(page: Page, ctx: ToolContext, named?: string): EnvironmentRef | undefined {
+  let url: URL;
+  try {
+    url = new URL(page.url());
+  } catch {
+    return undefined;
+  }
+  const preferred = named !== undefined ? ctx.environments.get(named) : undefined;
+  const env = preferred && environmentOrigins(preferred).includes(url.origin) ? preferred : environmentForUrl(url, ctx.environments);
+  if (!env) return undefined;
+  const ref: EnvironmentRef = { environmentId: env.environmentId, environmentClass: env.environmentClass, generation: env.generation };
+  if (env.buildDigest !== undefined) ref.buildDigest = env.buildDigest;
+  return ref;
+}
+
+/** The path an oracle names (`http_expectation.path`): below the environment's baseUrl path prefix, never the query. */
+function environmentRelativePath(url: URL, env: EnvironmentDescriptor | undefined): string {
+  const prefix = env?.baseUrl ? new URL(env.baseUrl).pathname.replace(/\/+$/, '') : '';
+  return prefix !== '' && url.pathname.startsWith(`${prefix}/`) ? url.pathname.slice(prefix.length) : url.pathname;
+}
+
+/** Bytes of a navigation's response body kept inline in the evidence `structured` payload (the artifact holds it all). */
+const NAVIGATION_EVIDENCE_BODY_LIMIT = 256 * 1024;
+
+/**
+ * (e2e[1]) Records the page load of browser.navigate as `api-response` evidence — the HTTP exchange the browser made for the
+ * document (final response after redirects: method, environment-relative path, status, redacted headers, body), the page
+ * title and the redirect chain — anchored to the environment the page is on. Like http.request evidence it can satisfy or
+ * violate an oracle's http_expectation.
+ */
+async function recordNavigation(ctx: ToolContext, page: Page, response: Awaited<ReturnType<Page['goto']>>, sessionId: string, title: string, named?: string): Promise<EvidenceRecord> {
+  const scrub = (t: string): string => (ctx.secrets ? ctx.secrets.redact(t) : t);
+  const finalUrl = new URL(response?.url() ?? page.url());
+  let bytes: Uint8Array | undefined;
+  if (response) {
+    try {
+      bytes = new Uint8Array(await response.body());
+    } catch {
+      bytes = undefined;
+    }
+  }
+  const headers = response ? Object.fromEntries(Object.entries(redactHeaders(response.headers())).map(([k, v]) => [k, scrub(v)])) : {};
+  const contentType = headers['content-type'] ?? 'text/html';
+  if (bytes === undefined) bytes = new Uint8Array(Buffer.from(await page.content(), 'utf8'));
+  const textual = isTextualContentType(contentType);
+  let bodyText: string | null = null;
+  if (textual) {
+    const full = scrub(Buffer.from(bytes).toString('utf8'));
+    bytes = new Uint8Array(Buffer.from(full, 'utf8'));
+    const cut = Buffer.from(full, 'utf8');
+    bodyText = storableText(cut.byteLength > NAVIGATION_EVIDENCE_BODY_LIMIT ? cut.subarray(0, NAVIGATION_EVIDENCE_BODY_LIMIT).toString('utf8') : full);
+  }
+  const redirectedFrom: string[] = [];
+  let prior = response?.request().redirectedFrom() ?? null;
+  while (prior && redirectedFrom.length < 10) {
+    try {
+      redirectedFrom.unshift(redactUrl(new URL(prior.url())));
+    } catch {
+      redirectedFrom.unshift('unparseable');
+    }
+    prior = prior.redirectedFrom();
+  }
+  const env = pageEnvironment(page, ctx, named);
+  const owner = env ? ctx.environments.get(env.environmentId) : undefined;
+  const status = response?.status() ?? null;
+  const structured = {
+    via: 'browser.navigate',
+    request: { method: response?.request().method() ?? 'GET', url: redactUrl(finalUrl), path: environmentRelativePath(finalUrl, owner) },
+    response: response
+      ? { status, statusText: response.statusText(), headers, body: bodyText, bodyBytes: bytes.byteLength, bodyEncoding: textual ? 'utf-8' : 'binary', bodySha256: sha256Hex(bytes) }
+      : null,
+    page: { url: redactUrl(finalUrl), title: scrub(title) },
+    redirectedFrom,
+    sessionId,
+  };
+  return ctx.recordEvidence({
+    evidenceType: 'api-response',
+    data: bytes,
+    mimeType: contentType,
+    summary: `browser GET ${redactUrl(finalUrl)} → ${status ?? 'no response'}${title ? ` (${scrub(title)})` : ''}`.slice(0, 500),
+    structured: JSON.parse(JSON.stringify(structured)) as JsonValue,
+    provenance: { target: `GET ${redactUrl(finalUrl)}` },
+    ...(env ? { environment: env } : {}),
+  });
 }
 
 export interface BrowserNavigateInput {
@@ -308,8 +406,10 @@ export function browserTools(options: BrowserToolOptions = {}): ToolSpec[] {
     },
     effect: 'read',
     riskClass: 'low',
-    resources: (input) => targetResources(input),
+    resources: (input, ctx) => targetResources(input, ctx.environments),
     environmentClass: (input, ctx) => targetEnvironmentClass(input, ctx.environments),
+    // (e2e[1]) the page load is recorded as api-response evidence (the document exchange)
+    evidenceTypes: ['api-response'],
     timeoutMs: 120_000,
     async execute(input, ctx) {
       try {
@@ -341,19 +441,23 @@ export function browserTools(options: BrowserToolOptions = {}): ToolSpec[] {
           return { status: 'failed', error: { code: 'permission_denied', message: `navigation was redirected off the allowlist: ${after}` } };
         }
         const blocked = await manager.drainBlocked(ctx.runId, ctx.agentId);
-        const structured: Record<string, unknown> = { url: finalUrl.href, status: response?.status() ?? null, title: await page.title(), sessionId: input.sessionId ?? 'default' };
+        const title = await page.title();
+        const sessionId = input.sessionId ?? 'default';
+        // (e2e[1]) the page load is evidence: what the browser received for the document, anchored to its environment
+        const evidence = await recordNavigation(ctx, page, response, sessionId, title, input.environmentId);
+        const structured: Record<string, unknown> = { url: finalUrl.href, status: response?.status() ?? null, title, sessionId, evidenceId: evidence.evidenceId };
         if (blocked.length > 0) structured['blockedRequests'] = blocked.slice(0, 5);
-        return { status: 'success', structured: structured as JsonValue };
+        return { status: 'success', structured: structured as JsonValue, evidenceRefs: [evidence.evidenceId] };
       } catch (e) {
         return failure(e, ctx, 'navigate');
       }
     },
   };
 
-  const click: ToolSpec<{ selector?: string; role?: string; name?: string; sessionId?: string; environmentId?: string; timeoutMs?: number }> = {
+  const click: ToolSpec<{ selector?: string; role?: string; name?: string; sessionId?: string; environmentId: string; timeoutMs?: number }> = {
     id: 'browser.click',
     title: 'Browser: click',
-    description: 'Click an element by CSS/text selector, or by ARIA role + accessible name. Pass environmentId so policy can classify the environment.',
+    description: 'Click an element by CSS/text selector, or by ARIA role + accessible name. environmentId is required: the environment the page is on (the click changes it; it is refused when the page is elsewhere).',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -365,6 +469,7 @@ export function browserTools(options: BrowserToolOptions = {}): ToolSpec[] {
         environmentId: ENV_ID_SCHEMA,
         timeoutMs: { type: 'integer', minimum: 1, maximum: 120_000 },
       },
+      required: ['environmentId'],
       anyOf: [{ required: ['selector'] }, { required: ['role'] }],
       not: { required: ['selector', 'role'] },
     },
@@ -372,6 +477,7 @@ export function browserTools(options: BrowserToolOptions = {}): ToolSpec[] {
     riskClass: 'medium',
     resources: (input) => sessionResource(input),
     environmentClass: (input, ctx) => (input.environmentId !== undefined ? requireEnvironment(ctx.environments, input.environmentId).environmentClass : undefined),
+    evidenceTypes: [],
     timeoutMs: 120_000,
     async execute(input, ctx) {
       try {
@@ -389,10 +495,10 @@ export function browserTools(options: BrowserToolOptions = {}): ToolSpec[] {
     },
   };
 
-  const fill: ToolSpec<{ selector: string; value: string; sessionId?: string; environmentId?: string; timeoutMs?: number }> = {
+  const fill: ToolSpec<{ selector: string; value: string; sessionId?: string; environmentId: string; timeoutMs?: number }> = {
     id: 'browser.fill',
     title: 'Browser: fill',
-    description: 'Fill an input/textarea matched by selector with a value.',
+    description: 'Fill an input/textarea matched by selector with a value. environmentId is required: the environment the page is on (refused when the page is elsewhere).',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -403,12 +509,13 @@ export function browserTools(options: BrowserToolOptions = {}): ToolSpec[] {
         environmentId: ENV_ID_SCHEMA,
         timeoutMs: { type: 'integer', minimum: 1, maximum: 120_000 },
       },
-      required: ['selector', 'value'],
+      required: ['selector', 'value', 'environmentId'],
     },
     effect: 'external',
     riskClass: 'medium',
     resources: (input) => sessionResource(input),
     environmentClass: (input, ctx) => (input.environmentId !== undefined ? requireEnvironment(ctx.environments, input.environmentId).environmentClass : undefined),
+    evidenceTypes: [],
     timeoutMs: 120_000,
     async execute(input, ctx) {
       try {
@@ -424,49 +531,70 @@ export function browserTools(options: BrowserToolOptions = {}): ToolSpec[] {
     },
   };
 
-  const text: ToolSpec<{ selector?: string; sessionId?: string; timeoutMs?: number }> = {
+  const text: ToolSpec<{ selector?: string; sessionId?: string; environmentId?: string; timeoutMs?: number }> = {
     id: 'browser.text',
     title: 'Browser: read text',
-    description: 'Visible text of the element matched by selector (default: the whole page body).',
+    description: 'Visible text of the element matched by selector (default: the whole page body), recorded as dom-snapshot evidence (cite it for DOM checks). Optional environmentId: the page must be on it.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
-      properties: { selector: { type: 'string', minLength: 1, maxLength: 2048 }, sessionId: SESSION_SCHEMA, timeoutMs: { type: 'integer', minimum: 1, maximum: 120_000 } },
+      properties: { selector: { type: 'string', minLength: 1, maxLength: 2048 }, sessionId: SESSION_SCHEMA, environmentId: ENV_ID_SCHEMA, timeoutMs: { type: 'integer', minimum: 1, maximum: 120_000 } },
     },
     effect: 'read',
     riskClass: 'low',
     resources: (input) => sessionResource(input),
+    environmentClass: (input, ctx) => (input.environmentId !== undefined ? requireEnvironment(ctx.environments, input.environmentId).environmentClass : undefined),
+    // (e2e[1]) a DOM check's evidence: the exact rendered text the agent read
+    evidenceTypes: ['dom-snapshot'],
     timeoutMs: 60_000,
     async execute(input, ctx) {
       try {
         const page = await manager.existingPage(ctx.runId, ctx.agentId, input.sessionId);
         if (!page) return { status: 'failed', error: { code: 'precondition_failed', message: 'no page in this session; call browser.navigate first' } };
-        const content = await page.locator(input.selector ?? 'body').first().innerText({ timeout: input.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS });
-        const buf = Buffer.from(content, 'utf8');
+        assertOnEnvironment(page, input.environmentId, ctx);
+        const selector = input.selector ?? 'body';
+        const content = await page.locator(selector).first().innerText({ timeout: input.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS });
+        const scrubbed = ctx.secrets ? ctx.secrets.redact(content) : content;
+        const buf = Buffer.from(scrubbed, 'utf8');
         const truncated = buf.byteLength > MAX_TEXT_BYTES;
-        const out = truncated ? buf.subarray(0, MAX_TEXT_BYTES).toString('utf8') : content;
-        return { status: 'success', structured: { url: page.url(), text: out, truncated }, text: out };
+        const out = truncated ? buf.subarray(0, MAX_TEXT_BYTES).toString('utf8') : scrubbed;
+        const url = page.url();
+        const env = pageEnvironment(page, ctx, input.environmentId);
+        const evidence = await ctx.recordEvidence({
+          evidenceType: 'dom-snapshot',
+          data: buf,
+          mimeType: 'text/plain; charset=utf-8',
+          summary: `DOM text of ${selector} on ${url}: ${JSON.stringify(out.slice(0, 120))}`.slice(0, 500),
+          structured: { url, selector, text: out, truncated, sessionId: input.sessionId ?? 'default' },
+          provenance: { target: `${url} ${selector}`.slice(0, 500) },
+          ...(env ? { environment: env } : {}),
+        });
+        return { status: 'success', structured: { url, text: out, truncated, evidenceId: evidence.evidenceId }, text: `${out}\n[dom-snapshot evidence ${evidence.evidenceId}]`, evidenceRefs: [evidence.evidenceId] };
       } catch (e) {
         return failure(e, ctx, 'text');
       }
     },
   };
 
-  const screenshot: ToolSpec<{ fullPage?: boolean; sessionId?: string }> = {
+  const screenshot: ToolSpec<{ fullPage?: boolean; sessionId?: string; environmentId?: string }> = {
     id: 'browser.screenshot',
     title: 'Browser: screenshot',
-    description: 'PNG screenshot of the current page, recorded as screenshot evidence.',
-    inputSchema: { type: 'object', additionalProperties: false, properties: { fullPage: { type: 'boolean' }, sessionId: SESSION_SCHEMA } },
+    description: 'PNG screenshot of the current page, stored as a screenshot evidence artifact (judge it visually only for what DOM and API cannot decide). Optional environmentId: the page must be on it.',
+    inputSchema: { type: 'object', additionalProperties: false, properties: { fullPage: { type: 'boolean' }, sessionId: SESSION_SCHEMA, environmentId: ENV_ID_SCHEMA } },
     effect: 'read',
     riskClass: 'low',
     resources: (input) => sessionResource(input),
+    environmentClass: (input, ctx) => (input.environmentId !== undefined ? requireEnvironment(ctx.environments, input.environmentId).environmentClass : undefined),
+    evidenceTypes: ['screenshot'],
     timeoutMs: 60_000,
     async execute(input, ctx) {
       try {
         const page = await manager.existingPage(ctx.runId, ctx.agentId, input.sessionId);
         if (!page) return { status: 'failed', error: { code: 'precondition_failed', message: 'no page in this session; call browser.navigate first' } };
+        assertOnEnvironment(page, input.environmentId, ctx);
         const png = await page.screenshot({ fullPage: input.fullPage === true, type: 'png' });
         const url = page.url();
+        const env = pageEnvironment(page, ctx, input.environmentId);
         const evidence = await ctx.recordEvidence({
           evidenceType: 'screenshot',
           data: new Uint8Array(png),
@@ -474,6 +602,7 @@ export function browserTools(options: BrowserToolOptions = {}): ToolSpec[] {
           summary: `screenshot of ${url}${input.fullPage ? ' (full page)' : ''}`.slice(0, 500),
           structured: { url, fullPage: input.fullPage === true, bytes: png.byteLength },
           provenance: { target: url },
+          ...(env ? { environment: env } : {}),
         });
         return { status: 'success', structured: { url, bytes: png.byteLength, evidenceId: evidence.evidenceId }, evidenceRefs: [evidence.evidenceId] };
       } catch (e) {

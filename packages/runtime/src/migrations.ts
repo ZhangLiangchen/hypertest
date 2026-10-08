@@ -1,5 +1,5 @@
 import type { Migration } from '@hypertest/core';
-import { RELEASE_MIGRATION } from './releases.ts';
+import { RELEASE_MIGRATION, RELEASE_STAGES_MIGRATION } from './releases.ts';
 
 /**
  * Runtime schema (PGlite + PostgreSQL 16).
@@ -25,6 +25,8 @@ import { RELEASE_MIGRATION } from './releases.ts';
  * - 007: `ht_agents.resume_after_turn` (A[4]: the session's last settled turn when a resume through resumeChild was
  *   requested — a later settled turn, or the session active again, means the engine already took the resume over, so a
  *   crash before the flag was cleared never runs a second turn).
+ * - 008 (`releases.ts`, F[0]): the suite kinds of the per-stage release gates, `ht_runtime_suite_results.binding`, and the
+ *   append-only `ht_runtime_shadow_comparisons`.
  */
 export const runtimeMigrations: Migration[] = [
   {
@@ -234,4 +236,6 @@ CREATE TABLE IF NOT EXISTS ht_model_switch_outcomes (
     id: 'runtime/007-resume-after-turn',
     sql: `ALTER TABLE ht_agents ADD COLUMN IF NOT EXISTS resume_after_turn integer CHECK (resume_after_turn IS NULL OR resume_after_turn >= 0);`,
   },
+  // F[0] per-stage release gates: suite kinds, bound results, shadow comparisons (releases.ts)
+  RELEASE_STAGES_MIGRATION,
 ];

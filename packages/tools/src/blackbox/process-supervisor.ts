@@ -5,7 +5,7 @@ import http from 'node:http';
 import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { HypertestError, noopLogger, sleep, type Logger } from '@hypertest/core';
-import { CONTROL_PATH_PREFIX, CONTROL_TOKEN_HEADER, errorMessage } from './common.ts';
+import { CONTROL_PATH_PREFIX, CONTROL_TOKEN_HEADER, errorMessage, tailFile } from './common.ts';
 import { CONTROL_TOKEN_AUDIENCE, verifyJwtHs256 } from './secrets.ts';
 
 /**
@@ -593,6 +593,20 @@ class Supervisor implements ProcessSupervisor {
         }
         this.#highestFence = token;
       }
+    }
+    if (method === 'GET' && path === '/logs') {
+      // (wave 3, logs.query) the supervised child's output: authorized like a mutating call (logs may carry secrets)
+      if (!this.#authorized(req)) return sendJson(res, 401, { error: `missing or invalid ${CONTROL_TOKEN_HEADER}` });
+      if (!this.#o.logFile) return sendJson(res, 409, { error: 'this supervisor keeps no log file (start it with --log-file / logFile)' });
+      const tail = Number(new URL(req.url ?? '/', 'http://x').searchParams.get('tail') ?? '200');
+      if (!Number.isInteger(tail) || tail < 1 || tail > 20_000) throw new BadRequest('tail must be an integer in [1, 20000]');
+      let t: ReturnType<typeof tailFile>;
+      try {
+        t = tailFile(this.#o.logFile, tail);
+      } catch {
+        t = { lines: [], truncated: false, size: 0 };
+      }
+      return sendJson(res, 200, { lines: t.lines, truncated: t.truncated, bytes: t.size, generation: this.#generation });
     }
     if (method === 'GET' && path === '/status') {
       return sendJson(res, 200, { generation: this.#generation, childPid: this.childPid ?? null, childPort: this.#childPort ?? null, childRunning: this.#childRunning, faults: this.#activeFaults() });

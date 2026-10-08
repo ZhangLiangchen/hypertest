@@ -126,5 +126,10 @@ export interface RuntimeEpoch {
   statusAfter: string;
   migratedBy: string;
   reason: string;
+  /**
+   * (additive, item 17) Work items that were waiting only on a model pause (`model:<agentId>`) at the checkpoint: they
+   * hold no turn in flight, migrate with the run, and their pauses carry over to this epoch.
+   */
+  carriedModelPauses?: string[];
   createdAt: string;
 }

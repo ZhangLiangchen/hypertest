@@ -1,0 +1,30 @@
+// gRPC fixture service of the grpc.* tool tests (blackbox-grpc.test.ts).
+syntax = "proto3";
+
+package shop;
+
+service Catalog {
+  rpc GetPrice (PriceRequest) returns (PriceReply);
+  rpc PlaceOrder (OrderRequest) returns (OrderReply);
+  rpc Slow (PriceRequest) returns (PriceReply);
+}
+
+message PriceRequest {
+  string sku = 1;
+  int32 qty = 2;
+}
+
+message PriceReply {
+  string sku = 1;
+  int64 total_cents = 2;
+}
+
+message OrderRequest {
+  string sku = 1;
+  int32 qty = 2;
+}
+
+message OrderReply {
+  string order_id = 1;
+  string status = 2;
+}

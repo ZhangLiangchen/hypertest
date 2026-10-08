@@ -3,6 +3,9 @@ import type { ActionCapability, DataClassification, ArtifactRef, ContextSnapshot
 import type { ArtifactStore, EvidenceLedger } from '@hypertest/evidence';
 import type { SideEffectAdapter, SideEffectGateway } from '@hypertest/operation';
 import type { ActionPermit, PolicyDecisionLog, PolicyEngine } from '@hypertest/policy';
+import type { McpServerConfig } from './blackbox/mcp.ts';
+import type { AcpAgentConfig } from './acp/client.ts';
+import type { ComputerToolsOptions } from './computer/computer.ts';
 
 /**
  * @hypertest/tools — the Tool & Capability Runtime and the testing execution plane.
@@ -213,7 +216,28 @@ export interface ToolSpec<I = any, O = JsonValue> {
   timeoutMs: number;
   /** Bytes of model-visible text before offloading to an artifact (default 16 KiB). */
   maxInlineBytes?: number;
+  /**
+   * (additive, wave 3) The evidence types the tool may record (beyond the runtime's implicit `tool-output` offload). The
+   * control plane's after_action check flags evidence of any other type (`flag-undeclared-evidence`); a tool that records
+   * evidence must declare its types here (or in the control plane's built-in TOOL_EVIDENCE_TYPES).
+   */
+  evidenceTypes?: readonly string[];
+  /**
+   * (additive, wave 3) Resource scopes the OPERATOR grants together with this tool (e.g. an MCP server's `mcp/<server>/**`,
+   * a desktop `desktop/<display>`), to agents whose permission profile is listed: the control plane adds them to the root
+   * capability of such agents (still ∩ their role's tool allowlist; children only by attenuation). A tool without it
+   * addresses scopes the built-in profiles already cover (workspace, run, env, loadgen, loadjob).
+   */
+  grant?: ToolGrant;
   execute(input: I, ctx: ToolContext): Promise<ToolOutcome<O>>;
+}
+
+/** (additive, wave 3) An operator-configured scope grant attached to a tool (see ToolSpec.grant). */
+export interface ToolGrant {
+  /** Canonical resource patterns (e.g. `mcp/github/**`). */
+  scopes: string[];
+  /** Permission profile names whose agents receive the scopes. */
+  profiles: string[];
 }
 
 export interface ToolRegistryLike {
@@ -348,7 +372,28 @@ export interface ToolRuntimeDeps extends BaseDeps {
   capabilitySecret: string;
   /** (additive, E[4]) The secret broker handed to tools (ToolContext.secrets); tool outputs are redacted with it. */
   secrets?: SecretBroker;
+  /**
+   * (additive, wave 3, row 250) The isolation tier of a call (per role / work item): the runtime runs the tool on the
+   * workspace with the tier's sandbox profile (and read-only for `read_only`). Undefined: the workspace as it is.
+   */
+  isolation?: IsolationTierResolver;
 }
+
+/** (additive, wave 3, row 250) Isolation tiers of sandboxed execution. */
+export type SandboxTier = 'read_only' | 'isolated' | 'separate';
+
+/** What a call's isolation tier changes on its workspace (only ever stricter for read-only: a read-only workspace stays read-only). */
+export interface IsolationDecision {
+  tier: SandboxTier;
+  /** Profile keys the tier sets (kind, image, network, allowedHosts, cpuLimit, memoryMb). */
+  sandbox?: Partial<Omit<SandboxProfile, 'envAllowlist'>>;
+  /** Commands see the workspace read-only (the jail binds its root read-only; mutating tools refuse). */
+  readOnly?: boolean;
+  /** Why this tier (role configuration, work item capability). */
+  reason?: string;
+}
+
+export type IsolationTierResolver = (call: { runId: string; workItemId: string; role: string; workspace: WorkspaceHandle }) => Promise<IsolationDecision | undefined> | IsolationDecision | undefined;
 
 export interface ToolRuntime {
   readonly registry: ToolRegistryLike;
@@ -388,6 +433,8 @@ export interface SandboxProfile {
   envAllowlist: string[];
   cpuLimit?: number;
   memoryMb?: number;
+  /** (additive, wave 3) The isolation tier this profile was selected for (informational; set by the runtime). */
+  tier?: SandboxTier;
 }
 
 export interface WorkspaceDeps extends BaseDeps {
@@ -446,6 +493,33 @@ export interface SandboxRunner {
   run(ws: WorkspaceHandle, command: string[], options: { cwd?: string; env?: Record<string, string>; timeoutMs: number; signal: AbortSignal; stdin?: string; maxOutputBytes?: number }): Promise<ProcessResult>;
   /** (additive, optional) Probes whether the runner can execute at all (e.g. docker daemon reachable). */
   available?(): Promise<boolean>;
+  /**
+   * (additive, wave 3, optional) An INTERACTIVE process under exactly the isolation of `run` (confined cwd, scrubbed
+   * environment, namespaces/jail, egress relays): its stdio stays open until it exits or `kill()` (e.g. an ACP agent
+   * speaking JSON-RPC over stdio). Aborting `signal` or exceeding `timeoutMs` kills its process group.
+   */
+  session?(ws: WorkspaceHandle, command: string[], options: SessionOptions): Promise<SandboxSession>;
+}
+
+/** (additive, wave 3) Options of SandboxRunner.session. */
+export interface SessionOptions {
+  cwd?: string;
+  env?: Record<string, string>;
+  signal: AbortSignal;
+  /** Wall-clock bound of the whole session (default: none — the caller's signal bounds it). */
+  timeoutMs?: number;
+}
+
+/** (additive, wave 3) A live sandboxed process (SandboxRunner.session). */
+export interface SandboxSession {
+  readonly pid: number | undefined;
+  stdin: NodeJS.WritableStream;
+  stdout: NodeJS.ReadableStream;
+  stderr: NodeJS.ReadableStream;
+  /** Resolves when the process has exited and the session's sandbox resources are released. */
+  exited: Promise<{ exitCode: number | null; signal: string | null; timedOut: boolean }>;
+  /** Terminates the process group (SIGTERM, then SIGKILL after the grace period) and waits for `exited`. */
+  kill(): Promise<void>;
 }
 
 // ----------------------------------------------------------------------------- environments (black-box)
@@ -458,8 +532,33 @@ export interface EnvironmentDescriptor {
   prometheusUrl?: string;
   generation: number;
   buildDigest?: string;
-  /** Process/docker/k8s control descriptors for env.* adapters. */
-  control?: { kind: 'process' | 'docker' | 'kubectl'; target: string; namespace?: string; command?: string[] };
+  /**
+   * Process/docker/k8s control descriptors for env.* adapters. (additive, wave 3) `context`: the kubectl context the
+   * environment lives in (`--context`; default the current context of the operator's kubeconfig).
+   */
+  control?: { kind: 'process' | 'docker' | 'kubectl'; target: string; namespace?: string; command?: string[]; context?: string };
+  /**
+   * (additive, wave 3) The environment's gRPC endpoint (`grpc.call` / `grpc.query` / `grpc.describe`): `target` host:port
+   * (agents never name hosts), the service definitions from `protoFiles` (+ `includeDirs`) or the server's `reflection`,
+   * `tls`, and the methods the operator declares read-only (`readMethods`, globs like `shop.Catalog/Get*`).
+   */
+  grpc?: { target: string; protoFiles?: string[]; includeDirs?: string[]; reflection?: boolean; tls?: boolean; readMethods?: string[] };
+  /**
+   * (additive, wave 3) Log sources of the environment for `logs.query` besides its control target's own logs (process
+   * supervisor, `docker logs`, `kubectl logs`): files on this host (absolute paths, operator-declared).
+   */
+  logs?: { files?: string[] };
+  /**
+   * (additive, wave 3) The environment's trace backend for `trace.query`: `otlp_file` (OTLP/JSON export file(s) at `path`),
+   * `jaeger` (query API at `url`) or `tempo` (HTTP API at `url`); `service` names the SUT's service.
+   */
+  traces?: { kind: 'otlp_file' | 'jaeger' | 'tempo'; url?: string; path?: string; service?: string };
+  /**
+   * (additive, wave 3) The environment's SQL database for `db.introspect` (read-only, through the database's own CLI /
+   * driver, never the Hypertest store): `postgres` (psql; connection from the variable NAMED `urlEnv`), `sqlite` (file
+   * `path`), `mysql` (mysql CLI; `urlEnv`). `schemas` limits what is listed.
+   */
+  database?: { kind: 'postgres' | 'sqlite' | 'mysql'; urlEnv?: string; path?: string; schemas?: string[] };
   /**
    * (additive) The SUT deduplicates non-idempotent requests by their `Idempotency-Key` header: a request interrupted
    * between sending and recording may be re-sent once with the same key (conformance-7); otherwise it goes to manual
@@ -579,6 +678,17 @@ export interface BuiltinToolOptions {
   retrieval?: { search(query: { text: string; symbol?: string; root?: string; limit?: number }): Promise<Array<{ path?: string; line?: number; snippet: string; score: number }>> };
   enableBrowser?: boolean;
   httpAllowlist?: string[];
+  /** (additive, E[5]) MCP servers whose `allowTools` become `mcp.<server>.<tool>` specs (lazily connected). */
+  mcpServers?: McpServerConfig[];
+  /** (additive, row 246) ACP agents whose `acp.<id>.prompt` tools drive an external coding agent on the caller's workspace. */
+  acpAgents?: AcpAgentConfig[];
+  /** (additive, row 246) Computer use: the computer.* tools over one desktop backend (x11 / xdotool / fake). */
+  computer?: ComputerToolsOptions;
+  /**
+   * (additive, wave 3) The variables operator-NAMED settings are read from (db.introspect `database.urlEnv`); default
+   * process.env. Values never reach agents or evidence.
+   */
+  env?: Record<string, string | undefined>;
   /**
    * (additive) State directory for the black-box tools (load job dirs, evidence markers); share it with
    * builtinSideEffectAdapters. Optional: without it load.observe dedupes evidence in-process only.

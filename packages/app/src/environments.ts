@@ -61,6 +61,52 @@ export function resolveEnvironments(configured: readonly EnvironmentConfig[], en
   });
 }
 
+/**
+ * (e2e[0]) The run target of a black-box run started with a URL (`hypertest run --url <sutUrl>`, `POST /runs` with
+ * `target.sutUrl`): the registered environment whose origins serve the URL — an operator-configured environment or the
+ * environment of an allowlisted URL target (`tools.httpAllowlist`, see `urlTargetEnvironments`) — becomes the run's
+ * `environmentId`, so its agents probe it under their `env/**` grant. A URL nothing serves is refused (precondition_failed)
+ * BEFORE a run exists: a run whose every probe would be refused at the capability check could only end inconclusive with
+ * no evidence. A target that names both must agree.
+ */
+export function resolveUrlTarget<T extends { sutUrl?: string; environmentId?: string }>(target: T, environments: Pick<EnvironmentRegistry, 'get' | 'list'>): T {
+  if (target?.sutUrl === undefined) return target;
+  let url: URL;
+  try {
+    url = new URL(target.sutUrl);
+  } catch {
+    throw new HypertestError('invalid_argument', `target.sutUrl must be an absolute http(s) URL (got ${JSON.stringify(target.sutUrl)})`);
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new HypertestError('invalid_argument', `target.sutUrl must be an http(s) URL (got ${JSON.stringify(target.sutUrl)})`);
+  const owners = environments.list().filter((e) => [e.baseUrl, e.metricsUrl, e.prometheusUrl].some((u) => {
+    if (!u) return false;
+    try {
+      return new URL(u).origin === url.origin;
+    } catch {
+      return false;
+    }
+  }));
+  if (target.environmentId !== undefined) {
+    const named = environments.get(target.environmentId);
+    if (named && !owners.some((o) => o.environmentId === named.environmentId)) {
+      throw new HypertestError('invalid_argument', `target.sutUrl ${url.origin} is not served by environment ${target.environmentId} (its origins: ${[named.baseUrl, named.metricsUrl, named.prometheusUrl].filter(Boolean).join(', ') || 'none'})`);
+    }
+    return target;
+  }
+  if (owners.length > 1) {
+    throw new HypertestError('invalid_argument', `target.sutUrl ${url.origin} is served by several environments (${owners.map((o) => o.environmentId).join(', ')}): name one (--environment <id>)`, { details: { sutUrl: target.sutUrl } });
+  }
+  const owner = owners[0];
+  if (!owner) {
+    throw new HypertestError(
+      'precondition_failed',
+      `the system under test ${url.origin} is neither a registered environment nor on tools.httpAllowlist: its agents could not reach it (add "${url.origin}" to tools.httpAllowlist, or register it under environments: and pass --environment <id>)`,
+      { details: { sutUrl: target.sutUrl } },
+    );
+  }
+  return { ...target, environmentId: owner.environmentId };
+}
+
 function readState(file: string): StateFile {
   let raw: string;
   try {

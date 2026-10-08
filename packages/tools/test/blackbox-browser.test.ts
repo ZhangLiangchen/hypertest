@@ -65,17 +65,29 @@ test('navigate, fill, click by role, read text, screenshot evidence', async (t) 
   const ctx = fakeContext({ environments: envs });
   const nav = await call('browser.navigate', { environmentId: 'env_ui', path: '/' }, ctx);
   assert.equal(nav.status, 'success', JSON.stringify(nav.error));
-  assert.deepEqual(structuredOf(nav), { url: `${server.url}/`, status: 200, title: 'Shop', sessionId: 'default' });
+  assert.deepEqual(structuredOf(nav), { url: `${server.url}/`, status: 200, title: 'Shop', sessionId: 'default', evidenceId: 'ev_fake_1' });
   assert.equal((await call('browser.fill', { selector: '#name', value: 'Ada', environmentId: 'env_ui' }, ctx)).status, 'success');
   const click = await call('browser.click', { role: 'button', name: 'Greet', environmentId: 'env_ui' }, ctx);
   assert.equal(click.status, 'success', JSON.stringify(click.error));
-  const text = await call('browser.text', { selector: '#out' }, ctx);
+  // env_ui and env_stage serve the same origin: the page's environment is ambiguous unless the call names it
+  const text = await call('browser.text', { selector: '#out', environmentId: 'env_ui' }, ctx);
   assert.equal(text.status, 'success');
   assert.equal(structuredOf(text)['text'], 'Hello Ada');
   const shot = await call('browser.screenshot', { fullPage: true }, ctx);
   assert.equal(shot.status, 'success');
-  assert.equal(ctx.evidence.length, 1);
-  const ev = ctx.evidence[0]!;
+  // (e2e[1]) navigate → api-response (the page load), text → dom-snapshot (the DOM check), screenshot → screenshot
+  assert.deepEqual(ctx.evidence.map((e) => e.input.evidenceType), ['api-response', 'dom-snapshot', 'screenshot']);
+  const [load, dom] = ctx.evidence;
+  assert.deepEqual(nav.evidenceRefs, [load!.record.evidenceId]);
+  const loaded = load!.input.structured as { request: { method: string; path: string }; response: { status: number; body: string }; page: { title: string } };
+  assert.deepEqual([loaded.request.method, loaded.request.path, loaded.response.status, loaded.page.title], ['GET', '/', 200, 'Shop']);
+  assert.match(loaded.response.body, /<h1 id="h">Welcome<\/h1>/);
+  assert.equal(load!.input.environment?.environmentId, 'env_ui', 'the page load is anchored to the environment the page is on');
+  assert.deepEqual(text.evidenceRefs, [dom!.record.evidenceId]);
+  assert.equal((dom!.input.structured as { text: string; selector: string }).text, 'Hello Ada');
+  assert.equal(dom!.input.environment?.environmentId, 'env_ui');
+  assert.equal(ctx.evidence[2]!.input.environment, undefined, 'a screenshot naming no environment on an origin two environments serve is not attributed to either (fail closed)');
+  const ev = ctx.evidence[2]!;
   assert.equal(ev.input.evidenceType, 'screenshot');
   assert.equal(ev.input.mimeType, 'image/png');
   assert.deepEqual([...(ev.input.data as Uint8Array).subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
@@ -109,6 +121,9 @@ test('interactions need a page and must stay on the named environment', async (t
   assert.equal(wrongEnv.error?.code, 'permission_denied');
   const missing = await call('browser.click', { selector: '#does-not-exist', timeoutMs: 300 }, ctx);
   assert.equal(missing.status, 'timeout');
+  // (e2e[1]) reads may name the environment too: refused when the page is elsewhere
+  const offEnvText = await call('browser.text', { environmentId: 'env_other' }, ctx);
+  assert.equal(offEnvText.error?.code, 'permission_denied');
   const spec = tools.get('browser.click')!;
   assert.equal(spec.effect, 'external');
   assert.equal(spec.environmentClass!({ selector: 'x', environmentId: 'env_ui' }, { environments: envs }), 'local');

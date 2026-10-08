@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { HypertestError, abortReason } from '@hypertest/core';
-import type { ProcessResult } from '../contracts.ts';
+import type { ProcessResult, SandboxSession } from '../contracts.ts';
 
 export const DEFAULT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 export const DEFAULT_KILL_GRACE_MS = 2000;
@@ -191,4 +191,62 @@ export function spawnProcess(req: SpawnRequest): Promise<ProcessResult> {
     if (req.stdin !== undefined) child.stdin.end(req.stdin);
     else child.stdin.end();
   });
+}
+
+/**
+ * (additive, wave 3) An interactive process in its own process group (detached, no shell, piped stdio) for
+ * SandboxRunner.session: `kill()`, the caller's `signal` or `timeoutMs` terminate the group (SIGTERM, SIGKILL after
+ * `killGraceMs`); `onClose` runs once after the process exited (sandbox resources released). A process that cannot be
+ * started rejects `exited`'s waiters through a closed session (exitCode 127).
+ */
+export function spawnSession(req: { argv: string[]; cwd: string; env: Record<string, string>; signal: AbortSignal; timeoutMs?: number; killGraceMs?: number; onClose?: () => Promise<void> }): SandboxSession {
+  if (!Array.isArray(req.argv) || req.argv.length === 0 || req.argv.some((a) => typeof a !== 'string' || a.includes('\0'))) throw new HypertestError('invalid_argument', 'command must be a non-empty array of strings without NUL');
+  if (req.signal.aborted) throw abortReason(req.signal);
+  const grace = req.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
+  const child = spawn(req.argv[0]!, req.argv.slice(1), { cwd: req.cwd, env: req.env, detached: true, shell: false, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+  trackGroup(child.pid);
+  let terminated = false;
+  let timedOut = false;
+  let killTimer: NodeJS.Timeout | undefined;
+  const terminate = () => {
+    if (terminated) return;
+    terminated = true;
+    killGroup(child.pid, 'SIGTERM');
+    killTimer = setTimeout(() => killGroup(child.pid, 'SIGKILL'), grace);
+    killTimer.unref();
+  };
+  const onAbort = () => terminate();
+  req.signal.addEventListener('abort', onAbort, { once: true });
+  const timer = req.timeoutMs !== undefined ? setTimeout(() => {
+    timedOut = true;
+    terminate();
+  }, req.timeoutMs) : undefined;
+  timer?.unref();
+  child.stdin.on('error', () => undefined);
+  const exited = new Promise<{ exitCode: number | null; signal: string | null; timedOut: boolean }>((resolve) => {
+    let done = false;
+    const finish = (exitCode: number | null, signal: string | null) => {
+      if (done) return;
+      done = true;
+      if (timer) clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      req.signal.removeEventListener('abort', onAbort);
+      if (child.pid !== undefined) liveGroups.delete(child.pid);
+      void (req.onClose ? req.onClose().catch(() => undefined) : Promise.resolve()).then(() => resolve({ exitCode, signal, timedOut }));
+    };
+    child.once('error', () => finish(127, null));
+    child.once('exit', () => killGroup(child.pid, 'SIGKILL'));
+    child.once('close', (code, signal) => finish(code, signal ?? null));
+  });
+  return {
+    pid: child.pid,
+    stdin: child.stdin,
+    stdout: child.stdout,
+    stderr: child.stderr,
+    exited,
+    async kill() {
+      terminate();
+      await exited;
+    },
+  };
 }

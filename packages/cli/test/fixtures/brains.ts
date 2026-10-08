@@ -113,7 +113,8 @@ function lead(scenario: string): RoleBrain {
       return call('evidence.query', { evidenceType: 'test-result' });
     }
     const ev = evidenceIds(v.toolResults[0]?.content ?? '');
-    const status = scenario === 'fail' ? 'failed' : ev.length > 0 ? 'satisfied' : 'open';
+    // (e2e[6]) a failed objective is 'unsatisfiable' (the plan schema: open | satisfied | unsatisfiable | dropped)
+    const status = scenario === 'fail' ? 'unsatisfiable' : ev.length > 0 ? 'satisfied' : 'open';
     if (v.step === 1) {
       return call('plan.propose_revision', {
         rationale: 'The recorded execution evidence decides the objective; hand over to the gate.',

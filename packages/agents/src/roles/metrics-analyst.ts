@@ -6,6 +6,9 @@ import { NON_EMPTY, SUMMARY, TERMINAL, budget, composePrompt, evidenceIds, recor
 const METRICS_TOOLS = [
   'metrics.*',
   'load.observe',
+  // (wave 3) logs and traces next to the metrics
+  'logs.query',
+  'trace.query',
   'oracle.get',
   'oracle.list',
   'blackboard.read',
@@ -47,7 +50,7 @@ const BODY = `
 ## Procedure
 1. Establish the question. Read the finding or experiment with \`blackboard.read\`, \`evidence.get\` and \`evidence.query\`: which service, which metric, which window (load job start and stop from its evidence, fault injection times) and which oracle threshold applies (\`oracle.get\`; \`oracle.list\` if none is cited).
 2. Check the load itself with \`load.observe\` when a load job is referenced: achieved rate, errors and duration versus the experiment specification. A load run that missed its target rate or duration cannot support a threshold claim.
-3. Query precisely with \`metrics.query\` (PromQL over the exact experiment window) or \`metrics.scrape\` for a raw exposition endpoint. Typical queries: histogram_quantile(0.95, sum by (le) (rate(<histogram>_bucket[1m]))) for latency; the ratio of 5xx to total request rate for errors; request rate for throughput; CPU, memory, queue depth and connection-pool usage for saturation. State the aggregation (p50, p95, p99, avg, max, rate), window and step for every number.
+3. Query precisely with \`metrics.query\` (PromQL over the exact experiment window) or \`metrics.scrape\` for a raw exposition endpoint. Typical queries: histogram_quantile(0.95, sum by (le) (rate(<histogram>_bucket[1m]))) for latency; the ratio of 5xx to total request rate for errors; request rate for throughput; CPU, memory, queue depth and connection-pool usage for saturation. State the aggregation (p50, p95, p99, avg, max, rate), window and step for every number. \`logs.query\` and \`trace.query\` show what the numbers hide: the errors behind an error rate, the slow spans behind a latency percentile.
 4. Judge sufficiency: non-empty series across the whole window, enough samples for the percentile you report (a p99 over a handful of requests is meaningless), scrape gaps noted. When data is missing or sparse, set dataSufficient to false and say what is missing; insufficient data can only lead to an inconclusive verdict, never a pass.
 5. Compare fairly: candidate versus baseline under the same workload and environment; separate a sustained shift from a single spike or warm-up effect; report the variance you observed instead of asserting a significance you did not measure.
 6. Record: when you were triggered by an existing finding, update it (updatesRecordId, restating its required fields) with the quantified impact rather than posting a duplicate. Post a new finding with \`blackboard.post_finding\` (category performance) only for a threshold violation or regression backed by metric evidence: exact value, threshold, window, oracleRef and evidenceRefs. Use \`blackboard.post_note\` for observations below the threshold and for data-quality problems.

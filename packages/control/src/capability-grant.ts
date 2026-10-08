@@ -122,3 +122,19 @@ export function unmetRequirements(cap: ActionCapability, requirements: readonly 
 export function describeUnmet(unmet: readonly UnmetRequirement[]): string[] {
   return unmet.map(({ requirement: r, missing }) => `${r.effect} on ${r.resourceScopes.join(', ')}${r.environmentClass ? ` in ${r.environmentClass}` : ''}: not granted — ${missing.join('; ')}`);
 }
+
+/**
+ * (wave 3) The resource scopes the operator grants together with configured tools (ToolSpec.grant — e.g. an MCP server's
+ * `mcp/<server>/**` scope, a computer-use desktop, an ACP agent) to agents of `profileName`: added to such agents' root
+ * capability next to their workspace, the run and the black-box plane. Only canonical patterns are granted (a malformed
+ * grant is ignored, never widened); a child receives them only through attenuation from its parent.
+ */
+export function toolGrantScopes(tools: ReadonlyArray<{ grant?: { scopes: readonly string[]; profiles: readonly string[] } }>, profileName: string): string[] {
+  const out = new Set<string>();
+  for (const t of tools) {
+    const g = t.grant;
+    if (!g || !Array.isArray(g.profiles) || !g.profiles.includes(profileName) || !Array.isArray(g.scopes)) continue;
+    for (const s of g.scopes) if (typeof s === 'string' && s !== '**' && nonCanonicalResource(s) === undefined) out.add(s);
+  }
+  return [...out].sort();
+}

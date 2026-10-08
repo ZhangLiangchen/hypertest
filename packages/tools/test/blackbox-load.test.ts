@@ -104,15 +104,31 @@ test('the results evidence records the environment the job MEASURED (its generat
   const ev = (await env.evidence.get(structuredOf(done)['evidenceId']))!;
   assert.equal(ev.evidenceType, 'metric');
   assert.deepEqual(ev.environment, { environmentId: 'env_load', environmentClass: 'local', generation: launchGeneration });
-  // a job against a bare URL names no registered environment: no environment is invented
-  const bare = await runtime.execute(toolRequest('load.start', { targetUrl: `${target.url}/hit-bare`, method: 'GET', ratePerSecond: 10, durationMs: 200, concurrency: 2 }));
-  assert.equal(bare.status, 'pending', bare.modelText);
-  await trackPid(dir, bare.operationId!);
-  const bareDone = await waitFor(async () => {
-    const r = await runtime.execute(toolRequest('load.observe', { operationId: bare.operationId! }));
+  // (e2e[0]) a job addressed by a URL on the environment's origin is a job ON that environment (its generation at launch)
+  const byUrl = await runtime.execute(toolRequest('load.start', { targetUrl: `${target.url}/hit-url`, method: 'GET', ratePerSecond: 10, durationMs: 200, concurrency: 2 }));
+  assert.equal(byUrl.status, 'pending', byUrl.modelText);
+  await trackPid(dir, byUrl.operationId!);
+  const byUrlDone = await waitFor(async () => {
+    const r = await runtime.execute(toolRequest('load.observe', { operationId: byUrl.operationId! }));
     return r.status === 'success' ? r : undefined;
-  }, 15_000, 100, 'bare load job verification');
-  assert.equal((await env.evidence.get(structuredOf(bareDone)['evidenceId']))!.environment, undefined);
+  }, 15_000, 100, 'URL load job verification');
+  assert.deepEqual((await env.evidence.get(structuredOf(byUrlDone)['evidenceId']))!.environment, { environmentId: 'env_load', environmentClass: 'local', generation: launchGeneration + 1 });
+  // a job against a bare URL of no registered environment: no environment is invented
+  const other = await startServer((_req, res) => {
+    res.end('ok');
+  });
+  try {
+    const bare = await runtime.execute(toolRequest('load.start', { targetUrl: `${other.url}/hit-bare`, method: 'GET', ratePerSecond: 10, durationMs: 200, concurrency: 2 }));
+    assert.equal(bare.status, 'pending', bare.modelText);
+    await trackPid(dir, bare.operationId!);
+    const bareDone = await waitFor(async () => {
+      const r = await runtime.execute(toolRequest('load.observe', { operationId: bare.operationId! }));
+      return r.status === 'success' ? r : undefined;
+    }, 15_000, 100, 'bare load job verification');
+    assert.equal((await env.evidence.get(structuredOf(bareDone)['evidenceId']))!.environment, undefined);
+  } finally {
+    await other.close();
+  }
 });
 
 test('load.start → pending → load.observe → verified results (20 rps × 1 s) through the ToolRuntime, with metric evidence recorded once', async () => {

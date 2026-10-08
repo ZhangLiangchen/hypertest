@@ -121,3 +121,16 @@ role's prompt tells it to run only checks whose output prints no restricted valu
 npx tsc -p packages/agents --noEmit
 node scripts/run-tests.mjs --package agents        # hermetic unit tests (no infra, no SQL: the package is stateless)
 ```
+
+## Tool surface (audit wave 3, additive)
+
+- `BUILTIN_TOOL_IDS` adds `grpc.call|query|describe`, `computer.screenshot|click|type|key`, `logs.query`, `trace.query`,
+  `net.capture`, `db.introspect`, `lsp.definitions|references|diagnostics`, `analysis.run`; `DYNAMIC_TOOL_NAMESPACES` is
+  `['mcp.', 'acp.']`. Grants: executor (grpc.*, logs/trace/net.capture, db.introspect), environment (logs, traces,
+  net.capture), rca (lsp.*, analysis.run, logs, traces, db.introspect), metrics_analyst (logs, traces), reviewer /
+  test_designer / fixer (lsp.*, analysis.run). Configured MCP/ACP/computer-use tools are added to roles by the app.
+- Approval loop (item 8): every prompt says that a call answered `approval_required` waits for a human decision filed
+  by Hypertest for exactly that call, and never to file an approval of one's own for a tool call. The environment
+  operator and the fixer no longer hold `request_approval`; the lead uses it only for decisions that are not tool calls.
+  Tests: `test/approval-loop.test.ts`; `test/roles.test.ts` key rules now expect `approval_required` instead of
+  `request_approval` for those two roles.

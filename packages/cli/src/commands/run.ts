@@ -212,7 +212,7 @@ export const runCommand: Command = {
     ['--repo <path>', 'repository under test (white-box); --commit/--base are resolved to full SHAs in it'],
     ['--commit <ref>', 'commit under test'],
     ['--base <ref>', 'base commit for change analysis'],
-    ['--url <sutUrl>', 'base URL of a running system under test (black-box)'],
+    ['--url <sutUrl>', 'base URL of a running system under test (black-box): served by a registered environment or listed in tools.httpAllowlist (it becomes the run\'s environment url-<host>-<port>); refused otherwise'],
     ['--environment <id>', 'an environment registered in the configuration'],
     ['--description <text>', 'target description'],
     ['--label k=v', 'run label (repeatable)'],

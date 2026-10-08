@@ -185,7 +185,8 @@ export async function runTrialChild(jobFile: string | undefined): Promise<number
   try {
     const task = await loadTask(job);
     const brains = withModelTimeoutInjection(await loadBrains(job, task), job.chaos?.injectModelTimeoutOnCall, undefined, (call) => progress({ type: 'chaos', kind: 'model_timeout', call }));
-    const overrides: HypertestOverrides = { scriptedBrains: brains, logger };
+    // an eval trial instance (F[8]: the arm's harness features are honoured)
+    const overrides: HypertestOverrides = { scriptedBrains: brains, logger, evalTrial: true };
     if (job.environments) overrides.environments = job.environments;
     if (job.workerId) overrides.workerId = job.workerId;
     if (job.chaos?.duplicateEventDelivery) {

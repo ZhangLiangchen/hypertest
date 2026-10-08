@@ -17,7 +17,7 @@ import { cleared, recordClassification, roleClassification, summaryFor, withheld
 import { createContextProvider, type TurnState } from './context-provider.ts';
 import { createToolDispatcher, offeredRisk } from './dispatcher.ts';
 import { createPhaseGovernor } from './phases.ts';
-import { describeUnmet, unmetRequirements, workItemConstraint, type UnmetRequirement } from './capability-grant.ts';
+import { describeUnmet, toolGrantScopes, unmetRequirements, workItemConstraint, type UnmetRequirement } from './capability-grant.ts';
 import {
   budgetWaitOperationId, delegationChatMessage, delegationSettled, inputWaitOperationId, isAwaitingInput, isBudgetPaused, isModelPaused, modelWaitOperationId, parseDelegationOperationId,
   unreadMessages,
@@ -273,7 +273,8 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
       const deny = [...new Set([...(role.toolPolicy.deny ?? []), ...(item.toolPolicy?.deny ?? [])])];
       // the item (a plan's choice) may tighten, never weaken, the role's routing requirements (I3)
       const modelPolicy: ModelPolicy = tightenModelPolicy(role.defaultModelPolicy, item.modelPolicy);
-      const scopes = [`${ws.resourcePrefix}/**`, `run/${run.runId}/**`, ...blackboxScopes(profile)];
+      // (wave 3) + the scopes the operator granted with configured tools (MCP servers, desktops, ACP agents) to this profile
+      const scopes = [`${ws.resourcePrefix}/**`, `run/${run.runId}/**`, ...blackboxScopes(profile), ...toolGrantScopes(deps.registry.list(), role.permissionProfile)];
       // I2 (H9): child = parent ∩ role ∩ … ∩ ENVIRONMENT policy — the role's environment classes narrowed to the classes
       // of the environments actually registered, plus `local` (this host, always present): a run whose only environments
       // are sandboxes never carries a staging- or production-capable token

@@ -27,7 +27,7 @@ export function envRestartTool(): ToolSpec<EnvRestartInput> {
   return {
     id: 'env.restart',
     title: 'Restart environment',
-    description: 'Restart a registered environment (process supervisor, docker container or k8s deployment). Verified restarts bump the environment generation, invalidating older context snapshots.',
+    description: 'Restart a registered environment (process supervisor, docker container or k8s deployment). Verified restarts bump the environment generation, invalidating older context snapshots. Call it directly: when the policy requires approval the call returns approval_required and the work waits for a human decision on exactly this call (do not file an approval yourself).',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -52,6 +52,10 @@ const FAULT_PARAMS: JsonSchema = {
     probability: { type: 'number', minimum: 0, maximum: 1, description: 'latency: share of requests delayed (default 1)' },
     rate: { type: 'number', minimum: 0, maximum: 1, description: 'error_rate: share of requests answered with `status`' },
     status: { type: 'integer', minimum: 400, maximum: 599, description: 'error_rate: injected status (default 503)' },
+    network: { type: 'string', description: 'network_disconnect (docker): the docker network to disconnect the container from' },
+    delayMs: { type: 'number', minimum: 0, maximum: 60_000, description: 'netem (docker): added delay' },
+    lossPct: { type: 'number', minimum: 0, maximum: 100, description: 'netem (docker): packet loss percentage' },
+    interface: { type: 'string', description: 'netem (docker): interface inside the container (default eth0)' },
   },
 };
 
@@ -60,13 +64,16 @@ export function envInjectFaultTool(): ToolSpec<EnvFaultInput> {
   return {
     id: 'env.inject_fault',
     title: 'Inject environment fault',
-    description: 'Inject a time-boxed fault in front of a process-supervised environment: latency {ms, jitterMs?, probability?} or error_rate {rate, status?}.',
+    description:
+      'Inject a time-boxed fault into an environment; it is reverted automatically after durationMs. Process-supervised environments: latency {ms, jitterMs?, probability?} or error_rate {rate, status?}. ' +
+      'Docker environments: pause, kill, network_disconnect {network}, netem {delayMs?, jitterMs?, lossPct?, interface?}. Kubernetes (kubectl) environments: pod_delete, scale_zero, network_deny. ' +
+      'Call it directly: when the policy requires approval the call returns approval_required and the work waits for a human decision on exactly this call (do not file an approval yourself).',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
       properties: {
         environmentId: ENV_ID_SCHEMA,
-        kind: { type: 'string', enum: ['latency', 'error_rate'] },
+        kind: { type: 'string', enum: ['latency', 'error_rate', 'pause', 'kill', 'network_disconnect', 'netem', 'pod_delete', 'scale_zero', 'network_deny'] },
         params: FAULT_PARAMS,
         durationMs: { type: 'integer', minimum: 1, maximum: 3_600_000 },
       },
@@ -86,7 +93,7 @@ export function envDeployTool(): ToolSpec<EnvDeployInput> {
   return {
     id: 'env.deploy',
     title: 'Deploy build to environment',
-    description: 'Deploy buildRef to a registered environment (process: restart with BUILD_REF; kubectl: set every container image). Critical risk: normally requires approval.',
+    description: 'Deploy buildRef to a registered environment (process: restart with BUILD_REF; kubectl: set every container image). Critical risk: normally requires approval. Call it directly: when the policy requires approval the call returns approval_required and the work waits for a human decision on exactly this call (do not file an approval yourself).',
     inputSchema: {
       type: 'object',
       additionalProperties: false,

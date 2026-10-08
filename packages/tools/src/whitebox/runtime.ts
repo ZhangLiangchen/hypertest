@@ -3,13 +3,17 @@ import { EFFECT_ORDER, EVENT_TYPES, RISK_ORDER, eventFrom, type ArtifactRef, typ
 import { recordEvidence, type RecordEvidenceInput } from '@hypertest/evidence';
 import type { SideEffectGateway, SideEffectOutcome } from '@hypertest/operation';
 import { capabilityAllows, matchesResourcePattern, matchesToolPattern, verifyCapability, type ActionPermit, type ActionRequest } from '@hypertest/policy';
-import type { ExperimentProvenance, ToolContext, ToolExecutionRequest, ToolExecutionResult, ToolOutcome, ToolRuntime, ToolRuntimeDeps, ToolSpec, ToolStatus } from '../contracts.ts';
+import type { ExperimentProvenance, IsolationDecision, ToolContext, ToolExecutionRequest, ToolExecutionResult, ToolOutcome, ToolRuntime, ToolRuntimeDeps, ToolSpec, ToolStatus, WorkspaceHandle } from '../contracts.ts';
 import { RECORD_EFFECT_ADAPTER_ID, RECORD_EFFECT_RESENDABLE_ADAPTER_ID, bindRecordEffect, type RecordedToolOutcome } from './record-effects.ts';
 import { UsageMeter, meteredArtifacts, runMetered } from './usage-meter.ts';
-import { runWithEgressContext, type EgressCallContext, type EgressWrite } from './egress-relay.ts';
-import { checkHost, controlEndpointReason, environmentClassForUrl, redactUrl } from '../blackbox/common.ts';
+import { runWithEgressContext, type CapturedExchange, type EgressCallContext, type EgressWrite } from './egress-relay.ts';
+import { checkHost, controlEndpointReason, environmentClassForUrl, environmentForUrl, redactUrl } from '../blackbox/common.ts';
 import { credentialScope } from '../blackbox/secrets.ts';
 
+/** (wave 3, item 9) Type of evidence a call recorded after its sandboxed commands' writes were refused (see markedInconclusive). */
+export const INCONCLUSIVE_EVIDENCE_TYPE = 'inconclusive';
+/** Evidence that stays as it is after a refused write: observations of the traffic itself, not outcomes. */
+const NEVER_INCONCLUSIVE: ReadonlySet<string> = new Set(['network-capture']);
 /** Default model-visible byte budget before a tool output is offloaded to the ArtifactStore (I9). */
 export const DEFAULT_MAX_INLINE_BYTES = 16 * 1024;
 /** Keys whose values are redacted before a tool input reaches policy evaluation and decision logs. */
@@ -196,6 +200,12 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
       }
       if (request.commitGuard !== undefined && typeof request.commitGuard !== 'function') throw new HypertestError('invalid_argument', 'malformed ToolExecutionRequest: commitGuard must be a function');
       if (request.egressGuard !== undefined && typeof request.egressGuard !== 'function') throw new HypertestError('invalid_argument', 'malformed ToolExecutionRequest: egressGuard must be a function');
+      // (wave 3, row 250) the call's isolation tier (role / work item): the tool runs on the workspace with the tier's sandbox
+      // profile; a read-only tier makes the workspace read-only for the call (never the reverse)
+      if (deps.isolation) {
+        const decision = await deps.isolation({ runId: request.runId, workItemId: request.workItemId, role: request.role, workspace: request.workspace });
+        if (decision) request = { ...request, workspace: isolatedWorkspace(request.workspace, decision) };
+      }
       const leaseOwner = request.leaseOwner ?? request.agentId;
       const started = clock.nowMs();
       const evCtx: EventContext = {
@@ -437,6 +447,13 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
       const relayed: EvidenceRecord[] = [];
       /** (review) Writes of this call's sandboxed commands the relay refused or left unsettled (⇒ the call is a fault). */
       const refusedEgress: string[] = [];
+      /**
+       * (wave 3, item 9) Evidence this call recorded after a write of its commands was refused: marked INCONCLUSIVE (type
+       * `inconclusive`, the original type and payload kept inside) — it can neither satisfy nor violate an assertion.
+       */
+      const markedInconclusive: Array<{ evidenceId: string; originalEvidenceType: string }> = [];
+      /** (wave 3, row 249) The relay's capture of this call's HTTP exchanges (`captureNetwork: true`). */
+      const exchanges: CapturedExchange[] | undefined = input !== null && typeof input === 'object' && (input as { captureNetwork?: unknown }).captureNetwork === true ? [] : undefined;
       const recordEvTo = (sink: EvidenceRecord[]): ToolContext['recordEvidence'] => async (inp) => {
         const provenance: ExperimentProvenance = { ...(inp.provenance ?? {}), toolId: spec.id, toolInvocationId: request.invocationId, workspaceId: request.workspace.workspaceId };
         const commit = inp.provenance?.commit ?? request.workspace.baseCommit;
@@ -466,10 +483,22 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
         if (environment !== undefined) evInput.environment = environment;
         if (inp.operationId !== undefined) evInput.operationId = inp.operationId;
         if (inp.parentEvidenceIds !== undefined) evInput.parentEvidenceIds = inp.parentEvidenceIds;
+        // (wave 3, item 9) a write of this call's commands was refused: what the call records from now on does not describe
+        // the system under test — it is kept, but as `inconclusive` evidence (never eligible to satisfy or violate an assertion)
+        const marked = sink === produced && refusedEgress.length > 0 && !NEVER_INCONCLUSIVE.has(inp.evidenceType);
+        if (marked) {
+          evInput.evidenceType = INCONCLUSIVE_EVIDENCE_TYPE;
+          evInput.summary = `[inconclusive: ${refusedEgress.length} sandbox egress write(s) refused] ${inp.summary}`;
+          evInput.structured = {
+            inconclusive: true, reason: 'egress_refused', originalEvidenceType: inp.evidenceType, refusedWrites: refusedEgress.length, refused: refusedEgress.slice(0, 10),
+            ...(inp.structured !== undefined ? { original: inp.structured } : {}),
+          };
+        }
         const eventContext: Partial<Omit<EventContext, 'runId'>> = { correlationId: evCtx.correlationId, actorId: evCtx.actorId, workItemId: request.workItemId, agentId: request.agentId };
         if (evCtx.causationId !== undefined) eventContext.causationId = evCtx.causationId;
         const rec = await recordEvidence(deps.evidence, artifacts, evInput, undefined, { eventContext });
         sink.push(rec);
+        if (marked) markedInconclusive.push({ evidenceId: rec.evidenceId, originalEvidenceType: inp.evidenceType });
         return rec;
       };
       const recordEv = recordEvTo(produced);
@@ -555,6 +584,20 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
           // requests for THIS invocation (operation ids, Idempotency-Key, evidence; replays answered from the record)
           const outcome: ToolOutcome = await withTimeout(timeoutMs, (signal) => runWithEgressContext(egressContext(), () => spec.execute(input, makeCtx(signal))), request.signal, `tool ${spec.id}`);
           if (!outcome || typeof outcome !== 'object' || typeof outcome.status !== 'string') throw new HypertestError('internal', `tool ${spec.id} returned a malformed outcome`);
+          // (wave 3, row 249) the HTTP exchanges of the call's commands, captured by the relay
+          if (exchanges) {
+            const dropped = (exchanges as CapturedExchange[] & { dropped?: number }).dropped ?? 0;
+            const doc = { capturedBy: 'sandbox-egress-relay', exchanges, exchangeCount: exchanges.length + dropped, dropped };
+            const outcomes = exchanges.reduce<Record<string, number>>((m, x) => ((m[x.outcome] = (m[x.outcome] ?? 0) + 1), m), {});
+            const cap = await recordEv({
+              evidenceType: 'network-capture',
+              data: JSON.stringify(doc),
+              mimeType: 'application/json',
+              summary: `${exchanges.length + dropped} HTTP exchange(s) of ${spec.id}'s commands through the sandbox egress relay (${Object.entries(outcomes).map(([k, v]) => `${v} ${k}`).join(', ') || 'none'})`,
+              structured: doc as unknown as JsonValue,
+            });
+            outcome.evidenceRefs = [...(outcome.evidenceRefs ?? []), cap.evidenceId];
+          }
           // (review) writes of its commands that governance refused (or left unsettled): the call is a tool FAULT, never an
           // outcome of the system under test (a test that could not write tells nothing about the SUT — no fake FAIL)
           if (refusedEgress.length > 0 && (outcome.status === 'success' || outcome.status === 'failed')) {
@@ -642,6 +685,17 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
         }
       } catch (e) {
         logger.error('tool completion event could not be emitted', { error: (e as Error).message });
+      }
+      // (wave 3, item 9) the precise record of what the refused writes made inconclusive
+      if (refusedEgress.length > 0) {
+        try {
+          await emit(EVENT_TYPES.evidenceInconclusive, {
+            toolId: spec.id, invocationId: request.invocationId, reason: 'egress_refused', refusedWrites: refusedEgress.length, refused: refusedEgress.slice(0, 10),
+            evidence: markedInconclusive.map((m) => ({ ...m })),
+          });
+        } catch (e) {
+          logger.error('evidence.inconclusive could not be emitted', { error: (e as Error).message });
+        }
       }
       return done;
 
@@ -756,6 +810,7 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
       /** (E[2]) What the egress relay of this call's sandboxed commands ledgers their writes for. */
       function egressContext(): EgressCallContext {
         const ctx: EgressCallContext = {
+          ...(exchanges ? { exchanges } : {}),
           runId: request.runId,
           workItemId: request.workItemId,
           agentId: request.agentId,
@@ -903,11 +958,30 @@ function applyRecordedOutcome(stage: Stage, outcome: SideEffectOutcome): void {
  * at its generation now (the generation the tool executed against).
  */
 function addressedEnvironment(input: unknown, environments: ToolRuntimeDeps['environments']): EnvironmentRef | undefined {
-  const id = input !== null && typeof input === 'object' ? (input as { environmentId?: unknown }).environmentId : undefined;
-  if (typeof id !== 'string' || !environments) return undefined;
-  const env = environments.get(id);
+  if (input === null || typeof input !== 'object' || !environments) return undefined;
+  const id = (input as { environmentId?: unknown }).environmentId;
+  let env = typeof id === 'string' ? environments.get(id) : undefined;
+  if (env === undefined && id === undefined) {
+    // (e2e[0]) a URL-addressed black-box call on a registered environment's origin: evidence anchored to that environment
+    for (const key of ['url', 'targetUrl', 'prometheusUrl'] as const) {
+      const raw = (input as Record<string, unknown>)[key];
+      if (typeof raw !== 'string') continue;
+      try {
+        env = environmentForUrl(new URL(raw), environments);
+      } catch {
+        env = undefined;
+      }
+      if (env) break;
+    }
+  }
   if (!env) return undefined;
   const ref: EnvironmentRef = { environmentId: env.environmentId, environmentClass: env.environmentClass, generation: env.generation };
   if (env.buildDigest !== undefined) ref.buildDigest = env.buildDigest;
   return ref;
+}
+
+/** (wave 3, row 250) The workspace a call runs on under its isolation tier. */
+export function isolatedWorkspace(ws: WorkspaceHandle, decision: IsolationDecision): WorkspaceHandle {
+  const sandbox: WorkspaceHandle['sandbox'] = { ...ws.sandbox, ...(decision.sandbox ?? {}), tier: decision.tier };
+  return { ...ws, sandbox, readOnly: ws.readOnly || decision.readOnly === true || decision.tier === 'read_only' };
 }

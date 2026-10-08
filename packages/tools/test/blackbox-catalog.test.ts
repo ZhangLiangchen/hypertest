@@ -11,8 +11,10 @@ const envs = createEnvironmentRegistry([
 test('blackboxTools: the catalog registers cleanly (ids, schemas) with the expected effect/risk classes', () => {
   const specs = blackboxTools({ stateDir: '/tmp/ht-state' });
   const registry = new ToolRegistry(specs);
+  // (wave 3) + gRPC tools and the observation tools (logs, traces, packet capture)
   assert.deepEqual(registry.list().map((s) => s.id).sort(), [
-    'env.deploy', 'env.inject_fault', 'env.restart', 'http.request', 'load.observe', 'load.start', 'load.stop', 'metrics.query', 'metrics.scrape',
+    'db.introspect', 'env.deploy', 'env.inject_fault', 'env.restart', 'grpc.call', 'grpc.describe', 'grpc.query', 'http.request', 'load.observe', 'load.start', 'load.stop', 'logs.query', 'metrics.query', 'metrics.scrape',
+    'net.capture', 'trace.query',
   ]);
   const byId = new Map(specs.map((s) => [s.id, s as ToolSpec]));
   const cls = (id: string, input: unknown) => {
@@ -27,6 +29,12 @@ test('blackboxTools: the catalog registers cleanly (ids, schemas) with the expec
   assert.deepEqual(cls('env.restart', {}), ['destructive', 'high']);
   assert.deepEqual(cls('env.inject_fault', {}), ['destructive', 'high']);
   assert.deepEqual(cls('env.deploy', {}), ['destructive', 'critical']);
+  assert.deepEqual(cls('logs.query', {}), ['read', 'low']);
+  assert.deepEqual(cls('db.introspect', {}), ['read', 'low']);
+  assert.deepEqual(cls('trace.query', {}), ['read', 'low']);
+  assert.deepEqual(cls('net.capture', {}), ['read', 'medium']);
+  assert.deepEqual(cls('grpc.call', {}), ['external', 'medium']);
+  assert.deepEqual(cls('grpc.query', {}), ['read', 'low']);
   assert.deepEqual(
     ['load.start', 'load.stop', 'env.restart', 'env.inject_fault', 'env.deploy'].map((id) => [id, byId.get(id)!.sideEffect?.adapterId, byId.get(id)!.sideEffect?.operationType]),
     [
@@ -38,6 +46,11 @@ test('blackboxTools: the catalog registers cleanly (ids, schemas) with the expec
     ],
   );
   assert.equal(blackboxTools({ stateDir: '/tmp/x', enableBrowser: true }).filter((s) => s.id.startsWith('browser.')).length, 5);
+  // (wave 3, item 8) approval-gated tools describe the real loop: call the tool, approval_required waits for the human
+  for (const id of ['env.restart', 'env.inject_fault', 'env.deploy']) {
+    assert.match(byId.get(id)!.description, /returns approval_required and the work waits for a human decision on exactly this call \(do not file an approval yourself\)/, id);
+    assert.doesNotMatch(byId.get(id)!.description, /request_approval/, id);
+  }
 });
 
 test('resources and environment classes come from the registry; the target resource of env tools is env/<id>', () => {

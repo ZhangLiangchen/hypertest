@@ -51,11 +51,15 @@ export const CONTAINED = [
   { prefix: 'playwright', allowed: ['tools'] },
   { prefix: 'playwright-core', allowed: ['tools'] },
   { prefix: '@modelcontextprotocol/', allowed: ['tools'] },
+  // (wave 3) the gRPC client (grpc.call / grpc.query / grpc.describe) and its protobuf codec live in the tools adapter
+  { prefix: '@grpc/', allowed: ['tools'] },
+  { prefix: 'protobufjs', allowed: ['tools'] },
   { prefix: 'ajv', allowed: ['core'] },
   { prefix: 'yaml', exact: true, allowed: ['app', 'policy', 'cli', 'eval'] },
   // the TypeScript compiler API is the syntax-tree parser of the code-retrieval symbol index (B[6]); the runtime adapters'
   // public-API tests type-check their exported surface with it
-  { prefix: 'typescript', exact: true, allowed: ['context', 'runtime-pi', 'runtime-dsh'] },
+  // (wave 3) … and the TypeScript language service of the white-box lsp.* tools / the in-process tsc of analysis.run
+  { prefix: 'typescript', exact: true, allowed: ['context', 'runtime-pi', 'runtime-dsh', 'tools'] },
 ];
 
 const IMPORT_RE = /(?:^|[\s;])(?:import|export)\s[^'"`]*?from\s*['"]([^'"]+)['"]|(?:^|[\s;(=])import\s*\(\s*['"]([^'"]+)['"]\s*\)|(?:^|[\s;])import\s*['"]([^'"]+)['"]/gm;

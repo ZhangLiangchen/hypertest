@@ -4,6 +4,7 @@
  * EXPLANATORY ONLY — they describe how an outcome was reached and never define success.
  */
 import type { EvalTask, TrialData } from './contracts.ts';
+import type { BlackboardRecord, Finding } from '@hypertest/domain';
 import {
   METRIC_PROBE_PREFIX, acceptedPlans, analyzeCompleteness, analyzeDefects, analyzePolicy, analyzeSensitivity, analyzeSideEffects, analyzeStaleness, analyzeVerdict, distinctRoleRoutes,
   maxParallelWork, routesByRole, timeToFirstEvidenceMs,
@@ -38,6 +39,13 @@ const bit = (b: boolean): number => (b ? 1 : 0);
  * - (additive) `mutationScore` (oracle sensitivity: killed / total seeded mutants over the run's mutation results);
  * - `evidenceCompleteness` (findings + critical claims citing existing evidence), `evidenceVerified` 1/0;
  * - `timeToFirstEvidenceMs` (when evidence exists);
+ * - (additive, F[10]) `independentReproductionRate` (confirmed product findings whose cited EXECUTION evidence comes from
+ *   ≥ 2 distinct agents — reproduced by someone other than the finder — over the confirmed ones; only with ≥ 1 confirmed),
+ *   `confirmedDefects`, `costPerConfirmedDefectUsd` / `tokensPerConfirmedDefect` (the run's model cost / tokens per
+ *   confirmed product finding; only with ≥ 1), `humanInterventions` (approvals the run had to ask a human for +
+ *   operations escalated to manual review + a final decision that requires human review), `recoveryCorrectness` (only
+ *   for a trial whose Hypertest process was killed: 1 when the recovered run reached a final decision with no duplicate
+ *   side effect and no orphan operation, else 0);
  * - probes `metric.<name>` (finite numbers) override/add `<name>`: the environment's ground truth wins.
  */
 export function outcomeMetrics(task: EvalTask, data: TrialData): Record<string, number> {
@@ -66,10 +74,53 @@ export function outcomeMetrics(task: EvalTask, data: TrialData): Record<string, 
   out['evidenceVerified'] = bit(completeness.ledgerOk);
   const ttfe = timeToFirstEvidenceMs(data.events);
   if (ttfe !== undefined) out['timeToFirstEvidenceMs'] = ttfe;
+  Object.assign(out, defectEconomics(data));
+  out['humanInterventions'] = humanInterventions(data);
+  if (data.harness.restarts > 0) {
+    out['recoveryCorrectness'] = bit(data.decision !== undefined && effects.unsettled.length === 0 && (!effects.probed || effects.duplicates === 0));
+  }
   for (const [name, value] of Object.entries(data.probes)) {
     if (name.startsWith(METRIC_PROBE_PREFIX) && typeof value === 'number' && Number.isFinite(value)) out[name.slice(METRIC_PROBE_PREFIX.length)] = value;
   }
   return out;
+}
+
+const EXECUTION_TYPES: ReadonlySet<string> = new Set(['test-result', 'api-response', 'stdout', 'stderr', 'metric', 'mutation-result', 'coverage', 'screenshot', 'trace', 'log']);
+const PRODUCT_CATEGORIES: ReadonlySet<string> = new Set(['product_defect', 'performance', 'security']);
+
+/** (F[10]) Confirmed product findings, their independent reproduction, and the cost per confirmed defect. */
+export function defectEconomics(data: TrialData): Record<string, number> {
+  const out: Record<string, number> = {};
+  const confirmed = data.findings.filter((r: BlackboardRecord<Finding>) => PRODUCT_CATEGORIES.has(r.payload.category) && r.payload.status === 'confirmed');
+  out['confirmedDefects'] = confirmed.length;
+  if (confirmed.length === 0) return out;
+  const evidence = new Map(data.evidence.map((e) => [e.evidenceId, e]));
+  const reproduced = confirmed.filter((r) => {
+    const agents = new Set(r.evidenceRefs.map((id) => evidence.get(id)).filter((e) => e !== undefined && EXECUTION_TYPES.has(e.evidenceType) && e.agentId !== undefined).map((e) => e!.agentId!));
+    return agents.size >= 2;
+  });
+  out['independentReproductionRate'] = reproduced.length / confirmed.length;
+  let costUsd = 0;
+  let tokens = 0;
+  for (const e of data.events) {
+    if (e.eventType !== 'model.invoked') continue;
+    const p = (e.payload ?? {}) as { ok?: unknown; usage?: { costUsd?: unknown; inputTokens?: unknown; outputTokens?: unknown } };
+    if (p.ok !== true) continue;
+    const n = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+    costUsd += n(p.usage?.costUsd);
+    tokens += n(p.usage?.inputTokens) + n(p.usage?.outputTokens);
+  }
+  out['costPerConfirmedDefectUsd'] = costUsd / confirmed.length;
+  out['tokensPerConfirmedDefect'] = tokens / confirmed.length;
+  return out;
+}
+
+/** (F[10]) Times the run needed a human: approval requests, manual-review escalations, a final decision needing review. */
+export function humanInterventions(data: TrialData): number {
+  let n = 0;
+  for (const e of data.events) if (e.eventType === 'approval.requested' || e.eventType === 'operation.manual_review') n++;
+  if (data.decision?.requiresHumanReview) n++;
+  return n;
 }
 
 /**

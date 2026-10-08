@@ -20,6 +20,9 @@ test('KNOWN_TOOL_IDS is exactly the built-in (tools) and domain (control) tool c
     'http.request', 'metrics.query', 'metrics.scrape', 'load.start', 'load.observe', 'load.stop',
     'env.restart', 'env.inject_fault', 'env.deploy',
     'browser.navigate', 'browser.click', 'browser.fill', 'browser.screenshot', 'browser.text',
+    // (wave 3: tool surface)
+    'grpc.call', 'grpc.query', 'grpc.describe', 'computer.screenshot', 'computer.click', 'computer.type', 'computer.key',
+    'logs.query', 'trace.query', 'net.capture', 'db.introspect', 'lsp.definitions', 'lsp.references', 'lsp.diagnostics', 'analysis.run',
   ]);
   assert.deepEqual([...DOMAIN_TOOL_IDS], [
     'blackboard.read', 'blackboard.post_finding', 'blackboard.post_hypothesis', 'blackboard.report_coverage_gap', 'blackboard.post_risk',
@@ -28,7 +31,7 @@ test('KNOWN_TOOL_IDS is exactly the built-in (tools) and domain (control) tool c
     'evidence.get', 'evidence.query', 'evidence.claim', 'delegate', 'delegate.status', 'delegate.collect', 'delegate.message', 'delegate.release',
     'request_approval', 'complete_work', 'fail_work',
   ]);
-  assert.equal(KNOWN_TOOL_IDS.length, 62);
+  assert.equal(KNOWN_TOOL_IDS.length, 77);
   assert.equal(new Set(KNOWN_TOOL_IDS).size, KNOWN_TOOL_IDS.length, 'tool ids are unique');
   assert.deepEqual([...KNOWN_TOOL_IDS], [...BUILTIN_TOOL_IDS, ...DOMAIN_TOOL_IDS]);
 });

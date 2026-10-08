@@ -36,6 +36,22 @@ export const BUILTIN_TOOL_IDS = Object.freeze([
   'browser.fill',
   'browser.screenshot',
   'browser.text',
+  // (wave 3: tool surface) gRPC, computer use, logs / traces / network capture, white-box symbols / static analysis / DB
+  'grpc.call',
+  'grpc.query',
+  'grpc.describe',
+  'computer.screenshot',
+  'computer.click',
+  'computer.type',
+  'computer.key',
+  'logs.query',
+  'trace.query',
+  'net.capture',
+  'db.introspect',
+  'lsp.definitions',
+  'lsp.references',
+  'lsp.diagnostics',
+  'analysis.run',
 ] as const);
 
 export const DOMAIN_TOOL_IDS = Object.freeze([
@@ -87,8 +103,11 @@ export const TERMINAL_TOOLS = Object.freeze(['complete_work', 'fail_work'] as co
  */
 export const WORKSPACE_WRITE_TOOL_IDS = Object.freeze(['fs.write', 'fs.apply_patch', 'git.commit'] as const satisfies readonly BuiltinToolId[]);
 
-/** Namespaces whose tools are discovered at runtime (MCP bridge); patterns inside them are accepted. */
-export const DYNAMIC_TOOL_NAMESPACES = Object.freeze(['mcp.'] as const);
+/**
+ * Namespaces whose tools are configured per deployment (MCP bridge `mcp.<server>.<tool>`, ACP agents `acp.<agent>.prompt`);
+ * patterns inside them are accepted.
+ */
+export const DYNAMIC_TOOL_NAMESPACES = Object.freeze(['mcp.', 'acp.'] as const);
 
 /**
  * Tool pattern semantics — identical to @hypertest/policy `matchesToolPattern` (which this package may

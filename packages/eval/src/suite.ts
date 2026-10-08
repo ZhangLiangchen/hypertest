@@ -10,7 +10,8 @@ import { resolveGrader } from './graders.ts';
 import { baselineEquivalence } from './core-graders.ts';
 import { GRADER_REVISIONS } from './grader-revisions.ts';
 import { trialKey } from './trial-records.ts';
-import { mcnemarExact, pairedBootstrapCI, passHatK, seededShuffle } from './stats.ts';
+import { mcnemarExact, pairedBootstrapCI, passAtK, passHatK, seededShuffle } from './stats.ts';
+import { suiteFingerprint } from './suite-versions.ts';
 
 /** The paired seed of a task/trial (identical for every arm). */
 export function trialSeed(suite: Pick<EvalSuite, 'suiteId' | 'revision'>, taskId: string, trial: number): string {
@@ -44,12 +45,22 @@ function validateSuite(suite: EvalSuite, options: SuiteOptions): void {
   }
 }
 
-/** Runs the suite sequentially (trials use real processes and ports; concurrency would add interference). */
+/**
+ * Runs the suite sequentially (trials use real processes and ports; concurrency would add interference). (F[14]) A
+ * cancelled suite (SuiteOptions.signal) starts no further trial; the trial in flight is cancelled and marked
+ * (`cancelled: true`, infra_error) and runSuite rejects with `cancelled` whose details carry `result`: the PARTIAL
+ * SuiteResult (`cancelled: true`) of everything that ran — kept, never summarized as a complete suite.
+ */
 export async function runSuite(suite: EvalSuite, options: SuiteOptions): Promise<SuiteResult> {
   validateSuite(suite, options);
   const trials: EvalTrial[] = [];
-  const cancelled = () =>
-    new HypertestError('cancelled', `suite ${suite.suiteId} was cancelled after ${trials.length} trial(s)`, { details: { completedTrials: trials.length, trials: trials.map((x) => ({ taskId: x.taskId, armId: x.armId, trial: x.trial, result: x.result })) } });
+  const fingerprint = suiteFingerprint(suite);
+  const cancelled = () => {
+    const partial: SuiteResult = { ...summarizeSuite(suite, options.arms.map((a) => a.armId), trials), cancelled: true, suiteFingerprint: fingerprint, track: options.track ?? 'cold', ...(options.tier ? { tier: options.tier } : {}) };
+    return new HypertestError('cancelled', `suite ${suite.suiteId} was cancelled after ${trials.length} trial(s)`, {
+      details: { completedTrials: trials.filter((x) => !x.cancelled).length, trials: trials.map((x) => ({ taskId: x.taskId, armId: x.armId, trial: x.trial, result: x.result, cancelled: x.cancelled === true })), result: partial as unknown as Record<string, unknown> },
+    });
+  };
   for (const task of suite.tasks) {
     for (let t = 0; t < options.trials; t++) {
       const seed = trialSeed(suite, task.taskId, t);
@@ -66,15 +77,18 @@ export async function runSuite(suite: EvalSuite, options: SuiteOptions): Promise
         if (options.logger) o.logger = options.logger;
         if (options.keepWorkDir !== undefined) o.keepWorkDir = options.keepWorkDir;
         if (options.probeTimeoutMs !== undefined) o.probeTimeoutMs = options.probeTimeoutMs;
+        if (options.track) o.track = options.track;
+        if (options.experience) o.experience = options.experience;
         const trial = await runTrial(task, arm, o);
+        trial.suiteFingerprint = fingerprint;
         if (task.baselineTaskId !== undefined) applyBaseline(trial, trials.find((x) => x.taskId === task.baselineTaskId && x.armId === arm.armId && x.trial === t));
         trials.push(trial);
         options.onTrial?.(trial);
       }
     }
   }
-  if (options.signal?.aborted) throw cancelled(); // the last trial was cancelled: never summarize a partial suite
-  return summarizeSuite(suite, options.arms.map((a) => a.armId), trials);
+  if (options.signal?.aborted) throw cancelled(); // the last trial was cancelled: never summarize a partial suite as complete
+  return { ...summarizeSuite(suite, options.arms.map((a) => a.armId), trials), suiteFingerprint: fingerprint, track: options.track ?? 'cold', ...(options.tier ? { tier: options.tier } : {}) };
 }
 
 /**
@@ -138,7 +152,19 @@ export function summarizeSuite(suite: Pick<EvalSuite, 'suiteId' | 'revision'>, a
       byTask.get(t.taskId)!.push(t.result === 'pass');
     }
     const hat = [...byTask.values()].map((r) => passHatK(r, r.length));
+    // (F[9]) pass@k and pass^k per k (k = 1, 3, 5 and the largest trial count), each the mean over the tasks with ≥ k graded trials
+    const maxK = Math.max(0, ...[...byTask.values()].map((r) => r.length));
+    const ks = [...new Set([1, 3, 5, maxK])].filter((k) => k >= 1 && k <= maxK).sort((a, b) => a - b);
+    const passAt: Record<string, number> = {};
+    const passHat: Record<string, number> = {};
+    for (const k of ks) {
+      const eligible = [...byTask.values()].filter((r) => r.length >= k);
+      passAt[String(k)] = mean(eligible.map((r) => passAtK(r, k)));
+      passHat[String(k)] = mean(eligible.map((r) => passHatK(r, k)));
+    }
     perArm[armId] = { passRate: graded.length === 0 ? 0 : graded.filter((t) => t.result === 'pass').length / graded.length, passHatK: mean(hat), metrics };
+    // (F[9]) only where something was graded: an arm without graded trials has no reliability to report
+    if (ks.length > 0) Object.assign(perArm[armId]!, { passAtK: passAt, passHatKByK: passHat });
   }
   const comparisons: SuiteResult['comparisons'] = [];
   for (let i = 0; i < armIds.length; i++) {
@@ -184,6 +210,8 @@ const HEADLINE = [
   'criticalFalseRelease', 'defectRecall', 'falseFail', 'duplicateSideEffects', 'orphanOperations', 'policyViolations', 'staleContextActions', 'evidenceCompleteness',
   // (additive) appended: the core-suite metrics
   'securityViolations', 'staleMutations', 'mutationScore',
+  // (additive, F[10])
+  'independentReproductionRate', 'costPerConfirmedDefectUsd', 'humanInterventions', 'recoveryCorrectness',
 ];
 
 /** Markdown report of a suite result (deterministic: no timestamps). Trajectory metrics are labelled explanatory. */
@@ -192,15 +220,31 @@ export function renderSuiteReport(result: SuiteResult): string {
   const lines: string[] = [];
   lines.push(`# Eval suite ${result.suiteId} (revision ${result.revision})`, '');
   lines.push(`${result.trials.length} trial(s), ${arms.length} arm(s). Outcome graders decide pass/fail; infra errors are excluded from rates.`, '');
+  const meta = [result.tier ? `tier ${result.tier}` : '', result.track ? `track ${result.track}` : '', result.suiteFingerprint ? `suite fingerprint ${result.suiteFingerprint.slice(0, 16)}` : ''].filter(Boolean);
+  if (meta.length > 0) lines.push(`${meta.join(', ')}.`, '');
+  if (result.cancelled) lines.push('**CANCELLED**: the suite was interrupted; this report covers the trials that ran (a cancelled trial is never counted).', '');
   lines.push('## Arms', '');
   const shown = HEADLINE.filter((k) => arms.some((a) => Object.hasOwn(result.perArm[a]!.metrics, k)));
-  lines.push(`| arm | pass rate | pass^k | graded | infra errors | ${shown.join(' | ')} |`);
-  lines.push(`|---|---|---|---|---|${shown.map(() => '---|').join('')}`);
+  const head = ['arm', 'pass rate', 'pass^k', 'graded', 'infra errors', ...shown];
+  lines.push(`| ${head.join(' | ')} |`);
+  lines.push(`|${head.map(() => '---|').join('')}`);
   for (const a of arms) {
     const r = result.perArm[a]!;
-    lines.push(`| ${cell(a)} | ${fmt(r.passRate)} | ${fmt(r.passHatK)} | ${fmt(r.metrics['graded'])} | ${fmt(r.metrics['infraErrors'])} | ${shown.map((k) => fmt(r.metrics[k])).join(' | ')} |`);
+    lines.push(`| ${[cell(a), fmt(r.passRate), fmt(r.passHatK), fmt(r.metrics['graded']), fmt(r.metrics['infraErrors']), ...shown.map((k) => fmt(r.metrics[k]))].join(' | ')} |`);
   }
   lines.push('');
+  // (F[9]) reliability per k: pass@k (at least one of k trials passes) vs pass^k (all k pass)
+  const ks = [...new Set(arms.flatMap((a) => Object.keys(result.perArm[a]!.passAtK ?? {})))].map(Number).sort((x, y) => x - y);
+  if (ks.length > 0) {
+    lines.push('## Reliability (pass@k / pass^k)', '');
+    lines.push(`| arm | ${ks.map((k) => `pass@${k} | pass^${k}`).join(' | ')} |`);
+    lines.push(`|---|${ks.map(() => '---|---|').join('')}`);
+    for (const a of arms) {
+      const r = result.perArm[a]!;
+      lines.push(`| ${cell(a)} | ${ks.map((k) => `${fmt(r.passAtK?.[String(k)])} | ${fmt(r.passHatKByK?.[String(k)])}`).join(' | ')} |`);
+    }
+    lines.push('');
+  }
   if (result.comparisons.length > 0) {
     lines.push('## Paired comparisons', '');
     lines.push('| arm A | arm B | pairs | b (A only) | c (B only) | McNemar p | passA − passB (95% CI) |');

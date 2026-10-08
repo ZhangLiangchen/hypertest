@@ -5,7 +5,7 @@ import { after, before, describe, test } from 'node:test';
 import { HypertestError, MemoryLogger } from '@hypertest/core';
 import { createEnvironmentRegistry, splitControlTarget, type EnvironmentDescriptor } from '@hypertest/tools';
 import { tempDir } from '@hypertest/testkit';
-import { persistentEnvironmentRegistry, resolveEnvironments } from '../src/index.ts';
+import { persistentEnvironmentRegistry, resolveEnvironments, resolveUrlTarget } from '../src/index.ts';
 
 const env = (generation: number, extra: Partial<EnvironmentDescriptor> = {}): EnvironmentDescriptor => ({
   environmentId: 'shop', environmentClass: 'local', baseUrl: 'http://127.0.0.1:8080', generation, ...extra,
@@ -107,5 +107,27 @@ describe('control tokens from control.tokenEnv', () => {
     const [resolved] = resolveEnvironments([{ ...env(0), control: { kind: 'process', target: 'http://127.0.0.1:9100/__hypertest', tokenEnv: 'SHOP_SUPERVISOR' } }], {}, logger);
     assert.equal(resolved!.control!.target, 'http://127.0.0.1:9100/__hypertest');
     assert.deepEqual(logger.entries.filter((e) => e.level === 'warn').map((e) => e.fields), [{ environmentId: 'shop', tokenEnv: 'SHOP_SUPERVISOR' }]);
+  });
+});
+
+describe('(e2e[0]) URL run targets: resolveUrlTarget', () => {
+  const registry = createEnvironmentRegistry([
+    env(0),
+    { environmentId: 'url-127.0.0.1-7450', environmentClass: 'local', baseUrl: 'http://127.0.0.1:7450', generation: 0 },
+  ]);
+
+  test('a URL served by an environment (operator or allowlisted URL target) becomes the run\'s environmentId', () => {
+    assert.deepEqual(resolveUrlTarget({ sutUrl: 'http://127.0.0.1:7450/shop' }, registry), { sutUrl: 'http://127.0.0.1:7450/shop', environmentId: 'url-127.0.0.1-7450' });
+    assert.deepEqual(resolveUrlTarget({ sutUrl: 'http://127.0.0.1:8080' }, registry), { sutUrl: 'http://127.0.0.1:8080', environmentId: 'shop' });
+    // a target without a URL is untouched; a target naming the serving environment is kept
+    assert.deepEqual(resolveUrlTarget({ repoPath: '/r' } as { repoPath: string; sutUrl?: string }, registry), { repoPath: '/r' });
+    assert.deepEqual(resolveUrlTarget({ sutUrl: 'http://127.0.0.1:8080', environmentId: 'shop' }, registry), { sutUrl: 'http://127.0.0.1:8080', environmentId: 'shop' });
+  });
+
+  test('failure paths: a URL nothing serves is refused (precondition_failed, names the allowlist); a conflicting environmentId and a non-http URL are invalid', () => {
+    assert.throws(() => resolveUrlTarget({ sutUrl: 'http://127.0.0.1:9999' }, registry), (e: unknown) => e instanceof HypertestError && e.code === 'precondition_failed' && /tools\.httpAllowlist/.test(e.message));
+    assert.throws(() => resolveUrlTarget({ sutUrl: 'http://127.0.0.1:7450', environmentId: 'shop' }, registry), (e: unknown) => e instanceof HypertestError && e.code === 'invalid_argument' && /not served by environment shop/.test(e.message));
+    assert.throws(() => resolveUrlTarget({ sutUrl: 'ftp://127.0.0.1/x' }, registry), (e: unknown) => e instanceof HypertestError && e.code === 'invalid_argument');
+    assert.throws(() => resolveUrlTarget({ sutUrl: 'not a url' }, registry), (e: unknown) => e instanceof HypertestError && e.code === 'invalid_argument');
   });
 });

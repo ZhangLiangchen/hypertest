@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { closeSync, fstatSync, openSync, readFileSync, readSync } from 'node:fs';
 import { readFile, rename, writeFile } from 'node:fs/promises';
 import { isIP } from 'node:net';
 import { HypertestError, type JsonSchema } from '@hypertest/core';
@@ -228,16 +228,76 @@ export function environmentOrigins(env: EnvironmentDescriptor): string[] {
 }
 
 /**
+ * (additive, e2e[0]) The registered environment that owns a raw URL's origin (its baseUrl, metricsUrl or prometheusUrl),
+ * else undefined. A URL-addressed black-box call on such an origin IS a call on that environment: the same resource key
+ * (`env/<id>`), environment class, trusted origins and evidence provenance as the environmentId form — the operator's
+ * registration (or its allowlisted URL target, see `urlTargetEnvironments`) is what the capability grants.
+ */
+export function environmentForUrl(url: URL, envs: EnvironmentRegistry | undefined): EnvironmentDescriptor | undefined {
+  if (!envs) return undefined;
+  const owners = envs.list().filter((env) => environmentOrigins(env).includes(url.origin));
+  // fail closed on ambiguity: two environments serving one origin (possibly of different classes) never let a URL pick
+  // one — the call must name its environment (environmentId)
+  return owners.length === 1 ? owners[0] : undefined;
+}
+
+/**
  * Environment class of a raw URL: the class of the registered environment that owns its origin, else
  * `local` for loopback hosts, else undefined (the policy then decides; default rules deny effects).
  */
 export function environmentClassForUrl(url: URL, envs: EnvironmentRegistry | undefined): string | undefined {
   if (envs) {
-    for (const env of envs.list()) {
-      if (environmentOrigins(env).includes(url.origin)) return env.environmentClass;
-    }
+    const owners = envs.list().filter((env) => environmentOrigins(env).includes(url.origin));
+    if (owners.length === 1) return owners[0]!.environmentClass;
+    // ambiguous: classes differ ⇒ unclassified (the policy's default rules deny effects); one shared class is that class
+    if (owners.length > 1) return owners.every((o) => o.environmentClass === owners[0]!.environmentClass) ? owners[0]!.environmentClass : undefined;
   }
   return isLoopbackHost(url.hostname) ? 'local' : undefined;
+}
+
+/** (additive, e2e[0]) The capability resource key of a URL: `env/<id>` of the environment owning its origin, else `url/<host>`. */
+export function urlResource(url: URL, envs: EnvironmentRegistry | undefined): string {
+  const env = environmentForUrl(url, envs);
+  return env ? `env/${env.environmentId}` : `url/${hostSegment(url)}`;
+}
+
+/**
+ * (additive, e2e[0]) The environment id of an allowlisted URL target (`tools.httpAllowlist` URL entries, `hypertest run
+ * --url`): `url-<host>-<port>` (characters outside the environment-id alphabet replaced by `_`; the scheme's default port
+ * when the URL names none).
+ */
+export function urlEnvironmentId(url: URL): string {
+  const port = url.port !== '' ? url.port : url.protocol === 'https:' ? '443' : '80';
+  return `url-${bareHostname(url).replace(/[^A-Za-z0-9_.-]/g, '_')}-${port}`;
+}
+
+/**
+ * (additive, e2e[0]) The black-box environments the operator's allowlisted URL targets stand for: one per URL entry of
+ * `httpAllowlist` (absolute http(s) URL) whose origin no environment of `registered` already serves. Its class is
+ * `local` for a loopback host, else `remoteClass` (the operator's `tools.urlEnvironmentClass`, default `sandbox`). No
+ * control target: env.* tools refuse it (nothing to restart or fault). Host patterns (`*.example.com`, `host:port`) are
+ * not environments and stay `url/<host>` resources no built-in grant covers.
+ */
+export function urlTargetEnvironments(httpAllowlist: readonly string[] | undefined, registered: readonly EnvironmentDescriptor[], options: { remoteClass?: string } = {}): EnvironmentDescriptor[] {
+  const out: EnvironmentDescriptor[] = [];
+  const served = new Set(registered.flatMap((e) => environmentOrigins(e)));
+  const ids = new Set(registered.map((e) => e.environmentId));
+  for (const entry of httpAllowlist ?? []) {
+    if (!/^https?:\/\//i.test(entry)) continue;
+    let url: URL;
+    try {
+      url = parseHttpUrl(entry, 'tools.httpAllowlist entry');
+    } catch {
+      continue;
+    }
+    if (served.has(url.origin)) continue;
+    const environmentId = urlEnvironmentId(url);
+    if (ids.has(environmentId)) continue;
+    served.add(url.origin);
+    ids.add(environmentId);
+    out.push({ environmentId, environmentClass: isLoopbackHost(url.hostname) ? 'local' : (options.remoteClass ?? 'sandbox'), baseUrl: entry, generation: 0 });
+  }
+  return out;
 }
 
 /** Header map with credential-bearing values replaced (keys lower-cased). */
@@ -417,4 +477,29 @@ export function runCommand(file: string, args: readonly string[], options: { tim
       resolve({ exitCode: typeof e.code === 'number' ? e.code : null, stdout: out, stderr: err || e.message, timedOut });
     });
   });
+}
+
+/**
+ * (additive, wave 3) The last `lines` lines of a text file (read from its end, at most `maxBytes`): `truncated` when the
+ * window did not reach the start of the file. Throws `not_found` for a missing file.
+ */
+export function tailFile(path: string, lines: number, maxBytes = 4 * 1024 * 1024): { lines: string[]; truncated: boolean; size: number } {
+  let fd: number;
+  try {
+    fd = openSync(path, 'r');
+  } catch (e) {
+    throw new HypertestError((e as NodeJS.ErrnoException).code === 'ENOENT' ? 'not_found' : 'unavailable', `cannot read ${path}: ${(e as Error).message}`);
+  }
+  try {
+    const size = fstatSync(fd).size;
+    const start = Math.max(0, size - maxBytes);
+    const buf = Buffer.alloc(size - start);
+    readSync(fd, buf, 0, buf.byteLength, start);
+    let all = buf.toString('utf8').split('\n');
+    if (start > 0) all = all.slice(1);
+    if (all.length > 0 && all[all.length - 1] === '') all.pop();
+    return { lines: all.slice(-lines), truncated: start > 0 || all.length > lines, size };
+  } finally {
+    closeSync(fd);
+  }
 }

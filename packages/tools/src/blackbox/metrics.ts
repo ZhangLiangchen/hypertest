@@ -81,7 +81,7 @@ export function metricsQueryTool(options: { httpAllowlist?: string[] }): ToolSpe
     },
     effect: 'read',
     riskClass: 'low',
-    resources: (input) => targetResources(input.environmentId !== undefined ? { environmentId: input.environmentId } : { url: input.prometheusUrl! }),
+    resources: (input, ctx) => targetResources(input.environmentId !== undefined ? { environmentId: input.environmentId } : { url: input.prometheusUrl! }, ctx.environments),
     environmentClass: (input, ctx) => targetEnvironmentClass(input.environmentId !== undefined ? { environmentId: input.environmentId } : { url: input.prometheusUrl! }, ctx.environments),
     timeoutMs: 120_000,
     async execute(input, ctx) {
@@ -173,7 +173,7 @@ export function metricsScrapeTool(options: { httpAllowlist?: string[] }): ToolSp
     },
     effect: 'read',
     riskClass: 'low',
-    resources: (input) => targetResources(input),
+    resources: (input, ctx) => targetResources(input, ctx.environments),
     environmentClass: (input, ctx) => targetEnvironmentClass(input, ctx.environments),
     timeoutMs: 120_000,
     async execute(input, ctx) {

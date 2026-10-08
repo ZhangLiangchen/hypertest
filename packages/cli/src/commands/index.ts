@@ -9,6 +9,7 @@ import { eventsCommand, evidenceCommand, reportCommand, statusCommand } from './
 import { cancelCommand, resumeCommand, runCommand } from './run.ts';
 import { runtimeCommand } from './runtime.ts';
 import { serveCommand, workerCommand } from './serve.ts';
+import { toolWorkerCommand } from './tool-worker.ts';
 import { memoryCommand } from './memory.ts';
 import { skillCommand } from './skill.ts';
 
@@ -37,4 +38,5 @@ export const ALL_COMMANDS: readonly Command[] = Object.freeze([
   evalCommand,
   serveCommand,
   workerCommand,
+  toolWorkerCommand,
 ]);

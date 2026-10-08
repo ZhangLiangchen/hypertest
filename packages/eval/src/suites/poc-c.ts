@@ -12,6 +12,11 @@
  *   brains' scripted provider outage (fallback route + new epoch). Expected verdict: pass (service healthy, evidence
  *   sufficient) — the resumed process re-attaches the SAME load job (exactly one job directory and worker).
  * - `pocCInsufficientTask()`: the metrics analyst never records the job's latency evidence ⇒ inconclusive, never pass.
+ * - `pocCAnomalyTask()` (F[4], coverage[9], coverage[10]): the complete PoC C flow — kv-service carries a seeded hot-key
+ *   latency anomaly; the metrics analyst finds it in the load job's metrics and posts a performance finding, which
+ *   creates the RCA and TestDesigner work through the reactors (not the lead); RCA, the metrics analysis and the executor
+ *   run at the same time; RCA posts an evidence-backed hypothesis, the TestDesigner a targeted regression test that fails
+ *   on the anomaly. Crash after the load job is acknowledged. Expected verdict: fail (C1 violated).
  * - `recoveryChaosTask()`: repeated kills at different points (a restart in flight — dispatched, no receipt yet — and
  *   a running load job — acknowledged, no evidence yet) ⇒ zero duplicate side effects, zero orphan operations.
  */
@@ -44,13 +49,20 @@ export const KV_ORACLE: EvalOracle = {
 export const POC_C_TASK_ID = 'poc-c-durable-load';
 export const POC_C_INSUFFICIENT_TASK_ID = 'poc-c-insufficient';
 export const RECOVERY_CHAOS_TASK_ID = 'recovery-chaos';
+export const POC_C_ANOMALY_TASK_ID = 'poc-c-anomaly';
+/** The seeded latency anomaly: every 10th GET of the hot key k1 takes 400 ms more (≈10 % of the load's requests ⇒ p99 ≥ 400 ms). */
+export const KV_HOT_KEY_ANOMALY = Object.freeze({ every: 10, ms: 400, key: 'k1' });
 
 /**
  * The kv-service fixture. Ground truth (probes): restarts the supervisor performed per operation id, load jobs per
  * operation id (the job directory IS the external effect), worker processes, the service generation.
  */
-export async function kvFixture(ctx: TrialContext, options: { warmupMs?: number } = {}): Promise<TrialFixture> {
-  const sup = await startKvService({ stateDir: join(ctx.workDir, 'kv'), ...(options.warmupMs !== undefined ? { warmupMs: options.warmupMs } : {}) });
+export async function kvFixture(ctx: TrialContext, options: { warmupMs?: number; slowKey?: { every: number; ms: number; key?: string } } = {}): Promise<TrialFixture> {
+  const sup = await startKvService({
+    stateDir: join(ctx.workDir, 'kv'),
+    ...(options.warmupMs !== undefined ? { warmupMs: options.warmupMs } : {}),
+    ...(options.slowKey !== undefined ? { slowKey: options.slowKey } : {}),
+  });
   const stateDir = join(trialDataDir(ctx), 'state');
   const observations = observationsFile(ctx);
   return {
@@ -72,6 +84,8 @@ export async function kvFixture(ctx: TrialContext, options: { warmupMs?: number 
         return out;
       },
       loadJobs: async (): Promise<JsonValue> => asJson(loadJobs(stateDir)),
+      // (additive, F[6]/F[7]) the faults the supervisor applied (ground truth of fault windows)
+      faults: async (): Promise<JsonValue> => asJson(sup.operations().filter((op) => op.kind === 'fault').map((op) => ({ operationId: op.operationId, fault: op.fault ?? null, requestedAt: op.requestedAt, expiresAt: op.expiresAt ?? null, state: op.state }))),
       'metric.serviceGeneration': () => sup.generation(),
       'metric.loadJobs': async () => loadJobs(stateDir).length,
     },
@@ -129,6 +143,27 @@ export function recoveryChaosTask(overrides: Partial<EvalTask> = {}): EvalTask {
       ],
     },
     graders: ['verdict', 'noDuplicateSideEffects', 'noOrphanOperations', 'loadJobReattached', 'recoveryAudit', 'evidenceIntegrity', 'policyViolation', 'auditReconstruction'],
+    ...overrides,
+  });
+}
+
+/**
+ * (F[4], coverage[9], coverage[10]) PoC C complete: metrics → anomaly → RCA hypothesis (reactor) ∥ metrics analysis ∥
+ * executor → targeted regression, across a Hypertest crash after the load job was acknowledged.
+ */
+export function pocCAnomalyTask(overrides: Partial<EvalTask> = {}): EvalTask {
+  return pocCTask({
+    taskId: POC_C_ANOMALY_TASK_ID,
+    title: 'Durable load with a latency anomaly: metrics → RCA ∥ metrics ∥ executor → targeted regression',
+    goal: 'Verify that kv-service meets its latency and error-rate objectives under 30 rps; analyse any anomaly to a root-cause hypothesis and cover it with a regression test.',
+    hiddenFaults: [{ faultId: 'kv-hot-key-latency', description: 'every 10th GET of the hot key k1 takes 400 ms more (p99 breaks kv-slo C1)', severity: 'P1', detectionHints: ['p99|latency', 'k1|/kv'] }],
+    expectedVerdict: 'fail',
+    setup: (ctx) => kvFixture(ctx, { slowKey: KV_HOT_KEY_ANOMALY }),
+    chaos: { kills: [{ after: 'acknowledged', operationType: 'load.start' }] },
+    graders: [
+      'verdict', 'defectDetected', 'anomalyReaction', 'rcaMetricsExecutorParallel', 'causalChain', 'loadJobReattached', 'noDuplicateSideEffects', 'noOrphanOperations', 'recoveryAudit',
+      'reportTracesToEvidence', 'evidenceCompleteness', 'evidenceIntegrity', 'policyViolation', 'auditReconstruction',
+    ],
     ...overrides,
   });
 }

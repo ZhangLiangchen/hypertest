@@ -745,3 +745,11 @@ write/fault/load call needs an active experiment; validation evidence must be bo
   restored (`git checkout -- <file>`): the evidence must be about the candidate as committed.
 - Only rca (among the roles holding `blackboard.post_finding`) may resolve findings; nobody in the built-in catalog
   can mark `verified_fixed` except rca (with evidence).
+
+## Tool surface (audit wave 3, additive)
+
+- `toolGrantScopes(tools, profileName)` (`capability-grant.ts`): the resource scopes of tools whose `ToolSpec.grant` names
+  the permission profile (e.g. an unbound MCP server's `mcp/<server>/**`, computer use's `desktop/<id>`); the worker adds
+  them to an agent's root capability. Tests: `test/tool-grants.test.ts`.
+- `request_approval`'s description now says it is for decisions that are not tool calls; an action that needs approval
+  is filed by the policy gate itself (`approval_required`).

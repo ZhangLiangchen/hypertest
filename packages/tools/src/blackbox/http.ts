@@ -1,10 +1,10 @@
 import { performance } from 'node:perf_hooks';
 import { HypertestError, abortReason, isHypertestError, sha256Hex, type JsonSchema, type JsonValue } from '@hypertest/core';
 import type { EvidenceRecord } from '@hypertest/domain';
-import type { EnvironmentRegistry, ToolContext, ToolOutcome, ToolSpec } from '../contracts.ts';
+import type { EnvironmentDescriptor, EnvironmentRegistry, ToolContext, ToolOutcome, ToolSpec } from '../contracts.ts';
 import {
-  ENV_ID_SCHEMA, checkEgress, environmentClassForUrl, environmentOrigins, errorMessage, hostSegment, isTextualContentType, joinUrl, parseHttpUrl, readBodyLimited, redactHeaders,
-  redactJsonSecrets, redactUrl, requireEnvironment, storableText,
+  ENV_ID_SCHEMA, checkEgress, environmentClassForUrl, environmentForUrl, environmentOrigins, errorMessage, isTextualContentType, joinUrl, parseHttpUrl, readBodyLimited, redactHeaders,
+  redactJsonSecrets, redactUrl, requireEnvironment, storableText, urlResource,
 } from './common.ts';
 import { credentialScope } from './secrets.ts';
 
@@ -120,13 +120,20 @@ export function resolveTarget(input: { url?: string; environmentId?: string; pat
   if (input.url === undefined) throw new HypertestError('invalid_argument', 'either url or environmentId is required');
   if (input.path !== undefined) throw new HypertestError('invalid_argument', 'path is only valid together with environmentId');
   const url = parseHttpUrl(input.url);
+  // (e2e[0]) a URL on a registered environment's origin is a call on that environment: its origins are trusted (as for
+  // environmentId + path; control endpoints stay refused by checkEgress)
+  const owner = environmentForUrl(url, envs);
+  if (owner) return { url, trustedOrigins: environmentOrigins(owner), environmentClass: owner.environmentClass };
   return { url, trustedOrigins: [], environmentClass: environmentClassForUrl(url, envs) };
 }
 
-/** Resource keys of a URL/environment addressed tool: `env/<id>` or `url/<host>`. */
-export function targetResources(input: { url?: string; environmentId?: string }): string[] {
+/**
+ * Resource keys of a URL/environment addressed tool: `env/<id>`, or for a URL the `env/<id>` of the registered
+ * environment owning its origin (e2e[0]: the allowlisted `--url` target is such an environment), else `url/<host>`.
+ */
+export function targetResources(input: { url?: string; environmentId?: string }, envs?: EnvironmentRegistry): string[] {
   if (input.environmentId !== undefined) return [`env/${input.environmentId}`];
-  if (input.url !== undefined) return [`url/${hostSegment(parseHttpUrl(input.url))}`];
+  if (input.url !== undefined) return [urlResource(parseHttpUrl(input.url), envs)];
   throw new HypertestError('invalid_argument', 'either url or environmentId is required');
 }
 
@@ -134,6 +141,20 @@ export function targetEnvironmentClass(input: { url?: string; environmentId?: st
   if (input.environmentId !== undefined) return requireEnvironment(envs, input.environmentId).environmentClass;
   if (input.url !== undefined) return environmentClassForUrl(parseHttpUrl(input.url), envs);
   return undefined;
+}
+
+/**
+ * (additive, e2e[0]) The registered environment a URL/environment addressed input targets: `environmentId`, else the
+ * environment owning the URL's origin; undefined for an unregistered URL (or an unparseable one).
+ */
+export function addressedEnvironmentOf(input: { url?: string; environmentId?: string }, envs: EnvironmentRegistry | undefined): EnvironmentDescriptor | undefined {
+  if (input.environmentId !== undefined) return envs?.get(input.environmentId);
+  if (input.url === undefined) return undefined;
+  try {
+    return environmentForUrl(parseHttpUrl(input.url), envs);
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -164,10 +185,10 @@ export function httpRequestTool(options: { httpAllowlist?: string[] }): ToolSpec
     outputSchema: HTTP_REQUEST_OUTPUT_SCHEMA,
     effect: (input) => (HTTP_READ_METHODS.includes(input.method) ? 'read' : 'external'),
     riskClass: (input) => (HTTP_READ_METHODS.includes(input.method) ? 'low' : 'medium'),
-    resources: (input) => targetResources(input),
+    resources: (input, ctx) => targetResources(input, ctx.environments),
     environmentClass: (input, ctx) => targetEnvironmentClass(input, ctx.environments),
     // a resend carries the same Idempotency-Key (the invocation id, or the caller's own header — same input)
-    resendable: (input, ctx) => NON_IDEMPOTENT_METHODS.includes(input.method.toUpperCase()) && input.environmentId !== undefined && ctx.environments.get(input.environmentId)?.honoursIdempotencyKey === true,
+    resendable: (input, ctx) => NON_IDEMPOTENT_METHODS.includes(input.method.toUpperCase()) && addressedEnvironmentOf(input, ctx.environments)?.honoursIdempotencyKey === true,
     // E[4]: a brokered credential is a capability scope (`credential:<environmentId>/<name>`), checked before anything runs
     credentialScopes: (input) => {
       if (input.credential === undefined) return [];
@@ -341,8 +362,9 @@ async function executeHttpRequest(input: HttpRequestInput, ctx: ToolContext, all
  * the environment's baseUrl path prefix (`/api/` + `/ok` ⇒ `/ok`), else the URL's pathname; never the query.
  */
 function requestPath(input: HttpRequestInput, url: URL, envs: ToolContext['environments']): string {
-  if (input.environmentId === undefined) return url.pathname;
-  const base = envs.get(input.environmentId)?.baseUrl;
+  const owner = addressedEnvironmentOf(input, envs);
+  if (owner === undefined) return url.pathname;
+  const base = owner.baseUrl;
   const prefix = base ? new URL(base).pathname.replace(/\/+$/, '') : '';
   return prefix !== '' && url.pathname.startsWith(`${prefix}/`) ? url.pathname.slice(prefix.length) : url.pathname;
 }

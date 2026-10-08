@@ -76,6 +76,11 @@ export const EVENT_TYPES = {
    * the manifest it is still pinned to: payload `{ runId, manifestId, by, reason }`.
    */
   runMigrationReleased: 'run.migration_released',
+  /**
+   * (additive, F[1]) The target runtime of a migration started driving the migrated run (its durable loop's first
+   * recover after the re-pin): payload `{ runId, epochId, seq, manifestId }`. Once per epoch.
+   */
+  runMigrationDriven: 'run.migration_driven',
   runConverging: 'run.converging',
   runGating: 'run.gating',
   runUpdated: 'run.updated',
@@ -178,6 +183,13 @@ export const EVENT_TYPES = {
 
   evidenceAttached: 'evidence.attached',
   evidenceSealed: 'evidence.sealed',
+  /**
+   * (additive, wave 3) Evidence a tool call recorded after a state-changing request of its sandboxed commands was refused
+   * by egress governance was marked inconclusive (`{ toolId, invocationId, reason: 'egress_refused', refusedWrites, refused,
+   * evidence: [{ evidenceId, originalEvidenceType }] }`): it neither satisfies nor violates an assertion; neither
+   * test.passed nor test.failed is emitted for such a call.
+   */
+  evidenceInconclusive: 'evidence.inconclusive',
 
   operationPrepared: 'operation.prepared',
   operationDispatched: 'operation.dispatched',

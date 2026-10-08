@@ -291,7 +291,8 @@ export function workTools(deps: ControlDeps): ToolSpec[] {
     domainTool<{ kind: ApprovalRequest['kind']; subject: JsonValue; rationale: string }>({
       id: 'request_approval',
       title: 'Request an approval',
-      description: 'Request an independent (human or governance) approval for a step you must not take on your own: a destructive environment action, a product fix, an oracle or test change, a budget increase, a manual review. Returns the approvalId.',
+      description:
+        'Request an independent (human or governance) decision that is not a tool call: an oracle or test change, a budget increase, a manual review. Returns the approvalId. Never use it for an action (a destructive environment operation, a product change, any tool call): call the tool itself — when the policy requires approval the call returns approval_required, Hypertest files the digest-bound approval for exactly that call and the work waits for the human decision; an approval you file for an action authorizes nothing.',
       inputSchema: {
         type: 'object',
         additionalProperties: false,

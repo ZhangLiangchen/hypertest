@@ -91,6 +91,16 @@ export function meteredSandbox(inner: SandboxRunner): SandboxRunner {
   };
   if (inner.kind !== undefined) (wrapped as { kind?: SandboxRunner['kind'] }).kind = inner.kind;
   if (inner.available) wrapped.available = () => inner.available!();
+  if (inner.session) {
+    // (wave 3) an interactive process is charged its wall time when it ends
+    wrapped.session = async (ws, command, options) => {
+      const meter = current.getStore();
+      const started = performance.now();
+      const s = await inner.session!(ws, command, options);
+      void s.exited.then(() => meter?.addCompute(performance.now() - started));
+      return s;
+    };
+  }
   return wrapped;
 }
 

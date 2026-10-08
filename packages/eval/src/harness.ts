@@ -21,6 +21,7 @@ import { createHypertest, defaultConfig, mergeConfig, type HypertestConfig, type
 import type { StartRunInput } from '@hypertest/control';
 import type { ScriptedBrain } from '@hypertest/model';
 import type {
+  ArmOverrides,
   ChaosPlan, ChildExit, EvalArm, EvalOracle, EvalTask, EvalTrial, Grader, GraderResult, RunOutcome, TrialChildJob, TrialContext, TrialData, TrialFixture, TrialOptions,
   TrialProgressEvent,
 } from './contracts.ts';
@@ -33,6 +34,9 @@ import { outcomeMetrics, trajectoryMetrics } from './metrics.ts';
 import { withModelTimeoutInjection, type ModelCallCounter } from './brains.ts';
 import { TRIAL_EXIT_CODES, describeKillPoint, dispatchCount, exitCodeForVerdict, killPointCount, killPointProblems, runChildTrial, verdictForExitCode } from './child.ts';
 import { establishOracles } from './oracles.ts';
+import { seedExperience, taskConstraintProblems, trackProblems, withTaskConstraints } from './task-constraints.ts';
+import { environmentDigestOf } from './suite-versions.ts';
+import { runExternalTrial } from './external.ts';
 
 /** Directory (inside the trial work directory) that holds the trial's Hypertest data (store, artifacts, keys, state). */
 export const TRIAL_DATA_DIR = 'hypertest';
@@ -123,6 +127,8 @@ function validateOptions(options: TrialOptions): void {
     throw new HypertestError('invalid_argument', `TrialOptions.probeTimeoutMs must be > 0, got ${String(options.probeTimeoutMs)}`);
   }
   if (options.mode !== undefined && options.mode !== 'in-process' && options.mode !== 'child-process') throw new HypertestError('invalid_argument', `TrialOptions.mode must be in-process or child-process, got ${String(options.mode)}`);
+  if (options.track !== undefined && options.track !== 'cold' && options.track !== 'learning') throw new HypertestError('invalid_argument', `TrialOptions.track must be cold or learning, got ${String(options.track)}`);
+  if (options.experience !== undefined && options.track !== 'learning') throw new HypertestError('invalid_argument', 'TrialOptions.experience is seeded only on the learning track (track: learning)');
 }
 
 /** A task's chaos plan is validated before any environment exists (a malformed plan is never half-applied). */
@@ -209,6 +215,32 @@ function validateFixture(fixture: unknown): asserts fixture is TrialFixture {
   if (!f || typeof f !== 'object') throw precondition('task.setup() returned no fixture');
   if (!f.target || typeof f.target !== 'object') throw precondition('the fixture has no target');
   if (typeof f.cleanup !== 'function') throw precondition('the fixture has no cleanup()');
+  if (f.operator !== undefined && (typeof f.operator !== 'object' || typeof f.operator.act !== 'function')) throw precondition('fixture.operator must be {act(ctx), intervalMs?}');
+  if (f.afterRun !== undefined && typeof f.afterRun !== 'function') throw precondition('fixture.afterRun must be a function');
+}
+
+/**
+ * (F[6]) Runs a fixture's scripted human operator against the CURRENT instance (it changes across in-process kills)
+ * until stopped. An operator error is logged; the operator keeps looking (a human retries).
+ */
+function startOperator(operator: NonNullable<TrialFixture['operator']>, current: () => HypertestInstance, runId: string, logger: Logger): { stop(): Promise<void> } {
+  let stopped = false;
+  const loop = (async () => {
+    while (!stopped) {
+      try {
+        await operator.act({ ht: current(), runId });
+      } catch (e) {
+        if (!stopped) logger.warn('the trial operator could not act', { error: (e as Error).message });
+      }
+      if (!stopped) await sleep(operator.intervalMs ?? 200);
+    }
+  })();
+  return {
+    async stop() {
+      stopped = true;
+      await loop;
+    },
+  };
 }
 
 /** A fresh PostgreSQL schema per trial (dropped at the end): the arm's `store.schema` is used as a prefix. */
@@ -322,6 +354,10 @@ interface ExecutionInput {
   logger: Logger;
   scope: Scope;
   signal?: AbortSignal;
+  /** (coverage[16]) learning track: approved experience seeded before the run. */
+  experience?: TrialOptions['experience'];
+  /** (item 6) The arm's composition overrides of this trial (created once). */
+  armOverrides?: ArmOverrides;
 }
 
 /** Rejects with `cancelled` when `signal` aborts (never, without a signal). */
@@ -369,8 +405,13 @@ async function executeInProcess(x: ExecutionInput): Promise<Execution> {
   const brains = withModelTimeoutInjection(arm.brains ? arm.brains(task, fixture) : {}, chaos.injectModelTimeoutOnCall, counter);
   if (chaos.duplicateEventDelivery && config.bus.kind !== 'inprocess') throw precondition('chaos.duplicateEventDelivery needs the in-process bus');
   let instances = 0;
+  const armOverrides = x.armOverrides;
   const compose = async (): Promise<HypertestInstance> => {
-    const overrides: HypertestOverrides = { scriptedBrains: brains, logger: logger.child({ instance: ++instances }) };
+    // (F[8]) an eval trial instance: the arm's harness features (causal arms) are honoured
+    const overrides: HypertestOverrides = { scriptedBrains: brains, logger: logger.child({ instance: ++instances }), evalTrial: true };
+    // (item 6) the arm's transport (e.g. the scripted wire fetch of the three-provider-class arm) and key environment
+    if (armOverrides?.fetch) overrides.fetch = armOverrides.fetch;
+    if (armOverrides?.env) overrides.env = armOverrides.env;
     if (fixture.environments) overrides.environments = fixture.environments;
     if (chaos.duplicateEventDelivery) {
       const bus = new InProcessEventBus({ duplicateDelivery: 1, logger });
@@ -383,8 +424,12 @@ async function executeInProcess(x: ExecutionInput): Promise<Execution> {
   };
   const deadline = Date.now() + x.timeoutMs;
   let ht = await compose();
-  await establishOracles(ht, task.oracles, input.runId);
+  if (input.oracleIds && input.oracleIds.length > 0) await establishOracles(ht, task.oracles, input.runId);
+  if (x.experience && x.experience.length > 0) await seedExperience(ht, x.experience, input.runId);
   await ht.start(input);
+  // (F[6]) a scripted human operator acts on the live instance while the run is in progress
+  const operator = fixture.operator ? startOperator(fixture.operator, () => ht, input.runId, logger) : undefined;
+  if (operator) scope.add('operator', () => operator.stop());
   let restarts = 0;
   // when a kill point is never reached (the run finished or the deadline passed first), the trial is still graded:
   // runTrial decides from the graders, the timeout and the unexercised chaos (unexercisedChaos / decideTrialResult)
@@ -401,6 +446,7 @@ async function executeInProcess(x: ExecutionInput): Promise<Execution> {
     await ht.resumeIncomplete();
   }
   const r = await awaitRun(ht, input.runId, deadline, logger, x.signal);
+  await operator?.stop();
   const out: Execution = { ht, harness: { restarts, injectedModelTimeouts: counter.injected, duplicateDelivery: chaos.duplicateEventDelivery === true, timedOut: r.timedOut } };
   if (r.outcome) out.outcome = r.outcome;
   if (r.error) out.error = r.error;
@@ -427,9 +473,18 @@ async function executeInChild(x: ExecutionInput): Promise<Execution> {
   };
   if (spec.taskModule) job.taskModule = spec.taskModule;
   if (spec.taskExport) job.taskExport = spec.taskExport;
-  if (task.oracles && task.oracles.length > 0) job.oracles = task.oracles;
+  if (task.oracles && task.oracles.length > 0 && input.oracleIds && input.oracleIds.length > 0) job.oracles = task.oracles;
   if (spec.args) job.brainsArgs = spec.args(task, fixture);
   if (fixture.environments) job.environments = fixture.environments;
+  if (x.experience && x.experience.length > 0) {
+    // the learning track's experience is seeded into the trial's store before the first child starts (the child opens it)
+    const seeding = await createHypertest(config, { scriptedBrains: gradingBrains(config), logger: logger.child({ instance: 'seeding' }), evalTrial: true, ...(fixture.environments ? { environments: fixture.environments } : {}) });
+    try {
+      await seedExperience(seeding, x.experience, input.runId);
+    } finally {
+      await seeding.close();
+    }
+  }
   if (chaos.injectModelTimeoutOnCall !== undefined || chaos.duplicateEventDelivery) {
     job.chaos = {};
     if (chaos.injectModelTimeoutOnCall !== undefined) job.chaos.injectModelTimeoutOnCall = chaos.injectModelTimeoutOnCall;
@@ -443,7 +498,7 @@ async function executeInChild(x: ExecutionInput): Promise<Execution> {
     ...(chaos.kills && chaos.kills.length > 0 ? { kills: chaos.kills } : {}),
   });
   // a grading instance over the same stores (the children are gone)
-  const overrides: HypertestOverrides = { scriptedBrains: gradingBrains(config), logger: logger.child({ instance: 'grading' }) };
+  const overrides: HypertestOverrides = { scriptedBrains: gradingBrains(config), logger: logger.child({ instance: 'grading' }), evalTrial: true };
   if (fixture.environments) overrides.environments = fixture.environments;
   const ht = await createHypertest(config, overrides);
   scope.add('hypertest', () => ht.close());
@@ -590,12 +645,24 @@ export async function runTrial(task: EvalTask, arm: EvalArm, options: TrialOptio
     const setup = graderSetupProblems(task, options);
     if (setup.length > 0) throw new HypertestError('invalid_argument', setup.join('; '));
     revisions = graderRevisionsOf(task, graders, options.judge);
-    if (options.mode === 'child-process' && !arm.child) throw precondition(`arm ${arm.armId} has no child spec (EvalArm.child) for a child-process trial`);
+    if (options.mode === 'child-process' && !arm.child && !arm.external) throw precondition(`arm ${arm.armId} has no child spec (EvalArm.child) for a child-process trial`);
+    const constraints = taskConstraintProblems(task);
+    if (constraints.length > 0) throw new HypertestError('invalid_argument', constraints.join('; '));
   } catch (e) {
     return infra(e);
   }
   trial.harness = `hypertest-eval@${EVAL_HARNESS_REVISION}/${options.mode ?? 'in-process'}`;
   trial.suiteRevision = task.suiteRevision;
+  // (row 310, coverage[16]) what the trial enforces and runs on is recorded with it
+  trial.track = options.track ?? 'cold';
+  if (task.allowedTools !== undefined) trial.allowedTools = [...task.allowedTools];
+  if (task.safetyConstraints !== undefined) trial.safetyConstraints = JSON.parse(JSON.stringify(task.safetyConstraints)) as NonNullable<EvalTask['safetyConstraints']>;
+  try {
+    const env = environmentDigestOf(task);
+    if (env !== undefined) trial.environmentImageDigest = env;
+  } catch (e) {
+    return infra(e);
+  }
   if (options.suiteId !== undefined) trial.suiteId = options.suiteId;
   trial.graderRevisions = { ...revisions };
   const logger = trialLogger(harnessLogger, { taskId: task.taskId, armId: arm.armId, trial: options.trial });
@@ -610,8 +677,16 @@ export async function runTrial(task: EvalTask, arm: EvalArm, options: TrialOptio
     validateFixture(f);
     fixture = f;
     let config = arm.config(trialBaseConfig(trialDataDir(ctx), options.baseConfig), ctx);
+    // (F[5]/F[7]) what the task itself needs (e.g. the browser tools of a UI task), re-checked for isolation below
+    if (task.configure) config = task.configure(config);
     const isolation = isolationProblems(config, workDir);
     if (isolation.length > 0) throw precondition(`arm ${arm.armId} breaks trial isolation: ${isolation.join('; ')}`);
+    const trackIssues = trackProblems(config, options.track ?? 'cold', (p) => inside(ctx.workDir, p));
+    if (trackIssues.length > 0) throw precondition(`arm ${arm.armId}: ${trackIssues.join('; ')}`);
+    // (row 310) the task's allowed tools and safety constraints become deny rules of the trial's own policy
+    config = withTaskConstraints(config, task);
+    const features = (config as { harness?: { features?: EvalTrial['harnessFeatures'] } }).harness?.features;
+    if (features) trial.harnessFeatures = { ...features };
     config = freshPostgresSchema(config, scope);
     const input: StartRunInput & { runId: string } = {
       goal: task.goal,
@@ -621,15 +696,34 @@ export async function runTrial(task: EvalTask, arm: EvalArm, options: TrialOptio
     };
     if (task.budget) input.budget = { ...task.budget };
     if (task.gate) input.gate = { ...task.gate };
-    if (task.oracles && task.oracles.length > 0) input.oracleIds = task.oracles.map((o: EvalOracle) => o.oracleId);
+    // (F[8]) without oracle governance (a causal arm) the run pins no oracle
+    if (task.oracles && task.oracles.length > 0 && features?.oracleGovernance !== false) input.oracleIds = task.oracles.map((o: EvalOracle) => o.oracleId);
     const x: ExecutionInput = { task, arm, fixture, config, input, workDir, timeoutMs: options.timeoutMs ?? DEFAULT_TRIAL_TIMEOUT_MS, logger, scope };
+    if (options.experience) x.experience = options.experience;
     if (options.signal) {
       if (options.signal.aborted) throw new HypertestError('cancelled', 'the trial was cancelled (signal) before its run started');
       x.signal = options.signal;
     }
+    // (F[8]) an external agent arm: the agent runs as a command; only the outcome graders judge it
+    if (arm.external) {
+      const ext = await runExternalTrial({ task, arm, fixture, ctx, graders, revisions, timeoutMs: x.timeoutMs, logger, ...(x.signal ? { signal: x.signal } : {}), ...(options.probeTimeoutMs !== undefined ? { probeTimeoutMs: options.probeTimeoutMs } : {}) });
+      Object.assign(trial, ext);
+      trial.durationMs = Date.now() - started;
+      return trial;
+    }
+    if (options.mode === 'child-process' && fixture.operator) throw precondition(`task ${task.taskId}: a scripted operator (fixture.operator) acts on the live instance: run it in-process`);
+    if (arm.overrides) {
+      if (options.mode === 'child-process') throw precondition(`arm ${arm.armId} overrides the instance's transport (EvalArm.overrides): run it in-process`);
+      x.armOverrides = arm.overrides(task, fixture);
+      // the arm's ground truth (e.g. the transport's log) is graded like the fixture's
+      if (x.armOverrides.probes) fixture.probes = { ...(fixture.probes ?? {}), ...x.armOverrides.probes };
+    }
     const exec = options.mode === 'child-process' ? await executeInChild(x) : await executeInProcess(x);
     if (exec.infraError) throw precondition(exec.infraError);
+    // (F[7]) what happens to the recorded state after the run (e.g. an attacker tampering with an artifact), before collection
+    const after = fixture.afterRun ? await fixture.afterRun({ ht: exec.ht, runId: input.runId, dataDir: trialDataDir(ctx) }) : undefined;
     const probes = await runProbes(fixture, options.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS);
+    if (after !== undefined) probes['afterRun'] = after;
     const data = await collectTrialData(exec.ht, { runId: input.runId, probes, harness: exec.harness, logger, ...(exec.outcome ? { outcome: exec.outcome } : {}) });
     trial.runId = input.runId;
     if (data.run) trial.runtimeManifestId = data.run.runtimeManifestId;
@@ -664,6 +758,8 @@ export async function runTrial(task: EvalTask, arm: EvalArm, options: TrialOptio
   } catch (e) {
     infra(e);
   } finally {
+    // (F[14]) a trial ended by the suite's cancellation is marked: never counted, never mistaken for a fault of the arm
+    if (options.signal?.aborted && trial.result !== 'pass' && trial.result !== 'fail') trial.cancelled = true;
     await scope.close(logger);
     if (fixture) {
       try {

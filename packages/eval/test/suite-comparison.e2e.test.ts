@@ -77,6 +77,6 @@ test('multi-LLM vs single provider on every PoC task: paired trials, McNemar com
   assert.equal(c.mcnemarP, 0.125);
   assert.ok(c.passDiffCI !== undefined && Math.abs(c.passDiffCI.mean - 4 / 6) < 1e-9 && c.passDiffCI.lo <= c.passDiffCI.mean && c.passDiffCI.hi <= 1);
   const report = renderSuiteReport(result);
-  assert.match(report, /^# Eval suite poc-all \(revision poc-1\)/);
+  assert.match(report, /^# Eval suite poc-all \(revision poc-2\)/);
   assert.match(report, /\| scripted-multi-llm \| scripted-single \| 6 \| 4 \| 0 \| 0\.1250 \|/);
 });

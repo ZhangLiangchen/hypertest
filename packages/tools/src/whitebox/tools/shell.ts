@@ -42,10 +42,13 @@ export function shellExecTool(options: BuiltinToolOptions): ToolSpec<ShellInput>
         cwd: { type: 'string', minLength: 1, maxLength: 4096 },
         timeoutMs: { type: 'integer', minimum: 1, maximum: MAX_TIMEOUT_MS },
         stdin: { type: 'string', maxLength: 1024 * 1024 },
+        captureNetwork: { type: 'boolean', default: false, description: 'Record every HTTP exchange the command makes with the registered environments (through the sandbox egress relay) as network-capture evidence.' },
       },
     },
     effect: 'execute',
     riskClass: 'medium',
+    // (wave 3) declared evidence: outputs, relayed writes, the egress capture, and outputs marked inconclusive after a refused write
+    evidenceTypes: ['stdout', 'stderr', 'api-response', 'network-capture', 'inconclusive'],
     timeoutMs: MAX_TIMEOUT_MS + 5_000,
     // a program can touch anything in the workspace whatever its cwd: the capability must cover the root
     // (a cwd outside the root is still refused by the sandbox's cwd confinement)

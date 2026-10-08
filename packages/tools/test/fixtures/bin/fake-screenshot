@@ -1,0 +1,3 @@
+#!/bin/sh
+# Fake screenshot command for the xdotool backend tests: a tiny valid PNG on stdout.
+node -e 'process.stdout.write(Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC", "base64"))'

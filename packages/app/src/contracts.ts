@@ -12,6 +12,7 @@ import type { DurableMemory, ProvenanceService, SkillRegistry, SkillRevision } f
 import type { AdapterRegistry, OperationLedger } from '@hypertest/operation';
 import type {
   AgentView, CanarySelection, CompatibilitySuiteResult, ModelSwitchRequest, PluginKernel, PromotionResult, RecordSuiteInput, RollbackResult, RuntimeRelease, RuntimeReleaseRegistry, SchemaMigrationAllowance,
+  ShadowComparison,
 } from '@hypertest/runtime';
 
 /**
@@ -94,10 +95,48 @@ export interface HypertestConfig {
    * the local sandbox where it cannot hide the signing keys, capability secret and store from them (no PID/mount jail on
    * this host, or `network: open`). Without it such a composition is refused (fail closed) and doctor reports an ERROR.
    */
-  sandbox?: Partial<SandboxProfile> & { egressWrites?: 'ledger' | 'refuse'; insecureAllowUnhiddenSecrets?: boolean };
+  sandbox?: Partial<SandboxProfile> & {
+    egressWrites?: 'ledger' | 'refuse';
+    insecureAllowUnhiddenSecrets?: boolean;
+    /**
+     * (additive, wave 3, row 250) Isolation tier per role: `read_only` (the workspace bound read-only for commands; mutating
+     * tools refuse), `isolated` (its own worktree / scratch; with kind oci a container), `separate` (its own sandbox profile:
+     * network, allowedHosts, kind/image, cpuLimit, memoryMb). Keys given here override the base profile for that role.
+     */
+    roles?: Record<string, SandboxRoleTierConfig>;
+  };
   /** (additive: `control.tokenEnv`) Environments registered at startup; see EnvironmentConfig. */
   environments?: EnvironmentConfig[];
-  tools?: { shellAllowlist?: string[]; httpAllowlist?: string[]; enableBrowser?: boolean };
+  /**
+   * (additive, e2e[0]) `urlEnvironmentClass`: the environment class of the black-box environments the URL entries of
+   * `httpAllowlist` stand for (`url-<host>-<port>`, the target of `hypertest run --url`) when their host is not loopback
+   * (loopback hosts are always `local`). Default `sandbox`. Never allowlist a production URL under a lower class.
+   */
+  tools?: {
+    shellAllowlist?: string[]; httpAllowlist?: string[]; enableBrowser?: boolean; urlEnvironmentClass?: string;
+    /** (additive, E[5]/stubs[1]/coverage[3]) MCP servers whose tools join the registry as `mcp.<id>.<tool>` (see McpServerToolConfig). */
+    mcpServers?: McpServerToolConfig[];
+    /**
+     * (additive, row 246) Remote tool workers (`hypertest tool-worker`): the execute step of each listed tool (no side-effect
+     * binding) runs on the worker at `url` over HMAC-signed HTTP with the shared secret from the variable NAMED `secretEnv`;
+     * capability, permit, freshness, Operation Ledger and evidence stay in this deployment (operation ids preserved).
+     */
+    remoteWorkers?: Array<{ id: string; url: string; secretEnv: string; tools: string[] }>;
+    /**
+     * (additive, row 246) External coding agents over the Agent Client Protocol (`acp.<id>.prompt`, offered to `roles`,
+     * default test_designer): the agent process runs in the caller's workspace sandbox (`sandbox: host` is an explicit,
+     * logged opt-out) and reaches files only through Hypertest (confined; writes only in an isolated worktree; no terminal;
+     * its permission requests refused). Variables by NAME only (`envFrom`).
+     */
+    acpAgents?: Array<{ id: string; command: string; args?: string[]; envFrom?: Record<string, string>; sandbox?: 'workspace' | 'host'; roles?: string[]; timeoutMs?: number }>;
+    /**
+     * (additive, row 246) Computer use: the computer.* tools (screenshot; click / type / key as ledgered external effects)
+     * over one desktop — `x11` (native XTEST client, e.g. Xvfb at `display`), `xdotool` (+ `screenshotCommand`), or `fake`
+     * (the documented test backend). The desktop `desktop/<displayId>` is granted to `grantTo` (default test_executor) and
+     * offered to `roles` (default vision_gui); `environmentClass` (default local: a display of this host) is its policy class.
+     */
+    computerUse?: { backend: 'x11' | 'xdotool' | 'fake'; display?: string; displayId?: string; environmentClass?: string; grantTo?: string[]; roles?: string[]; xdotool?: string; screenshotCommand?: string[] };
+  };
   signing?: { keyFile?: string };
   /**
    * L4 durable memory. `sql`: in this process's store (embedded deployments, tests). `powercontext`: a separate context
@@ -130,7 +169,20 @@ export interface HypertestConfig {
    * active (default false: an installation that never activated a release runs unmanaged — any runtime but a rolled-back
    * one creates runs; once a release is active, new runs are created only under it or a canary that selects them).
    */
-  runtime?: { requireActiveRelease?: boolean };
+  runtime?: {
+    requireActiveRelease?: boolean;
+    /**
+     * (additive, F[0]) What a SHADOW release of this deployment mirrors (`hypertest runtime shadow`): finished runs of the
+     * active release selected by `percentage` (run-id bucket) and/or `labels`; `minRuns` mirrored runs (no divergence)
+     * make a passing production replay; `timeoutMs` bounds one mirrored run.
+     */
+    shadow?: { percentage?: number; labels?: Record<string, string>; minRuns?: number; timeoutMs?: number };
+  };
+  /**
+   * (additive, F[8]) The harness subsystems of an EVAL causal arm (unset = on, H6). Switching one off is refused outside
+   * an eval trial instance (HypertestOverrides.evalTrial): see harness-features.ts.
+   */
+  harness?: { features?: HarnessFeatureConfig };
   /**
    * (additive, A[6]) Kernel plugins: local ES modules pinned by the sha256 of their entry file, loaded at composition in
    * this order (init → start → health; stopped in reverse on close), recorded in the RuntimeManifest. A plugin may
@@ -139,6 +191,15 @@ export interface HypertestConfig {
    * as built-in tools (and are offered only to roles whose tool policy allows them).
    */
   plugins?: PluginConfig[];
+}
+
+/** (additive, F[8]) The harness features of a causal eval arm (H0 … H6). */
+export interface HarnessFeatureConfig {
+  subagents?: boolean;
+  dynamicScheduler?: boolean;
+  blackboard?: boolean;
+  contextFreshness?: boolean;
+  oracleGovernance?: boolean;
 }
 
 /** (additive, A[6]) One configured kernel plugin. */
@@ -153,6 +214,36 @@ export interface PluginConfig {
   capabilities: string[];
   /** Plugin configuration (no secrets: plugins read their secrets from `*Env` names they document). */
   config?: Record<string, JsonValue>;
+}
+
+/**
+ * (additive, E[5]/stubs[1]/coverage[3]) A configured MCP server. Its `allowTools` become `mcp.<id>.<tool>` ToolSpecs of the
+ * registry (pinned by the runtime manifest), offered to `roles` (default executor) and run through the full pipeline:
+ * capability → policy permit → freshness (mutating) → Operation Ledger (external/destructive effects: record-only adapter,
+ * keyed by the invocation id) → `mcp-response` evidence. Exactly one transport: `command` (+ args, cwd; stdio) or `url`
+ * (streamable HTTP). Secrets only by NAME: `envFrom` (server variable → Hypertest variable) and `headersFromEnv` (header →
+ * variable); a missing variable makes the server unavailable (fail closed). Classification is the operator's: `effect` /
+ * `riskClass` per server (default external / medium), refined by `toolEffects`; `environmentId` binds the server to a
+ * registered environment (its tools address `env/<id>` with its class), otherwise its tools address `mcp/<id>/<tool>`, a
+ * scope granted to the permission profiles in `grantTo` (default test_executor, environment_operator).
+ */
+export interface McpServerToolConfig {
+  id: string;
+  command?: string;
+  args?: string[];
+  cwd?: string;
+  envFrom?: Record<string, string>;
+  url?: string;
+  headersFromEnv?: Record<string, string>;
+  allowTools: string[];
+  effect?: 'read' | 'record' | 'write_workspace' | 'execute' | 'external' | 'destructive';
+  riskClass?: 'low' | 'medium' | 'high' | 'critical';
+  toolEffects?: Record<string, { effect?: McpServerToolConfig['effect']; riskClass?: McpServerToolConfig['riskClass'] }>;
+  environmentId?: string;
+  environmentClass?: string;
+  roles?: string[];
+  grantTo?: string[];
+  timeoutMs?: number;
 }
 
 /** (additive, conformance-1) A configured oracle: the OracleSpec content plus the human who establishes it. */
@@ -172,6 +263,11 @@ export interface HypertestOverrides {
   clock?: Clock;
   ids?: IdGenerator;
   logger?: Logger;
+  /**
+   * (additive, F[8]) This instance is an eval trial: `harness.features` may switch subsystems off (the causal arms H0–H5).
+   * Any other instance refuses a configuration that disables a feature.
+   */
+  evalTrial?: boolean;
   /** Brains for `scripted` providers keyed by provider id (tests, PoCs, eval). */
   scriptedBrains?: Record<string, ScriptedBrain>;
   /** Extra environments/tools/adapters injected by eval fixtures. */
@@ -377,6 +473,11 @@ export interface MigrateRunInput {
   checkpointTimeoutMs?: number;
   /** Start driving the migrated run here when this instance is the target runtime (default false). */
   drive?: boolean;
+  /**
+   * (additive, F[1]) With `drive`: how long to wait for this runtime's durable loop to take the run over (its first
+   * recover records `run.migration_driven`; default 30 000 ms). A previous loop still open elsewhere is woken meanwhile.
+   */
+  driveTimeoutMs?: number;
   signal?: AbortSignal;
 }
 
@@ -384,8 +485,21 @@ export interface MigrateRunInput {
 export interface RunMigrationResult {
   run: TestRun;
   epoch: RuntimeEpoch;
-  /** This instance started driving the run (drive: true and this instance is the target). */
+  /**
+   * This instance drives the run (drive: true, this instance is the target, and its durable loop took the run over —
+   * `run.migration_driven` was recorded for the epoch). Never true for a start that did not take effect.
+   */
   driven: boolean;
+  /** (additive, F[1]) Why a requested drive did not take effect (the run is migrated; what the operator does next). */
+  driveProblem?: string;
+}
+
+/** (additive, F[0]) One mirror of a production run on this shadow release. */
+export interface ShadowMirrorResult {
+  comparison: ShadowComparison;
+  shadowRunId: string;
+  /** false: the run was mirrored before (its comparison is returned). */
+  created: boolean;
 }
 
 /**
@@ -423,6 +537,43 @@ export interface RuntimeReleaseService {
    */
   releaseCheckpoint(runId: string, input: { by: string; reason: string }): Promise<TestRun>;
   epochs(runId: string): Promise<RuntimeEpoch[]>;
+  /**
+   * (additive, F[1]) Records `run.migration_driven` when this runtime's durable loop starts driving a run whose latest
+   * RuntimeEpoch targets this manifest (once per epoch; true when recorded now). Called by every loop's recover.
+   */
+  markDriven(runId: string): Promise<boolean>;
+  /**
+   * (additive, F[0], e2e[5]) Records a `compatibility` result from an eval SuiteResult: passing only when every trial
+   * passed AND every trial ran under `manifestId` (binding eval_trials); a passing result of other manifests is refused.
+   */
+  recordEvalSuite(input: { manifestId: string; kind: 'compatibility'; result: unknown; digest: string; by: string; detail?: string }): Promise<CompatibilitySuiteResult>;
+  /**
+   * (additive, F[0], F[13]) Records the `release_gate` result (canary → active): the eval release gate `report` of a CORE
+   * candidate (suite id `core`, every trial ran under `manifestId`) against a baseline; passing when the gate passed and
+   * every candidate trial passed. Any other suite is refused.
+   */
+  recordReleaseGate(input: {
+    manifestId: string;
+    candidate: unknown;
+    candidateDigest: string;
+    baselineDigest: string;
+    report: { pass: boolean; suiteId: string; checks?: Array<{ checkId: string; pass: boolean }> };
+    by: string;
+  }): Promise<CompatibilitySuiteResult>;
+  /**
+   * (additive, F[0]) Mirrors a FINISHED production run onto this runtime, which must be the shadow release: a new run
+   * (label `hypertest.shadow_of`) with the same goal, target, budget and oracles, whose every external effect is dry-run
+   * (recorded `not_applied: dry_run`, never dispatched); its decision is compared with the production decision and the
+   * comparison recorded. Idempotent per source run.
+   */
+  mirror(sourceRunId: string, input: { by: string; timeoutMs?: number }): Promise<ShadowMirrorResult>;
+  /** (additive, F[0]) Finished runs of the active release that `runtime.shadow` selects and this shadow did not mirror yet (newest first). */
+  shadowCandidates(input?: { limit?: number }): Promise<string[]>;
+  /**
+   * (additive, F[0]) Records the `production_replay` result (shadow → canary) of a shadow release from its shadow
+   * comparisons: passing with at least `minRuns` (runtime.shadow.minRuns, default 1) mirrored runs and no divergence.
+   */
+  recordProductionReplay(input: { manifestId?: string; by: string; minRuns?: number }): Promise<CompatibilitySuiteResult>;
 }
 
 /** (additive) Options of startApiServer. */
@@ -469,4 +620,15 @@ export interface DiagnoseOptions {
   connect?: boolean;
   /** Per-probe timeout (default 3000 ms). */
   timeoutMs?: number;
+}
+
+/** (additive, wave 3, row 250) The isolation tier of one role (`sandbox.roles.<role>`). */
+export interface SandboxRoleTierConfig {
+  tier: 'read_only' | 'isolated' | 'separate';
+  kind?: 'local' | 'oci';
+  image?: string;
+  network?: 'none' | 'loopback' | 'egress_allowlist' | 'open';
+  allowedHosts?: string[];
+  cpuLimit?: number;
+  memoryMb?: number;
 }

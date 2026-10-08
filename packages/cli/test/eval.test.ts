@@ -8,6 +8,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { after, before, describe, test } from 'node:test';
+import { HypertestError, type JsonValue } from '@hypertest/core';
 import { defaultConfig } from '@hypertest/app';
 import type { EvalArm, EvalSuite, EvalTrial, SuiteOptions, SuiteResult } from '@hypertest/eval';
 import { tempDir } from '@hypertest/testkit';
@@ -198,13 +199,70 @@ describe('hypertest eval run', () => {
       setImmediate(() => stop.abort());
       return pending;
     };
-    const r = await cli(['eval', 'run', 'poc-a-whitebox'], { cwd: dir.path, signal: stop.signal, loadEval: async () => stub.module });
+    // (F[14]) this stub platform ignores SuiteOptions.signal: after the grace period the CLI reports it and returns
+    const r = await cli(['eval', 'run', 'poc-a-whitebox', '--cancel-grace-ms', '50'], { cwd: dir.path, signal: stop.signal, loadEval: async () => stub.module });
     release({ suiteId: 'poc-a-whitebox', revision: 'r1', trials: [], perArm: {}, comparisons: [] });
     assert.equal(r.code, 130);
-    // runSuite cannot be cancelled: the CLI says the trials in progress keep running instead of pretending they stopped
-    assert.match(r.stderr, new RegExp(`interrupted: the evaluation cannot be cancelled from the CLI \\(@hypertest/eval has no cancellation\\); trials still in progress finish in the background, a second Ctrl-C terminates the process; trial workspace ${workDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} is left in place\\n$`));
+    // the CLI says the trials in progress keep running instead of pretending they stopped
+    assert.match(r.stderr, new RegExp(`interrupted: the evaluation did not stop within 50 ms of its cancellation \\(this eval platform does not honour it\\); trials still in progress finish in the background, a second Ctrl-C terminates the process; trial workspace ${workDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} is left in place\\n$`));
+    assert.equal(stub.calls.length, 0, 'runSuite was replaced');
     assert.equal(existsSync(workDir), true);
     await rm(workDir, { recursive: true, force: true });
+  });
+
+  test('(F[14]) a platform that honours the cancellation: interrupt ⇒ 130 with the partial result (marked cancelled) still written to --out', async () => {
+    const stub = stubEval();
+    const stop = new AbortController();
+    stub.module.runSuite = (suite, o) =>
+      new Promise((_resolve, reject) => {
+        o.onTrial?.({ taskId: 't1', armId: 'scripted', trial: 0, seed: 's0', result: 'pass', verdict: 'fail', graders: [], outcomeMetrics: {}, trajectoryMetrics: {}, durationMs: 5 });
+        o.signal!.addEventListener('abort', () => {
+          const partial: SuiteResult = {
+            suiteId: suite.suiteId, revision: suite.revision, cancelled: true, perArm: {}, comparisons: [],
+            trials: [
+              { taskId: 't1', armId: 'scripted', trial: 0, seed: 's0', result: 'pass', verdict: 'fail', graders: [], outcomeMetrics: {}, trajectoryMetrics: {}, durationMs: 5 },
+              { taskId: 't1', armId: 'scripted', trial: 1, seed: 's1', result: 'infra_error', cancelled: true, graders: [], outcomeMetrics: {}, trajectoryMetrics: {}, durationMs: 3 },
+            ],
+          };
+          reject(new HypertestError('cancelled', 'the eval suite was cancelled', { details: { result: partial as unknown as JsonValue } }));
+        }, { once: true });
+        setImmediate(() => stop.abort());
+      });
+    const r = await cli(['eval', 'run', 'poc-a-whitebox', '--arms', 'scripted', '--trials', '2', '--out', 'partial.json'], { cwd: dir.path, signal: stop.signal, loadEval: async () => stub.module });
+    assert.equal(r.code, 130, r.stderr);
+    assert.match(r.stderr, /interrupted: cancelled after 1 completed trial\(s\); the partial result is kept \(marked cancelled: it never gates anything\)/);
+    const persisted = JSON.parse(await readFile(join(dir.path, 'partial.json'), 'utf8')) as SuiteResult;
+    assert.equal(persisted.cancelled, true);
+    assert.deepEqual(persisted.trials.map((t) => [t.trial, t.result, t.cancelled ?? false]), [[0, 'pass', false], [1, 'infra_error', true]]);
+  });
+
+  test('(F[14]) --timeout cancels through the same signal: exit 1, partial result kept; the signal reaches runSuite', async () => {
+    const stub = stubEval();
+    let sawSignal = false;
+    stub.module.runSuite = (suite, o) =>
+      new Promise((_resolve, reject) => {
+        sawSignal = o.signal !== undefined;
+        o.signal!.addEventListener('abort', () => reject(new HypertestError('cancelled', 'cancelled', { details: { result: { suiteId: suite.suiteId, revision: suite.revision, cancelled: true, trials: [], perArm: {}, comparisons: [] } } })), { once: true });
+      });
+    const r = await cli(['eval', 'run', 'poc-a-whitebox', '--arms', 'scripted', '--timeout', '100', '--json'], { cwd: dir.path, loadEval: async () => stub.module });
+    assert.equal(r.code, 1, r.stderr);
+    assert.equal(sawSignal, true);
+    assert.match(r.stderr, /the evaluation exceeded --timeout 100 ms: cancelled after 0 completed trial\(s\)/);
+    assert.equal(parseJson<SuiteResult>(r).cancelled, true);
+  });
+
+  test('(F[9]) --trials k: the CLI summary shows pass@k and pass^k per k next to the pass rate', async () => {
+    const stub = stubEval({ render: false });
+    const inner = stub.module.runSuite!;
+    stub.module.runSuite = async (suite, o) => {
+      const res = await inner(suite, o);
+      for (const a of Object.keys(res.perArm)) Object.assign(res.perArm[a]!, { passAtK: { '1': 1, '3': 1 }, passHatKByK: { '1': 1, '3': 1 } });
+      return res;
+    };
+    const r = await cli(['eval', 'run', 'poc-a-whitebox', '--arms', 'scripted', '--trials', '3'], { cwd: dir.path, loadEval: async () => stub.module });
+    assert.equal(r.code, 0, r.stderr);
+    assert.match(r.stdout, /^ARM\s+PASS RATE\s+PASS\^K\s+PASS@1\s+PASS\^1\s+PASS@3\s+PASS\^3$/m);
+    assert.match(r.stdout, /^scripted\s+1\.000\s+1\.000\s+1\.000\s+1\.000\s+1\.000\s+1\.000$/m);
   });
 
   test('interrupted before the suite starts ⇒ 130; no trial is run and the temporary workspace is removed', async () => {
@@ -243,7 +301,8 @@ describe('hypertest eval run', () => {
     assert.strictEqual(options.judge, judge);
     const bad = await cli(['eval', 'run', 'poc-a-whitebox', '--judge', 'gpt'], { cwd: dir.path, loadEval: async () => stub.module });
     assert.equal(bad.code, 2);
-    assert.match(bad.stderr, /--judge must be scripted \(got "gpt"\)/);
+    // (F[11]) the judge kinds are now scripted|config: the refusal names both
+    assert.match(bad.stderr, /--judge must be scripted \(the calibrated CI judge\) or config \(the configuration's model routes\), got "gpt"/);
     const none = stubEval();
     const missing = await cli(['eval', 'run', 'poc-a-whitebox', '--judge', 'scripted'], { cwd: dir.path, loadEval: async () => none.module });
     assert.deepEqual([missing.code, missing.stderr], [1, 'hypertest eval: @hypertest/eval does not export scriptedJudge: this build has no LLM judge [unsupported]\n']);

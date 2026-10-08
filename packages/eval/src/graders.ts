@@ -16,6 +16,7 @@ import { verifyRuntimeManifest } from '@hypertest/runtime';
 import type { Grader, GraderContext, GraderResult, PlanDynamicsOptions, VersionedGrader } from './contracts.ts';
 import { POC_GRADERS } from './poc-graders.ts';
 import { CORE_SUITE_GRADERS } from './core-graders.ts';
+import { EXTENDED_GRADERS } from './extended-graders.ts';
 import { llmRubricGrader } from './judge.ts';
 import { GRADER_REVISIONS, LLM_GRADER_IDS, normalizedSource } from './grader-revisions.ts';
 import {
@@ -302,6 +303,8 @@ export const GRADERS: Readonly<Record<string, Grader>> = Object.freeze({
   planDynamics: planDynamicsGrader,
   // (additive) the PoC acceptance graders (src/poc-graders.ts)
   ...POC_GRADERS,
+  // (additive, F[5]/F[6]/F[7]) the extended core suites and chaos cases (src/extended-graders.ts)
+  ...EXTENDED_GRADERS,
   // (additive) the core-suite graders (src/core-graders.ts) and the independent LLM judge, always LAST (src/judge.ts)
   ...CORE_SUITE_GRADERS,
   llmRubric: llmRubricGrader,

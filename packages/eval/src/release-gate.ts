@@ -13,12 +13,20 @@
  * side effects, a critical false release outside the pairs — are read from EVERY candidate trial that recorded them, an
  * infra error included (a trial whose grading failed still records what its run did). Cost is reported by the suite,
  * never a gate criterion here (a product decision).
+ *
+ * (additive) Two more checks: the product SLO on the candidate's critical false release RATE (row 321;
+ * `maxCriticalFalseReleaseRate`, default 0 — absolute, whatever the baseline did), and the per-task defect regression
+ * (F[13]): a hidden defect the baseline detected in every trial and the candidate in none of its trials fails the gate
+ * even when too few pairs exist for McNemar to reach significance. Grader revision changes are comparable through bridge
+ * reports without a discontinuity (F[12]).
  */
 import { HypertestError } from '@hypertest/core';
-import type { EvalTrial, ReleaseGateCheck, ReleaseGateOptions, ReleaseGateReport, SuiteResult } from './contracts.ts';
+import type { BridgeReport, EvalTrial, ReleaseGateCheck, ReleaseGateOptions, ReleaseGateReport, SuiteResult } from './contracts.ts';
 import { mcnemarExact, pairedBootstrapCI } from './stats.ts';
 
 const DEFAULT_ALPHA = 0.05;
+/** (row 321) Default product SLO: no critical false release at all. */
+export const DEFAULT_CRITICAL_FALSE_RELEASE_SLO = 0;
 
 function invalid(message: string): HypertestError {
   return new HypertestError('invalid_argument', message);
@@ -83,6 +91,42 @@ function check(checkId: ReleaseGateCheck['checkId'], description: string, pass: 
   return { checkId, description, pass, detail, values };
 }
 
+/** The grader revisions of a task (undefined when not recorded or not uniform across its trials). */
+function graderRevisionsOfTask(trials: readonly EvalTrial[], taskId: string): Record<string, string> | undefined {
+  const texts = new Set<string>();
+  let out: Record<string, string> | undefined;
+  for (const t of trials) {
+    if (t.taskId !== taskId) continue;
+    texts.add(JSON.stringify(Object.fromEntries(Object.entries(t.graderRevisions ?? {}).sort(([a], [b]) => a.localeCompare(b)))));
+    out = t.graderRevisions;
+  }
+  return texts.size === 1 ? out : undefined;
+}
+
+/**
+ * (F[12]) Whether the grader revisions of a task differ only by graders bridged without a discontinuity (baseline
+ * revision → candidate revision). Returns the bridges used, or the problems.
+ */
+function bridgedRevisions(base: Record<string, string> | undefined, cand: Record<string, string> | undefined, bridges: readonly BridgeReport[]): { ok: boolean; used: BridgeReport[]; problems: string[] } {
+  if (!base || !cand) return { ok: false, used: [], problems: ['grader revisions not recorded uniformly'] };
+  const ids = new Set([...Object.keys(base), ...Object.keys(cand)]);
+  const used: BridgeReport[] = [];
+  const problems: string[] = [];
+  for (const id of ids) {
+    if (base[id] === cand[id]) continue;
+    if (base[id] === undefined || cand[id] === undefined) {
+      problems.push(`grader ${id} is graded in only one result`);
+      continue;
+    }
+    const b = bridges.find((x) => x.graderId === id && x.fromRevision === base[id] && x.toRevision === cand[id]);
+    if (!b) problems.push(`grader ${id} ${base[id]} → ${cand[id]} has no bridge comparison`);
+    else if (b.pairs < 1) problems.push(`the bridge of ${id} ${base[id]} → ${cand[id]} compared no trial`);
+    else if (b.discontinuity) problems.push(`the bridge of ${id} ${base[id]} → ${cand[id]} declares a discontinuity (${b.newlyFailing.length} newly failing, ${b.newlyPassing.length} newly passing): re-baseline`);
+    else used.push(b);
+  }
+  return { ok: problems.length === 0, used, problems };
+}
+
 /** Revisions recorded for a task in one result: grader revisions and oracle revisions (canonical text per task). */
 function revisionsByTask(trials: readonly EvalTrial[], field: 'graderRevisions' | 'oracleRevisions'): Map<string, Set<string>> {
   const out = new Map<string, Set<string>>();
@@ -110,12 +154,20 @@ export function evaluateReleaseGate(baselineInput: SuiteResult, candidateInput: 
   const cGraded = cTrials.filter(graded);
   const pairs = bGraded.map((b) => ({ b, c: cByKey.get(key(b)) })).filter((p): p is { b: EvalTrial; c: EvalTrial } => graded(p.c));
   const checks: ReleaseGateCheck[] = [];
+  const bridges = options.bridges ?? [];
+  const bridgesUsed = new Map<string, BridgeReport>();
+  const slo = options.maxCriticalFalseReleaseRate ?? DEFAULT_CRITICAL_FALSE_RELEASE_SLO;
+  if (!(typeof slo === 'number' && slo >= 0 && slo <= 1)) throw invalid(`maxCriticalFalseReleaseRate must be in [0, 1], got ${String(slo)}`);
 
   // comparable: same suite, same revision, same grader and oracle revisions per task (else: bridge first)
   {
     const problems: string[] = [];
     if (baseline.suiteId !== candidate.suiteId) problems.push(`suite ${baseline.suiteId} vs ${candidate.suiteId}`);
     if (baseline.revision !== candidate.revision) problems.push(`suite revision ${baseline.revision} vs ${candidate.revision} (a new suite revision needs a new baseline)`);
+    // (F[12]) the same revision name over different suite content (tasks, fixtures, brains) is not the same suite
+    else if (baseline.suiteFingerprint !== undefined && candidate.suiteFingerprint !== undefined && baseline.suiteFingerprint !== candidate.suiteFingerprint) {
+      problems.push(`suite ${candidate.suiteId}@${candidate.revision} content differs (fingerprint ${baseline.suiteFingerprint.slice(0, 12)} vs ${candidate.suiteFingerprint.slice(0, 12)}): a changed suite needs a new revision and a new baseline`);
+    }
     // the eval harness decides how trials run and what counts as graded: results of different revisions or trial modes
     // (in-process vs child-process) are not like-for-like
     const bHarness = harnessesOf(bTrials);
@@ -128,7 +180,18 @@ export function evaluateReleaseGate(baselineInput: SuiteResult, candidateInput: 
         const other = bRev.get(task);
         if (!other) continue;
         const same = revs.size === 1 && other.size === 1 && [...revs][0] === [...other][0];
-        if (!same) problems.push(`task ${task}: ${field} ${[...other].join(' | ')} vs ${[...revs].join(' | ')}${field === 'graderRevisions' ? ' (a changed grader needs a bridge comparison and a new baseline)' : ''}`);
+        if (same) continue;
+        if (field === 'graderRevisions') {
+          // (F[12]) a grader change bridged without a discontinuity keeps the results comparable
+          const bridged = bridgedRevisions(graderRevisionsOfTask(bTrials, task), graderRevisionsOfTask(cTrials, task), bridges);
+          if (bridged.ok) {
+            for (const b of bridged.used) bridgesUsed.set(`${b.graderId}@${b.fromRevision}→${b.toRevision}`, b);
+            continue;
+          }
+          problems.push(`task ${task}: ${field} ${[...other].join(' | ')} vs ${[...revs].join(' | ')} (${bridged.problems.join('; ')}${bridges.length === 0 ? '; a changed grader needs a bridge comparison (eval bridge) or a new baseline' : ''})`);
+          continue;
+        }
+        problems.push(`task ${task}: ${field} ${[...other].join(' | ')} vs ${[...revs].join(' | ')}`);
       }
     }
     checks.push(check('comparable', 'the results are comparable (suite, revision, eval harness, grader and oracle revisions)', problems.length === 0, problems.length === 0 ? `${baseline.suiteId}@${baseline.revision}, harness ${harnessesOf(bTrials)}, same grader and oracle revisions per task` : problems.slice(0, 8).join('; '), { problems: problems.length }));
@@ -154,6 +217,20 @@ export function evaluateReleaseGate(baselineInput: SuiteResult, candidateInput: 
     const ok = missing.length === 0 && cCfr <= bCfr && unpairedCfr === 0;
     checks.push(check('critical_false_release', 'critical false release is not worse', ok, missing.length > 0 ? `criticalFalseRelease missing for ${[...new Set(missing)].slice(0, 6).join(', ')}` : `${cCfr} vs baseline ${bCfr} over ${pairs.length} pair(s); ${unpairedCfr} in ${unpaired.length} unpaired candidate trial(s)`, {
       baseline: bCfr, candidate: cCfr, unpairedCandidate: unpairedCfr, baselineRate: pairs.length ? bCfr / pairs.length : 0, candidateRate: pairs.length ? cCfr / pairs.length : 0,
+    }));
+  }
+
+  // (row 321) the product SLO: the candidate's critical false release RATE, absolute — every candidate trial that recorded
+  // the metric counts (an infra error included); the rate is over the graded trials (at least one)
+  {
+    const recorded = cTrials.filter((t) => metric(t, 'criticalFalseRelease') !== undefined);
+    const total = recorded.reduce((sum, t) => sum + metric(t, 'criticalFalseRelease')!, 0);
+    const denominator = Math.max(1, cGraded.length);
+    const rate = total / denominator;
+    const where = recorded.filter((t) => metric(t, 'criticalFalseRelease')! > 0).map(label);
+    const ok = cGraded.length > 0 && rate <= slo;
+    checks.push(check('critical_false_release_slo', `critical false release rate within the product SLO (≤ ${slo})`, ok, cGraded.length === 0 ? 'the candidate graded no trial' : `rate ${rate.toFixed(4)} (${total} over ${cGraded.length} graded trial(s))${where.length > 0 ? `: ${where.slice(0, 6).join(', ')}` : ''}`, {
+      rate, slo, criticalFalseReleases: total, graded: cGraded.length,
     }));
   }
 
@@ -183,6 +260,22 @@ export function evaluateReleaseGate(baselineInput: SuiteResult, candidateInput: 
         ? 'no paired task hides a defect: nothing to compare'
         : `recall ${cMean.toFixed(3)} vs baseline ${bMean.toFixed(3)} over ${measured.length} pair(s); lost ${b}, gained ${c}, McNemar p ${p.toFixed(4)} (α ${alpha})${ci}`;
     checks.push(check('defect_recall', `defect recall is not significantly lower (exact McNemar, α ${alpha})`, ok, detail, values));
+  }
+
+  // (F[13]) per-task defect regression: a hidden defect the baseline detected in EVERY graded trial and the candidate in
+  // NONE of its graded trials is a sure loss — significant or not (few pairs can never reach p < α)
+  {
+    const tasks = [...new Set(bGraded.filter((t) => metric(t, 'defectRecall') !== undefined).map((t) => t.taskId))].sort();
+    const lost: string[] = [];
+    for (const task of tasks) {
+      const b = bGraded.filter((t) => t.taskId === task);
+      const c = cGraded.filter((t) => t.taskId === task);
+      if (b.length === 0 || c.length === 0) continue;
+      const bAlways = b.every((t) => metric(t, 'defectRecall') === 1);
+      const cNever = c.every((t) => (metric(t, 'defectRecall') ?? 0) < 1);
+      if (bAlways && cNever) lost.push(`${task} (baseline ${b.length}/${b.length} trial(s), candidate 0/${c.length})`);
+    }
+    checks.push(check('defect_regression', 'no hidden defect the baseline always detected is never detected', lost.length === 0, lost.length === 0 ? `${tasks.length} task(s) with hidden defects` : `lost: ${lost.slice(0, 6).join(', ')}`, { tasks: tasks.length, lost: lost.length }));
   }
 
   // security violations = 0 over every candidate trial that recorded them (policy violations executed + environment
@@ -225,6 +318,7 @@ export function evaluateReleaseGate(baselineInput: SuiteResult, candidateInput: 
     pairs: pairs.length,
     alpha,
     checks,
+    ...(bridgesUsed.size > 0 ? { bridgesUsed: [...bridgesUsed.values()].map((b) => ({ graderId: b.graderId, fromRevision: b.fromRevision, toRevision: b.toRevision, pairs: b.pairs })) } : {}),
   };
 }
 
@@ -243,6 +337,7 @@ export function renderReleaseGateReport(report: ReleaseGateReport): string {
     '|---|---|---|',
     ...report.checks.map((c) => `| ${cell(c.description)} | ${c.pass ? 'pass' : '**FAIL**'} | ${cell(c.detail)} |`),
     '',
+    ...(report.bridgesUsed && report.bridgesUsed.length > 0 ? ['Bridged grader revisions: ' + report.bridgesUsed.map((b) => `${b.graderId} ${b.fromRevision} → ${b.toRevision} (${b.pairs} pair(s), no discontinuity)`).join('; '), ''] : []),
   ];
   return lines.join('\n');
 }

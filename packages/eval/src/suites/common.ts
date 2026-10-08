@@ -4,8 +4,8 @@ import type { JsonValue } from '@hypertest/core';
 import type { TrialContext } from '../contracts.ts';
 import { asJson, readObservations } from '../fixtures.ts';
 
-/** Revision of the PoC suites (paired seeds and reports carry it). */
-export const POC_SUITE_REVISION = 'poc-1';
+/** Revision of the PoC suites (paired seeds and reports carry it). poc-2: + poc-c-anomaly (F[4]). */
+export const POC_SUITE_REVISION = 'poc-2';
 
 /** The brains' observation log of a trial (inside the trial directory: removed with it). */
 export function observationsFile(ctx: Pick<TrialContext, 'workDir'>): string {

@@ -38,7 +38,7 @@ describe('evaluateReleaseGate', () => {
   test('a like-for-like candidate passes every check', () => {
     const r = evaluateReleaseGate(suite(tasks()), suite(tasks()));
     assert.equal(r.pass, true, JSON.stringify(r.checks, null, 1));
-    assert.deepEqual(r.checks.map((c) => c.checkId), ['comparable', 'coverage', 'critical_false_release', 'defect_recall', 'security_violations', 'duplicate_side_effects', 'evidence_completeness']);
+    assert.deepEqual(r.checks.map((c) => c.checkId), ['comparable', 'coverage', 'critical_false_release', 'critical_false_release_slo', 'defect_recall', 'defect_regression', 'security_violations', 'duplicate_side_effects', 'evidence_completeness']);
     assert.deepEqual([r.pairs, r.baseline.arm, r.candidate.arm, r.alpha], [10, 'arm', 'arm', 0.05]);
     const md = renderReleaseGateReport(r);
     assert.match(md, /^# Eval release gate: PASS/);
@@ -96,7 +96,7 @@ describe('evaluateReleaseGate', () => {
     assert.match(checkOf(rev, 'comparable').detail, /suite revision core-1 vs core-2/);
     const grader = evaluateReleaseGate(suite(tasks()), suite(tasks(10, (i) => (i === 2 ? { graderRevisions: { verdict: '2', defectDetected: '1' } } : {}))));
     assert.equal(grader.pass, false);
-    assert.match(checkOf(grader, 'comparable').detail, /task task-2: graderRevisions .* \(a changed grader needs a bridge comparison and a new baseline\)/);
+    assert.match(checkOf(grader, 'comparable').detail, /task task-2: graderRevisions .* \(grader verdict 1 → 2 has no bridge comparison; a changed grader needs a bridge comparison \(eval bridge\) or a new baseline\)/);
     const legacy = evaluateReleaseGate(suite(tasks(10, () => ({ graderRevisions: undefined as never }))), suite(tasks()));
     assert.match(checkOf(legacy, 'comparable').detail, /\(not recorded\)/);
     const oracle = evaluateReleaseGate(suite(tasks()), suite(tasks(10, () => ({ oracleRevisions: { o: 2 } }))));
@@ -161,5 +161,65 @@ describe('evaluateReleaseGate', () => {
     assert.throws(() => evaluateReleaseGate({ suiteId: 'x' } as never, suite(tasks())), (e: unknown) => isHypertestError(e, 'invalid_argument') && /the baseline is not an eval suite result/.test((e as Error).message));
     assert.throws(() => evaluateReleaseGate(suite(tasks()), suite([{ taskId: 't' } as never])), (e: unknown) => isHypertestError(e, 'invalid_argument') && /trials\[0\]/.test((e as Error).message));
     assert.throws(() => evaluateReleaseGate(suite(tasks()), suite(tasks()), { alpha: 2 }), (e: unknown) => isHypertestError(e, 'invalid_argument'));
+  });
+});
+
+describe('evaluateReleaseGate (wave 3: product SLO, per-task defect regression, bridges, suite fingerprints)', () => {
+  test('(row 321) the critical-false-release product SLO is configurable and enforced on the candidate rate (default 0)', () => {
+    // 1 critical false release over 10 graded candidate trials, also in the baseline: "not worse" holds, the SLO decides
+    const one = (i: number) => (i === 2 ? { criticalFalseRelease: 1 } : {});
+    const strict = evaluateReleaseGate(suite(tasks(10, () => ({}), one)), suite(tasks(10, () => ({}), one)));
+    assert.equal(checkOf(strict, 'critical_false_release').pass, true);
+    assert.equal(checkOf(strict, 'critical_false_release_slo').pass, false);
+    assert.match(checkOf(strict, 'critical_false_release_slo').detail, /rate 0\.1000 \(1 over 10 graded trial\(s\)\)/);
+    assert.equal(strict.pass, false);
+    const tolerant = evaluateReleaseGate(suite(tasks(10, () => ({}), one)), suite(tasks(10, () => ({}), one)), { maxCriticalFalseReleaseRate: 0.1 });
+    assert.equal(checkOf(tolerant, 'critical_false_release_slo').pass, true);
+    assert.equal(tolerant.pass, true);
+    // an infra-error trial's recorded false release still counts against the SLO
+    const hidden = evaluateReleaseGate(suite(tasks()), suite([...tasks(), trial('crashed', 0, { result: 'infra_error' }, { criticalFalseRelease: 1 })]), { maxCriticalFalseReleaseRate: 0.05 });
+    assert.equal(checkOf(hidden, 'critical_false_release_slo').pass, false);
+    assert.throws(() => evaluateReleaseGate(suite(tasks()), suite(tasks()), { maxCriticalFalseReleaseRate: 2 }), /maxCriticalFalseReleaseRate must be in \[0, 1\]/);
+  });
+
+  test('(F[13] repro) a candidate that never detects what the baseline always detected fails, even when McNemar cannot reach significance', () => {
+    // 3 defect tasks: the baseline detects every one, the candidate none — 3 discordant pairs: p = 0.25 > α
+    const baseline = suite(tasks(3, () => ({}), () => ({ defectRecall: 1 })));
+    const candidate = suite(tasks(3, () => ({}), () => ({ defectRecall: 0 })));
+    const r = evaluateReleaseGate(baseline, candidate);
+    assert.equal(checkOf(r, 'defect_recall').pass, true, 'too few pairs for significance (this alone let the regression through before)');
+    assert.equal(checkOf(r, 'defect_regression').pass, false);
+    assert.match(checkOf(r, 'defect_regression').detail, /lost: task-0 \(baseline 1\/1 trial\(s\), candidate 0\/1\)/);
+    assert.equal(r.pass, false);
+    // a task detected in at least one candidate trial is no sure loss
+    const flaky = suite([trial('task-0', 0, {}, { defectRecall: 0 }), trial('task-0', 1, {}, { defectRecall: 1 })]);
+    const base2 = suite([trial('task-0', 0, {}, { defectRecall: 1 }), trial('task-0', 1, {}, { defectRecall: 1 })]);
+    assert.equal(checkOf(evaluateReleaseGate(base2, flaky), 'defect_regression').pass, true);
+  });
+
+  test('(F[12]) a grader revision change is comparable only through a bridge without discontinuity', () => {
+    const v1 = suite(tasks(4, () => ({ graderRevisions: { verdict: '1', generatedTestsGoverned: '1' } })));
+    const v2 = suite(tasks(4, () => ({ graderRevisions: { verdict: '1', generatedTestsGoverned: '2' } })));
+    const unbridged = evaluateReleaseGate(v1, v2);
+    assert.equal(checkOf(unbridged, 'comparable').pass, false);
+    assert.match(checkOf(unbridged, 'comparable').detail, /generatedTestsGoverned 1 → 2 has no bridge comparison/);
+    const bridge = { graderId: 'generatedTestsGoverned', fromRevision: '1', toRevision: '2', pairs: 4, agreement: 1, flips: 0, newlyFailing: [], newlyPassing: [], mcnemarP: 1, discontinuity: false } as never;
+    const bridged = evaluateReleaseGate(v1, v2, { bridges: [bridge] });
+    assert.equal(checkOf(bridged, 'comparable').pass, true, checkOf(bridged, 'comparable').detail);
+    assert.deepEqual(bridged.bridgesUsed, [{ graderId: 'generatedTestsGoverned', fromRevision: '1', toRevision: '2', pairs: 4 }]);
+    assert.match(renderReleaseGateReport(bridged), /Bridged grader revisions: generatedTestsGoverned 1 → 2 \(4 pair\(s\), no discontinuity\)/);
+    const broken = evaluateReleaseGate(v1, v2, { bridges: [{ ...(bridge as object), discontinuity: true, newlyFailing: ['task-1'] } as never] });
+    assert.match(checkOf(broken, 'comparable').detail, /declares a discontinuity .*re-baseline/);
+    const empty = evaluateReleaseGate(v1, v2, { bridges: [{ ...(bridge as object), pairs: 0 } as never] });
+    assert.match(checkOf(empty, 'comparable').detail, /compared no trial/);
+  });
+
+  test('(F[12]) the same suite revision over different content (fingerprint) is not comparable', () => {
+    const a = suite(tasks(), { suiteFingerprint: 'a'.repeat(64) });
+    const b = suite(tasks(), { suiteFingerprint: 'b'.repeat(64) });
+    const r = evaluateReleaseGate(a, b);
+    assert.equal(checkOf(r, 'comparable').pass, false);
+    assert.match(checkOf(r, 'comparable').detail, /suite core@core-1 content differs \(fingerprint aaaaaaaaaaaa vs bbbbbbbbbbbb\)/);
+    assert.equal(checkOf(evaluateReleaseGate(a, suite(tasks(), { suiteFingerprint: 'a'.repeat(64) })), 'comparable').pass, true);
   });
 });

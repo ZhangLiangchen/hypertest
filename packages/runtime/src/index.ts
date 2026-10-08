@@ -20,6 +20,9 @@ export {
   type ActiveReleasePointer, type CanarySelection, type CompatibilitySuiteKind, type CompatibilitySuiteResult, type ManifestSchemaKey, type NewRuntimeEpoch,
   type PromotionReadiness, type PromotionResult, type RecordSuiteInput, type ReleaseAction, type ReleaseTransition, type RollbackResult, type RunAdmission,
   type RuntimeRelease, type RuntimeReleaseRegistry, type RuntimeReleaseRegistryDeps, type SchemaMigrationAllowance,
+  // (additive, F[0]) per-stage release gates, bound suite results, shadow comparisons
+  ACCEPTED_BINDINGS, RELEASE_GATE_SUITE_ID, RELEASE_STAGES_MIGRATION, SHADOW_OF_LABEL, STAGE_REQUIREMENTS, suiteBindingProblems,
+  type NewShadowComparison, type ShadowComparison, type SuiteResultBinding,
 } from './releases.ts';
 export { EngineRegistry } from './registry.ts';
 export { engineContractSuite } from './contract-suite.ts';

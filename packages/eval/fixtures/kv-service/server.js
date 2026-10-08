@@ -12,12 +12,21 @@
 // KV_WRITE_LOG (optional, an absolute path): every PUT is appended as a JSON line {key, value, idempotencyKey, pid,
 // startedAt, at} — the environment's own record of the writes it served (eval ground truth; the store is in memory, so a
 // restart loses it).
+// KV_SLOW_EVERY / KV_SLOW_MS / KV_SLOW_KEY (optional): a seeded latency anomaly — every KV_SLOW_EVERY-th GET of key
+// KV_SLOW_KEY (default k1) takes KV_SLOW_MS more (the hot-key regression of the PoC C anomaly and performance suites).
+// KV_SLOW_PUT_MS (optional): a PUT is APPLIED (and logged) at once but answered only after this delay — a client that dies
+// meanwhile cannot know whether its write landed (the unqueryable-target chaos case).
 import { appendFileSync } from 'node:fs';
 import http from 'node:http';
 
 const MAX_LATENCY_MS = Math.max(1, Number(process.env.KV_MAX_LATENCY_MS ?? 6));
 const WRITE_LOG = process.env.KV_WRITE_LOG;
 const WARMUP_MS = Math.max(0, Number(process.env.KV_WARMUP_MS ?? 0));
+const SLOW_EVERY = Math.max(0, Number(process.env.KV_SLOW_EVERY ?? 0));
+const SLOW_MS = Math.max(0, Number(process.env.KV_SLOW_MS ?? 0));
+const SLOW_KEY = process.env.KV_SLOW_KEY ?? 'k1';
+const SLOW_PUT_MS = Math.max(0, Number(process.env.KV_SLOW_PUT_MS ?? 0));
+let slowCount = 0;
 const BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1];
 const started = Date.now();
 const store = new Map([['k1', 'v1'], ['k2', 'v2']]);
@@ -87,8 +96,9 @@ const server = http.createServer((req, res) => {
         body = { error: 'method_not_allowed' };
       }
       observe(method, status, Number(process.hrtime.bigint() - t0) / 1e9);
-      json(res, status, body);
-    }, 1 + Math.floor(Math.random() * MAX_LATENCY_MS));
+      if (method === 'PUT' && SLOW_PUT_MS > 0) setTimeout(() => json(res, status, body), SLOW_PUT_MS);
+      else json(res, status, body);
+    }, 1 + Math.floor(Math.random() * MAX_LATENCY_MS) + (method === 'GET' && SLOW_EVERY > 0 && m[1] === SLOW_KEY && ++slowCount % SLOW_EVERY === 0 ? SLOW_MS : 0));
   });
 });
 

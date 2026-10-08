@@ -8,7 +8,7 @@ import type { EnvironmentRef, EvidenceRecord } from '@hypertest/domain';
 import type { CompensationResult, DispatchReceipt, ObservationResult, OperationContext, PreparedOperation, SideEffectAdapter, SideEffectCapabilities, SideEffectOutcome, VerificationResult } from '@hypertest/operation';
 import type { EnvironmentRegistry, ToolContext, ToolOutcome, ToolSpec } from '../contracts.ts';
 import {
-  ENV_ID_SCHEMA, OPERATION_ID_SCHEMA, assertOperationId, checkEgress, environmentClassForUrl, environmentOrigins, errorMessage, hostSegment, joinUrl, parseHttpUrl, pidState, readJsonFile,
+  ENV_ID_SCHEMA, OPERATION_ID_SCHEMA, assertOperationId, checkEgress, environmentClassForUrl, environmentForUrl, environmentOrigins, errorMessage, hostSegment, joinUrl, parseHttpUrl, pidState, readJsonFile,
   readJsonFileSync, requireEnvironment, writeJsonAtomic,
 } from './common.ts';
 import { HTTP_METHODS } from './http.ts';
@@ -118,15 +118,18 @@ function workerMarker(operationId: string): string {
 }
 
 /** Resolves the target URL of a load job from `targetUrl` or `environmentId` + `path`. */
-export function resolveLoadTarget(input: Pick<LoadStartInput, 'environmentId' | 'targetUrl' | 'path'>, envs: EnvironmentRegistry | undefined): { url: URL; environmentClass: string | undefined; trustedOrigins: string[] } {
+export function resolveLoadTarget(input: Pick<LoadStartInput, 'environmentId' | 'targetUrl' | 'path'>, envs: EnvironmentRegistry | undefined): { url: URL; environmentClass: string | undefined; trustedOrigins: string[]; environmentId?: string } {
   if (input.environmentId !== undefined) {
     const env = requireEnvironment(envs, input.environmentId);
     if (!env.baseUrl) throw new HypertestError('precondition_failed', `environment ${env.environmentId} has no baseUrl`);
-    return { url: joinUrl(env.baseUrl, input.path, `environment ${env.environmentId} baseUrl`), environmentClass: env.environmentClass, trustedOrigins: environmentOrigins(env) };
+    return { url: joinUrl(env.baseUrl, input.path, `environment ${env.environmentId} baseUrl`), environmentClass: env.environmentClass, trustedOrigins: environmentOrigins(env), environmentId: env.environmentId };
   }
   if (input.targetUrl === undefined) throw new HypertestError('invalid_argument', 'either targetUrl or environmentId is required');
   if (input.path !== undefined) throw new HypertestError('invalid_argument', 'path is only valid together with environmentId');
   const url = parseHttpUrl(input.targetUrl, 'targetUrl');
+  // (e2e[0]) a target URL on a registered environment's origin is a load job on that environment
+  const owner = environmentForUrl(url, envs);
+  if (owner) return { url, environmentClass: owner.environmentClass, trustedOrigins: environmentOrigins(owner), environmentId: owner.environmentId };
   return { url, environmentClass: environmentClassForUrl(url, envs), trustedOrigins: [] };
 }
 
@@ -343,11 +346,11 @@ export class HttpLoadAdapter implements SideEffectAdapter<LoadStartInput, LoadJo
     if (!(Number.isInteger(concurrency) && concurrency >= 1 && concurrency <= 10_000)) throw new HypertestError('invalid_argument', 'concurrency must be an integer in [1, 10000]');
     const timeoutMs = input.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     if (!(Number.isInteger(timeoutMs) && timeoutMs > 0)) throw new HypertestError('invalid_argument', 'timeoutMs must be a positive integer');
-    const { url, environmentClass } = resolveLoadTarget(input, this.#o.environments);
+    const { url, environmentClass, environmentId } = resolveLoadTarget(input, this.#o.environments);
     const spec: LoadJobSpec = { operationId, targetUrl: url.href, method, ratePerSecond: input.ratePerSecond, durationMs: input.durationMs, concurrency, timeoutMs };
     if (input.body !== undefined) spec.body = input.body;
     if (input.headers !== undefined) spec.headers = normalizeHeaders(input.headers);
-    if (input.environmentId !== undefined) spec.environmentId = input.environmentId;
+    if (environmentId !== undefined) spec.environmentId = environmentId;
     if (environmentClass !== undefined) {
       spec.environmentClass = environmentClass;
       setBounded(jobEnvironmentClass, operationId, environmentClass);
@@ -578,8 +581,8 @@ function boundOnly(id: string): ToolSpec['execute'] {
 }
 
 function loadTargetResources(input: LoadStartInput, envs: EnvironmentRegistry): string[] {
-  const { url } = resolveLoadTarget(input, envs);
-  const primary = input.environmentId !== undefined ? `env/${input.environmentId}` : `url/${hostSegment(url)}`;
+  const { url, environmentId } = resolveLoadTarget(input, envs);
+  const primary = environmentId !== undefined ? `env/${environmentId}` : `url/${hostSegment(url)}`;
   return [primary, `loadgen/${hostSegment(url)}`];
 }
 

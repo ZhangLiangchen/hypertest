@@ -204,3 +204,12 @@ absent (`npm run infra:up` writes `.infra/env`).
 - (unit model-runtime, wave 1) New command `model` (`switch`, `prices set|clear|list`); `eval apply-scores`;
   `resume [<runId>]`; `status <runId>` prints the run's agents (`--json`: `agents`). The init template declares every
   route's capability profile explicitly (classification, action risk) and explains unknown prices.
+
+## Tool surface (audit wave 3, additive)
+
+- `hypertest run --url <sutUrl>`: the URL must be one of `tools.httpAllowlist`; it resolves to the ad-hoc environment
+  `url-<host>-<port>` (http.request / load / metrics on it are permitted and evidenced) — test `test/blackbox-url.e2e.test.ts`
+  (scripted brains: probe → evidence → verdict; an unlisted URL is refused before a run is created).
+- `hypertest tool-worker --tools <ids> [--id w1] [--listen host:port] [--secret-env NAME]` serves delegated tools to
+  `tools.remoteWorkers` over HMAC-signed HTTP (default secret variable `HYPERTEST_TOOL_WORKER_SECRET`; `--json` prints the
+  URL); `packages/app/test/remote-worker.e2e.test.ts` runs it as a second process.

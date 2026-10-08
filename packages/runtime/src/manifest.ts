@@ -153,6 +153,10 @@ export function toolCatalogRevision(tools: readonly Pick<ToolSpec, 'id'>[] | rea
       environmentClass: typeof t.environmentClass === 'function',
       resendable: typeof t.resendable === 'function',
       sideEffect: binding ? { adapterId: binding.adapterId, operationType: binding.operationType, leaseTtlMs: binding.leaseTtlMs ?? null } : null,
+      // (additive, wave 3) what the tool may record and the scopes the operator grants with it are part of the runtime: hashed
+      // only when present, so the revision of a catalog without them is unchanged
+      ...(Array.isArray(t.evidenceTypes) ? { evidenceTypes: [...t.evidenceTypes].sort() } : {}),
+      ...(t.grant ? { grant: { scopes: [...t.grant.scopes].sort(), profiles: [...t.grant.profiles].sort() } } : {}),
     };
   });
   entries.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));

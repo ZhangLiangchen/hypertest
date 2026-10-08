@@ -49,10 +49,10 @@ function ok(r: ToolExecutionResult): ToolExecutionResult {
 
 test('builtinTools: every white-box tool registers with a unique id and a valid schema', () => {
   const ids = whiteboxTools(options).map((s) => s.id);
-  assert.deepEqual(ids, ['fs.read', 'fs.list', 'fs.search', 'fs.write', 'fs.apply_patch', 'git.status', 'git.diff', 'git.log', 'git.show', 'git.blame', 'git.commit', 'shell.exec', 'test.run', 'coverage.collect', 'mutation.run', 'code.symbols', 'code.references']);
+  assert.deepEqual(ids, ['fs.read', 'fs.list', 'fs.search', 'fs.write', 'fs.apply_patch', 'git.status', 'git.diff', 'git.log', 'git.show', 'git.blame', 'git.commit', 'shell.exec', 'test.run', 'coverage.collect', 'mutation.run', 'code.symbols', 'code.references', 'lsp.definitions', 'lsp.references', 'lsp.diagnostics', 'analysis.run']);
   // the black-box half is part of the catalog (static import: a renamed export cannot silently drop it)
   const all = builtinTools(options).map((s) => s.id);
-  for (const id of [...ids, 'http.request', 'metrics.query', 'load.start', 'load.observe', 'load.stop', 'env.restart', 'env.inject_fault', 'env.deploy']) assert.ok(all.includes(id), id);
+  for (const id of [...ids, 'http.request', 'metrics.query', 'load.start', 'load.observe', 'load.stop', 'env.restart', 'env.inject_fault', 'env.deploy', 'logs.query', 'trace.query', 'net.capture', 'db.introspect', 'grpc.call']) assert.ok(all.includes(id), id);
   assert.equal(new Set(all).size, all.length, 'ids are unique');
   assert.match(rt.registry.revision(), /^[0-9a-f]{64}$/);
 });

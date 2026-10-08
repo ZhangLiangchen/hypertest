@@ -48,7 +48,12 @@ test('execute: text content joined, structuredContent kept, isError ⇒ failed (
   const runtime = newRuntime(env, await b.listTools());
   const sum = await runtime.execute(toolRequest('mcp.calc.add', { a: 2, b: 3 }));
   assert.equal(sum.status, 'success', sum.modelText);
-  assert.equal(sum.modelText, '5');
+  // (E[5]) every MCP call records mcp-response evidence; the runtime names it in the model text
+  assert.match(sum.modelText, /^5\n\[evidence: ev_\w+\]$/);
+  assert.equal(sum.evidenceRefs.length, 1);
+  const [rec] = await env.evidence.getMany(sum.evidenceRefs);
+  assert.equal(rec!.evidenceType, 'mcp-response');
+  assert.deepEqual((rec!.structured as { server: string; tool: string; arguments: unknown; isError: boolean }).arguments, { a: 2, b: 3 });
   assert.deepEqual(sum.structured, { sum: 5 });
   const div = await runtime.execute(toolRequest('mcp.calc.divide', { a: 1, b: 0 }));
   assert.equal(div.status, 'failed');

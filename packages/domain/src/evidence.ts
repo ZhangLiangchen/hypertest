@@ -40,6 +40,8 @@ export interface Provenance {
   workspaceId?: string;
   target?: string;
   inputsHash?: string;
+  /** (additive, wave 3) Where the tool call's body executed when not in this process: `remote:<workerId>` (remote tool worker). */
+  executedBy?: string;
 }
 
 export interface EvidenceProducer {

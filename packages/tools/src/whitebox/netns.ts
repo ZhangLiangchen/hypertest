@@ -41,6 +41,11 @@ export interface IsolationSpec {
    * endpoint. Nothing else is reachable.
    */
   egress?: ReadonlyArray<{ host: string; port: number; socket: string }>;
+  /**
+   * (wave 3, row 250) Directories bound read-only for the command (jail strategy only): the workspace root of a read-only
+   * workspace (a shared snapshot, the `read_only` sandbox tier) — the command can read it, never change it.
+   */
+  readOnly?: readonly string[];
 }
 
 /** How the local sandbox isolates a command. */
@@ -111,6 +116,14 @@ def private(d, keep):
         mount('/proc/self/fd/%d' % fd, k, None, BIND | REC, None)
         os.close(fd)
     mount('tmpfs', d, None, REMOUNT | RDONLY | NOSUID | NODEV, None)
+def ro_bind(p):
+    p = os.path.realpath(p)
+    if not os.path.isdir(p): return
+    mount(p, p, None, BIND | REC, None)
+    # keep the flags the underlying mount has (a user namespace may not clear locked nosuid/nodev/noexec), add read-only
+    f = os.statvfs(p).f_flag
+    keep = (NOSUID if f & 2 else 0) | (NODEV if f & 4 else 0) | (NOEXEC if f & 8 else 0) | (1024 if f & 1024 else 0) | (2048 if f & 2048 else 0) | ((1 << 21) if f & 4096 else 0)
+    mount(None, p, None, REMOUNT | BIND | RDONLY | keep, None)
 def listen_egress():
     out = []
     for e in cfg.get('egress') or []:
@@ -180,6 +193,7 @@ if init == 0:
         mount('proc', '/proc', 'proc', NOSUID | NODEV | NOEXEC, None)
         for p in cfg['hide']: hide(p)
         if cfg['private']: private(cfg['private']['dir'], cfg['private']['keep'])
+        for p in cfg.get('readonly') or []: ro_bind(p)
         egress = listen_egress()
         drop_identity()
         os.chdir(cfg['cwd'])
@@ -310,6 +324,7 @@ export async function probeNetworkIsolation(options: NetworkIsolationOptions = {
             uid, gid, jail, cwd: spec.cwd, hide: [...(spec.hide ?? [])],
             private: spec.privateDir ? { dir: spec.privateDir.dir, keep: [...spec.privateDir.keep] } : null,
             egress: jail ? (spec.egress ?? []).map((e) => ({ host: e.host, port: e.port, socket: e.socket })) : [],
+            readonly: jail ? [...(spec.readOnly ?? [])] : [],
           };
           return [unshare, ...flags, '--', python, '-I', '-c', HELPER, JSON.stringify(cfg), ...argv];
         };

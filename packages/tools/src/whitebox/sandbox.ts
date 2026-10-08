@@ -1,13 +1,13 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { availableParallelism, tmpdir } from 'node:os';
 import { connect, createServer, type Server, type Socket } from 'node:net';
 import { join, relative, resolve, sep } from 'node:path';
 import { HypertestError } from '@hypertest/core';
-import type { EgressEndpointPolicy, EgressWritePolicy, LocalSandboxOptions, OciSandboxOptions, ProcessResult, SandboxProfile, SandboxRunner, WorkspaceHandle } from '../contracts.ts';
-import { DEFAULT_KILL_GRACE_MS, DEFAULT_MAX_OUTPUT_BYTES, spawnProcess } from './process.ts';
+import type { EgressEndpointPolicy, EgressWritePolicy, LocalSandboxOptions, OciSandboxOptions, ProcessResult, SandboxProfile, SandboxRunner, SandboxSession, SessionOptions, WorkspaceHandle } from '../contracts.ts';
+import { DEFAULT_KILL_GRACE_MS, DEFAULT_MAX_OUTPUT_BYTES, spawnProcess, spawnSession } from './process.ts';
 import { confineExisting } from './paths.ts';
 import { networkIsolation, resolveProgram, type IsolationSpec, type NetworkIsolation } from './netns.ts';
 import { createEgressHttpServer, currentEgressContext, type EgressCallContext } from './egress-relay.ts';
@@ -78,80 +78,133 @@ export function createLocalSandbox(options: LocalSandboxOptions = {}): SandboxRu
   const grace = options.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
   const defaultMax = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
   const isolation = (): Promise<NetworkIsolation> => networkIsolation(options.networkIsolation ?? {});
+
+  /**
+   * Everything a command needs before it is spawned — confined cwd, private HOME/TMPDIR, scrubbed environment, the
+   * namespace/jail wrapper (or the explicit refusal) and the egress relays — shared by `run` and `session` (so an
+   * interactive process is isolated exactly like a one-shot command). `notStarted`: the program does not exist.
+   */
+  async function prepare(ws: WorkspaceHandle, command: string[], opts: { cwd?: string | undefined; env?: Record<string, string> | undefined }): Promise<{ argv: string[]; cwd: string; env: Record<string, string>; cleanup: () => Promise<void>; notStarted?: ProcessResult }> {
+    // never a silent isolation downgrade: a workspace whose profile demands a container is not run as a
+    // plain host process
+    if (ws.sandbox?.kind === 'oci') {
+      throw new HypertestError('precondition_failed', `workspace ${ws.workspaceId} requires the OCI sandbox (profile kind 'oci'); the local sandbox cannot provide it`);
+    }
+    const cwd = await sandboxCwd(ws, opts.cwd);
+    const { home, tmp, cleanup: homeCleanup } = await privateHome(ws);
+    const cleanups: Array<() => Promise<void>> = [];
+    const cleanup = async () => {
+      for (const c of cleanups) await c().catch(() => undefined);
+      await homeCleanup();
+    };
+    try {
+      const env: Record<string, string> = {
+        ...allowlistedEnv(ws.sandbox),
+        PATH: process.env['PATH'] ?? '/usr/local/bin:/usr/bin:/bin',
+        HOME: home,
+        LANG: process.env['LANG'] ?? 'C.UTF-8',
+        TMPDIR: tmp,
+        ...(opts.env ?? {}),
+        [SANDBOX_MARKER_ENV]: 'local',
+      };
+      let argv = command;
+      const network = ws.sandbox?.network;
+      // (wave 3, row 250) the profile's keys are honoured or the command is refused — never accepted and ignored
+      const extraEgress = egressAllowlist(ws);
+      const readOnlyRoot = ws.readOnly === true;
+      if (readOnlyRoot && network === 'open' && options.allowUnhiddenPaths !== true) {
+        throw new HypertestError('precondition_failed', `workspace ${ws.workspaceId} is read-only, but a command with an open network runs without namespaces: the local sandbox cannot bind it read-only (refused, fail closed)`, {
+          details: { workspaceId: ws.workspaceId, network },
+        });
+      }
+      // E[4]: paths this sandbox must hide (keys, capability secret, store) are hidden only by the jail strategy; a command
+      // that would see them runs only when its owner explicitly accepted that (allowUnhiddenPaths) — never silently
+      const mustHide = (options.hiddenPaths?.length ?? 0) > 0 && options.allowUnhiddenPaths !== true;
+      if (mustHide && network === 'open') {
+        throw new HypertestError('precondition_failed', `the local sandbox cannot hide ${options.hiddenPaths!.join(', ')} from a command with an open network (no namespaces): refused (fail closed)`, {
+          details: { workspaceId: ws.workspaceId, network },
+        });
+      }
+      if (network !== 'open') {
+        // fail closed: every profile but an explicitly open network (and a workspace without a profile) is isolated
+        const iso = await isolation();
+        if (iso.available && !iso.jail && readOnlyRoot && options.allowUnhiddenPaths !== true) {
+          throw new HypertestError('precondition_failed', `workspace ${ws.workspaceId} is read-only, but this host's isolation (strategy ${iso.strategy}) has no mount namespace to bind it read-only: refused (fail closed)`, {
+            details: { workspaceId: ws.workspaceId, strategy: iso.strategy },
+          });
+        }
+        if (iso.available && !iso.jail && extraEgress.length > 0) {
+          throw new HypertestError('precondition_failed', `sandbox.allowedHosts needs the jail strategy to relay the allowed endpoints (this host: ${iso.strategy}): refused (fail closed)`, { details: { workspaceId: ws.workspaceId } });
+        }
+        if (iso.available && !iso.jail && mustHide) {
+          throw new HypertestError('precondition_failed', `the local sandbox cannot hide ${options.hiddenPaths!.join(', ')} from commands on this host (strategy ${iso.strategy} has no PID/mount jail): refused (fail closed)`, {
+            details: { workspaceId: ws.workspaceId, strategy: iso.strategy },
+          });
+        }
+        if (!iso.available) {
+          throw new HypertestError(
+            'precondition_failed',
+            `the local sandbox cannot enforce network '${network ?? 'none'}' for workspace ${ws.workspaceId}: ${iso.reason}. Use the OCI sandbox, or set the sandbox profile's network to 'open' to accept an unrestricted network explicitly`,
+            { details: { workspaceId: ws.workspaceId, network: network ?? null } },
+          );
+        }
+        if (Array.isArray(command) && command.length > 0 && typeof command[0] === 'string') {
+          // a program that cannot be started is reported like an unwrapped spawn (exit 127 + spawnError), without
+          // ever starting it outside the namespace
+          if (!resolveProgram(command[0], env['PATH'], cwd)) return { argv, cwd, env, cleanup, notStarted: notStarted(command[0]) };
+          const spec = isolationSpec(ws, cwd, options);
+          if (readOnlyRoot && iso.jail) spec.readOnly = [ws.root];
+          // allowlisted egress (the SUT's loopback endpoints) for every profile but `none` — jail strategy only; (wave 3)
+          // `egress_allowlist` adds the profile's allowedHosts (loopback endpoints, HTTP-aware like every relay)
+          if (network !== 'none' && network !== undefined && iso.jail && (options.egress || extraEgress.length > 0)) {
+            const endpoints = loopbackEndpointPolicies([...(options.egress ? await options.egress(ws) : []), ...extraEgress]);
+            if (endpoints.length > 0) {
+              // E[2]: HTTP-aware relays — safe methods pass, writes are ledgered (or refused), raw traffic refused unless
+              // the environment allows it; the tool call the command runs for is captured now
+              const fw = await startEgressForwarders(endpoints, options.egressWrites ?? 'ledger', currentEgressContext());
+              cleanups.push(fw.close);
+              spec.egress = fw.list;
+            }
+          }
+          argv = iso.wrap(command, spec);
+        }
+      }
+      // (wave 3, row 250) resource limits of the profile on the local sandbox (inherited by every process of the command)
+      argv = await withResourceLimits(argv, ws);
+      return { argv, cwd, env, cleanup };
+    } catch (e) {
+      await cleanup();
+      throw e;
+    }
+  }
+
   return {
     kind: 'local',
     async available() {
       return true;
     },
     async run(ws: WorkspaceHandle, command: string[], opts: RunOptions): Promise<ProcessResult> {
-      // never a silent isolation downgrade: a workspace whose profile demands a container is not run as a
-      // plain host process
-      if (ws.sandbox?.kind === 'oci') {
-        throw new HypertestError('precondition_failed', `workspace ${ws.workspaceId} requires the OCI sandbox (profile kind 'oci'); the local sandbox cannot provide it`);
-      }
-      const cwd = await sandboxCwd(ws, opts.cwd);
-      const { home, tmp, cleanup } = await privateHome(ws);
-      const cleanups: Array<() => Promise<void>> = [];
+      const prepared = await prepare(ws, command, opts);
       try {
-        const env: Record<string, string> = {
-          ...allowlistedEnv(ws.sandbox),
-          PATH: process.env['PATH'] ?? '/usr/local/bin:/usr/bin:/bin',
-          HOME: home,
-          LANG: process.env['LANG'] ?? 'C.UTF-8',
-          TMPDIR: tmp,
-          ...(opts.env ?? {}),
-          [SANDBOX_MARKER_ENV]: 'local',
-        };
-        let argv = command;
-        const network = ws.sandbox?.network;
-        // E[4]: paths this sandbox must hide (keys, capability secret, store) are hidden only by the jail strategy; a command
-        // that would see them runs only when its owner explicitly accepted that (allowUnhiddenPaths) — never silently
-        const mustHide = (options.hiddenPaths?.length ?? 0) > 0 && options.allowUnhiddenPaths !== true;
-        if (mustHide && network === 'open') {
-          throw new HypertestError('precondition_failed', `the local sandbox cannot hide ${options.hiddenPaths!.join(', ')} from a command with an open network (no namespaces): refused (fail closed)`, {
-            details: { workspaceId: ws.workspaceId, network },
-          });
-        }
-        if (network !== 'open') {
-          // fail closed: every profile but an explicitly open network (and a workspace without a profile) is isolated
-          const iso = await isolation();
-          if (iso.available && !iso.jail && mustHide) {
-            throw new HypertestError('precondition_failed', `the local sandbox cannot hide ${options.hiddenPaths!.join(', ')} from commands on this host (strategy ${iso.strategy} has no PID/mount jail): refused (fail closed)`, {
-              details: { workspaceId: ws.workspaceId, strategy: iso.strategy },
-            });
-          }
-          if (!iso.available) {
-            throw new HypertestError(
-              'precondition_failed',
-              `the local sandbox cannot enforce network '${network ?? 'none'}' for workspace ${ws.workspaceId}: ${iso.reason}. Use the OCI sandbox, or set the sandbox profile's network to 'open' to accept an unrestricted network explicitly`,
-              { details: { workspaceId: ws.workspaceId, network: network ?? null } },
-            );
-          }
-          if (Array.isArray(command) && command.length > 0 && typeof command[0] === 'string') {
-            // a program that cannot be started is reported like an unwrapped spawn (exit 127 + spawnError), without
-            // ever starting it outside the namespace
-            if (!resolveProgram(command[0], env['PATH'], cwd)) return notStarted(command[0]);
-            const spec = isolationSpec(ws, cwd, options);
-            // allowlisted egress (the SUT's loopback endpoints) for every profile but `none` — jail strategy only
-            if (network !== 'none' && network !== undefined && iso.jail && options.egress) {
-              const endpoints = loopbackEndpointPolicies(await options.egress(ws));
-              if (endpoints.length > 0) {
-                // E[2]: HTTP-aware relays — safe methods pass, writes are ledgered (or refused), raw traffic refused unless
-                // the environment allows it; the tool call the command runs for is captured now
-                const fw = await startEgressForwarders(endpoints, options.egressWrites ?? 'ledger', currentEgressContext());
-                cleanups.push(fw.close);
-                spec.egress = fw.list;
-              }
-            }
-            argv = iso.wrap(command, spec);
-          }
-        }
-        const req: Parameters<typeof spawnProcess>[0] = { argv, cwd, env, timeoutMs: opts.timeoutMs, signal: opts.signal, maxOutputBytes: opts.maxOutputBytes ?? defaultMax, killGraceMs: grace };
+        if (prepared.notStarted) return prepared.notStarted;
+        const req: Parameters<typeof spawnProcess>[0] = { argv: prepared.argv, cwd: prepared.cwd, env: prepared.env, timeoutMs: opts.timeoutMs, signal: opts.signal, maxOutputBytes: opts.maxOutputBytes ?? defaultMax, killGraceMs: grace };
         if (opts.stdin !== undefined) req.stdin = opts.stdin;
         return await spawnProcess(req);
       } finally {
-        for (const c of cleanups) await c().catch(() => undefined);
-        await cleanup();
+        await prepared.cleanup();
+      }
+    },
+    async session(ws: WorkspaceHandle, command: string[], opts: SessionOptions): Promise<SandboxSession> {
+      const prepared = await prepare(ws, command, opts);
+      if (prepared.notStarted) {
+        await prepared.cleanup();
+        throw new HypertestError('unavailable', prepared.notStarted.stderr, { details: { spawnError: prepared.notStarted.spawnError } });
+      }
+      try {
+        return spawnSession({ argv: prepared.argv, cwd: prepared.cwd, env: prepared.env, signal: opts.signal, killGraceMs: grace, ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}), onClose: prepared.cleanup });
+      } catch (e) {
+        await prepared.cleanup();
+        throw e;
       }
     },
   };
@@ -264,6 +317,77 @@ async function startEgressForwarders(
       await rm(dir, { recursive: true, force: true });
     },
   };
+}
+
+/**
+ * (wave 3, row 250) The extra egress of a profile with `network: 'egress_allowlist'`: its `allowedHosts` as relayed
+ * origins. The local sandbox relays loopback endpoints only — a host it cannot relay is refused, never ignored (the
+ * configuration rejects it up front). Any other network mode with allowedHosts is refused too.
+ */
+export function egressAllowlist(ws: WorkspaceHandle): string[] {
+  const hosts = ws.sandbox?.allowedHosts ?? [];
+  if (hosts.length === 0) return [];
+  if (ws.sandbox.network !== 'egress_allowlist') {
+    throw new HypertestError('precondition_failed', `sandbox.allowedHosts applies only to network 'egress_allowlist' (workspace ${ws.workspaceId} has '${ws.sandbox.network}'): refused`, { details: { workspaceId: ws.workspaceId } });
+  }
+  const out: string[] = [];
+  for (const h of hosts) {
+    const origin = /^[a-z]+:\/\//i.test(h) ? h : `http://${h}`;
+    let url: URL;
+    try {
+      url = new URL(origin);
+    } catch {
+      throw new HypertestError('precondition_failed', `sandbox.allowedHosts entry ${JSON.stringify(h)} is not a host:port or origin`);
+    }
+    const host = url.hostname.replace(/^\[|\]$/g, '');
+    if (!(host === 'localhost' || host === '::1' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)) || url.port === '') {
+      throw new HypertestError('precondition_failed', `sandbox.allowedHosts entry ${h}: the local sandbox relays only loopback endpoints with a port (use the OCI sandbox with network 'open' for remote hosts): refused`);
+    }
+    out.push(url.origin);
+  }
+  return out;
+}
+
+/** CPUs this process may run on (`Cpus_allowed_list`), else 0..n-1. */
+function allowedCpus(): number[] {
+  try {
+    const line = readFileSync('/proc/self/status', 'utf8').split('\n').find((l) => l.startsWith('Cpus_allowed_list:'));
+    const out: number[] = [];
+    for (const part of (line?.split(':')[1] ?? '').trim().split(',')) {
+      const [a, b] = part.split('-').map(Number);
+      if (a === undefined || !Number.isInteger(a)) continue;
+      for (let c = a; c <= (b !== undefined && Number.isInteger(b) ? b : a); c++) out.push(c);
+    }
+    if (out.length > 0) return out;
+  } catch {
+    // not Linux
+  }
+  return Array.from({ length: availableParallelism() }, (_, i) => i);
+}
+
+/**
+ * (wave 3, row 250) `memoryMb` and `cpuLimit` on the local sandbox: util-linux `prlimit --data` (the data segment,
+ * anonymous mappings included, per process — a process allocating beyond it fails with ENOMEM) and `taskset` (the
+ * command runs on ceil(cpuLimit) CPUs; a fractional quota needs the OCI sandbox's cgroup `--cpus`). Without the program
+ * the command is refused (fail closed), never run unlimited.
+ */
+export async function withResourceLimits(argv: string[], ws: WorkspaceHandle): Promise<string[]> {
+  const { memoryMb, cpuLimit } = ws.sandbox ?? {};
+  let out = argv;
+  if (cpuLimit !== undefined) {
+    if (!(typeof cpuLimit === 'number' && cpuLimit > 0)) throw new HypertestError('invalid_argument', 'sandbox.cpuLimit must be a positive number');
+    const taskset = resolveProgram('taskset', process.env['PATH']);
+    if (!taskset) throw new HypertestError('precondition_failed', `sandbox.cpuLimit needs util-linux 'taskset' on this host (workspace ${ws.workspaceId}): refused (fail closed)`);
+    const cpus = allowedCpus().slice(0, Math.max(1, Math.ceil(cpuLimit)));
+    out = [taskset, '-c', cpus.join(','), ...out];
+  }
+  if (memoryMb !== undefined) {
+    if (!(typeof memoryMb === 'number' && memoryMb > 0)) throw new HypertestError('invalid_argument', 'sandbox.memoryMb must be a positive number');
+    const prlimit = resolveProgram('prlimit', process.env['PATH']);
+    if (!prlimit) throw new HypertestError('precondition_failed', `sandbox.memoryMb needs util-linux 'prlimit' on this host (workspace ${ws.workspaceId}): refused (fail closed)`);
+    out = [prlimit, `--data=${Math.floor(memoryMb * 1024 * 1024)}`, '--', ...out];
+  }
+  return out;
 }
 
 /**
@@ -392,6 +516,10 @@ export function createOciSandbox(options: OciSandboxOptions): SandboxRunner {
     },
     async run(ws, command, opts) {
       if (!Array.isArray(command) || command.length === 0) throw new HypertestError('invalid_argument', 'command must be a non-empty array of strings');
+      // (wave 3, row 250) plain docker has no per-host egress filter: an allowlist would silently become `--network none`
+      if ((ws.sandbox.allowedHosts ?? []).length > 0) {
+        throw new HypertestError('precondition_failed', `the OCI sandbox cannot enforce sandbox.allowedHosts (no per-host egress filter); use the local sandbox for loopback endpoints or network 'open' explicitly: refused`, { details: { workspaceId: ws.workspaceId } });
+      }
       const cwd = await sandboxCwd(ws, opts.cwd);
       const cwdRel = relative(await confineExisting(ws.root, '.'), cwd);
       if (ws.tempDir) {
@@ -424,6 +552,25 @@ export function createOciSandbox(options: OciSandboxOptions): SandboxRunner {
       };
       if (opts.stdin !== undefined) req.stdin = opts.stdin;
       return spawnProcess(req);
+    },
+  };
+}
+
+/**
+ * (wave 3, row 250) One runner over a local and an OCI sandbox: each command runs on the one its workspace profile names
+ * (`sandbox.kind`, set per call by the isolation tier) — a tier that asks for a container never runs as a host process.
+ */
+export function routedSandbox(runners: { local: SandboxRunner; oci: SandboxRunner }): SandboxRunner {
+  const pick = (ws: WorkspaceHandle): SandboxRunner => (ws.sandbox?.kind === 'oci' ? runners.oci : runners.local);
+  return {
+    async available() {
+      return (await runners.local.available?.()) !== false;
+    },
+    run: (ws, command, opts) => pick(ws).run(ws, command, opts),
+    async session(ws, command, opts) {
+      const r = pick(ws);
+      if (!r.session) throw new HypertestError('unsupported', `the ${ws.sandbox?.kind ?? 'local'} sandbox runs no interactive sessions`);
+      return r.session(ws, command, opts);
     },
   };
 }

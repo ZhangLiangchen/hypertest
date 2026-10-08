@@ -11,8 +11,8 @@
  *   → finding.confirmed wakes the independent reviewer, who judges the recorded HTTP exchange
  *   → plan drained → lead Plan v2 readyForGate ⇒ fail (B1 violated, unresolved P1).
  */
-import type { JsonValue } from '@hypertest/core';
-import { evIds, inputRecord, jsonOf, leadReply, recIds, resultText, str, toolCall, type BrainView, type RoleBrain } from './kit.ts';
+import { sleep, type JsonValue } from '@hypertest/core';
+import { evIds, inputRecord, jsonOf, leadReply, pairedCalls, recIds, resultText, str, toolCall, type BrainView, type RoleBrain } from './kit.ts';
 import { pocReviewer, reviewerOfFinding, reviewerOfRun } from './poc-a.ts';
 
 export const BANK_ENV_ID = 'bank';
@@ -216,38 +216,50 @@ test('a negative transfer amount is rejected with 400', async () => {
 `;
 }
 
-/** TestDesigner reaction: write → register → run (fails on the defect: known-bad of this artifact) → validate → complete. */
-export const pocBTestDesigner: RoleBrain = (v) => {
+/** Attempts of the regression run when a run is refused before it executes (e.g. its egress write met a held claim). */
+export const MAX_REGRESSION_RUN_ATTEMPTS = 6;
+
+/**
+ * TestDesigner reaction: write → register → run (fails on the defect: known-bad of this artifact) → validate → complete.
+ * Dispatches on the transcript, like a model: a run that was REFUSED (a tool fault, e.g. its write to the bank was
+ * refused while the probing experiment still held the environment) is retried after a pause, at most
+ * MAX_REGRESSION_RUN_ATTEMPTS times; only a run that executed is used as validation evidence.
+ */
+export const pocBTestDesigner: RoleBrain = async (v) => {
   const finding = inputRecord(v, 'finding');
   if (!finding) return toolCall('fail_work', { reason: 'agent_failed', message: 'no finding record in the task inputs' });
   const base = /^POST (https?:\/\/[^/\s]+)\//.exec(String(finding.payload['reproduction'] ?? ''))?.[1];
   if (!base) return toolCall('fail_work', { reason: 'agent_failed', message: 'the finding names no reproducible endpoint' });
-  switch (v.step) {
-    case 0:
-      return toolCall('fs.write', { path: REGRESSION_TEST_PATH, content: regressionTest(base) });
-    case 1:
-      return toolCall('test_artifact.register', {
-        path: REGRESSION_TEST_PATH, sourceType: 'generated', runner: { framework: 'node_test', selector: REGRESSION_TEST_PATH },
-        oracleRefs: [{ oracleId: BANK_ORACLE_ID, revision: 1, assertionIds: ['B1'] }],
-      });
-    case 2:
-      return toolCall('test.run', { framework: 'node_test', selector: REGRESSION_TEST_PATH, testArtifactIds: [str(jsonOf(resultText(v, 1)), 'artifactId')!] });
-    case 3: {
-      const run = resultText(v, 2);
-      const artifactId = str(jsonOf(resultText(v, 1)), 'artifactId')!;
-      // D-1: a black-box service has no base revision to run against: the known-good run cannot exist yet — recorded, so
-      // the artifact can never support a P0/P1 assertion on its own
-      return toolCall('test_artifact.validate', /NOT PASSED/.test(run)
-        ? { artifactId, knownBadEvidenceId: evIds(run).at(-1)!, knownGoodUnavailableReason: 'the defective bank service is the only deployment: no fixed build exists to run this regression test against' }
-        : { artifactId, knownGoodEvidenceId: evIds(run).at(-1)! });
-    }
-    default: {
-      const artifactId = str(jsonOf(resultText(v, 1)), 'artifactId')!;
-      const ev = evIds(resultText(v, 2)).at(-1)!;
-      const summary = `Regression test ${REGRESSION_TEST_PATH} (artifact ${artifactId}) for finding ${finding.recordId}: it fails on the defective service (known-bad ${ev}); no known-good deployment exists (recorded).`;
-      return toolCall('complete_work', { summary, evidenceRefs: [ev], recordRefs: [finding.recordId], output: { summary, testArtifacts: [{ artifactId, path: REGRESSION_TEST_PATH, covers: [finding.recordId], evidenceRefs: [ev] }] } });
-    }
+  const calls = pairedCalls(v);
+  const of = (tool: string) => calls.filter((c) => c.tool === tool);
+  if (of('fs.write').length === 0) return toolCall('fs.write', { path: REGRESSION_TEST_PATH, content: regressionTest(base) });
+  const registered = of('test_artifact.register').at(-1);
+  if (!registered) {
+    return toolCall('test_artifact.register', {
+      path: REGRESSION_TEST_PATH, sourceType: 'generated', runner: { framework: 'node_test', selector: REGRESSION_TEST_PATH },
+      oracleRefs: [{ oracleId: BANK_ORACLE_ID, revision: 1, assertionIds: ['B1'] }],
+    });
   }
+  const artifactId = str(jsonOf(registered.result?.content), 'artifactId');
+  if (!artifactId) return toolCall('fail_work', { reason: 'agent_failed', message: `the test artifact was not registered: ${(registered.result?.content ?? '').slice(0, 300)}` });
+  const runs = of('test.run');
+  const last = runs.at(-1);
+  if (!last || (last.result?.isError === true && runs.length < MAX_REGRESSION_RUN_ATTEMPTS)) {
+    if (last) await sleep(1000);
+    return toolCall('test.run', { framework: 'node_test', selector: REGRESSION_TEST_PATH, testArtifactIds: [artifactId] });
+  }
+  if (last.result?.isError === true) return toolCall('fail_work', { reason: 'agent_failed', message: `the regression test could not run (${runs.length} attempts): ${(last.result.content ?? '').slice(0, 300)}` });
+  const run = last.result?.content ?? '';
+  const ev = evIds(run).at(-1)!;
+  if (of('test_artifact.validate').length === 0) {
+    // D-1: a black-box service has no base revision to run against: the known-good run cannot exist yet — recorded, so
+    // the artifact can never support a P0/P1 assertion on its own
+    return toolCall('test_artifact.validate', /NOT PASSED/.test(run)
+      ? { artifactId, knownBadEvidenceId: ev, knownGoodUnavailableReason: 'the defective bank service is the only deployment: no fixed build exists to run this regression test against' }
+      : { artifactId, knownGoodEvidenceId: ev });
+  }
+  const summary = `Regression test ${REGRESSION_TEST_PATH} (artifact ${artifactId}) for finding ${finding.recordId}: it fails on the defective service (known-bad ${ev}); no known-good deployment exists (recorded).`;
+  return toolCall('complete_work', { summary, evidenceRefs: [ev], recordRefs: [finding.recordId], output: { summary, testArtifacts: [{ artifactId, path: REGRESSION_TEST_PATH, covers: [finding.recordId], evidenceRefs: [ev] }] } });
 };
 
 // ------------------------------------------------------------------------------------------------ reviewer (reaction)

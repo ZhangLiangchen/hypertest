@@ -148,6 +148,71 @@ it is trusted as given. The `skills.trial` configuration key is set by `skill va
 instance started with it shows those unpublished revisions to its agents and logs a warning — never set it on a
 production deployment.
 
+### Tool surface: URL targets, MCP, ACP, remote workers, gRPC, computer use, observation, isolation tiers
+
+Black-box runs against a URL: every `tools.httpAllowlist` URL becomes an environment `url-<host>-<port>` (class `local`
+for loopback, else `tools.urlEnvironmentClass`, default `sandbox` — never allowlist a production URL under a lower
+class). `hypertest run --url http://127.0.0.1:8080 --goal …` targets it; a URL nothing serves is refused.
+
+```yaml
+tools:
+  httpAllowlist: ["http://127.0.0.1:8080"]
+  mcpServers:                                   # mcp.<id>.<tool>; effects ledgered, mcp-response evidence
+    - { id: tickets, command: node, args: [server.mjs], envFrom: { TICKETS_TOKEN: HT_TICKETS_TOKEN }, allowTools: [create_ticket, list_tickets],
+        toolEffects: { list_tickets: { effect: read, riskClass: low } }, environmentId: shop, roles: [executor] }
+    - { id: tracker, url: "https://mcp.example.test/mcp", headersFromEnv: { authorization: MCP_TRACKER_AUTH }, allowTools: [list], effect: read }
+  acpAgents:                                    # acp.<id>.prompt: an external coding agent in the caller's workspace sandbox
+    - { id: coder, command: my-acp-agent, envFrom: { AGENT_KEY: HT_AGENT_KEY }, roles: [test_designer] }
+  remoteWorkers:                                # delegated tools run on `hypertest tool-worker` (HMAC-signed HTTP)
+    - { id: w1, url: "http://10.0.0.7:7441", secretEnv: HT_WORKER_SECRET, tools: [http.request, metrics.query] }
+  computerUse: { backend: x11, display: ":99", displayId: kiosk }   # computer.* for vision_gui (x11 | xdotool | fake)
+environments:
+  - environmentId: shop
+    environmentClass: local
+    generation: 0
+    baseUrl: "http://127.0.0.1:8080"
+    control: { kind: kubectl, target: deployment/shop/app, namespace: shop, context: kind-dev }
+    grpc: { target: "127.0.0.1:50051", reflection: true, readMethods: ["shop.Catalog/Get*"] }
+    logs: { files: [/var/log/shop/app.log] }
+    traces: { kind: tempo, url: "http://127.0.0.1:3200", service: shop }
+    database: { kind: postgres, urlEnv: SHOP_DB_URL, schemas: [public] }
+```
+
+The remote worker: `HT_WORKER_SECRET=… hypertest -c worker.yaml tool-worker --tools http.request,metrics.query --id w1
+--listen 0.0.0.0:7441` (secret of at least 32 characters, by name only). Tools with their own side-effect adapter
+(env.*, load.*) are not delegable.
+
+Observation tools (all reads): `logs.query` (supervisor output — start the supervisor with `--log-file` —,
+`docker logs`, `kubectl logs`, declared files), `trace.query` (OTLP/JSON file, Jaeger, Tempo), `net.capture` (a pcap of
+the environment's host:port; needs tcpdump with capture privilege, else it fails `unsupported`/`permission_denied`),
+`db.introspect` (schema, read-only, through psql / sqlite / mysql). `test.run` and `shell.exec` take `captureNetwork:
+true` to record every HTTP exchange of their commands. Code intelligence: `lsp.*` (TypeScript language service),
+`analysis.run` (tsc, workspace eslint, pyflakes or a compile check, go vet).
+
+Fault injection: `env.inject_fault` kinds `latency`/`error_rate` (process environments), `pause`/`kill`/
+`network_disconnect`/`netem` (docker; netem needs `tc` and NET_ADMIN in the container), `pod_delete`/`scale_zero`/
+`network_deny` (kubectl). A fault is time-boxed: a detached reverter undoes it at `durationMs` even if Hypertest stops
+(jobs under `<dataDir>/state/faults/<operationId>`). If a revert fails, the environment refuses further operations
+until you repair it and delete that job directory.
+
+Isolation tiers and sandbox keys — every accepted key is enforced or the start/command is refused:
+
+```yaml
+sandbox:
+  kind: local
+  network: egress_allowlist
+  allowedHosts: ["127.0.0.1:9000"]     # local sandbox only, loopback host:port, relayed HTTP-aware
+  memoryMb: 2048                       # local: prlimit --data per process; oci: --memory
+  cpuLimit: 2                          # local: ceil(cpuLimit) CPUs (taskset); oci: --cpus
+  roles:
+    reviewer: { tier: read_only }                                  # workspace bound read-only for its commands
+    executor: { tier: separate, network: loopback, memoryMb: 4096 }
+    rca:      { tier: isolated, kind: oci, image: "node:22" }      # its commands run in a container
+```
+
+A work item whose capability requirements grant no `write_workspace` runs its commands read-only; one whose
+requirements name no environment runs them without egress. gVisor/Firecracker runtimes are not supported (deferred).
+
 ## 2. Security
 
 | Control | Default | Guidance |

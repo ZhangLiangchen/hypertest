@@ -667,3 +667,37 @@ when Chromium cannot launch. The MCP test server is `test/blackbox-mcp-server.mj
   anything else is `permission_denied`.
 - Tests: `test/side-effect-governance.test.ts`, `test/secret-broker.test.ts`, `test/blackbox-supervisor.test.ts` (E[0], E[1],
   env.deploy after approval), `test/blackbox-http.test.ts`, `test/sandbox.test.ts`.
+
+## Tool surface (audit wave 3, unit tool-surface, additive)
+
+Every new tool goes through the same pipeline as the others: capability check → policy permit → freshness (mutating) →
+Operation Ledger (external/destructive effects) → evidence. Each declares its evidence types on its spec
+(`ToolSpec.evidenceTypes`, also in the runtime manifest); an unbound tool with a configured audience declares
+`ToolSpec.grant` (the scopes `toolGrantScopes` adds to those permission profiles).
+
+| Area | Tools / API | Files | Tests |
+|---|---|---|---|
+| URL targets (e2e[0]) | `urlTargetEnvironments(httpAllowlist, registered, {remoteClass})` — one environment `url-<host>-<port>` per allowlisted URL; `environmentForUrl` (fails closed on ambiguity), `urlResource`, `addressedEnvironmentOf`; http/load/metrics by URL are calls on the owning environment | `blackbox/common.ts`, `http.ts`, `load.ts` | `blackbox-url-targets.test.ts`, `blackbox-http.test.ts`, `blackbox-load.test.ts` |
+| Browser (e2e[1]) | `browser.navigate` → `api-response` evidence; `browser.text` → `dom-snapshot`; `browser.click`/`browser.fill` require `environmentId` (resource `env/<id>`) | `blackbox/browser.ts` | `blackbox-browser.test.ts` |
+| MCP (E[5]) | `McpServerConfig` with `command` (stdio) or `url` (streamable HTTP), `headers`, `toolEffects`, `environmentId`, `grantTo`, `unavailableReason`; `mcp-response` evidence (secrets redacted) | `blackbox/mcp.ts` | `blackbox-mcp*.test.ts` |
+| gRPC | `grpc.call` (external, `idempotency-key` = operation id), `grpc.query` (only `grpc.readMethods`), `grpc.describe`; `.proto` or server reflection; unary only | `blackbox/grpc.ts` | `blackbox-grpc.test.ts` |
+| ACP | `acpTools(agents, {sandbox, workspaces})` → `acp.<id>.prompt` (JSON-RPC stdio in the workspace sandbox via `SandboxRunner.session`; fs confined; permissions refused) | `acp/client.ts`, `whitebox/sandbox.ts` (`session`) | `acp.test.ts` |
+| Remote worker | `startRemoteToolWorker`, `remoteToolSpec`, `remoteSignature` / `verifyRemoteSignature` (HMAC-SHA256 over ts, method, path, body digest) | `remote/worker.ts` | `remote-worker.test.ts` |
+| Computer use | `computerTools({backend})`: `computer.screenshot` (read) and `computer.click/type/key` (external, `ui-action` + screenshot evidence); `x11Backend` (native XTEST/GetImage), `xdotoolBackend`, `fakeComputerBackend` | `computer/{computer,x11}.ts` | `computer-use.test.ts` (live Xvfb + Chromium) |
+| Fault injection | `env.inject_fault` on docker (`pause`, `kill`, `network_disconnect`, `netem`) and kubectl (`pod_delete`, `scale_zero`, `network_deny`); job dir `<stateDir>/faults/<operationId>`, detached reverter (`fault-worker.ts`), `effectUntil`, `revert_failed` blocks the environment, overdue faults reverted by the adapter; `builtinSideEffectAdapters` passes `stateDir` | `blackbox/{fault-injection,fault-worker,env-adapters,env-tools}.ts` | `blackbox-faults.test.ts` (fake docker/kubectl on PATH; live tests skip with the reason) |
+| Observation | `logs.query` (supervisor `GET <control>/logs`, docker/kubectl logs, declared files), `trace.query` (OTLP/JSON file, Jaeger, Tempo), `net.capture` (tcpdump → pcap) | `blackbox/observe.ts`, `process-supervisor.ts` (`/logs`) | `blackbox-observe.test.ts` |
+| Network capture | `captureNetwork: true` on test.run / shell.exec: the egress relay records every exchange (`CapturedExchange`) → `network-capture` evidence | `whitebox/egress-relay.ts`, `runtime.ts` | `egress-capture.test.ts` |
+| Egress refused (item 9) | evidence a call records after a refused relayed write is `inconclusive` (`INCONCLUSIVE_EVIDENCE_TYPE`; `{inconclusive, reason: egress_refused, originalEvidenceType, original}`); event `evidence.inconclusive` | `whitebox/runtime.ts` | `egress-capture.test.ts` |
+| Code intelligence | `lsp.definitions` / `lsp.references` / `lsp.diagnostics` (TypeScript language service, reads confined to the workspace), `analysis.run` (tsc, eslint, pyflakes/compile check, go vet → `static-analysis` evidence) | `whitebox/tools/{lsp,analysis}.ts` | `whitebox-analysis.test.ts` |
+| DB introspection | `db.introspect` (postgres via psql read-only, sqlite `mode=ro`, mysql client; connection from the variable `database.urlEnv` names, `BuiltinToolOptions.env`) → `database-snapshot` | `blackbox/database.ts` | `whitebox-analysis.test.ts` (live PostgreSQL) |
+| Isolation tiers | `ToolRuntimeDeps.isolation` (`IsolationTierResolver` → `IsolationDecision {tier, sandbox, readOnly}`), `isolatedWorkspace`; local sandbox: read-only bind of read-only workspaces (`IsolationSpec.readOnly`), `allowedHosts` (`egressAllowlist`), `memoryMb`/`cpuLimit` (`withResourceLimits`: prlimit/taskset), OCI refuses `allowedHosts`; `routedSandbox({local, oci})` | `whitebox/{sandbox,netns,runtime}.ts` | `sandbox-tiers.test.ts` |
+
+Contract changes (all additive): `ToolSpec.evidenceTypes`, `ToolSpec.grant`; `BuiltinToolOptions.mcpServers`, `acpAgents`,
+`computer`, `env`; `BlackboxToolOptions.env`; `EnvironmentDescriptor.grpc`, `logs`, `traces`, `database`,
+`control.context`; `SandboxRunner.session`; `SandboxProfile.tier`; `ToolRuntimeDeps.isolation`; `EnvFaultInput.kind`
+(docker/kubectl kinds); `DockerEnvAdapterOptions.stateDir`, `KubectlEnvAdapterOptions.stateDir`; `EgressCallContext.exchanges`.
+Behaviour changes: a URL on a registered environment's origin is a call on that environment (was: an unowned `url/<host>`
+call); `browser.click`/`browser.fill` need `environmentId`; MCP calls record evidence; test.run / shell.exec / mutation.run
+declare their evidence types on the spec. New dependencies (exact, confined to this package by
+`scripts/check-boundaries.mjs`): `@grpc/grpc-js` 1.14.5, `protobufjs` 7.6.6 (Apache-2.0 / BSD-3-Clause), `typescript` 5.9.3
+(Apache-2.0).

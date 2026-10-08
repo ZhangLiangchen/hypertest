@@ -34,6 +34,21 @@ export const GRADER_REVISIONS: Readonly<Record<string, string>> = Object.freeze(
   testChangeGoverned: '1',
   recoveryAudit: '1',
   insufficientDataNotPassed: '1',
+  // (F[4]) PoC C complete: anomaly → reactor RCA/regression, RCA ∥ metrics ∥ executor
+  anomalyReaction: '1',
+  rcaMetricsExecutorParallel: '1',
+  // (F[5]/F[6]/F[7]) extended core suites and chaos cases
+  blackBoxOnly: '1',
+  uiEvidence: '1',
+  faultTolerance: '1',
+  tamperDetected: '1',
+  delegation: '1',
+  convergence: '1',
+  budgetExhaustion: '1',
+  competingFaultsIsolated: '1',
+  unqueryableEscalated: '1',
+  // (item 6) the three-provider-class arm
+  providerClassesAudited: '1',
   // core suites (context-freshness, model-switch, security-injection, test-generation)
   freshnessGuarded: '1',
   modelSwitchContinuity: '1',

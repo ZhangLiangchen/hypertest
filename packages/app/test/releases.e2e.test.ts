@@ -33,16 +33,35 @@ async function open(cfg: HypertestConfig, brains: Record<string, RoleBrain>, env
   return createHypertest(cfg, { scriptedBrains: { sim: roleRouter(brains) }, logger: new MemoryLogger(), env: { ...process.env, ...env } });
 }
 
+const DIGEST = 'c'.repeat(64);
+
+/** The gate of candidate → shadow (as CI records it): the engine contract suite (attested) + a compatibility eval bound to the manifest. */
 async function greenSuites(ht: HypertestInstance, manifestId: string): Promise<void> {
-  await ht.releases.recordSuite({ manifestId, kind: 'engine_contract', suiteId: 'agent-engine-abi', suiteRevision: '1', passed: true, summary: { total: 21, failed: 0 }, by: 'ci:github' });
-  await ht.releases.recordSuite({ manifestId, kind: 'replay', suiteId: 'poc-a-whitebox', suiteRevision: 'poc-1', passed: true, summary: { total: 3, failed: 0 }, by: 'ci:github' });
+  await ht.releases.recordSuite({ manifestId, kind: 'engine_contract', suiteId: 'agent-engine-abi', suiteRevision: '1', passed: true, summary: { total: 21, failed: 0 }, reportDigest: DIGEST, binding: { kind: 'attested' }, by: 'ci:github' });
+  await ht.releases.recordSuite({ manifestId, kind: 'compatibility', suiteId: 'poc-a-whitebox', suiteRevision: 'poc-1', passed: true, summary: { total: 3, failed: 0 }, binding: { kind: 'eval_trials', manifestIds: [manifestId] }, by: 'ci:github' });
+}
+
+/**
+ * (F[0]) Promotion through the stage gates: records the NEXT stage's gate the way the release pipeline does (shadow →
+ * canary: one equivalent mirrored run as a production replay; canary → active: the core release gate), then promotes.
+ */
+async function gatedPromote(ht: HypertestInstance, manifestId: string, input: Parameters<HypertestInstance['releases']['promote']>[1]) {
+  const reg = ht.releases.registry;
+  const release = await reg.get(manifestId);
+  if (release?.state === 'shadow') {
+    const c = await reg.recordShadowComparison({ manifestId, sourceRunId: `run_prod_${manifestId.slice(3, 11)}`, sourceManifestId: 'rm_production', shadowRunId: `run_mirror_${manifestId.slice(3, 11)}_${Date.now()}`, sourceVerdict: 'fail', shadowVerdict: 'fail', divergences: [], recordedBy: 'ci:shadow' });
+    await reg.recordSuiteResult({ manifestId, kind: 'production_replay', suiteId: 'shadow-mirror', passed: true, summary: { total: 1, failed: 0 }, binding: { kind: 'shadow_comparisons', comparisonIds: [c.comparisonId] }, by: 'ci:shadow' });
+  } else if (release?.state === 'canary') {
+    await reg.recordSuiteResult({ manifestId, kind: 'release_gate', suiteId: 'core', suiteRevision: 'core-2', passed: true, summary: { total: 7, failed: 0 }, reportDigest: DIGEST, binding: { kind: 'eval_gate', manifestIds: [manifestId], candidateDigest: DIGEST, baselineDigest: DIGEST }, by: 'ci:github' });
+  }
+  return ht.releases.promote(manifestId, input);
 }
 
 async function toCanary(ht: HypertestInstance, manifestId: string, canary: { percentage?: number; labels?: Record<string, string> }): Promise<void> {
   if (manifestId === ht.manifest.manifestId) await ht.releases.register({ by: ALICE });
   await greenSuites(ht, manifestId);
-  await ht.releases.promote(manifestId, { by: ALICE, reason: 'compatibility suite green' });
-  await ht.releases.promote(manifestId, { by: ALICE, reason: 'production replay green', canary });
+  await gatedPromote(ht, manifestId, { by: ALICE, reason: 'compatibility suite green' });
+  await gatedPromote(ht, manifestId, { by: ALICE, reason: 'production replay green', canary });
 }
 
 /** Resolves when no work item of the run holds a live claim (every in-flight turn gave its claim back). */
@@ -91,7 +110,7 @@ describe('runtime releases e2e: admission, promotion, rollback + quarantine, mig
       try {
         oldId = ht.manifest.manifestId;
         await toCanary(ht, oldId, { percentage: 10 });
-        const active = await ht.releases.promote(oldId, { by: ALICE, reason: 'release gate green' });
+        const active = await gatedPromote(ht, oldId, { by: ALICE, reason: 'release gate green' });
         assert.deepEqual([active.release.state, active.pointer?.manifestId], ['active', oldId]);
         r0 = (await ht.start({ goal: GOAL, target })).runId;
         await inLead0;
@@ -135,7 +154,7 @@ describe('runtime releases e2e: admission, promotion, rollback + quarantine, mig
         await inExecutor1;
 
         // promotion to active: OLD retires but keeps R0 (a live run pinned to it) — it is not retired while R0 lives
-        const promoted = await ht.releases.promote(newId, { by: ALICE, reason: 'canary healthy' });
+        const promoted = await gatedPromote(ht, newId, { by: ALICE, reason: 'canary healthy' });
         assert.deepEqual([promoted.release.state, promoted.retiring?.manifestId, promoted.retired], ['active', oldId, []]);
         const listed = await ht.releases.list();
         const oldView = listed.find((r) => r.manifestId === oldId)!;
@@ -256,12 +275,12 @@ describe('runtime migration refusals and governance pauses', () => {
     const here = ht.manifest.manifestId;
     await ht.releases.register({ by: ALICE });
     await greenSuites(ht, here);
-    for (const [i, reason] of ['contract', 'replay', 'gate'].entries()) await ht.releases.promote(here, { by: ALICE, reason, ...(i === 1 ? { canary: { percentage: 5 } } : {}) });
+    for (const [i, reason] of ['contract', 'replay', 'gate'].entries()) await gatedPromote(ht, here, { by: ALICE, reason, ...(i === 1 ? { canary: { percentage: 5 } } : {}) });
     const canary = otherManifest('canary');
     await ht.releases.register({ manifest: canary, by: ALICE });
     await greenSuites(ht, canary.manifestId);
-    await ht.releases.promote(canary.manifestId, { by: ALICE, reason: 'r' });
-    await ht.releases.promote(canary.manifestId, { by: ALICE, reason: 'r', canary: { labels: { canary: 'yes' } } });
+    await gatedPromote(ht, canary.manifestId, { by: ALICE, reason: 'r' });
+    await gatedPromote(ht, canary.manifestId, { by: ALICE, reason: 'r', canary: { labels: { canary: 'yes' } } });
     const candidate = otherManifest('candidate');
     await ht.releases.register({ manifest: candidate, by: ALICE });
 
@@ -335,10 +354,10 @@ describe('a rollback that commits between the admission and the creation of a ru
       const old = buildRuntimeManifest({ ...content, policyBundleRevision: `${content.policyBundleRevision}+old` }, '2026-01-01T00:00:00.000Z');
       await ht.releases.register({ manifest: old, by: ALICE });
       await greenSuites(ht, old.manifestId);
-      for (const [i, reason] of ['contract', 'replay', 'gate'].entries()) await ht.releases.promote(old.manifestId, { by: ALICE, reason, ...(i === 1 ? { canary: { percentage: 5 } } : {}) });
+      for (const [i, reason] of ['contract', 'replay', 'gate'].entries()) await gatedPromote(ht, old.manifestId, { by: ALICE, reason, ...(i === 1 ? { canary: { percentage: 5 } } : {}) });
       const here = ht.manifest.manifestId;
       await toCanary(ht, here, { percentage: 100 });
-      await ht.releases.promote(here, { by: ALICE, reason: 'gate' });
+      await gatedPromote(ht, here, { by: ALICE, reason: 'gate' });
       const before = await ht.start({ goal: GOAL, target: {} });
       assert.equal(before.runtimeManifestId, here);
 
@@ -455,7 +474,7 @@ describe('runtime.requireActiveRelease, drained releases retire, image digest in
         await assert.rejects(ht.start({ goal: GOAL, target: {} }), refusedStart(/^runtime release: no runtime release is active \(runtime\.requireActiveRelease\)/));
         assert.deepEqual(await ht.listRuns(), []);
         await toCanary(ht, first, { percentage: 100 });
-        await ht.releases.promote(first, { by: ALICE, reason: 'gate' });
+        await gatedPromote(ht, first, { by: ALICE, reason: 'gate' });
         const run = await ht.start({ goal: GOAL, target: {} });
         assert.equal(run.runtimeManifestId, first);
         await ht.cancel(run.runId, 'not needed');
@@ -468,7 +487,7 @@ describe('runtime.requireActiveRelease, drained releases retire, image digest in
     try {
       assert.notEqual(ht.manifest.manifestId, first);
       await toCanary(ht, ht.manifest.manifestId, { percentage: 50 });
-      const p = await ht.releases.promote(ht.manifest.manifestId, { by: ALICE, reason: 'gate' });
+      const p = await gatedPromote(ht, ht.manifest.manifestId, { by: ALICE, reason: 'gate' });
       assert.deepEqual([p.retiring?.manifestId, p.retired], [first, [first]]);
       assert.equal((await ht.releases.registry.get(first))!.state, 'retired');
       assert.deepEqual((await ht.releases.registry.history(first)).map((t) => t.action).slice(-2), ['retire', 'retire']);
@@ -493,8 +512,8 @@ function otherRuntime(ht: HypertestInstance, tag: string): RuntimeManifest {
 async function registerCanary(ht: HypertestInstance, m: RuntimeManifest): Promise<void> {
   await ht.releases.register({ manifest: m, by: ALICE });
   await greenSuites(ht, m.manifestId);
-  await ht.releases.promote(m.manifestId, { by: ALICE, reason: 'contract' });
-  await ht.releases.promote(m.manifestId, { by: ALICE, reason: 'replay', canary: { labels: { canary: 'yes' } } });
+  await gatedPromote(ht, m.manifestId, { by: ALICE, reason: 'contract' });
+  await gatedPromote(ht, m.manifestId, { by: ALICE, reason: 'replay', canary: { labels: { canary: 'yes' } } });
 }
 
 /** Per-run gates of the lead's first turn: the test decides when each run's planning turn may finish. */
@@ -551,7 +570,7 @@ describe('migration races and crash windows', () => {
       const here = ht.manifest.manifestId;
       await ht.releases.register({ by: ALICE });
       await greenSuites(ht, here);
-      for (const [i, reason] of ['contract', 'replay', 'gate'].entries()) await ht.releases.promote(here, { by: ALICE, reason, ...(i === 1 ? { canary: { percentage: 5 } } : {}) });
+      for (const [i, reason] of ['contract', 'replay', 'gate'].entries()) await gatedPromote(ht, here, { by: ALICE, reason, ...(i === 1 ? { canary: { percentage: 5 } } : {}) });
       const canary = otherRuntime(ht, 'canary');
       await registerCanary(ht, canary);
       const run = await ht.start({ goal: GOAL, target: { repoPath: repo.path, commit: repo.head } });
@@ -629,10 +648,10 @@ describe('migration races and crash windows', () => {
       const old = otherRuntime(ht, 'old');
       await ht.releases.register({ manifest: old, by: ALICE });
       await greenSuites(ht, old.manifestId);
-      for (const [i, reason] of ['contract', 'replay', 'gate'].entries()) await ht.releases.promote(old.manifestId, { by: ALICE, reason, ...(i === 1 ? { canary: { percentage: 5 } } : {}) });
+      for (const [i, reason] of ['contract', 'replay', 'gate'].entries()) await gatedPromote(ht, old.manifestId, { by: ALICE, reason, ...(i === 1 ? { canary: { percentage: 5 } } : {}) });
       const here = ht.manifest.manifestId;
       await toCanary(ht, here, { percentage: 100 });
-      await ht.releases.promote(here, { by: ALICE, reason: 'gate' });
+      await gatedPromote(ht, here, { by: ALICE, reason: 'gate' });
       const target = otherRuntime(ht, 'target');
       await registerCanary(ht, target);
       const run = await ht.start({ goal: GOAL, target: { repoPath: repo.path, commit: repo.head } });
@@ -681,7 +700,7 @@ describe('migration races and crash windows', () => {
       const old = otherRuntime(ht, 'old');
       await ht.releases.register({ manifest: old, by: ALICE });
       await greenSuites(ht, old.manifestId);
-      for (const [i, reason] of ['contract', 'replay', 'gate'].entries()) await ht.releases.promote(old.manifestId, { by: ALICE, reason, ...(i === 1 ? { canary: { percentage: 5 } } : {}) });
+      for (const [i, reason] of ['contract', 'replay', 'gate'].entries()) await gatedPromote(ht, old.manifestId, { by: ALICE, reason, ...(i === 1 ? { canary: { percentage: 5 } } : {}) });
       const here = ht.manifest.manifestId;
       await toCanary(ht, here, { labels: { canary: 'yes' } });
       const run = await ht.start({ goal: GOAL, target: { repoPath: repo.path, commit: repo.head }, labels: { canary: 'yes' } });
@@ -840,7 +859,7 @@ describe('migration races and crash windows', () => {
       const here = ht.manifest.manifestId;
       await ht.releases.register({ by: ALICE });
       await greenSuites(ht, here);
-      for (const [i, reason] of ['contract', 'replay', 'gate'].entries()) await ht.releases.promote(here, { by: ALICE, reason, ...(i === 1 ? { canary: { percentage: 5 } } : {}) });
+      for (const [i, reason] of ['contract', 'replay', 'gate'].entries()) await gatedPromote(ht, here, { by: ALICE, reason, ...(i === 1 ? { canary: { percentage: 5 } } : {}) });
       const canary = otherRuntime(ht, 'canary');
       await registerCanary(ht, canary);
       const target = { repoPath: repo.path, commit: repo.head };

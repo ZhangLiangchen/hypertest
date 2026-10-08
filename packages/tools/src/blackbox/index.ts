@@ -2,11 +2,14 @@
 import type { SideEffectAdapter } from '@hypertest/operation';
 import type { EnvironmentRegistry, ToolSpec } from '../contracts.ts';
 import { browserTools, closeBrowserManagers } from './browser.ts';
+import { observeTools } from './observe.ts';
+import { dbIntrospectTool } from './database.ts';
 import { DockerEnvAdapter, EnvControlAdapter, KubectlEnvAdapter, ProcessEnvAdapter } from './env-adapters.ts';
 import { envDeployTool, envInjectFaultTool, envRestartTool } from './env-tools.ts';
 import { httpRequestTool } from './http.ts';
 import { HttpLoadAdapter, HttpLoadStopAdapter, loadObserveTool, loadStartTool, loadStopTool } from './load.ts';
 import { McpToolBridge, type McpServerConfig } from './mcp.ts';
+import { grpcTools } from './grpc.ts';
 import { metricsQueryTool, metricsScrapeTool } from './metrics.ts';
 import { recordEffectAdapters } from '../whitebox/record-effects.ts';
 
@@ -26,6 +29,8 @@ export interface BlackboxToolOptions {
    * For full discovery (input schemas, all tools) use `new McpToolBridge({servers}).listTools()`.
    */
   mcpServers?: McpServerConfig[];
+  /** (additive, wave 3) Variables operator-named settings are read from (db.introspect `database.urlEnv`); default process.env. */
+  env?: Record<string, string | undefined>;
 }
 
 /**
@@ -48,6 +53,11 @@ export function blackboxTools(options: BlackboxToolOptions): ToolSpec[] {
     envRestartTool(),
     envInjectFaultTool(),
     envDeployTool(),
+    // (wave 3) gRPC unary calls / reads / descriptions on an environment's declared endpoint
+    ...grpcTools(),
+    // (wave 3) environment logs, traces and packet capture; the environment database's schema (read-only)
+    ...observeTools(),
+    dbIntrospectTool(o.env !== undefined ? { env: o.env } : {}),
   ] as ToolSpec[];
   if (o.enableBrowser === true) specs.push(...browserTools({ ...allow, ...(o.chromiumPath !== undefined ? { chromiumPath: o.chromiumPath } : {}) }));
   if (o.mcpServers && o.mcpServers.length > 0) {
@@ -78,8 +88,8 @@ export async function closeBlackboxResources(): Promise<void> {
  */
 export function builtinSideEffectAdapters(options: { stateDir: string; environments: EnvironmentRegistry; kubectl?: string; docker?: string }): SideEffectAdapter[] {
   const processEnv = new ProcessEnvAdapter({ environments: options.environments });
-  const docker = new DockerEnvAdapter({ environments: options.environments, ...(options.docker !== undefined ? { docker: options.docker } : {}) });
-  const kubectl = new KubectlEnvAdapter({ environments: options.environments, ...(options.kubectl !== undefined ? { kubectl: options.kubectl } : {}) });
+  const docker = new DockerEnvAdapter({ environments: options.environments, stateDir: options.stateDir, ...(options.docker !== undefined ? { docker: options.docker } : {}) });
+  const kubectl = new KubectlEnvAdapter({ environments: options.environments, stateDir: options.stateDir, ...(options.kubectl !== undefined ? { kubectl: options.kubectl } : {}) });
   return [
     new HttpLoadAdapter({ stateDir: options.stateDir, environments: options.environments }),
     new HttpLoadStopAdapter({ stateDir: options.stateDir, environments: options.environments }),
@@ -92,11 +102,22 @@ export function builtinSideEffectAdapters(options: { stateDir: string; environme
 }
 
 export { createEnvironmentRegistry } from '../whitebox/environments.ts';
+export { dbIntrospectTool, groupCatalog, type DbIntrospectInput, type DbTable, type DbColumn } from './database.ts';
 export {
-  ENV_ID_SCHEMA, OPERATION_ID_SCHEMA, CONTROL_PATH_PREFIX, checkEgress, checkHost, controlEndpointReason, environmentClassForUrl, hostMatches, isLoopbackHost, joinUrl, publicControlTarget, redactHeaders,
-  redactJsonSecrets, redactUrl, splitControlTarget, type HostCheckInput,
+  logsQueryTool, traceQueryTool, netCaptureTool, observeTools, otlpSpans, jaegerSpans, summarizeTraces, pcapPacketCount,
+  type LogsQueryInput, type TraceQueryInput, type TraceSpan, type TraceSummary, type NetCaptureInput,
+} from './observe.ts';
+export {
+  DOCKER_FAULT_KINDS, KUBECTL_FAULT_KINDS, PROCESS_FAULT_KINDS, FAULT_WORKER_PATH, dockerFaultPlan, kubectlFaultPlan, denyAllPolicy, faultJobDir, readFaultJob, unrevertedFaults,
+  type ContainerFaultKind, type FaultPlan, type FaultJobView,
+} from './fault-injection.ts';
+export type { FaultJobSpec, FaultJobState, FaultRevertCommand } from './fault-worker.ts';
+export type { ContainerFaultObservation } from './env-adapters.ts';
+export {
+  ENV_ID_SCHEMA, OPERATION_ID_SCHEMA, CONTROL_PATH_PREFIX, checkEgress, checkHost, controlEndpointReason, environmentClassForUrl, environmentForUrl, environmentOrigins, hostMatches, isLoopbackHost, joinUrl,
+  publicControlTarget, redactHeaders, redactJsonSecrets, redactUrl, splitControlTarget, urlEnvironmentId, urlResource, urlTargetEnvironments, type HostCheckInput,
 } from './common.ts';
-export { httpRequestTool, HTTP_REQUEST_INPUT_SCHEMA, NON_IDEMPOTENT_METHODS, EVIDENCE_BODY_LIMIT, type HttpRequestInput, type HttpRequestResult } from './http.ts';
+export { addressedEnvironmentOf, httpRequestTool, HTTP_REQUEST_INPUT_SCHEMA, NON_IDEMPOTENT_METHODS, EVIDENCE_BODY_LIMIT, type HttpRequestInput, type HttpRequestResult } from './http.ts';
 export {
   parsePrometheusText, parsePromValue, histogramQuantile, histogramBuckets, histogramStats, summarizeMetrics, parsePrometheusApiResponse,
   type PromSample, type PromFamily, type PromMetricType, type PromParseResult, type PromParseError, type HistogramBucket, type HistogramStats, type MetricsSummary, type PromQueryResult, type PromSeries,
@@ -121,7 +142,8 @@ export {
   browserTools, BrowserSessionManager, defaultBrowserManager, closeBrowserManagers, chromiumExecutablePath, DEFAULT_CHROMIUM_PATH,
   type BrowserToolOptions, type BrowserManagerOptions, type BrowserNavigateInput, type BrowserEgressGuard, type BlockedRequest,
 } from './browser.ts';
-export { McpToolBridge, mcpToolId, sanitizeMcpSegment, normalizeMcpSchema, type McpServerConfig, type McpToolBridgeOptions } from './mcp.ts';
+export { GRPC_STATUS_NAMES, GrpcDefinitions, grpcMethodIsRead, grpcServices, grpcTools, type GrpcCallInput } from './grpc.ts';
+export { DEFAULT_MCP_GRANT, McpToolBridge, mcpToolId, sanitizeMcpSegment, normalizeMcpSchema, type McpServerConfig, type McpToolBridgeOptions } from './mcp.ts';
 // (E[4] / coverage[8]) the secret broker: short-lived, scoped credentials minted per call; long-lived secrets never reach agents
 export {
   CONTROL_TOKEN_AUDIENCE, CONTROL_TOKEN_TTL_MS, CREDENTIAL_SCOPE_PREFIX, DEFAULT_CREDENTIAL_TTL_MS, MAX_CREDENTIAL_TTL_MS, brokeredCredentialProblems, createSecretBroker, credentialScope,

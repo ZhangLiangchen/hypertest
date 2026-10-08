@@ -10,25 +10,71 @@ import { verifyRuntimeManifest } from './manifest.ts';
  *
  *   candidate ─(compatibility suite)→ shadow ─(production replay)→ canary ─(release gate)→ active → retiring → retired
  *
- * one audited step at a time. Every promotion needs the latest recorded result of BOTH compatibility suites of that
- * manifest to be a pass: the engine contract suite (`engine_contract`, the AgentEngine ABI golden suite) and a replay /
- * golden eval suite (`replay`). The single ACTIVE POINTER names the release new TestRuns are created under; a canary
- * (at most one) serves only the runs its selection picks (a deterministic percentage bucket of the run id and/or run
- * labels). Rollback moves the pointer back to the previous active release (or stops a canary/shadow/candidate), retires
- * the rolled-back release for good, and hands its live runs to the caller for quarantine. Runs keep running on the
- * manifest they are pinned to (I11); a live run changes runtime only by an explicit migration, recorded here as a
- * RuntimeEpoch.
+ * one audited step at a time, each step behind ITS OWN gate (F[0]) — the latest recorded result of every suite kind the
+ * target stage requires (STAGE_REQUIREMENTS, cumulative) must be a pass BOUND to this manifest:
  *
- * History tables (suite results, transitions, epochs) are append-only (database triggers); a registered manifest is
- * immutable (only its state, canary selection and rolled-back flag change).
+ *   → shadow  `engine_contract` (the AgentEngine ABI golden suite: executed here, or attested by CI with its report
+ *             digest) + `compatibility` (an eval suite whose every trial ran under THIS manifest);
+ *   → canary  + `production_replay` (the shadow comparisons: production runs mirrored onto the shadow release in dry-run
+ *             mode and compared with the decisions of the active release — at least one, no divergence beyond the
+ *             recorded threshold; the comparisons are re-counted here);
+ *   → active  + `release_gate` (the eval release gate of the CORE suite — suite id `core`, every candidate trial ran under
+ *             THIS manifest — against the committed baseline).
+ *
+ * A passing result without its binding is refused at record time; a legacy `replay` result (recorded before the stage
+ * gates) counts for nothing. The single ACTIVE POINTER names the release new TestRuns are created under; a canary (at
+ * most one) serves only the runs its selection picks (a deterministic percentage bucket of the run id and/or run
+ * labels); a shadow release creates only mirrored (dry-run) runs. Rollback moves the pointer back to the previous active
+ * release (or stops a canary/shadow/candidate), retires the rolled-back release for good, and hands its live runs to the
+ * caller for quarantine. Runs keep running on the manifest they are pinned to (I11); a live run changes runtime only by
+ * an explicit migration, recorded here as a RuntimeEpoch.
+ *
+ * History tables (suite results, transitions, epochs, shadow comparisons) are append-only (database triggers); a
+ * registered manifest is immutable (only its state, canary selection and rolled-back flag change).
  */
 
 export const RELEASE_STATES: readonly RuntimeReleaseState[] = Object.freeze(['candidate', 'shadow', 'canary', 'active', 'retiring', 'retired']);
 /** The only promotions: one step along candidate → shadow → canary → active. */
 export const PROMOTION_PATH: Readonly<Partial<Record<RuntimeReleaseState, RuntimeReleaseState>>> = Object.freeze({ candidate: 'shadow', shadow: 'canary', canary: 'active' });
-/** The compatibility suites every promotion requires (latest result of each must pass). */
-export const SUITE_KINDS = Object.freeze(['engine_contract', 'replay'] as const);
+/** The suite kinds the stage gates read (the latest result of each kind a stage requires must be a bound pass). */
+export const SUITE_KINDS = Object.freeze(['engine_contract', 'compatibility', 'production_replay', 'release_gate'] as const);
 export type CompatibilitySuiteKind = (typeof SUITE_KINDS)[number];
+/**
+ * (F[0]) The gate of each promotion target, cumulative: what a release must have passed (latest result of each kind,
+ * bound to the manifest) to ENTER the stage. A later failing result of an earlier kind blocks every later step too.
+ */
+export const STAGE_REQUIREMENTS: Readonly<Record<'shadow' | 'canary' | 'active', readonly CompatibilitySuiteKind[]>> = Object.freeze({
+  shadow: Object.freeze(['engine_contract', 'compatibility'] as const),
+  canary: Object.freeze(['engine_contract', 'compatibility', 'production_replay'] as const),
+  active: Object.freeze(['engine_contract', 'compatibility', 'production_replay', 'release_gate'] as const),
+});
+/** The only suite id a `release_gate` result may name: every runtime release runs the CORE eval (F[13]). */
+export const RELEASE_GATE_SUITE_ID = 'core';
+/** Run label of a mirrored (shadow) run: the id of the production run it mirrors. Such runs never dispatch external effects. */
+export const SHADOW_OF_LABEL = 'hypertest.shadow_of';
+/**
+ * How a suite result is tied to the manifest it certifies:
+ * - `attested`: CI or a human vouches for an external report (engine_contract only; the report digest is required);
+ * - `executed`: the suite ran in this installation, whose manifest is the one certified (engine_contract);
+ * - `eval_trials`: an eval SuiteResult whose every trial ran under `manifestIds` (= exactly the certified manifest);
+ * - `shadow_comparisons`: the recorded shadow comparisons `comparisonIds` of the manifest (re-counted at record time);
+ * - `eval_gate`: the eval release gate over a core-suite candidate whose trials ran under `manifestIds`, with the
+ *   candidate's and the baseline's digests.
+ */
+export interface SuiteResultBinding {
+  kind: 'attested' | 'executed' | 'eval_trials' | 'shadow_comparisons' | 'eval_gate';
+  manifestIds?: string[];
+  comparisonIds?: string[];
+  candidateDigest?: string;
+  baselineDigest?: string;
+}
+/** The binding kinds a PASSING result of each suite kind may carry. */
+export const ACCEPTED_BINDINGS: Readonly<Record<CompatibilitySuiteKind, readonly SuiteResultBinding['kind'][]>> = Object.freeze({
+  engine_contract: Object.freeze(['attested', 'executed'] as const),
+  compatibility: Object.freeze(['eval_trials'] as const),
+  production_replay: Object.freeze(['shadow_comparisons'] as const),
+  release_gate: Object.freeze(['eval_gate'] as const),
+});
 /** Schemas a RuntimeManifest pins (`schemas.<key>`). */
 export const MANIFEST_SCHEMA_KEYS = Object.freeze(['event', 'contextSnapshot', 'tool', 'operation', 'evidence'] as const);
 export type ManifestSchemaKey = (typeof MANIFEST_SCHEMA_KEYS)[number];
@@ -72,9 +118,36 @@ export interface CompatibilitySuiteResult {
   summary: { total?: number; failed?: number; detail?: string };
   /** sha256 of the suite report the result was taken from (e.g. an eval SuiteResult JSON). */
   reportDigest?: string;
+  /** (additive, F[0]) How the result is bound to the manifest it certifies (absent on legacy and failing results). */
+  binding?: SuiteResultBinding;
+  /** (additive) `replay`: a legacy result recorded before the stage gates (read as an unbound compatibility result). */
+  legacyKind?: 'replay';
   recordedBy: string;
   recordedAt: string;
 }
+
+/**
+ * (additive, F[0]) One production run mirrored onto a shadow release (dry-run: no external effect dispatched) and the
+ * comparison of the shadow run's decision with the production decision.
+ */
+export interface ShadowComparison {
+  comparisonId: string;
+  /** The shadow release. */
+  manifestId: string;
+  sourceRunId: string;
+  /** The manifest the production run ran under (a shadow mirrors runs of another release). */
+  sourceManifestId: string;
+  shadowRunId: string;
+  sourceVerdict: string | null;
+  shadowVerdict: string | null;
+  diverged: boolean;
+  /** What differs (verdict, violated/unknown criteria, run status, human review); empty when equivalent. */
+  divergences: string[];
+  recordedBy: string;
+  recordedAt: string;
+}
+
+export type NewShadowComparison = Omit<ShadowComparison, 'comparisonId' | 'recordedAt' | 'diverged'>;
 
 export type ReleaseAction = 'register' | 'promote' | 'rollback' | 'restore' | 'retire';
 
@@ -103,6 +176,10 @@ export interface PromotionReadiness {
   ready: boolean;
   problems: string[];
   latest: Partial<Record<CompatibilitySuiteKind, CompatibilitySuiteResult>>;
+  /** (additive) The stage the next promotion enters (undefined when the release cannot be promoted from its state). */
+  to?: RuntimeReleaseState;
+  /** (additive) The suite kinds that stage requires. */
+  required?: CompatibilitySuiteKind[];
 }
 
 export interface PromotionResult {
@@ -124,7 +201,7 @@ export interface RollbackResult {
 }
 
 export type RunAdmission =
-  | { allowed: true; mode: 'unmanaged' | 'active' | 'canary'; activeManifestId?: string }
+  | { allowed: true; mode: 'unmanaged' | 'active' | 'canary' | 'shadow'; activeManifestId?: string }
   | { allowed: false; reason: string; activeManifestId?: string; state?: RuntimeReleaseState };
 
 export interface RecordSuiteInput {
@@ -135,6 +212,8 @@ export interface RecordSuiteInput {
   passed: boolean;
   summary?: { total?: number; failed?: number; detail?: string };
   reportDigest?: string;
+  /** (additive, F[0]) Required for a passing result: how it is bound to the manifest (see ACCEPTED_BINDINGS). */
+  binding?: SuiteResultBinding;
   by: string;
 }
 
@@ -154,7 +233,7 @@ export interface RuntimeReleaseRegistry {
   recordSuiteResult(input: RecordSuiteInput, tx?: SqlExecutor): Promise<CompatibilitySuiteResult>;
   /** Every recorded result of the manifest, oldest first. */
   suiteResults(manifestId: string): Promise<CompatibilitySuiteResult[]>;
-  /** Whether the latest result of every required suite passed (and the release may be promoted at all). */
+  /** Whether the latest bound result of every suite the NEXT stage requires passed (and the release may be promoted at all). */
   promotionReadiness(manifestId: string, tx?: SqlExecutor): Promise<PromotionReadiness>;
   /** One step along candidate → shadow → canary → active (entering canary needs a selection). */
   promote(manifestId: string, input: { by: string; reason: string; canary?: CanarySelection }, tx?: SqlExecutor): Promise<PromotionResult>;
@@ -162,8 +241,11 @@ export interface RuntimeReleaseRegistry {
   rollback(input: { by: string; reason: string; manifestId?: string }, tx?: SqlExecutor): Promise<RollbackResult>;
   /** retiring → retired (the caller checks that no live run is pinned to it any more). */
   retire(manifestId: string, input: { by: string; reason: string }, tx?: SqlExecutor): Promise<RuntimeRelease>;
-  /** Whether a NEW run may be created under `manifestId`. */
-  admit(input: { manifestId: string; runId: string; labels?: Record<string, string>; requireActive?: boolean }): Promise<RunAdmission>;
+  /**
+   * Whether a NEW run may be created under `manifestId`. (additive) `shadowOf`: the run mirrors that production run —
+   * admitted under a SHADOW release only (mode `shadow`; it dispatches no external effect).
+   */
+  admit(input: { manifestId: string; runId: string; labels?: Record<string, string>; requireActive?: boolean; shadowOf?: string }): Promise<RunAdmission>;
   /** Transitions, oldest first (all, or of one manifest). */
   history(manifestId?: string): Promise<ReleaseTransition[]>;
   /** Appends the next RuntimeEpoch of a run (seq and previous epoch are assigned here). */
@@ -177,6 +259,10 @@ export interface RuntimeReleaseRegistry {
    * commit. Lock order: this lock before any run lock (the rollback's order: pointer move, then the quarantine sweep).
    */
   lock(tx: SqlExecutor): Promise<void>;
+  /** (additive, F[0]) Records the comparison of a mirrored shadow run with its production run (append-only). */
+  recordShadowComparison(input: NewShadowComparison, tx?: SqlExecutor): Promise<ShadowComparison>;
+  /** (additive, F[0]) The shadow comparisons of a shadow release, oldest first. */
+  shadowComparisons(manifestId: string, tx?: SqlExecutor): Promise<ShadowComparison[]>;
 }
 
 // ------------------------------------------------------------------------------------------------ schema
@@ -291,6 +377,41 @@ DROP TRIGGER IF EXISTS ht_runtime_releases_identity ON ht_runtime_releases;
 CREATE TRIGGER ht_runtime_releases_identity BEFORE UPDATE OR DELETE ON ht_runtime_releases FOR EACH ROW EXECUTE FUNCTION ht_runtime_release_identity();
 DROP TRIGGER IF EXISTS ht_runtime_releases_no_truncate ON ht_runtime_releases;
 CREATE TRIGGER ht_runtime_releases_no_truncate BEFORE TRUNCATE ON ht_runtime_releases FOR EACH STATEMENT EXECUTE FUNCTION ht_runtime_append_only();
+`,
+};
+
+/**
+ * (additive, F[0]) Release stages: the suite kinds of the per-stage gates (a legacy `replay` row stays readable), the
+ * binding of a suite result to the manifest it certifies, and the append-only shadow comparisons.
+ */
+export const RELEASE_STAGES_MIGRATION: Migration = {
+  id: 'runtime/008-release-stages',
+  sql: `
+ALTER TABLE ht_runtime_suite_results DROP CONSTRAINT IF EXISTS ht_runtime_suite_results_kind_check;
+ALTER TABLE ht_runtime_suite_results ADD CONSTRAINT ht_runtime_suite_results_kind_check
+  CHECK (kind IN ('engine_contract', 'replay', 'compatibility', 'production_replay', 'release_gate'));
+ALTER TABLE ht_runtime_suite_results ADD COLUMN IF NOT EXISTS binding jsonb;
+
+CREATE TABLE IF NOT EXISTS ht_runtime_shadow_comparisons (
+  comparison_id      text PRIMARY KEY,
+  seq                bigserial NOT NULL,
+  manifest_id        text NOT NULL REFERENCES ht_runtime_releases (manifest_id),
+  source_run_id      text NOT NULL,
+  source_manifest_id text NOT NULL,
+  shadow_run_id      text NOT NULL UNIQUE,
+  source_verdict     text,
+  shadow_verdict     text,
+  diverged           boolean NOT NULL,
+  divergences        jsonb NOT NULL,
+  recorded_by        text NOT NULL,
+  recorded_at        timestamptz NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ht_runtime_shadow_comparisons_idx ON ht_runtime_shadow_comparisons (manifest_id, seq);
+
+DROP TRIGGER IF EXISTS ht_runtime_shadow_comparisons_no_mutation ON ht_runtime_shadow_comparisons;
+CREATE TRIGGER ht_runtime_shadow_comparisons_no_mutation BEFORE UPDATE OR DELETE ON ht_runtime_shadow_comparisons FOR EACH ROW EXECUTE FUNCTION ht_runtime_append_only();
+DROP TRIGGER IF EXISTS ht_runtime_shadow_comparisons_no_truncate ON ht_runtime_shadow_comparisons;
+CREATE TRIGGER ht_runtime_shadow_comparisons_no_truncate BEFORE TRUNCATE ON ht_runtime_shadow_comparisons FOR EACH STATEMENT EXECUTE FUNCTION ht_runtime_append_only();
 `,
 };
 
@@ -441,15 +562,19 @@ interface SuiteRow {
   passed: boolean;
   summary: unknown;
   report_digest: string | null;
+  binding?: unknown;
   recorded_by: string;
   recorded_at: unknown;
 }
+
+const SUITE_COLUMNS = 'result_id, manifest_id, kind, suite_id, suite_revision, passed, summary, report_digest, binding, recorded_by, recorded_at';
 
 function toSuiteResult(r: SuiteRow): CompatibilitySuiteResult {
   const out: CompatibilitySuiteResult = {
     resultId: r.result_id,
     manifestId: r.manifest_id,
-    kind: r.kind as CompatibilitySuiteKind,
+    // a legacy `replay` row is read as an (unbound) compatibility result: it never satisfies a stage gate
+    kind: (r.kind === 'replay' ? 'compatibility' : r.kind) as CompatibilitySuiteKind,
     suiteId: r.suite_id,
     passed: r.passed === true,
     summary: fromJsonColumn<CompatibilitySuiteResult['summary']>(r.summary) ?? {},
@@ -458,7 +583,71 @@ function toSuiteResult(r: SuiteRow): CompatibilitySuiteResult {
   };
   if (r.suite_revision !== null) out.suiteRevision = r.suite_revision;
   if (r.report_digest !== null) out.reportDigest = r.report_digest;
+  if (r.kind === 'replay') out.legacyKind = 'replay';
+  const binding = r.binding === null || r.binding === undefined ? undefined : fromJsonColumn<SuiteResultBinding | null>(r.binding);
+  if (binding) out.binding = binding;
   return out;
+}
+
+interface ComparisonRow {
+  comparison_id: string;
+  manifest_id: string;
+  source_run_id: string;
+  source_manifest_id: string;
+  shadow_run_id: string;
+  source_verdict: string | null;
+  shadow_verdict: string | null;
+  diverged: boolean;
+  divergences: unknown;
+  recorded_by: string;
+  recorded_at: unknown;
+}
+
+const COMPARISON_COLUMNS = 'comparison_id, manifest_id, source_run_id, source_manifest_id, shadow_run_id, source_verdict, shadow_verdict, diverged, divergences, recorded_by, recorded_at';
+
+function toComparison(r: ComparisonRow): ShadowComparison {
+  return {
+    comparisonId: r.comparison_id,
+    manifestId: r.manifest_id,
+    sourceRunId: r.source_run_id,
+    sourceManifestId: r.source_manifest_id,
+    shadowRunId: r.shadow_run_id,
+    sourceVerdict: r.source_verdict,
+    shadowVerdict: r.shadow_verdict,
+    diverged: r.diverged === true,
+    divergences: fromJsonColumn<string[]>(r.divergences) ?? [],
+    recordedBy: r.recorded_by,
+    recordedAt: toIso(r.recorded_at),
+  };
+}
+
+/**
+ * (F[0]) Problems of a suite result's binding to the manifest it certifies (empty = acceptable). A FAILING result is
+ * always acceptable (it only blocks); a passing one needs a binding its kind accepts (ACCEPTED_BINDINGS) that names
+ * exactly this manifest.
+ */
+export function suiteBindingProblems(input: Pick<RecordSuiteInput, 'manifestId' | 'kind' | 'suiteId' | 'passed' | 'binding' | 'reportDigest'>): string[] {
+  const b = input.binding;
+  if (b !== undefined && (b === null || typeof b !== 'object' || Array.isArray(b))) return ['binding must be an object {kind, …}'];
+  if (!input.passed) return [];
+  if (!b) return [`a passing ${input.kind} result must say how it is bound to manifest ${short(input.manifestId)} (binding: ${ACCEPTED_BINDINGS[input.kind].join(' | ')})`];
+  const problems: string[] = [];
+  if (!ACCEPTED_BINDINGS[input.kind].includes(b.kind)) problems.push(`a passing ${input.kind} result is bound by ${ACCEPTED_BINDINGS[input.kind].join(' or ')}, not ${String(b.kind)}`);
+  const ids = b.manifestIds;
+  if (b.kind === 'executed' || b.kind === 'eval_trials' || b.kind === 'eval_gate') {
+    if (!Array.isArray(ids) || ids.length === 0) problems.push(`binding ${b.kind} must name the manifest(s) the suite ran under`);
+    else {
+      const others = [...new Set(ids)].filter((m) => m !== input.manifestId);
+      if (others.length > 0) problems.push(`the suite ran under ${others.map(short).join(', ')}, not under ${short(input.manifestId)}: a result certifies only the manifest it ran under`);
+    }
+  }
+  if (b.kind === 'attested' && input.reportDigest === undefined) problems.push('an attested result needs the digest of the report it attests (--report)');
+  if (b.kind === 'shadow_comparisons' && (!Array.isArray(b.comparisonIds) || b.comparisonIds.length === 0)) problems.push('a production replay result must name the shadow comparisons it summarizes (at least one)');
+  if (b.kind === 'eval_gate') {
+    if (input.suiteId !== RELEASE_GATE_SUITE_ID) problems.push(`the release gate runs the core eval: suite ${JSON.stringify(input.suiteId)} does not count (only ${RELEASE_GATE_SUITE_ID})`);
+    for (const k of ['candidateDigest', 'baselineDigest'] as const) if (typeof b[k] !== 'string' || !/^[0-9a-f]{64}$/.test(b[k]!)) problems.push(`binding eval_gate needs ${k} (sha256 hex)`);
+  }
+  return problems;
 }
 
 interface TransitionRow {
@@ -565,14 +754,23 @@ export function createRuntimeReleaseRegistry(deps: RuntimeReleaseRegistryDeps): 
   async function latestResults(q: SqlExecutor, manifestId: string): Promise<Partial<Record<CompatibilitySuiteKind, CompatibilitySuiteResult>>> {
     const out: Partial<Record<CompatibilitySuiteKind, CompatibilitySuiteResult>> = {};
     for (const kind of SUITE_KINDS) {
-      const r = await q.query<SuiteRow>(
-        `SELECT result_id, manifest_id, kind, suite_id, suite_revision, passed, summary, report_digest, recorded_by, recorded_at
-         FROM ht_runtime_suite_results WHERE manifest_id = $1 AND kind = $2 ORDER BY seq DESC LIMIT 1`,
-        [manifestId, kind],
-      );
+      // a legacy `replay` row is the latest compatibility result when nothing newer was recorded (and it counts for nothing)
+      const kinds = kind === 'compatibility' ? ['compatibility', 'replay'] : [kind];
+      const r = await q.query<SuiteRow>(`SELECT ${SUITE_COLUMNS} FROM ht_runtime_suite_results WHERE manifest_id = $1 AND kind = ANY($2) ORDER BY seq DESC LIMIT 1`, [manifestId, kinds]);
       if (r.rows[0]) out[kind] = toSuiteResult(r.rows[0]);
     }
     return out;
+  }
+
+  /** Why a stored result does not satisfy its gate (undefined when it does). */
+  function gateProblem(kind: CompatibilitySuiteKind, r: CompatibilitySuiteResult | undefined, manifestId: string): string | undefined {
+    const name = (x: CompatibilitySuiteResult) => `${x.suiteId}${x.suiteRevision ? `@${x.suiteRevision}` : ''}, ${x.resultId}`;
+    if (!r) return `no ${kind} suite result is recorded for ${short(manifestId)}`;
+    if (!r.passed) return `the latest ${kind} suite result (${name(r)}) failed`;
+    if (r.legacyKind === 'replay') return `the latest ${kind} result (${name(r)}) is a legacy replay result recorded before the stage gates: record a ${kind} result bound to ${short(manifestId)}`;
+    const binding = suiteBindingProblems({ manifestId, kind, suiteId: r.suiteId, passed: true, ...(r.binding ? { binding: r.binding } : {}), ...(r.reportDigest ? { reportDigest: r.reportDigest } : {}) });
+    if (binding.length > 0) return `the latest ${kind} result (${name(r)}) is not bound to ${short(manifestId)}: ${binding.join('; ')}`;
+    return undefined;
   }
 
   async function readiness(q: SqlExecutor, manifestId: string): Promise<PromotionReadiness> {
@@ -581,12 +779,20 @@ export function createRuntimeReleaseRegistry(deps: RuntimeReleaseRegistryDeps): 
     const problems: string[] = [];
     if (release.rolledBack) problems.push(`release ${short(manifestId)} was rolled back: it is never promoted again (register a fixed runtime)`);
     if (!verifyRuntimeManifest(release.manifest)) problems.push(`the manifest of release ${short(manifestId)} does not verify against its id`);
-    for (const kind of SUITE_KINDS) {
-      const r = latest[kind];
-      if (!r) problems.push(`no ${kind} suite result is recorded for ${short(manifestId)}`);
-      else if (!r.passed) problems.push(`the latest ${kind} suite result (${r.suiteId}${r.suiteRevision ? `@${r.suiteRevision}` : ''}, ${r.resultId}) failed`);
+    const to = PROMOTION_PATH[release.state];
+    const out: PromotionReadiness = { ready: false, problems, latest };
+    if (!to) problems.push(`release ${short(manifestId)} is ${release.state}: it has no next stage`);
+    else {
+      out.to = to;
+      const required = [...STAGE_REQUIREMENTS[to as 'shadow' | 'canary' | 'active']];
+      out.required = required;
+      for (const kind of required) {
+        const p = gateProblem(kind, latest[kind], manifestId);
+        if (p) problems.push(p);
+      }
     }
-    return { ready: problems.length === 0, problems, latest };
+    out.ready = problems.length === 0;
+    return out;
   }
 
   const registry: RuntimeReleaseRegistry = {
@@ -657,27 +863,38 @@ export function createRuntimeReleaseRegistry(deps: RuntimeReleaseRegistryDeps): 
       // a result that reports failures is never a pass (a caller cannot record "passed" over failed cases)
       if (input.passed && summary.failed !== undefined && summary.failed > 0) throw invalid(`recordSuiteResult: a result with ${summary.failed} failed case(s) cannot be recorded as passed`);
       if (input.passed && summary.total === 0) throw invalid('recordSuiteResult: a suite that ran no case cannot be recorded as passed (NOT RUN is not PASS)');
+      const bindingProblems = suiteBindingProblems({ manifestId, kind: input.kind, suiteId, passed: input.passed, ...(input.binding !== undefined ? { binding: input.binding } : {}), ...(input.reportDigest !== undefined ? { reportDigest: input.reportDigest } : {}) });
+      if (bindingProblems.length > 0) throw precondition(`recordSuiteResult: ${bindingProblems.join('; ')}`, { manifestId, kind: input.kind, problems: bindingProblems });
       return inTx(tx, async (q) => {
         await mustLoad(q, manifestId);
+        const b = input.binding;
+        if (b?.kind === 'shadow_comparisons') {
+          // the comparisons are re-counted here: a production replay result cannot claim runs it does not summarize
+          const ids = [...new Set(b.comparisonIds ?? [])];
+          const rows = (await q.query<ComparisonRow>(`SELECT ${COMPARISON_COLUMNS} FROM ht_runtime_shadow_comparisons WHERE manifest_id = $1 AND comparison_id = ANY($2)`, [manifestId, ids])).rows;
+          if (rows.length !== ids.length || ids.length !== (b.comparisonIds ?? []).length) {
+            throw precondition(`recordSuiteResult: the production replay names ${(b.comparisonIds ?? []).length} shadow comparison(s) of ${short(manifestId)}; ${rows.length} distinct ones exist`, { manifestId });
+          }
+          const diverged = rows.filter((x) => x.diverged === true).length;
+          if (summary.total !== rows.length || summary.failed !== diverged) {
+            throw precondition(`recordSuiteResult: the production replay summary (${String(summary.total)} runs, ${String(summary.failed)} diverged) does not match its comparisons (${rows.length} runs, ${diverged} diverged)`, { manifestId });
+          }
+        }
         const resultId = ids.next('rsr');
         const now = clock.isoNow();
         const r = await q.query<SuiteRow>(
-          `INSERT INTO ht_runtime_suite_results (result_id, manifest_id, kind, suite_id, suite_revision, passed, summary, report_digest, recorded_by, recorded_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10)
-           RETURNING result_id, manifest_id, kind, suite_id, suite_revision, passed, summary, report_digest, recorded_by, recorded_at`,
-          [resultId, manifestId, input.kind, suiteId, input.suiteRevision ?? null, input.passed, JSON.stringify(summary), input.reportDigest ?? null, by, now],
+          `INSERT INTO ht_runtime_suite_results (result_id, manifest_id, kind, suite_id, suite_revision, passed, summary, report_digest, binding, recorded_by, recorded_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9::jsonb, $10, $11)
+           RETURNING ${SUITE_COLUMNS}`,
+          [resultId, manifestId, input.kind, suiteId, input.suiteRevision ?? null, input.passed, JSON.stringify(summary), input.reportDigest ?? null, b === undefined ? null : JSON.stringify(b), by, now],
         );
-        logger.info('runtime compatibility suite result recorded', { manifestId, kind: input.kind, suiteId, passed: input.passed, by });
+        logger.info('runtime compatibility suite result recorded', { manifestId, kind: input.kind, suiteId, passed: input.passed, binding: b?.kind, by });
         return toSuiteResult(r.rows[0]!);
       });
     },
 
     async suiteResults(manifestId) {
-      const r = await db.query<SuiteRow>(
-        `SELECT result_id, manifest_id, kind, suite_id, suite_revision, passed, summary, report_digest, recorded_by, recorded_at
-         FROM ht_runtime_suite_results WHERE manifest_id = $1 ORDER BY seq`,
-        [manifestId],
-      );
+      const r = await db.query<SuiteRow>(`SELECT ${SUITE_COLUMNS} FROM ht_runtime_suite_results WHERE manifest_id = $1 ORDER BY seq`, [manifestId]);
       return r.rows.map(toSuiteResult);
     },
 
@@ -701,7 +918,8 @@ export function createRuntimeReleaseRegistry(deps: RuntimeReleaseRegistryDeps): 
         if (!ready.ready) {
           throw precondition(`release ${short(manifestId)} cannot be promoted to ${to}: ${ready.problems.join('; ')}`, { manifestId, to, problems: ready.problems });
         }
-        const suiteResultIds = SUITE_KINDS.map((k) => ready.latest[k]!.resultId);
+        // the gate of THIS step: the results it passed on are recorded with the transition
+        const suiteResultIds = (ready.required ?? []).map((k) => ready.latest[k]!.resultId);
         const now = clock.isoNow();
         let canary: CanarySelection | undefined;
         if (to === 'canary') {
@@ -727,7 +945,7 @@ export function createRuntimeReleaseRegistry(deps: RuntimeReleaseRegistryDeps): 
         } else {
           await setState(q, manifestId, to, now, to === 'canary' ? { canary: canary! } : {});
         }
-        const details: Record<string, unknown> = { suiteResultIds };
+        const details: Record<string, unknown> = { suiteResultIds, gate: ready.required ?? [] };
         if (canary) details['canary'] = canary;
         if (result.retiring) details['retiring'] = result.retiring.manifestId;
         const t = await transition(q, { manifestId, action: 'promote', fromState: release.state, toState: to, actor: by, reason, details }, now);
@@ -808,7 +1026,18 @@ export function createRuntimeReleaseRegistry(deps: RuntimeReleaseRegistryDeps): 
         }
         return { allowed: true, mode: 'unmanaged' };
       }
-      if (cur.manifestId === manifestId) return { allowed: true, mode: 'active', activeManifestId: cur.manifestId };
+      if (cur.manifestId === manifestId) {
+        if (input.shadowOf !== undefined) return { allowed: false, state: 'active', activeManifestId: cur.manifestId, reason: `runtime ${short(manifestId)} is the active release: it does not mirror runs (only a shadow release does)` };
+        return { allowed: true, mode: 'active', activeManifestId: cur.manifestId };
+      }
+      if (input.shadowOf !== undefined) {
+        // F[0]: a shadow release creates only mirrors of production runs (dry-run); every other release refuses mirrors
+        if (release?.state === 'shadow' && !release.rolledBack) return { allowed: true, mode: 'shadow', activeManifestId: cur.manifestId };
+        return {
+          allowed: false, activeManifestId: cur.manifestId, ...(release ? { state: release.state } : {}),
+          reason: `runtime ${short(manifestId)} is ${release ? `a ${release.state} release` : 'not a registered release'}: only a shadow release mirrors runs (run ${input.shadowOf})`,
+        };
+      }
       if (release?.state === 'canary') {
         if (canarySelects(release.canary, { runId, labels: input.labels ?? {} })) return { allowed: true, mode: 'canary', activeManifestId: cur.manifestId };
         return {
@@ -869,6 +1098,35 @@ export function createRuntimeReleaseRegistry(deps: RuntimeReleaseRegistryDeps): 
     async lock(tx) {
       if (!tx || typeof tx.query !== 'function') throw invalid('lock: a transaction is required (the lock is held until it ends)');
       await lock(tx);
+    },
+
+    async recordShadowComparison(input, tx) {
+      const manifestId = requireText(input?.manifestId, 'recordShadowComparison: manifestId');
+      const sourceRunId = requireText(input.sourceRunId, 'recordShadowComparison: sourceRunId');
+      const shadowRunId = requireText(input.shadowRunId, 'recordShadowComparison: shadowRunId');
+      const sourceManifestId = requireText(input.sourceManifestId, 'recordShadowComparison: sourceManifestId');
+      const by = requireText(input.recordedBy, 'recordShadowComparison: recordedBy');
+      if (sourceRunId === shadowRunId) throw invalid('recordShadowComparison: a run is not its own shadow');
+      if (sourceManifestId === manifestId) throw invalid('recordShadowComparison: a shadow mirrors runs of ANOTHER release');
+      if (!Array.isArray(input.divergences) || input.divergences.some((d) => typeof d !== 'string' || d.trim() === '')) throw invalid('recordShadowComparison: divergences must be a list of non-empty strings');
+      return inTx(tx, async (q) => {
+        const release = await mustLoad(q, manifestId);
+        if (release.state !== 'shadow') throw precondition(`release ${short(manifestId)} is ${release.state}: only a shadow release records shadow comparisons`, { manifestId, state: release.state });
+        const comparisonId = ids.next('rsc');
+        const now = clock.isoNow();
+        const r = await q.query<ComparisonRow>(
+          `INSERT INTO ht_runtime_shadow_comparisons (comparison_id, manifest_id, source_run_id, source_manifest_id, shadow_run_id, source_verdict, shadow_verdict, diverged, divergences, recorded_by, recorded_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11) RETURNING ${COMPARISON_COLUMNS}`,
+          [comparisonId, manifestId, sourceRunId, sourceManifestId, shadowRunId, input.sourceVerdict ?? null, input.shadowVerdict ?? null, input.divergences.length > 0, JSON.stringify(input.divergences), by, now],
+        );
+        logger.info('shadow comparison recorded', { manifestId, sourceRunId, shadowRunId, diverged: input.divergences.length > 0 });
+        return toComparison(r.rows[0]!);
+      });
+    },
+
+    async shadowComparisons(manifestId, tx) {
+      const r = await (tx ?? db).query<ComparisonRow>(`SELECT ${COMPARISON_COLUMNS} FROM ht_runtime_shadow_comparisons WHERE manifest_id = $1 ORDER BY seq`, [manifestId]);
+      return r.rows.map(toComparison);
     },
   };
   return registry;

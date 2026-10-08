@@ -1,32 +1,56 @@
 import { HypertestError, abortReason, noopLogger, sha256Hex, type JsonSchema, type JsonValue, type Logger } from '@hypertest/core';
 import type { RiskClass, ToolEffect } from '@hypertest/domain';
-import type { ToolContext, ToolOutcome, ToolSpec } from '../contracts.ts';
-import { errorMessage } from './common.ts';
+import type { ToolContext, ToolGrant, ToolOutcome, ToolSpec } from '../contracts.ts';
+import { errorMessage, requireEnvironment } from './common.ts';
+import { redactSecrets } from '../whitebox/runtime.ts';
 
 /**
- * MCP bridge: connects to MCP servers over stdio (@modelcontextprotocol/sdk Client + StdioClientTransport)
- * and exposes their tools as ToolSpecs `mcp.<server>.<tool>`, so every MCP call passes the Hypertest
- * pipeline (capability, policy, events, offload). Effect/risk are declared per server by the operator
- * (default external/medium), never by the server itself.
+ * MCP bridge: connects to MCP servers over stdio (@modelcontextprotocol/sdk Client + StdioClientTransport) or streamable
+ * HTTP (StreamableHTTPClientTransport, `url`) and exposes their tools as ToolSpecs `mcp.<server>.<tool>`, so every MCP
+ * call passes the Hypertest pipeline (capability, policy, freshness, Operation Ledger for external effects, evidence,
+ * events, offload). Effect/risk are declared by the operator — per server, refined per tool (`toolEffects`) — never by the
+ * server itself (default external/medium). A server bound to a registered environment (`environmentId`) acts on it: its
+ * tools address `env/<id>` and carry that environment's class; any other server's tools address `mcp/<server>/<tool>`,
+ * a scope granted only to the permission profiles the operator names (`grantTo`). Every call records `mcp-response`
+ * evidence (server, tool, redacted arguments, the result).
  */
+
+/** (additive) Default permission profiles granted the `mcp/<server>/**` scope of a server not bound to an environment. */
+export const DEFAULT_MCP_GRANT: readonly string[] = Object.freeze(['test_executor', 'environment_operator']);
 
 export interface McpServerConfig {
   /** Server name (tool id segment). */
   name: string;
-  command: string;
+  /** stdio transport: the server program (exactly one of `command` and `url`). */
+  command?: string;
   args?: string[];
   /** Extra environment (merged over the SDK's safe default: HOME, LOGNAME, PATH, SHELL, TERM, USER). */
   env?: Record<string, string>;
   cwd?: string;
+  /** (additive) Streamable HTTP transport: the server's MCP endpoint (exactly one of `command` and `url`). */
+  url?: string;
+  /** (additive) Headers sent to an HTTP server (resolved by the composition from `*Env` names; never logged). */
+  headers?: Record<string, string>;
   effect?: ToolEffect;
   riskClass?: RiskClass;
+  /** (additive) Per-tool classification overriding the server default (e.g. a read-only `list_issues`). */
+  toolEffects?: Record<string, { effect?: ToolEffect; riskClass?: RiskClass }>;
   /** Only these MCP tool names are exposed (default: all). */
   allowTools?: string[];
-  /** Environment class the server acts on (policy input; e.g. `sandbox`). */
+  /** Environment class the server acts on (policy input; e.g. `sandbox`). Ignored when `environmentId` is set. */
   environmentClass?: string;
+  /** (additive) The registered environment the server acts on: its tools address `env/<id>` with its class. */
+  environmentId?: string;
+  /** (additive) Permission profiles granted `mcp/<server>/**` (not environment-bound servers; default DEFAULT_MCP_GRANT). */
+  grantTo?: string[];
+  /** (additive) Set by the composition when the server cannot be started as configured (a missing `*Env` variable): calls fail `unavailable` with it, nothing is spawned. */
+  unavailableReason?: string;
   /** Per-call timeout (default 60 s). */
   timeoutMs?: number;
 }
+
+/** Bytes of an MCP result's text kept inline in the `mcp-response` evidence payload (the artifact holds it all). */
+const MCP_EVIDENCE_TEXT_LIMIT = 256 * 1024;
 
 export interface McpToolBridgeOptions {
   servers: McpServerConfig[];
@@ -125,7 +149,10 @@ export class McpToolBridge {
     if (!options || !Array.isArray(options.servers)) throw new HypertestError('invalid_argument', 'McpToolBridge requires servers');
     const names = new Set<string>();
     for (const s of options.servers) {
-      if (!s || typeof s.name !== 'string' || s.name === '' || typeof s.command !== 'string' || s.command === '') throw new HypertestError('invalid_argument', 'every MCP server needs a name and a command');
+      if (!s || typeof s.name !== 'string' || s.name === '') throw new HypertestError('invalid_argument', 'every MCP server needs a name');
+      const hasCommand = typeof s.command === 'string' && s.command !== '';
+      const hasUrl = typeof s.url === 'string' && s.url !== '';
+      if (hasCommand === hasUrl) throw new HypertestError('invalid_argument', `MCP server ${s.name} needs exactly one of command (stdio) and url (streamable HTTP)`);
       const seg = sanitizeMcpSegment(s.name);
       if (names.has(seg)) throw new HypertestError('invalid_argument', `duplicate MCP server name ${s.name}`);
       names.add(seg);
@@ -161,13 +188,23 @@ export class McpToolBridge {
 
   async #open(config: McpServerConfig): Promise<Connected> {
     const epoch = this.#closed;
-    const [{ Client }, { StdioClientTransport }] = await Promise.all([import('@modelcontextprotocol/sdk/client/index.js'), import('@modelcontextprotocol/sdk/client/stdio.js')]);
-    const params: ConstructorParameters<typeof StdioClientTransport>[0] = { command: config.command, args: config.args ?? [], stderr: 'pipe' };
-    if (config.env) params.env = config.env;
-    if (config.cwd) params.cwd = config.cwd;
-    const transport = new StdioClientTransport(params);
-    // drain stderr (an unread pipe would eventually block the server) into debug logs
-    transport.stderr?.on('data', (chunk: Buffer) => this.#logger.debug('MCP server stderr', { server: config.name, text: chunk.toString('utf8').slice(0, 2000) }));
+    if (config.unavailableReason !== undefined) throw new HypertestError('unavailable', `MCP server ${config.name} is unavailable: ${config.unavailableReason}`);
+    const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+    let transport: { close(): Promise<void> };
+    if (config.url !== undefined) {
+      // (additive) streamable HTTP: the operator's endpoint, headers resolved from *Env names by the composition
+      const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
+      transport = new StreamableHTTPClientTransport(new URL(config.url), config.headers ? { requestInit: { headers: { ...config.headers } } } : {});
+    } else {
+      const { StdioClientTransport } = await import('@modelcontextprotocol/sdk/client/stdio.js');
+      const params: ConstructorParameters<typeof StdioClientTransport>[0] = { command: config.command!, args: config.args ?? [], stderr: 'pipe' };
+      if (config.env) params.env = config.env;
+      if (config.cwd) params.cwd = config.cwd;
+      const stdio = new StdioClientTransport(params);
+      // drain stderr (an unread pipe would eventually block the server) into debug logs
+      stdio.stderr?.on('data', (chunk: Buffer) => this.#logger.debug('MCP server stderr', { server: config.name, text: chunk.toString('utf8').slice(0, 2000) }));
+      transport = stdio;
+    }
     const client = new Client({ name: this.#o.clientName ?? 'hypertest', version: '0.3.0' }, { capabilities: {} }) as unknown as McpClientLike;
     try {
       await client.connect(transport, { timeout: config.timeoutMs ?? 30_000 });
@@ -233,19 +270,26 @@ export class McpToolBridge {
 
   #spec(config: McpServerConfig, toolName: string, description: string | undefined, inputSchema: JsonSchema): ToolSpec<Record<string, unknown>> {
     const id = mcpToolId(config.name, toolName);
-    const resource = `mcp/${sanitizeMcpSegment(config.name)}/${sanitizeMcpSegment(toolName, 32)}`;
-    return {
+    const own = Object.hasOwn(config.toolEffects ?? {}, toolName) ? config.toolEffects![toolName]! : {};
+    const environmentId = config.environmentId;
+    const resource = environmentId !== undefined ? `env/${environmentId}` : `mcp/${sanitizeMcpSegment(config.name)}/${sanitizeMcpSegment(toolName, 32)}`;
+    const spec: ToolSpec<Record<string, unknown>> = {
       id,
       title: `${config.name}: ${toolName}`,
       description: (description && description.trim() !== '' ? description : `MCP tool ${toolName} of server ${config.name}`).slice(0, 2000),
       inputSchema,
-      effect: config.effect ?? 'external',
-      riskClass: config.riskClass ?? 'medium',
+      effect: own.effect ?? config.effect ?? 'external',
+      riskClass: own.riskClass ?? config.riskClass ?? 'medium',
       resources: () => [resource],
-      ...(config.environmentClass !== undefined ? { environmentClass: () => config.environmentClass } : {}),
+      evidenceTypes: ['mcp-response'],
       timeoutMs: config.timeoutMs ?? 60_000,
       execute: (input, ctx) => this.#call(config, toolName, input, ctx),
     };
+    if (environmentId !== undefined) spec.environmentClass = (_input, ctx) => requireEnvironment(ctx.environments, environmentId).environmentClass;
+    else if (config.environmentClass !== undefined) spec.environmentClass = () => config.environmentClass;
+    // (additive) an unbound server's scope is granted only to the profiles the operator names
+    if (environmentId === undefined) spec.grant = { scopes: [`mcp/${sanitizeMcpSegment(config.name)}/**`], profiles: [...(config.grantTo ?? DEFAULT_MCP_GRANT)] } satisfies ToolGrant;
+    return spec;
   }
 
   async #call(config: McpServerConfig, toolName: string, input: Record<string, unknown>, ctx: ToolContext): Promise<ToolOutcome> {
@@ -264,9 +308,28 @@ export class McpToolBridge {
       const msg = errorMessage(e);
       return { status: /timed out|timeout/i.test(msg) ? 'timeout' : 'failed', error: { code: /timed out|timeout/i.test(msg) ? 'timeout' : 'mcp_error', message: `MCP ${config.name}.${toolName}: ${msg}` } };
     }
-    const text = renderContent(result.content);
-    const outcome: ToolOutcome = { status: result.isError === true ? 'failed' : 'success', text };
-    if (result.structuredContent !== undefined && result.structuredContent !== null) outcome.structured = JSON.parse(JSON.stringify(result.structuredContent)) as JsonValue;
+    const rawText = renderContent(result.content);
+    // E[4]: no long-lived secret and no minted credential reaches the evidence or the model, whatever the server echoes
+    const text = ctx.secrets ? ctx.secrets.redact(rawText) : rawText;
+    const structuredContent = result.structuredContent !== undefined && result.structuredContent !== null ? (JSON.parse(ctx.secrets ? ctx.secrets.redact(JSON.stringify(result.structuredContent)) : JSON.stringify(result.structuredContent)) as JsonValue) : undefined;
+    // (additive) the exchange is evidence: what was asked (redacted arguments) and what the server answered
+    const evidenceText = Buffer.byteLength(text) > MCP_EVIDENCE_TEXT_LIMIT ? Buffer.from(text).subarray(0, MCP_EVIDENCE_TEXT_LIMIT).toString('utf8') : text;
+    const record = { server: config.name, tool: toolName, transport: config.url !== undefined ? 'http' : 'stdio', arguments: redactSecrets(input ?? {}), isError: result.isError === true, text: evidenceText, ...(structuredContent !== undefined ? { structuredContent } : {}) };
+    // a server bound to an environment: the evidence is anchored to it (environment / generation provenance)
+    const boundEnv = config.environmentId !== undefined ? ctx.environments.get(config.environmentId) : undefined;
+    const environment = boundEnv ? { environmentId: boundEnv.environmentId, environmentClass: boundEnv.environmentClass, generation: boundEnv.generation, ...(boundEnv.buildDigest !== undefined ? { buildDigest: boundEnv.buildDigest } : {}) } : undefined;
+    const evidence = await ctx.recordEvidence({
+      evidenceType: 'mcp-response',
+      data: JSON.stringify({ ...record, text }),
+      mimeType: 'application/json',
+      summary: `MCP ${config.name}.${toolName} → ${result.isError === true ? 'error' : 'ok'}: ${JSON.stringify(text.slice(0, 120))}`.slice(0, 500),
+      structured: JSON.parse(JSON.stringify(record)) as JsonValue,
+      provenance: { target: `mcp:${config.name}/${toolName}` },
+      ...(ctx.operationId !== undefined ? { operationId: ctx.operationId } : {}),
+      ...(environment ? { environment } : {}),
+    });
+    const outcome: ToolOutcome = { status: result.isError === true ? 'failed' : 'success', text, evidenceRefs: [evidence.evidenceId] };
+    if (structuredContent !== undefined) outcome.structured = structuredContent;
     if (result.isError === true) outcome.error = { code: 'mcp_tool_error', message: text.slice(0, 2000) || `MCP tool ${toolName} reported an error` };
     return outcome;
   }

@@ -22,9 +22,14 @@ import {
 } from '../brains/core.ts';
 import { LEDGER_ORACLE } from './poc-a.ts';
 import { OBSERVATIONS_PROBE, observationsFile, observationsProbe } from './common.ts';
+import {
+  apiBlackboxTask, chaosBudgetExhaustionTask, chaosCompetingFaultsTask, chaosKillAfterSuccessTask, chaosUnqueryableTargetTask, evidenceMissingTask, evidenceTamperTask, faultToleranceErrorsTask,
+  faultToleranceLatencyTask, multiAgentConvergenceTask, multiAgentDelegationTask, performanceRegressionTask, performanceSloTask,
+} from './extended.ts';
 
 /** Revision of the core suites. */
-export const CORE_SUITE_REVISION = 'core-1';
+/** core-2: the core suite also runs the extended core suites (F[5]/F[6]/F[7]) except the browser task (CI has no Chromium). */
+export const CORE_SUITE_REVISION = 'core-2';
 
 export const CONTEXT_FRESHNESS_TASK_ID = 'context-freshness';
 export const MODEL_SWITCH_BASELINE_TASK_ID = 'model-switch-baseline';
@@ -277,13 +282,20 @@ export function testGenerationSuite(): EvalSuite {
   return { suiteId: 'test-generation', revision: CORE_SUITE_REVISION, tasks: [testGenerationTask(), testGenerationInsensitiveTask(), testGenerationDefectTask()] };
 }
 
-/** Every core-suite task: the suite of the eval release gate (`hypertest eval run core --out …`, then `eval gate`). */
+/**
+ * Every core-suite task: the suite of the eval release gate (`hypertest eval run core --out …`, then `eval gate`; promotion
+ * of a runtime release to active needs it bound to the release's manifest). core-2 (F[5]/F[6]/F[7]): plus the extended
+ * core suites — API black-box, Performance, FaultTolerance, Evidence, MultiAgent and the chaos cases. The UI black-box
+ * task needs a local Chromium and stays in the `api-ui-blackbox` suite and the `deep` tier.
+ */
 export function coreSuite(): EvalSuite {
   return {
     suiteId: 'core',
     revision: CORE_SUITE_REVISION,
     tasks: [
       contextFreshnessTask(), modelSwitchBaselineTask(), modelSwitchTask(), securityInjectionTask(), testGenerationTask(), testGenerationInsensitiveTask(), testGenerationDefectTask(),
+      apiBlackboxTask(), performanceSloTask(), performanceRegressionTask(), faultToleranceLatencyTask(), faultToleranceErrorsTask(), evidenceTamperTask(), evidenceMissingTask(),
+      multiAgentDelegationTask(), multiAgentConvergenceTask(), chaosKillAfterSuccessTask(), chaosBudgetExhaustionTask(), chaosCompetingFaultsTask(), chaosUnqueryableTargetTask(),
     ],
   };
 }

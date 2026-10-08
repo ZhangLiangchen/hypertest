@@ -1,0 +1,6 @@
+#!/bin/sh
+# Fake xdotool for the computer-use tests: records argv (one JSON array per line) to $FAKE_XDOTOOL_LOG and answers the
+# geometry query; anything else succeeds silently.
+node -e 'require("fs").appendFileSync(process.env.FAKE_XDOTOOL_LOG, JSON.stringify({ display: process.env.DISPLAY, argv: process.argv.slice(1) }) + "\n")' -- "$@"
+if [ "$1" = "getdisplaygeometry" ]; then echo "1024 768"; fi
+exit 0

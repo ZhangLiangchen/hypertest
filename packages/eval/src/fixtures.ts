@@ -12,7 +12,7 @@
  */
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { closeSync, existsSync, openSync, readdirSync, readFileSync } from 'node:fs';
-import { cp, mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
@@ -125,6 +125,34 @@ export async function createLedgerRepo(parentDir: string, options: LedgerRepoOpt
   return { path, base, head };
 }
 
+/**
+ * (additive, coverage[14]) A git repository from directories: `base` committed first (the base commit), then `candidate`
+ * copied over it and committed (the commit under test; absent ⇒ head = base). Used by the private-suite and the
+ * SWE-bench-style sanity loaders.
+ */
+export async function createGitFixtureRepo(parentDir: string, options: { base: string; candidate?: string; name?: string; patch?: string }): Promise<LedgerRepo> {
+  await mkdir(parentDir, { recursive: true });
+  const path = await mkdtemp(join(parentDir, `${(options.name ?? 'repo').replace(/[^A-Za-z0-9._-]+/g, '_')}-`));
+  // never a VCS directory of the source (a worktree's .git file would make the copy part of another repository)
+  const noGit = (src: string) => !/(^|[\\/])\.git$/.test(src);
+  await cp(options.base, path, { recursive: true, filter: noGit });
+  await git(path, ['init', '-q', '-b', 'main']);
+  await git(path, ['add', '-A']);
+  await git(path, ['commit', '-q', '--allow-empty', '-m', 'base']);
+  const base = await git(path, ['rev-parse', 'HEAD']);
+  if (options.candidate === undefined && options.patch === undefined) return { path, base, head: base };
+  if (options.candidate !== undefined) await cp(options.candidate, path, { recursive: true, filter: noGit });
+  if (options.patch !== undefined) {
+    await writeFile(join(path, '.hypertest-candidate.patch'), options.patch);
+    await git(path, ['apply', '--whitespace=nowarn', '.hypertest-candidate.patch']);
+    await rm(join(path, '.hypertest-candidate.patch'), { force: true });
+  }
+  await git(path, ['add', '-A']);
+  await git(path, ['commit', '-q', '--allow-empty', '-m', 'candidate']);
+  const head = await git(path, ['rev-parse', 'HEAD']);
+  return { path, base, head };
+}
+
 /** A file of the repository at a revision (probes: the candidate's test code must be unchanged after the run). */
 export async function gitShowFile(repoPath: string, rev: string, file: string): Promise<string> {
   return git(repoPath, ['show', `${rev}:${file}`], { raw: true });
@@ -208,6 +236,13 @@ export interface KvServiceOptions {
   maxLatencyMs?: number;
   /** How long to wait for the supervisor to report the service ready (default 20 000 ms). */
   readyTimeoutMs?: number;
+  /**
+   * (additive, F[4]) A seeded latency anomaly: every `every`-th GET of key `key` (default k1) takes `ms` more — the hot
+   * key regression a load test's p99 shows (PoC C anomaly, performance suite). Absent ⇒ a healthy service.
+   */
+  slowKey?: { every: number; ms: number; key?: string };
+  /** (additive, F[6]) A PUT is applied at once but answered only after this many ms (an in-flight write at a kill). */
+  slowPutMs?: number;
 }
 
 /** kv-service under its own process supervisor (see startKvService). */
@@ -240,7 +275,9 @@ export async function startKvService(options: KvServiceOptions): Promise<KvServi
   const args = [
     '--no-warnings', PROCESS_SUPERVISOR_CLI_PATH, '--port', '0', '--cwd', options.stateDir, '--state-file', stateFile, '--log-file', join(options.stateDir, 'kv-service.log'),
     '--env', `KV_WARMUP_MS=${options.warmupMs ?? 0}`, '--env', `KV_MAX_LATENCY_MS=${options.maxLatencyMs ?? 6}`,
+    ...(options.slowKey ? ['--env', `KV_SLOW_EVERY=${options.slowKey.every}`, '--env', `KV_SLOW_MS=${options.slowKey.ms}`, '--env', `KV_SLOW_KEY=${options.slowKey.key ?? 'k1'}`] : []),
     ...(options.writeLog !== undefined ? ['--env', `KV_WRITE_LOG=${options.writeLog}`] : []),
+    ...(options.slowPutMs !== undefined ? ['--env', `KV_SLOW_PUT_MS=${options.slowPutMs}`] : []),
     '--', process.execPath, KV_SERVICE_SERVER,
   ];
   const errFd = openSync(join(options.stateDir, 'supervisor.err'), 'a');
@@ -317,13 +354,13 @@ export async function startKvService(options: KvServiceOptions): Promise<KvServi
 }
 
 /** Load job directories created under a Hypertest state dir (`<stateDir>/loadjobs/<operationId>`), with their worker pid. */
-export function loadJobs(stateDir: string): Array<{ operationId: string; pid?: number; state?: string }> {
+export function loadJobs(stateDir: string): Array<{ operationId: string; pid?: number; state?: string; startedAt?: string; finishedAt?: string; errorRate?: number }> {
   const root = join(stateDir, 'loadjobs');
   if (!existsSync(root)) return [];
   return readdirSync(root)
     .sort()
     .map((operationId) => {
-      const out: { operationId: string; pid?: number; state?: string } = { operationId };
+      const out: { operationId: string; pid?: number; state?: string; startedAt?: string; finishedAt?: string; errorRate?: number } = { operationId };
       try {
         const pid = Number.parseInt(readFileSync(join(root, operationId, 'pid'), 'utf8').trim(), 10);
         if (Number.isInteger(pid) && pid > 0) out.pid = pid;
@@ -331,8 +368,12 @@ export function loadJobs(stateDir: string): Array<{ operationId: string; pid?: n
         // no worker pid recorded
       }
       try {
-        const status = JSON.parse(readFileSync(join(root, operationId, 'status.json'), 'utf8')) as { state?: unknown };
+        const status = JSON.parse(readFileSync(join(root, operationId, 'status.json'), 'utf8')) as { state?: unknown; startedAt?: unknown; finishedAt?: unknown; errorRate?: unknown };
         if (typeof status.state === 'string') out.state = status.state;
+        // (additive, F[6]/F[7]) the job's time window and error rate: ground truth of which fault it ran under
+        if (typeof status.startedAt === 'string') out.startedAt = status.startedAt;
+        if (typeof status.finishedAt === 'string') out.finishedAt = status.finishedAt;
+        if (typeof status.errorRate === 'number') out.errorRate = status.errorRate;
       } catch {
         // no status yet
       }

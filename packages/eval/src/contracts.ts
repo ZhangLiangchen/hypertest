@@ -57,6 +57,25 @@ export interface TrialFixture {
    * directory. Never secrets: brains see what a model sees.
    */
   brainArgs?: JsonValue;
+  /**
+   * (additive, F[6]) A SCRIPTED HUMAN OPERATOR acting during the run (in-process trials only): `act` is called every
+   * `intervalMs` (default 200) with the live instance — e.g. it resolves an operation under manual review from the
+   * fixture's ground truth, as an on-call human would (`hypertest operations resolve`). Agents never act through it.
+   */
+  operator?: TrialOperator;
+  /**
+   * (additive, F[7] evidence suite) Runs after the run ended and BEFORE the trial's data is collected and graded (e.g. an
+   * attacker tampers with a stored artifact). Its JSON result is recorded as the probe `afterRun`.
+   */
+  afterRun?: (ctx: { ht: HypertestInstance; runId: string; dataDir: string }) => Promise<JsonValue>;
+}
+
+/** (additive, F[6]) A scripted human operator of a trial (TrialFixture.operator). */
+export interface TrialOperator {
+  /** Poll interval (ms, default 200). */
+  intervalMs?: number;
+  /** One look at the run; errors are logged and the operator keeps going. */
+  act(ctx: { ht: HypertestInstance; runId: string }): Promise<void>;
 }
 
 /** (additive) An oracle established by a human authority before the run (the input of OracleGovernance.establish). */
@@ -137,6 +156,34 @@ export interface EvalTask {
   /** (additive) The rubric the `llmRubric` grader asks the independent judge (default VERDICT_CONSISTENCY_RUBRIC). */
   rubric?: JudgeRubric;
   /**
+   * (additive, row 310) The tools the trial's agents may use (tool ids or `prefix.*` patterns): the trial's
+   * configuration DENIES every other tool to every role (policy rules), and the trial records the list. Absent ⇒ the
+   * deployment's tool policy as configured.
+   */
+  allowedTools?: string[];
+  /**
+   * (additive, row 310) Safety constraints the trial enforces through its configuration (policy deny rules) and records:
+   * `forbid_tool` (a tool id or `prefix.*`), `max_action_risk` (calls above the risk are denied), `no_writes` (every
+   * write/external effect denied).
+   */
+  safetyConstraints?: SafetyConstraint[];
+  /**
+   * (additive, row 310/319) The digest of the system fixture the task runs against (`sha256:<hex>` of an OCI image, or
+   * of the fixture's files): recorded on every trial. Absent ⇒ the harness fingerprints the fixture sources it knows
+   * (fixtureFiles).
+   */
+  environmentImageDigest?: string;
+  /** (additive, row 319) Files/directories whose content is the task's environment (fingerprinted per trial when no image digest is given). */
+  fixtureFiles?: string[];
+  /** (additive, coverage[15]) Tiers the task belongs to (`pr-smoke`, `release-core`, `deep`, `failure-recovery`). */
+  tiers?: EvalTier[];
+  /**
+   * (additive, F[5]/F[7]) Task-level configuration of the trial (applied after the arm's configuration, before the
+   * task constraints): e.g. the browser tools a UI task needs. It may only ADD capabilities the task needs; the harness
+   * re-checks trial isolation afterwards.
+   */
+  configure?: (config: HypertestConfig) => HypertestConfig;
+  /**
    * (additive) A no-failure twin task of the same suite (it must come earlier in EvalSuite.tasks): after every trial,
    * runSuite checks that this task's trial reached the same verdict and the same canonical state as the baseline's trial
    * of the same arm and trial number (grader `baselineEquivalence`; a mismatch fails the trial, a missing baseline leaves
@@ -152,6 +199,68 @@ export interface EvalArm {
   brains?: (task: EvalTask, fixture: TrialFixture) => Record<string, ScriptedBrain>;
   /** (additive) Child-process support: where a trial child loads its brains from. */
   child?: ChildArmSpec;
+  /**
+   * (additive, F[8]) The family the arm belongs to: `causal` (H0–H6 at a fixed model: harness features vary, nothing else),
+   * `product` (a frontier/product baseline: another engine or an external agent), `model` (provider/model variation).
+   */
+  family?: 'causal' | 'product' | 'model';
+  /**
+   * (additive, F[8]) An EXTERNAL agent (Claude Code, Codex, OpenHands, …) invoked as a command instead of a Hypertest
+   * run: the harness runs it in the fixture's workspace and grades its reported verdict and findings with the outcome
+   * graders only (see externalAgentArm).
+   */
+  external?: ExternalAgentSpec;
+  /**
+   * (additive, item 6) Composition overrides of the trial's Hypertest instance, created once per trial: the fetch the HTTP
+   * model adapters use (e.g. the scripted wire transport), the environment API-key variables are read from, and extra
+   * ground-truth probes (e.g. the transport's log). In-process trials only (a fetch does not cross a process boundary).
+   */
+  overrides?: (task: EvalTask, fixture: TrialFixture) => ArmOverrides;
+}
+
+/** (additive, item 6) What EvalArm.overrides contributes to a trial. */
+export interface ArmOverrides {
+  fetch?: typeof fetch;
+  env?: Record<string, string | undefined>;
+  probes?: Record<string, () => Promise<JsonValue>>;
+}
+
+/** (additive, row 310) A safety constraint of an EvalTask (enforced through the trial's policy and recorded). */
+export type SafetyConstraint =
+  | { kind: 'forbid_tool'; tool: string }
+  | { kind: 'max_action_risk'; risk: 'low' | 'medium' | 'high' }
+  | { kind: 'no_writes' };
+
+/** (additive, coverage[15]) Eval tiers (architecture-improvements §Trial 设计). */
+export type EvalTier = 'pr-smoke' | 'release-core' | 'deep' | 'failure-recovery';
+
+/** (additive, coverage[16]) Eval tracks: `cold` (default) shares no long-term memory across trials; `learning` admits approved experience only. */
+export type EvalTrack = 'cold' | 'learning';
+
+/** (additive, F[8]) The harness subsystems a causal arm switches (H0 … H6). */
+export interface HarnessFeatures {
+  /** Specialized role agents (false: the lead is the only agent — H0 single agent). */
+  subagents: boolean;
+  /** The dynamic DAG scheduler (false: one turn at a time, a static sequential pipeline). */
+  dynamicScheduler: boolean;
+  /** Blackboard reactions (false: no event-driven work — roles never react to findings, reviews, …). */
+  blackboard: boolean;
+  /** Context freshness (false: no stale-snapshot refusal of mutating calls). */
+  contextFreshness: boolean;
+  /** Oracle governance (false: runs pin no oracle and the gate does not require one). */
+  oracleGovernance: boolean;
+}
+
+/** (additive, F[8]) How an external agent arm invokes its agent. */
+export interface ExternalAgentSpec {
+  /** Executable (resolved on PATH) — e.g. `claude`, `codex`, `openhands`, or a test fake. */
+  command: string;
+  /** Arguments; `{goal}`, `{workspace}`, `{sutUrl}`, `{report}` are substituted. */
+  args: string[];
+  /** Variable NAMES passed through to the agent (its credentials stay in the environment, never in the config). */
+  envPassthrough?: string[];
+  /** Per-trial timeout of the command (default the trial timeout). */
+  timeoutMs?: number;
 }
 
 export interface GraderResult {
@@ -213,6 +322,20 @@ export interface EvalTrial {
   canonical?: CanonicalState;
   /** (additive) Results of candidate grader revisions run on the same trial data (HarnessOptions.bridge); never counted. */
   bridge?: GraderResult[];
+  /** (additive, F[14]) The trial was cancelled (SuiteOptions.signal / --timeout): result infra_error, never counted. */
+  cancelled?: boolean;
+  /** (additive, coverage[16]) The track the trial ran on (cold: no cross-trial memory). */
+  track?: EvalTrack;
+  /** (additive, row 310) EvalTask.allowedTools as enforced on the trial. */
+  allowedTools?: string[];
+  /** (additive, row 310) EvalTask.safetyConstraints as enforced on the trial. */
+  safetyConstraints?: SafetyConstraint[];
+  /** (additive, row 310/319) The fixture's image digest, or `files:<sha256>` of its fingerprinted files. */
+  environmentImageDigest?: string;
+  /** (additive, F[8]) The harness features the trial's instance ran with (causal arms). */
+  harnessFeatures?: HarnessFeatures;
+  /** (additive, F[12]) The suite content fingerprint (suiteFingerprint) the trial belongs to. */
+  suiteFingerprint?: string;
 }
 
 export interface EvalSuite {
@@ -242,6 +365,8 @@ export interface SuiteOptions extends HarnessOptions {
   workDir: string;
   baseConfig?: HypertestConfig;
   timeoutMs?: number;
+  /** (additive, coverage[15]) The tier the suite runs as (recorded on the result). */
+  tier?: EvalTier;
   /** (additive) Called after every trial (e.g. CLI progress output). */
   onTrial?: (trial: EvalTrial) => void;
   /**
@@ -255,8 +380,16 @@ export interface SuiteResult {
   suiteId: string;
   revision: string;
   trials: EvalTrial[];
-  perArm: Record<string, { passRate: number; passHatK: number; metrics: Record<string, number> }>;
+  perArm: Record<string, { passRate: number; passHatK: number; metrics: Record<string, number>; passAtK?: Record<string, number>; passHatKByK?: Record<string, number> }>;
   comparisons: Array<{ armA: string; armB: string; mcnemarP: number; b: number; c: number } & ComparisonDetail>;
+  /** (additive, F[14]) The suite was cancelled: `trials` holds what completed (and the cancelled trial). */
+  cancelled?: boolean;
+  /** (additive, coverage[15]) The tier the suite ran as. */
+  tier?: EvalTier;
+  /** (additive, coverage[16]) The track every trial ran on. */
+  track?: EvalTrack;
+  /** (additive, F[12]) sha256 over the suite's task definitions, fixtures and brains (suiteFingerprint). */
+  suiteFingerprint?: string;
 }
 
 // ============================================================================= (additive) platform types
@@ -468,6 +601,14 @@ export interface HarnessOptions {
   bridge?: Record<string, VersionedGrader>;
   /** Harness logger (default: none). The Hypertest instances of a trial log into an in-memory logger. */
   logger?: Logger;
+  /**
+   * (additive, coverage[16]) `cold` (default): a trial shares no long-term memory with any other — an arm whose memory
+   * backend lives outside the trial directory (a shared PowerContext/memory service) is refused before the trial.
+   * `learning`: such a backend is admitted, and `experience` (approved items only) is seeded into every trial's store.
+   */
+  track?: EvalTrack;
+  /** (additive, coverage[16]) Learning track: experience items to seed (only `approved`/`published` ones are admitted; the rest are refused and counted). */
+  experience?: ExperienceSeed[];
   /** Keep the trial work directories (default false: removed after the trial). */
   keepWorkDir?: boolean;
   /** Per-probe timeout (default 30 000 ms). */
@@ -692,9 +833,24 @@ export interface ReleaseGateOptions {
   candidateArm?: string;
   /** Significance level of "defect recall not significantly lower" (exact McNemar; default 0.05). */
   alpha?: number;
+  /**
+   * (additive, row 321) The product SLO: the largest critical false release RATE (critical false releases / graded
+   * candidate trials, infra errors that recorded one included) a candidate may have, whatever the baseline did. Default
+   * 0 (DEFAULT_CRITICAL_FALSE_RELEASE_SLO): a release that passed a seeded critical defect never ships.
+   */
+  maxCriticalFalseReleaseRate?: number;
+  /**
+   * (additive, F[12]) Bridge reports (bridgeCompare / `eval bridge`) that make results of different grader revisions
+   * comparable: a task whose grader revisions differ only by graders bridged WITHOUT discontinuity (same revisions, at
+   * least one pair) is comparable; a discontinuity needs a new baseline.
+   */
+  bridges?: BridgeReport[];
 }
 
-export type ReleaseGateCheckId = 'comparable' | 'coverage' | 'critical_false_release' | 'defect_recall' | 'security_violations' | 'duplicate_side_effects' | 'evidence_completeness';
+export type ReleaseGateCheckId =
+  | 'comparable' | 'coverage' | 'critical_false_release' | 'defect_recall' | 'security_violations' | 'duplicate_side_effects' | 'evidence_completeness'
+  // (additive) the product SLO (row 321) and the per-task defect regression (F[13])
+  | 'critical_false_release_slo' | 'defect_regression';
 
 export interface ReleaseGateCheck {
   checkId: ReleaseGateCheckId;
@@ -702,6 +858,15 @@ export interface ReleaseGateCheck {
   pass: boolean;
   detail: string;
   values: Record<string, number>;
+}
+
+/** (additive, coverage[16]) An experience item seeded into a learning-track trial (memory export / an approved skill). */
+export interface ExperienceSeed {
+  kind: 'lesson' | 'pattern' | 'pitfall' | 'test_idea' | 'skill_candidate';
+  /** Only `approved` / `published` items are admitted. */
+  status: string;
+  content: string;
+  scope?: { project?: string; role?: string; topic?: string };
 }
 
 /** (additive) Result of the eval release gate: pass only when every check passes. */
@@ -714,4 +879,6 @@ export interface ReleaseGateReport {
   pairs: number;
   alpha: number;
   checks: ReleaseGateCheck[];
+  /** (additive, F[12]) The bridges the comparability check used. */
+  bridgesUsed?: Array<{ graderId: string; fromRevision: string; toRevision: string; pairs: number }>;
 }

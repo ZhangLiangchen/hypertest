@@ -6,6 +6,11 @@
 //   GET  /health                                       → 200 {status, accounts, total, deposited, balanceConserved}
 //   GET  /metrics                                      → Prometheus text (request counter, total balance gauge)
 //   GET  /__eval/effects                               → {effects: {<Idempotency-Key>: count}} (ground truth for the eval probe)
+//   GET  /ui, GET /ui/app.js                           → (additive, UI black-box suite) a transfer form page: from, to, amount,
+//                                                        Send; the outcome is shown in #result
+//
+// Hidden UI defect: the page's resultMessage() ignores the HTTP status — a REJECTED transfer (400) is shown as
+// "Transfer complete" (the API itself rejects it correctly).
 //
 // Hidden defect: the transfer validation rejects only a ZERO amount, so a negative amount is accepted (201) and moves
 // money backwards (the recipient pays the sender). Money is still conserved: the defect is invisible to the total.
@@ -62,6 +67,38 @@ function metrics() {
   return `${lines.join('\n')}\n`;
 }
 
+const UI_PAGE = `<!doctype html>
+<html><head><meta charset="utf-8"><title>Bank transfers</title><script src="/ui/app.js"></script></head>
+<body>
+<h1>Transfer money</h1>
+<form id="transfer">
+  <label>From <input id="from" name="from"></label>
+  <label>To <input id="to" name="to"></label>
+  <label>Amount <input id="amount" name="amount"></label>
+  <button id="send" type="submit">Send</button>
+</form>
+<p id="result"></p>
+</body></html>
+`;
+
+const UI_SCRIPT = `// The outcome message of a transfer answer (status, JSON body).
+// DEFECT: the status is ignored — a rejected transfer is reported as complete.
+function resultMessage(status, body) {
+  return 'Transfer complete';
+}
+if (typeof window !== 'undefined') {
+  window.addEventListener('DOMContentLoaded', () => {
+    document.getElementById('transfer').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const value = (id) => document.getElementById(id).value;
+      const res = await fetch('/transfers', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ from: value('from'), to: value('to'), amount: Number(value('amount')) }) });
+      const body = await res.json();
+      document.getElementById('result').textContent = resultMessage(res.status, body);
+    });
+  });
+}
+`;
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
   const method = req.method ?? 'GET';
@@ -77,6 +114,12 @@ const server = http.createServer(async (req, res) => {
     }
     if (method === 'GET' && path === '/metrics') return send(res, 200, metrics(), '/metrics', method);
     if (method === 'GET' && path === '/__eval/effects') return send(res, 200, { effects: Object.fromEntries(effects) }, '/__eval/effects', method);
+    if (method === 'GET' && (path === '/ui' || path === '/ui/app.js')) {
+      const html = path === '/ui';
+      requests.set(`GET ${path} 200`, (requests.get(`GET ${path} 200`) ?? 0) + 1);
+      res.writeHead(200, { 'content-type': html ? 'text/html; charset=utf-8' : 'text/javascript; charset=utf-8' });
+      return res.end(html ? UI_PAGE : UI_SCRIPT);
+    }
     if (method === 'POST' && path === '/accounts') {
       const body = await readJson(req);
       if (!body || typeof body.owner !== 'string' || body.owner === '' || !Number.isInteger(body.balance) || body.balance < 0) {

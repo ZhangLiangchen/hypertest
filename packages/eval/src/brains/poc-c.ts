@@ -194,7 +194,12 @@ export const pocCExecutor: RoleBrain = (v) => {
   }
   if (last.isError) return toolCall('fail_work', { reason: 'agent_failed', message: `the diagnostics dump could not be collected (${dumps.length} attempt(s)): ${last.content.slice(0, 300)}` });
   const after = v.toolResults.at(-1);
-  if (after !== last) return toolCall('fail_work', { reason: 'agent_failed', message: `completion after the dump was refused: ${(after?.content ?? '').slice(0, 300)}` });
+  if (after !== last) {
+    // a completion refused on a stale snapshot (the environment was restarted meanwhile) is retried in a new turn, on a
+    // fresh snapshot (at most MAX_DUMP_ATTEMPTS completions); any other refusal fails the item
+    const completions = v.toolResults.filter((r) => toolIdOf(r.name) === 'complete_work').length;
+    if (!(staleRefusal(after) && completions < MAX_DUMP_ATTEMPTS)) return toolCall('fail_work', { reason: 'agent_failed', message: `completion after the dump was refused: ${(after?.content ?? '').slice(0, 300)}` });
+  }
   const text = last.content;
   const bytes = requestBytes(v.request);
   // I9: the dump itself never enters the model's messages — only a bounded digest with the artifact reference

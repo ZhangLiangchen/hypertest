@@ -5,6 +5,7 @@ import { HypertestError, jsonClone, validateJson } from '@hypertest/core';
 import { MODEL_CAPABILITY_PROFILE_SCHEMA, anthropicCompatibilityClass, type ModelCapabilityProfile } from '@hypertest/model';
 import { DEFAULT_POLICY_RULES, POLICY_RULE_SCHEMA, type OracleGovernance } from '@hypertest/policy';
 import { DEFAULT_SHELL_ALLOWLIST, brokeredCredentialProblems, type BrokeredCredentialConfig } from '@hypertest/tools';
+import { acpAgentProblems, computerUseProblems, environmentToolProblems, mcpServerProblems, remoteWorkerProblems, sandboxKeyProblems, sandboxRoleProblems } from './tool-config.ts';
 import { BUILTIN_ROLES, RoleCatalog, type RoleOverrides } from '@hypertest/agents';
 import type { HypertestConfig, HypertestConfigInput, LoadConfigOptions, OracleConfig, ProviderConfig, RouteConfig } from './contracts.ts';
 
@@ -58,6 +59,8 @@ const TOP_LEVEL_KEYS = new Set([
   'environments', 'tools', 'signing', 'memory', 'observability', 'oracles', 'runtime', 'plugins',
   // (additive, B[6] / B[7]) L3 retrieval (semantic embedder route) and skills (eval trial revisions)
   'retrieval', 'skills',
+  // (additive, F[8]) harness features of an eval causal arm
+  'harness',
 ]);
 /** Discriminated sections: a patch with another `kind` replaces the section instead of merging into it. */
 const KIND_SECTIONS = new Set(['store', 'bus', 'durable', 'artifacts', 'memory']);
@@ -595,8 +598,33 @@ function validateSections(errors: Errors, c: Record<string, unknown>): void {
   }
   const runtime = c['runtime'];
   if (runtime !== undefined && objectAt(errors, 'runtime', runtime, false)) {
-    unknownKeys(errors, 'runtime', runtime, ['requireActiveRelease']);
+    unknownKeys(errors, 'runtime', runtime, ['requireActiveRelease', 'shadow']);
     if (runtime['requireActiveRelease'] !== undefined && typeof runtime['requireActiveRelease'] !== 'boolean') errors.push('runtime.requireActiveRelease must be a boolean');
+    // (F[0]) what a shadow release mirrors and how many mirrored runs a production replay needs
+    const shadow = runtime['shadow'];
+    if (shadow !== undefined && objectAt(errors, 'runtime.shadow', shadow, false)) {
+      unknownKeys(errors, 'runtime.shadow', shadow, ['percentage', 'labels', 'minRuns', 'timeoutMs']);
+      const pct = shadow['percentage'];
+      if (pct !== undefined && !(typeof pct === 'number' && Number.isInteger(pct) && pct >= 0 && pct <= 100)) errors.push('runtime.shadow.percentage must be an integer between 0 and 100');
+      const labels = shadow['labels'];
+      if (labels !== undefined && (labels === null || typeof labels !== 'object' || Array.isArray(labels) || Object.entries(labels).some(([k, v]) => k.trim() === '' || typeof v !== 'string'))) {
+        errors.push('runtime.shadow.labels must be a map of label → string value');
+      }
+      for (const k of ['minRuns', 'timeoutMs'] as const) {
+        const v = shadow[k];
+        if (v !== undefined && !(typeof v === 'number' && Number.isSafeInteger(v) && v >= 1)) errors.push(`runtime.shadow.${k} must be an integer ≥ 1`);
+      }
+    }
+  }
+  // (F[8]) harness features of an eval causal arm (honoured only for an eval trial instance: harness-features.ts)
+  const harness = c['harness'];
+  if (harness !== undefined && objectAt(errors, 'harness', harness, false)) {
+    unknownKeys(errors, 'harness', harness, ['features']);
+    const features = harness['features'];
+    if (features !== undefined && objectAt(errors, 'harness.features', features, false)) {
+      unknownKeys(errors, 'harness.features', features, ['subagents', 'dynamicScheduler', 'blackboard', 'contextFreshness', 'oracleGovernance']);
+      for (const [k, v] of Object.entries(features)) if (typeof v !== 'boolean') errors.push(`harness.features.${k} must be a boolean`);
+    }
   }
   const memory = c['memory'];
   if (memory !== undefined && objectAt(errors, 'memory', memory, false) && oneOf(errors, 'memory.kind', memory['kind'], ['sql', 'powercontext', 'service'])) {
@@ -885,7 +913,9 @@ function validateRest(errors: Errors, c: Record<string, unknown>): void {
   }
   const sandbox = c['sandbox'];
   if (sandbox !== undefined && objectAt(errors, 'sandbox', sandbox, false)) {
-    unknownKeys(errors, 'sandbox', sandbox, ['kind', 'image', 'network', 'allowedHosts', 'envAllowlist', 'cpuLimit', 'memoryMb', 'egressWrites', 'insecureAllowUnhiddenSecrets']);
+    unknownKeys(errors, 'sandbox', sandbox, ['kind', 'image', 'network', 'allowedHosts', 'envAllowlist', 'cpuLimit', 'memoryMb', 'egressWrites', 'insecureAllowUnhiddenSecrets', 'roles']);
+    // (wave 3, row 250) every accepted key is honoured by the selected sandbox (else refused here); isolation tiers per role
+    errors.push(...sandboxKeyProblems(sandbox, 'sandbox'), ...sandboxRoleProblems(sandbox));
     // E[4]: the loud opt-in to run agent commands where the sandbox cannot hide keys, capability secret and store
     if (sandbox['insecureAllowUnhiddenSecrets'] !== undefined && typeof sandbox['insecureAllowUnhiddenSecrets'] !== 'boolean') errors.push('sandbox.insecureAllowUnhiddenSecrets must be a boolean');
     // E[2]: what a sandboxed command's state-changing request to the SUT becomes (ledgered operation, or refused)
@@ -909,7 +939,9 @@ function validateRest(errors: Errors, c: Record<string, unknown>): void {
       envs.forEach((e, i) => {
         const at = `environments[${i}]`;
         if (!objectAt(errors, at, e, true)) return;
-        unknownKeys(errors, at, e, ['environmentId', 'environmentClass', 'baseUrl', 'metricsUrl', 'prometheusUrl', 'generation', 'buildDigest', 'control', 'isolation', 'honoursIdempotencyKey', 'rawEgress', 'credentials']);
+        unknownKeys(errors, at, e, ['environmentId', 'environmentClass', 'baseUrl', 'metricsUrl', 'prometheusUrl', 'generation', 'buildDigest', 'control', 'isolation', 'honoursIdempotencyKey', 'rawEgress', 'credentials', 'grpc', 'logs', 'traces', 'database']);
+        // (wave 3) tool-surface keys: grpc endpoint, log files, trace backend, database (by variable NAME), kubectl context
+        errors.push(...environmentToolProblems(e, at));
         // E[4] / coverage[8]: brokered credentials (short-lived, minted per call from a *Env secret; agents only name them)
         const credentials = e['credentials'];
         if (credentials !== undefined) {
@@ -948,7 +980,7 @@ function validateRest(errors: Errors, c: Record<string, unknown>): void {
         for (const k of ['baseUrl', 'metricsUrl', 'prometheusUrl']) if (e[k] !== undefined) httpUrl(errors, `${at}.${k}`, e[k], false);
         const control = e['control'];
         if (control !== undefined && objectAt(errors, `${at}.control`, control, false)) {
-          unknownKeys(errors, `${at}.control`, control, ['kind', 'target', 'namespace', 'command', 'tokenEnv']);
+          unknownKeys(errors, `${at}.control`, control, ['kind', 'target', 'namespace', 'command', 'tokenEnv', 'context']);
           oneOf(errors, `${at}.control.kind`, control['kind'], ['process', 'docker', 'kubectl']);
           if (str(errors, `${at}.control.target`, control['target'], true) && /#.*\btoken=/i.test(control['target'])) {
             errors.push(`${at}.control.target: inline control tokens are not allowed; set control.tokenEnv to the NAME of the variable holding the token`);
@@ -964,7 +996,17 @@ function validateRest(errors: Errors, c: Record<string, unknown>): void {
   }
   const tools = c['tools'];
   if (tools !== undefined && objectAt(errors, 'tools', tools, false)) {
-    unknownKeys(errors, 'tools', tools, ['shellAllowlist', 'httpAllowlist', 'enableBrowser']);
+    unknownKeys(errors, 'tools', tools, ['shellAllowlist', 'httpAllowlist', 'enableBrowser', 'urlEnvironmentClass', 'mcpServers', 'remoteWorkers', 'acpAgents', 'computerUse']);
+    // (row 246) computer use: backend, display, grants, offered roles
+    errors.push(...computerUseProblems(tools['computerUse']));
+    // (row 246) ACP agents: command, variables by NAME, sandbox placement, offered roles
+    errors.push(...acpAgentProblems(tools['acpAgents']));
+    // (row 246) remote tool workers: url, secret by variable NAME, delegated tools
+    errors.push(...remoteWorkerProblems(tools['remoteWorkers']));
+    // (E[5]/stubs[1]/coverage[3]) MCP servers: transport, *Env names only, allowTools, classification, grants
+    errors.push(...mcpServerProblems(tools['mcpServers'], c['environments']));
+    // (e2e[0]) the class of allowlisted non-loopback URL targets (default sandbox)
+    if (tools['urlEnvironmentClass'] !== undefined) str(errors, 'tools.urlEnvironmentClass', tools['urlEnvironmentClass'], false);
     stringList(errors, 'tools.shellAllowlist', tools['shellAllowlist']);
     stringList(errors, 'tools.httpAllowlist', tools['httpAllowlist']);
     if (tools['enableBrowser'] !== undefined && typeof tools['enableBrowser'] !== 'boolean') errors.push('tools.enableBrowser must be a boolean');

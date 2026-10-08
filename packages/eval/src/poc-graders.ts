@@ -6,7 +6,8 @@
  *
  * Registered in GRADERS (ids): pocAWorkflow, pocBWorkflow, pocCWorkflow, causalChain, singleLeaseOwner,
  * noOrphanOperations, loadJobReattached, offloadBounded, modelFallback, contextIsolation, independentReview,
- * reportTracesToEvidence, testChangeGoverned, recoveryAudit, insufficientDataNotPassed.
+ * reportTracesToEvidence, testChangeGoverned, recoveryAudit, insufficientDataNotPassed, anomalyReaction,
+ * rcaMetricsExecutorParallel.
  */
 import { HypertestError, type JsonValue } from '@hypertest/core';
 import type { BlackboardRecord, DomainEvent, EvidenceRecord, Finding, Hypothesis, Review, TestArtifact, WorkItem } from '@hypertest/domain';
@@ -518,6 +519,99 @@ export const pocCWorkflowGrader: Grader = async (ctx) => {
   ]);
 };
 
+// ------------------------------------------------------------------------------------------------ PoC C anomaly (F[4])
+
+/** Work items of `role` created by the reactors from event `eventId` (origin reactor, causation = the event). */
+export function reactionsTo(items: readonly WorkItem[], eventId: string, role: string): WorkItem[] {
+  return items.filter((w) => w.role === role && w.origin.kind === 'reactor' && w.origin.eventId === eventId && w.causationEventId === eventId);
+}
+
+/**
+ * (F[4], coverage[9]) Anomaly → RCA: a PERFORMANCE finding posted by the metrics analyst (the anomaly found in metrics)
+ * cites recorded metric evidence; its `finding.created` created the RCA and TestDesigner work through the reactors
+ * (`system:reactors`, causation = that event — the lead is not in the path); the RCA reaction posted an evidence-backed
+ * hypothesis on the finding's lineage; the TestDesigner reaction generated a TARGETED regression test (bound to the
+ * finding's oracle assertion) whose recorded run failed on the anomaly; the finding ended confirmed.
+ */
+export const anomalyReactionGrader: Grader = async (ctx) => {
+  const missing = noRun('anomalyReaction', ctx.data);
+  if (missing) return missing;
+  const { events, workItems, evidence } = ctx.data;
+  const roles = agentRoles(events);
+  const byId = new Map(evidence.map((e) => [e.evidenceId, e]));
+  const created = events.filter((e) => e.eventType === 'finding.created' && roles.get(e.agentId ?? '') === 'metrics_analyst');
+  const anomalies = created
+    .map((e) => ({ event: e, finding: ctx.data.findings.find((f) => f.lineageId === str(payload(e)['lineageId'])) }))
+    .filter((a): a is { event: DomainEvent<unknown>; finding: BlackboardRecord<Finding> } => a.finding !== undefined && a.finding.payload.category === 'performance');
+  if (anomalies.length === 0) return { graderId: 'anomalyReaction', pass: false, score: 0, detail: `no performance finding posted by the metrics analyst (${created.length} finding(s) by it)` };
+  const hypotheses = await ctx.ht.services.blackboard.query<Hypothesis>({ runId: ctx.data.runId!, recordType: 'hypothesis' });
+  const artifacts = latestOf(await ctx.ht.services.specs.listTestArtifacts(ctx.data.runId!));
+  const workCreated = new Map(events.filter((e) => e.eventType === 'work.created').map((e) => [str(payload(e)['workItemId']) ?? e.aggregateId, e]));
+  const agentsByItem = new Map<string, string>();
+  for (const e of events) if (e.eventType === 'agent.spawned') agentsByItem.set(str(payload(e)['workItemId']) ?? '', str(payload(e)['agentId']) ?? e.aggregateId);
+  const checks: Check[] = [];
+  for (const { event, finding } of anomalies) {
+    const label = `anomaly ${finding.recordId}`;
+    const metric = finding.evidenceRefs.filter((id) => byId.get(id)?.evidenceType === 'metric');
+    checks.push({ name: `${label} cites recorded metric evidence`, ok: metric.length > 0, detail: `evidence ${finding.evidenceRefs.join(', ') || 'none'}` });
+    const rca = reactionsTo(workItems, event.eventId, 'rca');
+    const td = reactionsTo(workItems, event.eventId, 'test_designer');
+    const reactions = [...rca, ...td];
+    checks.push({ name: `${label} created an RCA work item (reactor)`, ok: rca.length >= 1, detail: `${rca.length}` });
+    checks.push({ name: `${label} created a test-designer work item (reactor)`, ok: td.length >= 1, detail: `${td.length}` });
+    checks.push({
+      name: `${label}: the reactions were created by the reactors from the event (not by the lead)`,
+      ok: reactions.length > 0 && reactions.every((w) => workCreated.get(w.workItemId)?.actorId === 'system:reactors'),
+      detail: reactions.map((w) => `${w.role}←${workCreated.get(w.workItemId)?.actorId ?? '?'}`).join(', '),
+    });
+    const rcaItems = new Set(rca.map((w) => w.workItemId));
+    const hyp = hypotheses.filter((h) => h.payload.findingLineageId === finding.lineageId && h.evidenceRefs.length > 0 && h.workItemId !== undefined && rcaItems.has(h.workItemId));
+    checks.push({ name: `${label} → evidence-backed RCA hypothesis on its lineage`, ok: hyp.length > 0, detail: `${hypotheses.length} hypothesis record(s) in the run` });
+    const tdAgents = new Set(td.map((w) => agentsByItem.get(w.workItemId)).filter((a): a is string => a !== undefined));
+    const assertion = finding.payload.oracleRef;
+    const targeted = artifacts.filter((a) => a.sourceType === 'generated' && a.generatedBy !== undefined && tdAgents.has(a.generatedBy.agentId)
+      && (assertion === undefined || a.oracleRefs.some((r) => r.oracleId === assertion.oracleId && (assertion.assertionId === undefined || r.assertionIds.includes(assertion.assertionId)))));
+    checks.push({ name: `${label} → targeted regression test (generated by its reaction, bound to ${assertion ? `${assertion.oracleId} ${assertion.assertionId ?? ''}`.trim() : 'its oracle'})`, ok: targeted.length > 0, detail: `${artifacts.length} test artifact(s)` });
+    const failing = evidence.filter((e) => e.evidenceType === 'test-result' && targeted.some((t) => (e.structured as { testArtifactId?: unknown } | undefined)?.testArtifactId === t.artifactId)
+      && (e.structured as { passed?: unknown } | undefined)?.passed === false);
+    checks.push({ name: `${label}: the regression test's recorded run failed on the anomaly`, ok: failing.length > 0, detail: 'no failing test-result evidence of the targeted test' });
+    checks.push({ name: `${label} was confirmed`, ok: finding.payload.status === 'confirmed', detail: `status ${finding.payload.status}` });
+  }
+  return fromChecks('anomalyReaction', checks);
+};
+
+export function latestOf(artifacts: readonly TestArtifact[]): TestArtifact[] {
+  const m = new Map<string, TestArtifact>();
+  for (const a of artifacts) {
+    const prev = m.get(a.artifactId);
+    if (!prev || a.revision > prev.revision) m.set(a.artifactId, a);
+  }
+  return [...m.values()];
+}
+
+/**
+ * (coverage[10]) RCA ∥ metrics ∥ executor: the RCA reaction ran AT THE SAME TIME as the metrics analysis and the
+ * executor's work (all three running together on L0), and all three completed.
+ */
+export const rcaMetricsExecutorParallelGrader: Grader = (ctx) => {
+  const missing = noRun('rcaMetricsExecutorParallel', ctx.data);
+  if (missing) return missing;
+  const { events, workItems } = ctx.data;
+  const rca = completedBy(workItems, 'rca', 'reactor');
+  const metrics = completedBy(workItems, 'metrics_analyst');
+  const executor = completedBy(workItems, 'executor');
+  const all = new Set([...rca, ...metrics, ...executor].map((w) => w.workItemId));
+  const together = maxConcurrent(events, all);
+  // per pair: RCA overlaps the metrics analysis, RCA overlaps the executor
+  const withRca = (others: readonly WorkItem[]) => Math.max(0, ...rca.flatMap((r) => others.map((o) => maxConcurrent(events, new Set([r.workItemId, o.workItemId])))));
+  return fromChecks('rcaMetricsExecutorParallel', [
+    { name: 'RCA (reactor), the metrics analysis and the executor completed', ok: rca.length >= 1 && metrics.length >= 1 && executor.length >= 1, detail: `rca ${rca.length}, metrics ${metrics.length}, executor ${executor.length}` },
+    { name: 'RCA ran in parallel with the metrics analysis', ok: withRca(metrics) >= 2, detail: `max ${withRca(metrics)} concurrently` },
+    { name: 'RCA ran in parallel with the executor', ok: withRca(executor) >= 2, detail: `max ${withRca(executor)} concurrently` },
+    { name: 'all three ran at the same time', ok: together >= 3, detail: `max ${together} concurrently` },
+  ]);
+};
+
 /** The PoC graders by id (merged into GRADERS). */
 export const POC_GRADERS: Readonly<Record<string, Grader>> = Object.freeze({
   pocAWorkflow: pocAWorkflowGrader,
@@ -535,6 +629,8 @@ export const POC_GRADERS: Readonly<Record<string, Grader>> = Object.freeze({
   testChangeGoverned: testChangeGovernedGrader,
   recoveryAudit: recoveryAuditGrader,
   insufficientDataNotPassed: insufficientDataNotPassedGrader,
+  anomalyReaction: anomalyReactionGrader,
+  rcaMetricsExecutorParallel: rcaMetricsExecutorParallelGrader,
 });
 
 export type { Finding };

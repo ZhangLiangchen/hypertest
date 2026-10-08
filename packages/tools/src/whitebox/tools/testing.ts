@@ -203,10 +203,13 @@ export function testRunTool(options: BuiltinToolOptions): ToolSpec<TestRunInput>
         testArtifactIds: { type: 'array', items: { type: 'string', minLength: 1, maxLength: 128 }, maxItems: 50 },
         revision: { enum: ['workspace', 'base'], default: 'workspace' },
         baseCommit: { type: 'string', pattern: '^[0-9a-f]{7,64}$' },
+        captureNetwork: { type: 'boolean', default: false, description: 'Record every HTTP exchange the tests make with the registered environments (through the sandbox egress relay) as network-capture evidence.' },
       },
     },
     effect: 'execute',
     riskClass: 'medium',
+    // (wave 3) a run whose relayed write was refused records its outcome as `inconclusive` evidence (never a pass or fail)
+    evidenceTypes: ['test-result', 'stdout', 'stderr', 'coverage', 'api-response', 'network-capture', 'inconclusive'],
     timeoutMs: 3_600_000,
     resources: (_input, ctx) => [rootResource(ctx)],
     async execute(input, ctx) {
@@ -368,6 +371,7 @@ export function mutationRunTool(options: BuiltinToolOptions): ToolSpec<MutationI
     },
     effect: 'execute',
     riskClass: 'medium',
+    evidenceTypes: ['mutation-result', 'api-response', 'inconclusive'],
     timeoutMs: 7_200_000,
     // copies and executes the whole workspace's test suite: the root is touched, not only the mutated file
     resources: (input, ctx) => [rootResource(ctx), pathResource(ctx, input.file)],

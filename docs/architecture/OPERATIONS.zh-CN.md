@@ -134,6 +134,68 @@ embedder。代码工具（`code.symbols`、`code.references`）和提示中的�
 `skill validate --result <file>` 评判你提供的 SuiteResult 文件而不是运行 eval：该文件按原样被信任。配置键 `skills.trial`
 由 `skill validate` 在其自己的 eval 实例上设置；带该配置启动的实例会向其 Agent 展示这些未发布的修订并记录警告——切勿在生产部署中设置。
 
+### 工具面：URL 目标、MCP、ACP、远程 worker、gRPC、computer use、观测、隔离层级
+
+针对 URL 的黑盒运行：`tools.httpAllowlist` 中的每个 URL 都成为环境 `url-<host>-<port>`（回环地址为 `local` 类别，
+否则为 `tools.urlEnvironmentClass`，默认 `sandbox`——绝不要把生产 URL 以更低的类别加入允许列表）。
+`hypertest run --url http://127.0.0.1:8080 --goal …` 以它为目标；没有任何环境提供的 URL 会被拒绝。
+
+```yaml
+tools:
+  httpAllowlist: ["http://127.0.0.1:8080"]
+  mcpServers:                                   # mcp.<id>.<tool>；效果记入台账，记录 mcp-response 证据
+    - { id: tickets, command: node, args: [server.mjs], envFrom: { TICKETS_TOKEN: HT_TICKETS_TOKEN }, allowTools: [create_ticket, list_tickets],
+        toolEffects: { list_tickets: { effect: read, riskClass: low } }, environmentId: shop, roles: [executor] }
+    - { id: tracker, url: "https://mcp.example.test/mcp", headersFromEnv: { authorization: MCP_TRACKER_AUTH }, allowTools: [list], effect: read }
+  acpAgents:                                    # acp.<id>.prompt：在调用方工作区沙箱中运行的外部编码 Agent
+    - { id: coder, command: my-acp-agent, envFrom: { AGENT_KEY: HT_AGENT_KEY }, roles: [test_designer] }
+  remoteWorkers:                                # 委派的工具在 `hypertest tool-worker` 上运行（HMAC 签名的 HTTP）
+    - { id: w1, url: "http://10.0.0.7:7441", secretEnv: HT_WORKER_SECRET, tools: [http.request, metrics.query] }
+  computerUse: { backend: x11, display: ":99", displayId: kiosk }   # 提供给 vision_gui 的 computer.*（x11 | xdotool | fake）
+environments:
+  - environmentId: shop
+    environmentClass: local
+    generation: 0
+    baseUrl: "http://127.0.0.1:8080"
+    control: { kind: kubectl, target: deployment/shop/app, namespace: shop, context: kind-dev }
+    grpc: { target: "127.0.0.1:50051", reflection: true, readMethods: ["shop.Catalog/Get*"] }
+    logs: { files: [/var/log/shop/app.log] }
+    traces: { kind: tempo, url: "http://127.0.0.1:3200", service: shop }
+    database: { kind: postgres, urlEnv: SHOP_DB_URL, schemas: [public] }
+```
+
+远程 worker：`HT_WORKER_SECRET=… hypertest -c worker.yaml tool-worker --tools http.request,metrics.query --id w1
+--listen 0.0.0.0:7441`（密钥至少 32 个字符，只给变量名）。带有自身副作用适配器的工具（env.*、load.*）不能委派。
+
+观测工具（全部为只读）：`logs.query`（监督器输出——用 `--log-file` 启动监督器——、`docker logs`、`kubectl logs`、
+声明的文件）、`trace.query`（OTLP/JSON 文件、Jaeger、Tempo）、`net.capture`（环境 host:port 的 pcap；需要具备抓包
+权限的 tcpdump，否则以 `unsupported`/`permission_denied` 失败）、`db.introspect`（只读的模式信息，通过 psql / sqlite /
+mysql）。`test.run` 与 `shell.exec` 接受 `captureNetwork: true`，记录其命令的每次 HTTP 交换。代码智能：`lsp.*`
+（TypeScript 语言服务）、`analysis.run`（tsc、工作区 eslint、pyflakes 或编译检查、go vet）。
+
+故障注入：`env.inject_fault` 的类型为 `latency`/`error_rate`（进程环境）、`pause`/`kill`/`network_disconnect`/`netem`
+（docker；netem 需要容器内有 `tc` 与 NET_ADMIN）、`pod_delete`/`scale_zero`/`network_deny`（kubectl）。故障有时限：
+即使 Hypertest 停止，独立的回滚进程也会在 `durationMs` 到期时撤销故障（作业位于 `<dataDir>/state/faults/<operationId>`）。
+回滚失败时，该环境拒绝后续操作，直到你修复它并删除该作业目录。
+
+隔离层级与沙箱键——每个被接受的键都会被执行，否则启动或命令被拒绝：
+
+```yaml
+sandbox:
+  kind: local
+  network: egress_allowlist
+  allowedHosts: ["127.0.0.1:9000"]     # 仅本地沙箱，回环 host:port，HTTP 感知的中继
+  memoryMb: 2048                       # 本地：每个进程 prlimit --data；oci：--memory
+  cpuLimit: 2                          # 本地：ceil(cpuLimit) 个 CPU（taskset）；oci：--cpus
+  roles:
+    reviewer: { tier: read_only }                                  # 工作区以只读方式绑定给其命令
+    executor: { tier: separate, network: loopback, memoryMb: 4096 }
+    rca:      { tier: isolated, kind: oci, image: "node:22" }      # 其命令在容器中运行
+```
+
+能力要求中没有 `write_workspace` 的工作项以只读方式运行其命令；能力要求中没有环境的工作项在无出站的情况下运行其命令。
+不支持 gVisor/Firecracker 运行时（延后）。
+
 ## 2. 安全
 
 | 控制项 | 默认值 | 建议 |

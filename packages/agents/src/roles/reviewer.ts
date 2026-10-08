@@ -13,6 +13,8 @@ const REVIEWER_TOOLS = [
   'git.show',
   'code.symbols',
   'code.references',
+  'lsp.*',
+  'analysis.run',
   'test.run',
   'oracle.get',
   'blackboard.read',
@@ -51,7 +53,7 @@ const BODY = `
    - Fit: the evidence shows the exact claimed outcome for the right selector, commit, build and environment; expected versus actual matches the oracle assertion and revision cited (read it with \`oracle.get\`).
    - Layer: the failure happened in the behaviour under test, not in setup, authentication or a precondition.
    - Classification and severity are justified by the evidence and by the oracle's severity.
-   - Test artifacts (subjectRef kind test_artifact, the ORACLE CONSISTENCY review of the artifact lifecycle): sensitivity was demonstrated (known-good pass and known-bad or mutant fail, both with evidence); its assertions check exactly the oracle assertions its oracleRefs name (read them with \`oracle.get\`): exact values, no weaker check; nothing was weakened, skipped or deselected. Your approve makes it gate evidence (refused unless it is validated, you are not its creator and its oracleRefs are in force); reject sends it back to draft. Inspect the test with \`fs.read\`, \`fs.search\`, \`fs.list\`, \`code.symbols\` and \`code.references\`; \`git.diff\`, \`git.log\`, \`git.show\` and \`git.status\` show what changed.
+   - Test artifacts (subjectRef kind test_artifact, the ORACLE CONSISTENCY review of the artifact lifecycle): sensitivity was demonstrated (known-good pass and known-bad or mutant fail, both with evidence); its assertions check exactly the oracle assertions its oracleRefs name (read them with \`oracle.get\`): exact values, no weaker check; nothing was weakened, skipped or deselected. Your approve makes it gate evidence (refused unless it is validated, you are not its creator and its oracleRefs are in force); reject sends it back to draft. Inspect the test with \`fs.read\`, \`fs.search\`, \`fs.list\`, \`code.symbols\` and \`code.references\` (\`lsp.*\` for type-aware navigation; \`analysis.run\` for static findings); \`git.diff\`, \`git.log\`, \`git.show\` and \`git.status\` show what changed.
    - Fixes: regression evidence exists after the fix, and the diff touches product code only.
 4. Reproduce when it is cheap and decisive: re-run the selector with \`test.run\` and compare with the recorded outcome. A result that does not reproduce is itself a finding for your rationale.
 5. Record every verdict with \`blackboard.post_review\`: subjectRef ({kind, id}, e.g. kind record with the rec_ id), verdict, rationale (point to the specific evidence and the specific gap or contradiction) and checkedEvidenceRefs (every evidence id you actually inspected).

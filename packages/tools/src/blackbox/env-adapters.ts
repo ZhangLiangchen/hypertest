@@ -1,9 +1,15 @@
+import { mkdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { HypertestError, hashCanonical, type Logger } from '@hypertest/core';
 import type { DispatchReceipt, ObservationResult, OperationContext, PreparedOperation, SideEffectAdapter, SideEffectCapabilities, VerificationResult } from '@hypertest/operation';
 import type { EnvironmentDescriptor, EnvironmentRegistry } from '../contracts.ts';
 import { CONTROL_TOKEN_HEADER, errorMessage, publicControlTarget, requireEnvironment, runCommand, splitControlTarget, type CommandResult } from './common.ts';
 import { mintControlToken } from './secrets.ts';
 import { FENCE_HEADER, OPERATION_HEADER, normalizeFault, type SupervisorFault, type SupervisorOperation } from './process-supervisor.ts';
+import {
+  beginFaultJob, dockerFaultPlan, faultJobDir, kubectlFaultPlan, markFaultApplied, markFaultNotApplied, readFaultJob, revertOverdue, reverterAlive, spawnReverter, unrevertedFaults, type FaultJobView, type FaultPlan,
+} from './fault-injection.ts';
+import type { FaultJobSpec } from './fault-worker.ts';
 
 /**
  * Environment control adapters (restart / deploy / fault injection) as SideEffectAdapters. Operation
@@ -25,7 +31,11 @@ export interface EnvDeployInput {
 }
 export interface EnvFaultInput {
   environmentId: string;
-  kind: 'latency' | 'error_rate';
+  /**
+   * process environments: `latency` | `error_rate` (the supervisor's proxy); (wave 3) docker: `pause` | `kill` |
+   * `network_disconnect` | `netem`; kubectl: `pod_delete` | `scale_zero` | `network_deny` (fault-injection.ts).
+   */
+  kind: 'latency' | 'error_rate' | 'pause' | 'kill' | 'network_disconnect' | 'netem' | 'pod_delete' | 'scale_zero' | 'network_deny';
   params: Record<string, unknown>;
   durationMs: number;
 }
@@ -254,6 +264,92 @@ export class ProcessEnvAdapter implements SideEffectAdapter<EnvInput, ProcessEnv
   }
 }
 
+// ----------------------------------------------------------------------------- (wave 3) container / cluster faults
+
+/** The observation of a container/cluster fault operation (its job directory). */
+export interface ContainerFaultObservation {
+  kind: 'container_fault';
+  fault: string;
+  state: 'active' | 'reverted' | 'revert_failed';
+  expiresAt: string;
+  revertedAt?: string;
+  revertedBy?: string;
+  results?: Array<{ argv: string[]; exitCode: number | null; stderr: string }>;
+}
+
+function faultDuration(input: EnvFaultInput): number {
+  if (!(Number.isInteger(input.durationMs) && input.durationMs > 0 && input.durationMs <= 3_600_000)) throw new HypertestError('invalid_argument', 'durationMs must be an integer in [1, 3600000]');
+  return input.durationMs;
+}
+
+/**
+ * Applies a planned container/cluster fault for an operation: records the job (operation-id-labelled), runs the apply
+ * commands, starts the detached reverter that ends it at expiry. A refused apply is definitively not applied.
+ */
+async function applyFault(stateDir: string, op: OperationContext, environmentId: string, plan: FaultPlan, durationMs: number, run: (argv: string[]) => Promise<CommandResult>): Promise<DispatchReceipt> {
+  const now = Date.now();
+  const spec: FaultJobSpec = { operationId: op.operation.operationId, environmentId, kind: plan.kind, appliedAt: new Date(now).toISOString(), expiresAt: new Date(now + durationMs).toISOString(), revert: plan.revert };
+  const prior = readFaultJob(stateDir, spec.operationId);
+  // a re-dispatch of an operation whose fault is already recorded never applies it twice
+  if (prior.state === 'active' || prior.state === 'reverted' || prior.state === 'revert_failed') {
+    return { accepted: true, externalJobId: spec.operationId, receipt: JSON.stringify({ jobDir: faultJobDir(stateDir, spec.operationId), expiresAt: prior.spec.expiresAt }) };
+  }
+  const dir = beginFaultJob(stateDir, spec);
+  for (const argv of plan.apply) {
+    const r = await run(argv);
+    if (r.exitCode !== 0) {
+      const reason = `${argv.slice(0, 3).join(' ')} … failed (exit ${r.exitCode}${r.spawnError ? `, ${r.spawnError}` : ''}): ${r.stderr.trim().slice(0, 500)}`;
+      markFaultNotApplied(dir, reason);
+      return { accepted: false, notAppliedReason: reason };
+    }
+  }
+  markFaultApplied(dir);
+  spawnReverter(dir);
+  return { accepted: true, externalJobId: spec.operationId, receipt: JSON.stringify({ jobDir: dir, expiresAt: spec.expiresAt }) };
+}
+
+/** Observes a container/cluster fault by its job directory; an overdue fault whose reverter is gone is reverted now. */
+async function observeFault(stateDir: string, op: OperationContext): Promise<ObservationResult<ContainerFaultObservation>> {
+  let view: FaultJobView = readFaultJob(stateDir, op.operation.operationId);
+  if (view.state === 'absent' || view.state === 'not_applied') return { state: 'absent' };
+  if (view.state === 'dispatching') return { state: 'uncertain', detail: `fault ${op.operation.operationId} was being applied when it was last seen (no apply outcome recorded)` };
+  if (view.state === 'active' && Date.parse(view.spec.expiresAt) <= Date.now() && !reverterAlive(faultJobDir(stateDir, op.operation.operationId))) {
+    const outcome = await revertOverdue(stateDir, view.spec);
+    view = { state: outcome.state, spec: view.spec, outcome };
+  }
+  const obs: ContainerFaultObservation = { kind: 'container_fault', fault: view.spec.kind, state: view.state, expiresAt: view.spec.expiresAt };
+  if (view.state !== 'active') {
+    obs.revertedAt = view.outcome.revertedAt;
+    obs.revertedBy = view.outcome.by;
+    obs.results = view.outcome.results;
+  }
+  return { state: 'present', observation: obs };
+}
+
+/**
+ * Refuses an operation on an environment whose earlier fault could not be reverted (its state is unknown until an
+ * operator repairs it and removes the fault job), or — for a new fault — that is still inside another fault's time box.
+ */
+async function assertFaultFree(stateDir: string | undefined, environmentId: string, type: string): Promise<void> {
+  if (!stateDir) return;
+  const open = await unrevertedFaults(stateDir, environmentId);
+  const failed = open.find((f) => f.state === 'revert_failed');
+  if (failed) throw new HypertestError('precondition_failed', `environment ${environmentId}: the ${failed.kind} fault of operation ${failed.operationId} could not be reverted (${failed.detail ?? 'unknown'}); repair the environment and remove ${faultJobDir(stateDir, failed.operationId)} first`);
+  const active = open.find((f) => f.state === 'active');
+  if (active && type === 'env.inject_fault') throw new HypertestError('precondition_failed', `environment ${environmentId} is still under the ${active.kind} fault of operation ${active.operationId} until ${active.expiresAt}`);
+}
+
+function verifyFault(obs: ContainerFaultObservation, environmentId: string): VerificationResult {
+  if (obs.state === 'revert_failed') {
+    const failed = (obs.results ?? []).filter((r) => r.exitCode !== 0).map((r) => `${r.argv.slice(1, 4).join(' ')}: ${r.stderr.trim().slice(0, 200)}`);
+    return { status: 'failed', reason: `the fault was applied but its revert FAILED (the environment may still be faulted; check it): ${failed.join('; ')}` };
+  }
+  const verified: VerificationResult = { status: 'verified', result: { environmentId, action: 'fault', fault: obs.fault, state: obs.state, expiresAt: obs.expiresAt, ...(obs.revertedAt ? { revertedAt: obs.revertedAt } : {}) } };
+  // E[1]: an active time-boxed fault holds its environment until it expires (the gateway keeps the lease)
+  if (obs.state === 'active') verified.effectUntil = obs.expiresAt;
+  return verified;
+}
+
 // ----------------------------------------------------------------------------- env.docker
 
 const CONTAINER_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$/;
@@ -262,6 +358,8 @@ export interface DockerEnvAdapterOptions {
   environments: EnvironmentRegistry;
   /** docker CLI binary (default `docker`). */
   docker?: string;
+  /** (additive, wave 3) State directory of fault jobs (`<stateDir>/faults/<operationId>`); faults need it. */
+  stateDir?: string;
   commandTimeoutMs?: number;
   /** Tolerated clock skew between this host and the docker daemon when comparing StartedAt (default 0). */
   clockSkewMs?: number;
@@ -295,9 +393,11 @@ function parseTime(iso: string | undefined): number {
  * effect can NOT be looked up by operation id (reconciliation best_effort): observe compares the
  * container's State.StartedAt with the dispatch time (from the receipt, else the operation's creation
  * time). The gateway therefore never retries an unknown dispatch blindly — without a receipt it goes to
- * manual_review. Deploy and fault injection are not supported for docker environments.
+ * manual_review. Deploy is not supported for docker environments. (wave 3) Fault injection: `pause`, `kill`,
+ * `network_disconnect`, `netem` — applied by the docker CLI, time-boxed and reverted by a detached reverter, observable
+ * by operation id through its job directory (fault-injection.ts).
  */
-export class DockerEnvAdapter implements SideEffectAdapter<EnvInput, DockerEnvObservation> {
+export class DockerEnvAdapter implements SideEffectAdapter<EnvInput, DockerEnvObservation | ContainerFaultObservation> {
   readonly adapterId = 'env.docker';
   readonly capabilities: SideEffectCapabilities = {
     supportsNativeIdempotency: false,
@@ -320,18 +420,36 @@ export class DockerEnvAdapter implements SideEffectAdapter<EnvInput, DockerEnvOb
     return runCommand(this.#o.docker ?? 'docker', args, { timeoutMs: this.#o.commandTimeoutMs ?? 120_000, signal });
   }
 
+  /** (wave 3) Fault jobs are found by operation id (their job directory), restarts are not. */
+  looksUpByOperationId(operationType: string): boolean {
+    return operationType === 'env.inject_fault' && this.#o.stateDir !== undefined;
+  }
+
   async prepare(op: OperationContext, input: EnvInput): Promise<PreparedOperation> {
     const type = operationTypeOf(op);
-    if (type !== 'env.restart') throw new HypertestError('unsupported', `${type} is not supported for docker environments (only env.restart)`);
+    if (type === 'env.deploy') throw new HypertestError('unsupported', 'env.deploy is not supported for docker environments (env.restart, env.inject_fault)');
     const env = requireEnvironment(this.#o.environments, input.environmentId);
     const container = requireControl(env, 'docker').target;
     if (!CONTAINER_RE.test(container)) throw new HypertestError('invalid_argument', `invalid docker container name ${JSON.stringify(container)}`);
+    await assertFaultFree(this.#o.stateDir, env.environmentId, type);
+    if (type === 'env.inject_fault') {
+      if (!this.#o.stateDir) throw new HypertestError('unsupported', 'docker fault injection needs a state directory for its fault jobs (builtinSideEffectAdapters stateDir)');
+      const f = input as EnvFaultInput;
+      const plan = dockerFaultPlan(this.#o.docker ?? 'docker', container, f.kind, f.params ?? {});
+      const desiredState = { action: 'fault', environmentId: env.environmentId, container, fault: plan.kind, params: plan.params, durationMs: faultDuration(f) };
+      return { desiredState, desiredStateHash: hashCanonical(desiredState), target: envTarget(env) };
+    }
     const desiredState = { action: 'restart', environmentId: env.environmentId, container };
     return { desiredState, desiredStateHash: hashCanonical(desiredState), target: envTarget(env) };
   }
 
   async dispatch(prepared: PreparedOperation, op: OperationContext): Promise<DispatchReceipt> {
-    const { container } = prepared.desiredState as { container: string };
+    const ds = prepared.desiredState as { action: string; environmentId: string; container: string; fault?: string; params?: Record<string, unknown>; durationMs?: number };
+    if (ds.action === 'fault') {
+      const plan = dockerFaultPlan(this.#o.docker ?? 'docker', ds.container, ds.fault!, ds.params ?? {});
+      return applyFault(this.#o.stateDir!, op, ds.environmentId, plan, ds.durationMs!, (argv) => this.#docker(argv.slice(1), op.signal));
+    }
+    const { container } = ds;
     const dispatchedAt = new Date().toISOString();
     const r = await this.#docker(['restart', container], op.signal);
     if (r.exitCode !== 0) {
@@ -362,7 +480,11 @@ export class DockerEnvAdapter implements SideEffectAdapter<EnvInput, DockerEnvOb
     return out;
   }
 
-  async observe(op: OperationContext): Promise<ObservationResult<DockerEnvObservation>> {
+  async observe(op: OperationContext): Promise<ObservationResult<DockerEnvObservation | ContainerFaultObservation>> {
+    if (op.operation.operationType === 'env.inject_fault') {
+      if (!this.#o.stateDir) return { state: 'uncertain', detail: 'no state directory: the fault job cannot be read' };
+      return observeFault(this.#o.stateDir, op);
+    }
     const env = requireEnvironment(this.#o.environments, environmentIdOf(op));
     const container = requireControl(env, 'docker').target;
     const state = await this.#inspect(container, op.signal);
@@ -386,7 +508,9 @@ export class DockerEnvAdapter implements SideEffectAdapter<EnvInput, DockerEnvOb
     return { state: 'present', observation: obs };
   }
 
-  async verify(obs: DockerEnvObservation, _hash: string, op: OperationContext): Promise<VerificationResult> {
+  async verify(observation: DockerEnvObservation | ContainerFaultObservation, _hash: string, op: OperationContext): Promise<VerificationResult> {
+    if ((observation as ContainerFaultObservation).kind === 'container_fault') return verifyFault(observation as ContainerFaultObservation, environmentIdOf(op));
+    const obs = observation as DockerEnvObservation;
     if (obs.running) {
       const environmentId = environmentIdOf(op);
       const bumped = await this.#bumper.bump(op.operation.operationId, environmentId);
@@ -409,8 +533,10 @@ export interface KubectlEnvAdapterOptions {
   environments: EnvironmentRegistry;
   /** kubectl binary (default `kubectl`). */
   kubectl?: string;
-  /** Optional `--context`. */
+  /** Optional `--context` (an environment's own `control.context` wins). */
   context?: string;
+  /** (additive, wave 3) State directory of fault jobs (`<stateDir>/faults/<operationId>`); faults need it. */
+  stateDir?: string;
   commandTimeoutMs?: number;
   logger?: Logger;
 }
@@ -450,7 +576,7 @@ interface K8sDeployment {
  * matching the operation id; verify = rollout status semantics (observedGeneration, updated/available
  * replicas, ProgressDeadlineExceeded ⇒ failed).
  */
-export class KubectlEnvAdapter implements SideEffectAdapter<EnvInput, KubectlEnvObservation> {
+export class KubectlEnvAdapter implements SideEffectAdapter<EnvInput, KubectlEnvObservation | ContainerFaultObservation> {
   readonly adapterId = 'env.kubectl';
   readonly capabilities: SideEffectCapabilities = {
     supportsNativeIdempotency: true,
@@ -469,9 +595,15 @@ export class KubectlEnvAdapter implements SideEffectAdapter<EnvInput, KubectlEnv
     this.#bumper = new GenerationBumper(options.environments);
   }
 
-  #kubectl(namespace: string, args: string[], signal: AbortSignal): Promise<CommandResult> {
-    const prefix = this.#o.context ? ['--context', this.#o.context] : [];
-    return runCommand(this.#o.kubectl ?? 'kubectl', [...prefix, '-n', namespace, ...args], { timeoutMs: this.#o.commandTimeoutMs ?? 120_000, signal });
+  /** `kubectl [--context c] -n <namespace>` for an environment (its own control.context, else the adapter's). */
+  #prefix(namespace: string, context: string | undefined): string[] {
+    const ctx = context ?? this.#o.context;
+    return [this.#o.kubectl ?? 'kubectl', ...(ctx ? ['--context', ctx] : []), '-n', namespace];
+  }
+
+  #kubectl(namespace: string, args: string[], signal: AbortSignal, context?: string): Promise<CommandResult> {
+    const [bin, ...prefix] = this.#prefix(namespace, context);
+    return runCommand(bin!, [...prefix, ...args], { timeoutMs: this.#o.commandTimeoutMs ?? 120_000, signal });
   }
 
   /** control.target: `[deployment/]<name>[/<container>]` (the container a deploy updates). */
@@ -488,7 +620,22 @@ export class KubectlEnvAdapter implements SideEffectAdapter<EnvInput, KubectlEnv
 
   async prepare(op: OperationContext, input: EnvInput): Promise<PreparedOperation> {
     const type = operationTypeOf(op);
-    if (type === 'env.inject_fault') throw new HypertestError('unsupported', 'env.inject_fault is not supported for kubectl environments');
+    await assertFaultFree(this.#o.stateDir, input.environmentId, type);
+    if (type === 'env.inject_fault') {
+      // (wave 3) pod_delete / scale_zero / network_deny: time-boxed, reverted by the detached reverter
+      if (!this.#o.stateDir) throw new HypertestError('unsupported', 'kubectl fault injection needs a state directory for its fault jobs (builtinSideEffectAdapters stateDir)');
+      const f = input as EnvFaultInput;
+      const { namespace, deployment, env } = this.#location(input.environmentId);
+      const d = await this.#get(namespace, deployment, op.signal, env.control?.context);
+      if (!d) throw new HypertestError('precondition_failed', `deployment ${namespace}/${deployment} not found`);
+      const selector = (d.spec as { selector?: { matchLabels?: Record<string, string> } } | undefined)?.selector?.matchLabels ?? {};
+      for (const [k, v] of Object.entries(selector)) if (!/^[A-Za-z0-9./_-]{1,253}$/.test(k) || !/^[A-Za-z0-9._-]{0,63}$/.test(v)) throw new HypertestError('invalid_argument', `unsupported selector label ${k}=${v}`);
+      const replicas = d.spec?.replicas ?? 1;
+      // the plan is validated now (kind supported, selector present); it is rebuilt at dispatch from the desired state
+      kubectlFaultPlan(this.#prefix(namespace, env.control?.context), deployment, f.kind, { replicas, selector, operationId: op.operation.operationId, namespace, policyFile: '/dev/null' });
+      const desiredState = { action: 'fault', environmentId: env.environmentId, namespace, deployment, fault: f.kind, selector, replicas, durationMs: faultDuration(f) };
+      return { desiredState, desiredStateHash: hashCanonical(desiredState), target: envTarget(env) };
+    }
     const { namespace, deployment, container, env } = this.#location(input.environmentId);
     const desiredState: Record<string, unknown> = { action: type === 'env.deploy' ? 'deploy' : 'restart', environmentId: env.environmentId, namespace, deployment };
     if (type === 'env.deploy') {
@@ -498,8 +645,8 @@ export class KubectlEnvAdapter implements SideEffectAdapter<EnvInput, KubectlEnv
     return { desiredState, desiredStateHash: hashCanonical(desiredState), target: envTarget(env) };
   }
 
-  async #get(namespace: string, deployment: string, signal: AbortSignal): Promise<K8sDeployment | undefined> {
-    const r = await this.#kubectl(namespace, ['get', 'deployment', deployment, '-o', 'json'], signal);
+  async #get(namespace: string, deployment: string, signal: AbortSignal, context?: string): Promise<K8sDeployment | undefined> {
+    const r = await this.#kubectl(namespace, ['get', 'deployment', deployment, '-o', 'json'], signal, context);
     if (r.exitCode !== 0) {
       if (/notfound|not found/i.test(r.stderr)) return undefined;
       throw commandFailure(`kubectl get deployment ${deployment}`, r);
@@ -512,6 +659,14 @@ export class KubectlEnvAdapter implements SideEffectAdapter<EnvInput, KubectlEnv
   }
 
   async dispatch(prepared: PreparedOperation, op: OperationContext): Promise<DispatchReceipt> {
+    const fault = prepared.desiredState as { action: string; environmentId: string; namespace: string; deployment: string; fault?: string; selector?: Record<string, string>; replicas?: number; durationMs?: number };
+    if (fault.action === 'fault') {
+      const context = this.#o.environments.get(fault.environmentId)?.control?.context;
+      const dir = faultJobDir(this.#o.stateDir!, op.operation.operationId);
+      mkdirSync(dir, { recursive: true });
+      const plan = kubectlFaultPlan(this.#prefix(fault.namespace, context), fault.deployment, fault.fault!, { replicas: fault.replicas ?? 1, selector: fault.selector ?? {}, operationId: op.operation.operationId, namespace: fault.namespace, policyFile: join(dir, 'networkpolicy.json') });
+      return applyFault(this.#o.stateDir!, op, fault.environmentId, plan, fault.durationMs!, (argv) => runCommand(argv[0]!, argv.slice(1), { timeoutMs: this.#o.commandTimeoutMs ?? 120_000, signal: op.signal }));
+    }
     const s = prepared.desiredState as { action: 'restart' | 'deploy'; namespace: string; deployment: string; buildRef?: string; container?: string };
     const operationId = op.operation.operationId;
     const templateAnnotations: Record<string, string> = { [OPERATION_ANNOTATION]: operationId, [RESTARTED_AT_ANNOTATION]: op.operation.createdAt };
@@ -542,9 +697,13 @@ export class KubectlEnvAdapter implements SideEffectAdapter<EnvInput, KubectlEnv
     return { accepted: true, externalJobId: `${s.namespace}/${s.deployment}`, receipt: r.stdout.trim().slice(0, 2000) };
   }
 
-  async observe(op: OperationContext): Promise<ObservationResult<KubectlEnvObservation>> {
-    const { namespace, deployment } = this.#location(environmentIdOf(op));
-    const d = await this.#get(namespace, deployment, op.signal);
+  async observe(op: OperationContext): Promise<ObservationResult<KubectlEnvObservation | ContainerFaultObservation>> {
+    if (op.operation.operationType === 'env.inject_fault') {
+      if (!this.#o.stateDir) return { state: 'uncertain', detail: 'no state directory: the fault job cannot be read' };
+      return observeFault(this.#o.stateDir, op);
+    }
+    const { namespace, deployment, env } = this.#location(environmentIdOf(op));
+    const d = await this.#get(namespace, deployment, op.signal, env.control?.context);
     if (!d) return { state: 'uncertain', detail: `deployment ${namespace}/${deployment} not found` };
     const mark = d.spec?.template?.metadata?.annotations?.[OPERATION_ANNOTATION];
     if (mark !== op.operation.operationId) return { state: 'absent' };
@@ -569,7 +728,9 @@ export class KubectlEnvAdapter implements SideEffectAdapter<EnvInput, KubectlEnv
     };
   }
 
-  async verify(obs: KubectlEnvObservation, _hash: string, op: OperationContext): Promise<VerificationResult> {
+  async verify(observation: KubectlEnvObservation | ContainerFaultObservation, _hash: string, op: OperationContext): Promise<VerificationResult> {
+    if ((observation as ContainerFaultObservation).kind === 'container_fault') return verifyFault(observation as ContainerFaultObservation, environmentIdOf(op));
+    const obs = observation as KubectlEnvObservation;
     if (obs.progressDeadlineExceeded) return { status: 'failed', reason: `deployment ${obs.namespace}/${obs.deployment} exceeded its progress deadline` };
     const progress = { observedGeneration: obs.observedGeneration, generation: obs.generation, replicas: obs.replicas, updatedReplicas: obs.updatedReplicas, availableReplicas: obs.availableReplicas };
     if (obs.observedGeneration < obs.generation) return { status: 'pending', progress: { ...progress, waiting: 'rollout spec update not yet observed' } };
@@ -640,7 +801,8 @@ export class EnvControlAdapter implements SideEffectAdapter<EnvInput, unknown> {
 
   async observe(op: OperationContext): Promise<ObservationResult<unknown>> {
     const backend = this.#backend(environmentIdOf(op));
-    if (!backend.capabilities.supportsExternalLookupByOperationId && op.operation.externalJobId === undefined) {
+    const byId = backend.capabilities.supportsExternalLookupByOperationId || (backend as { looksUpByOperationId?: (t: string) => boolean }).looksUpByOperationId?.(op.operation.operationType) === true;
+    if (!byId && op.operation.externalJobId === undefined) {
       return { state: 'uncertain', detail: `backend ${backend.adapterId} cannot look up effects by operation id and no dispatch receipt was recorded; refusing to guess` };
     }
     return backend.observe(op);

@@ -472,3 +472,28 @@ new embedder stay in memory (logged at startup of the first search). Code leaves
   reaches an off-host embedder), `test/skills.e2e.test.ts`, `test/event-catalog.e2e.test.ts` (every event type of the
   typical catalog on a scripted run's L0, `test.recovered` included). Behaviour changes reflected in existing tests: the
   unknown-key message lists `retrieval` and `skills`; the code section's heading names its retrievers.
+
+## Tool surface (audit wave 3, unit tool-surface, additive)
+
+Configuration keys (validated in `config.ts`, problems from `tool-config.ts`; every accepted key is honoured or refused):
+
+- `tools.urlEnvironmentClass` — class of non-loopback allowlisted URL targets (default `sandbox`). `compose.ts` registers
+  one environment per `tools.httpAllowlist` URL (`urlTargetEnvironments`); `run({target: {sutUrl}})` resolves the URL to
+  it (`resolveUrlTarget`: ambiguous → invalid_argument, nothing serves it → precondition_failed).
+- `tools.mcpServers` (`mcpServerProblems`, `mcpServerConfigs`: variables by NAME, a missing one makes the server
+  unavailable), `tools.acpAgents` (`acpAgentConfigs`), `tools.remoteWorkers` (`withRemoteWorkers`; `startToolWorker`
+  serves `hypertest tool-worker`), `tools.computerUse` (`computerUseOptions`); `withToolRoleGrants` offers `mcp.<id>.*`,
+  `acp.<id>.*`, `computer.*` to the configured roles (defaults `DEFAULT_MCP_ROLES`, `DEFAULT_ACP_ROLES`,
+  `DEFAULT_COMPUTER_ROLES`).
+- `environments[].grpc|logs|traces|database|control.context` (`environmentToolProblems`; database credentials only by
+  variable name). The instance environment is passed to the tools (`BuiltinToolOptions.env`) for `database.urlEnv`.
+- `sandbox.allowedHosts` (only with `network: egress_allowlist`, local sandbox, loopback host:port), `cpuLimit`,
+  `memoryMb` (`sandboxKeyProblems`), and `sandbox.roles.<role>: {tier: read_only | isolated | separate, kind, image,
+  network, allowedHosts, cpuLimit, memoryMb}` (`sandboxRoleProblems`; read_only is refused for roles holding workspace
+  write tools). `isolationResolver(config, blackboard)` is the ToolRuntime's isolation tier per call (role tier, made
+  stricter by the work item's capability requirements). When a tier names the other sandbox kind both runners are
+  composed (`routedSandbox`).
+
+Tests: `test/tool-surface-config.test.ts`, `test/environments.test.ts`, `test/mcp-tools.e2e.test.ts`,
+`test/vision-gui.e2e.test.ts`, `test/acp-agent.e2e.test.ts`, `test/remote-worker.e2e.test.ts`,
+`test/computer-use.e2e.test.ts`, `test/sandbox-tiers.e2e.test.ts`.

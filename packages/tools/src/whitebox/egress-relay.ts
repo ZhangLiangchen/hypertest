@@ -86,7 +86,46 @@ export interface EgressCallContext {
    * nothing about the system under test (never a fake FAIL).
    */
   refused?: string[];
+  /**
+   * (additive, wave 3, row 249: network inspection) When present, the relay appends every HTTP exchange of this call's
+   * commands (relayed reads, ledgered writes, refused requests) — metadata, redacted headers, sizes, timing; bounded by
+   * MAX_CAPTURED_EXCHANGES — and the runtime records them as `network-capture` evidence of the call.
+   */
+  exchanges?: CapturedExchange[];
   logger?: Logger;
+}
+
+/** Largest number of exchanges captured for one call (later ones are counted, not kept). */
+export const MAX_CAPTURED_EXCHANGES = 2000;
+
+/** (wave 3) One HTTP exchange a sandboxed command made through the relay (network inspection). */
+export interface CapturedExchange {
+  startedAt: string;
+  method: string;
+  url: string;
+  /** relayed (safe method, sent as is), ledgered (a write run as an operation), refused (403/413, nothing sent), failed. */
+  outcome: 'relayed' | 'ledgered' | 'refused' | 'failed';
+  status: number | null;
+  durationMs: number;
+  requestHeaders: Record<string, string>;
+  responseHeaders?: Record<string, string>;
+  requestBytes?: number;
+  responseBytes?: number;
+  operationId?: string;
+  reason?: string;
+}
+
+function captureExchange(call: EgressCallContext | undefined, e: CapturedExchange): void {
+  const list = call?.exchanges;
+  if (!list) return;
+  if (list.length < MAX_CAPTURED_EXCHANGES) list.push(e);
+  else (list as CapturedExchange[] & { dropped?: number }).dropped = ((list as CapturedExchange[] & { dropped?: number }).dropped ?? 0) + 1;
+}
+
+function headerRecord(h: Record<string, string | string[] | undefined>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(h)) if (v !== undefined) out[k] = Array.isArray(v) ? v.join(', ') : v;
+  return out;
 }
 
 /** (review) One state-changing request a sandboxed command sends through the relay (what `authorize` decides on). */
@@ -219,13 +258,30 @@ export function createEgressHttpServer(endpoint: { host: string; port: number; p
    */
   function reply(res: http.ServerResponse, status: number, body: Record<string, unknown>, extra: Record<string, string> = {}): void {
     if (call?.refused && (body['error'] === 'hypertest_egress_refused' || body['error'] === 'hypertest_egress_unsettled')) call.refused.push(`${status} ${String(body['reason'] ?? body['error'])}`.slice(0, 1000));
+    const current = exchangeOf.get(res);
+    if (current) {
+      captureExchange(call, {
+        ...current.base, outcome: body['error'] === 'hypertest_egress_failed' ? 'failed' : 'refused', status, durationMs: Date.now() - current.t0,
+        ...(typeof body['operationId'] === 'string' ? { operationId: body['operationId'] } : {}), reason: String(body['reason'] ?? body['error']).slice(0, 1000),
+      });
+      exchangeOf.delete(res);
+    }
     sendJson(res, status, body, extra);
   }
+  /** (wave 3) The exchange being handled per response (captured once, when it is answered). */
+  const exchangeOf = new WeakMap<http.ServerResponse, { t0: number; base: Pick<CapturedExchange, 'startedAt' | 'method' | 'url' | 'requestHeaders' | 'requestBytes'> }>();
 
   async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const method = (req.method ?? 'GET').toUpperCase();
     const path = req.url && req.url.startsWith('/') ? req.url : '/';
     const headers = forwardHeaders(req.headers);
+    if (call?.exchanges) {
+      const len = Number(req.headers['content-length']);
+      exchangeOf.set(res, {
+        t0: Date.now(),
+        base: { startedAt: new Date().toISOString(), method, url: `${origin}${path}`, requestHeaders: redactHeaders(headerRecord(req.headers)), ...(Number.isFinite(len) ? { requestBytes: len } : {}) },
+      });
+    }
     // (review) the environment-control namespace is never reachable from a sandboxed command (any method): env.* tools only
     const pathname = path.split('?')[0] ?? path;
     const controlPrefix = CONTROL_PATH_PREFIX.replace(/\/+$/, '');
@@ -238,6 +294,13 @@ export function createEgressHttpServer(endpoint: { host: string; port: number; p
       // no side effect: relayed as is (streamed both ways)
       const up = http.request({ host: endpoint.host, port: endpoint.port, method, path, headers: { ...headers, ...(req.headers['content-length'] ? { 'content-length': req.headers['content-length'] } : {}) } }, (r) => {
         res.writeHead(r.statusCode ?? 502, r.statusMessage ?? '', forwardHeaders(r.headers));
+        const current = exchangeOf.get(res);
+        if (current) {
+          exchangeOf.delete(res);
+          let bytes = 0;
+          r.on('data', (c: Buffer) => (bytes += c.byteLength));
+          r.on('end', () => captureExchange(call, { ...current.base, outcome: 'relayed', status: r.statusCode ?? null, durationMs: Date.now() - current.t0, responseHeaders: redactHeaders(headerRecord(r.headers)), responseBytes: bytes }));
+        }
         r.pipe(res);
       });
       up.on('error', (e) => reply(res, 502, { error: 'hypertest_egress_failed', reason: `${origin} unreachable: ${e.message}` }));
@@ -362,6 +425,11 @@ export function createEgressHttpServer(endpoint: { host: string; port: number; p
       const bytes = s.bodySha256 ? Buffer.from(await call.artifacts.get(s.bodySha256)) : Buffer.alloc(0);
       const resHeaders: Record<string, string> = {};
       for (const [k, v] of Object.entries(s.headers ?? {})) if (!HOP_BY_HOP.has(k.toLowerCase())) resHeaders[k] = v;
+      const current = exchangeOf.get(res);
+      if (current) {
+        exchangeOf.delete(res);
+        captureExchange(call, { ...current.base, requestBytes: body.byteLength, outcome: 'ledgered', status: s.status, durationMs: Date.now() - current.t0, responseHeaders: redactHeaders(resHeaders), responseBytes: bytes.byteLength, operationId: out.operation.operationId });
+      }
       res.writeHead(s.status, s.statusText ?? '', { ...resHeaders, 'content-length': String(bytes.byteLength), ...opHeader });
       res.end(method === 'HEAD' ? undefined : bytes);
     } catch (e) {

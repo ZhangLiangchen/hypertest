@@ -1,7 +1,11 @@
 import { HypertestError } from '@hypertest/core';
 import { blackboxTools, type BlackboxToolOptions } from '../blackbox/index.ts';
+import { acpTools } from '../acp/client.ts';
+import { computerTools } from '../computer/computer.ts';
 import type { BuiltinToolOptions, ToolSpec } from '../contracts.ts';
 import { codeReferencesTool, codeSymbolsTool } from './tools/code.ts';
+import { analysisRunTool } from './tools/analysis.ts';
+import { lspDefinitionsTool, lspDiagnosticsTool, lspReferencesTool } from './tools/lsp.ts';
 import { fsApplyPatchTool, fsListTool, fsReadTool, fsSearchTool, fsWriteTool } from './tools/fs.ts';
 import { gitBlameTool, gitCommitTool, gitDiffTool, gitLogTool, gitShowTool, gitStatusTool } from './tools/git.ts';
 import { shellExecTool } from './tools/shell.ts';
@@ -33,6 +37,11 @@ export function whiteboxTools(input: BuiltinToolOptions): ToolSpec[] {
     mutationRunTool(options),
     codeSymbolsTool(options),
     codeReferencesTool(options),
+    // (wave 3, row 248) TypeScript language-service navigation and the static analyzers
+    lspDefinitionsTool(options),
+    lspReferencesTool(options),
+    lspDiagnosticsTool(options),
+    analysisRunTool(options),
   ] as ToolSpec[];
 }
 
@@ -47,6 +56,10 @@ export function builtinTools(input: BuiltinToolOptions): ToolSpec[] {
   const options: BuiltinToolOptions = input && input.sandbox ? { ...input, sandbox: meteredSandbox(input.sandbox) } : input;
   const specs = whiteboxTools(options);
   specs.push(...blackboxTools(options as BuiltinToolOptions & BlackboxToolOptions));
+  // (row 246) external coding agents over the Agent Client Protocol, on the caller's workspace (its sandbox)
+  if (options.acpAgents && options.acpAgents.length > 0) specs.push(...acpTools(options.acpAgents, { sandbox: options.sandbox, workspaces: options.workspaces }));
+  // (row 246) computer use over the configured desktop backend
+  if (options.computer) specs.push(...computerTools(options.computer));
   const seen = new Set<string>();
   for (const s of specs) {
     if (seen.has(s.id)) throw new HypertestError('conflict', `builtin tool id ${s.id} is defined twice`);

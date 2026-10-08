@@ -34,7 +34,7 @@ import {
 } from '@hypertest/context';
 import { OpenAICompatibleEmbedder, createCodeToolRetrieval, withExperienceEvents, createFreshnessPassLog, createSkillRegistry, recordTranscriptOnL0, withTrialSkills, type SkillRevision } from '@hypertest/context';
 import {
-  ToolRegistry, builtinSideEffectAdapters, builtinTools, closeBlackboxResources, createEnvironmentRegistry, createLocalSandbox, createOciSandbox, createSecretBroker,
+  ToolRegistry, builtinSideEffectAdapters, builtinTools, closeBlackboxResources, createEnvironmentRegistry, createLocalSandbox, createOciSandbox, createSecretBroker, routedSandbox,
   createSqlEnvironmentRegistry, createToolRuntime, createWorkspaceManager, networkIsolation, toolsMigrations, type BrokeredCredentialConfig, type BuiltinToolOptions, type EgressEndpointPolicy,
   type EnvironmentRegistry, type NetworkIsolationOptions, type SandboxProfile, type ToolRuntimeDeps,
 } from '@hypertest/tools';
@@ -55,7 +55,9 @@ import {
   DEFAULT_ENV_ALLOWLIST, completeRoute, oracleSpecFromConfig, providerCompatibilityClass, resolveConfigPaths, roleOverrides, validateConfig, validateRunOverrides,
   withDerivedPaths,
 } from './config.ts';
-import { ENVIRONMENT_STATE_FILE, persistentEnvironmentRegistry, resolveEnvironments } from './environments.ts';
+import { ENVIRONMENT_STATE_FILE, persistentEnvironmentRegistry, resolveEnvironments, resolveUrlTarget } from './environments.ts';
+import { urlTargetEnvironments } from '@hypertest/tools';
+import { acpAgentConfigs, computerUseOptions, isolationResolver, mcpServerConfigs, withRemoteWorkers, withToolRoleGrants } from './tool-config.ts';
 import { recordedFailureFlipDetector } from './governance.ts';
 import { keysDir, loadCapabilitySecret, loadSigningKeys } from './keys.ts';
 import { acquireDirectoryLock, lockFileFor } from './lock.ts';
@@ -63,8 +65,10 @@ import { providerLocality } from './diagnose.ts';
 import { startMemoryServiceProcess } from './memory-service.ts';
 import {
   agentClassification, condenserPrivacyFloor, createReleaseService, hypertestGitSha, imageDigestFrom, releaseGovernedControlPlane, runtimeReleaseNotes, withRuntimeReleaseNotes,
+  shadowDryRunAdapters, shadowRunLookup, handoverControlPlane,
 } from './releases.ts';
 import type { HypertestConfig, HypertestInstance, HypertestOverrides, HypertestServices, ProviderConfig, RuntimeReleaseService } from './contracts.ts';
+import { applyHarnessFeatures, harnessFreshness, harnessRoleCatalog } from './harness-features.ts';
 
 /** Every migration of the stateful packages, in dependency order (applied idempotently at startup). */
 export const ALL_MIGRATIONS: readonly Migration[] = Object.freeze([
@@ -221,6 +225,29 @@ function buildProviders(config: HypertestConfig, overrides: HypertestOverrides, 
  * `<providerId>:<model>` otherwise). A route pinning a different tag for anthropic/pi-ai is refused (the router would
  * reject every continuation of such a route).
  */
+/**
+ * (additive, F[11]) The model providers and the enabled route profiles of a configuration OUTSIDE an instance — e.g. the
+ * eval's independent LLM judge (`hypertest eval run --judge config`) routes over them with its own router. `routeIds`
+ * narrows to those routes (an unknown or disabled one is refused). Credentials resolve through `env` (`*Env` names).
+ */
+export async function configuredModels(
+  config: HypertestConfig,
+  overrides: Pick<HypertestOverrides, 'scriptedBrains' | 'env' | 'logger' | 'fetch'> = {},
+  routeIds?: readonly string[],
+): Promise<{ routes: ModelCapabilityProfile[]; providers: ModelProvider[] }> {
+  const env = overrides.env ?? process.env;
+  const logger = overrides.logger ?? jsonLogger({ level: 'warn', fields: { component: 'hypertest-models' } });
+  const providers = buildProviders(config, overrides, env, logger);
+  const catalog = await buildCatalog(config, providers);
+  let routes = catalog.list().filter((r) => r.enabled !== false);
+  if (routeIds !== undefined) {
+    const missing = routeIds.filter((id) => !routes.some((r) => r.routeId === id));
+    if (missing.length > 0) throw invalid(`no enabled route ${missing.join(', ')} in the configuration (models.routes)`);
+    routes = routes.filter((r) => routeIds.includes(r.routeId));
+  }
+  return { routes, providers: providers.list() };
+}
+
 export async function buildCatalog(config: HypertestConfig, providers: ProviderRegistry): Promise<ModelCatalog> {
   const profiles: ModelCapabilityProfile[] = [];
   for (const [i, route] of config.models.routes.entries()) {
@@ -451,7 +478,7 @@ export async function assertSecretsHidden(config: HypertestConfig, profile: Sand
 
 /** The local sandbox profile: loopback network, minimal environment allowlist, merged with `config.sandbox`. */
 export function sandboxProfile(config: HypertestConfig): SandboxProfile {
-  const { egressWrites: _w, insecureAllowUnhiddenSecrets: _i, ...profile } = config.sandbox ?? {};
+  const { egressWrites: _w, insecureAllowUnhiddenSecrets: _i, roles: _r, ...profile } = config.sandbox ?? {};
   return { kind: 'local', network: 'loopback', envAllowlist: [...DEFAULT_ENV_ALLOWLIST], ...profile } as SandboxProfile;
 }
 
@@ -695,7 +722,8 @@ export async function decisionProblems(
 export async function createHypertest(input: HypertestConfig, overrides: HypertestOverrides = {}): Promise<HypertestInstance> {
   const errors = validateConfig(input);
   if (errors.length > 0) throw invalid(`invalid configuration:\n  - ${errors.join('\n  - ')}`, { errors });
-  const config = withDerivedPaths(resolveConfigPaths(input, process.cwd()));
+  // (F[8]) an eval causal arm's harness features (refused outside an eval trial instance)
+  const config = applyHarnessFeatures(withDerivedPaths(resolveConfigPaths(input, process.cwd())), overrides);
   const env = overrides.env ?? process.env;
   const clock = overrides.clock ?? systemClock;
   const ids = overrides.ids ?? new UlidIdGenerator();
@@ -775,7 +803,14 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
     // ---- external world (operation) + environments (generations persisted: a restart never forgets a deploy)
     const stateDir = join(dataDir, 'state');
     await mkdir(stateDir, { recursive: true, mode: 0o700 });
-    const configuredEnvironments = [...resolveEnvironments(config.environments ?? [], env, logger), ...(overrides.environments ?? [])];
+    const operatorEnvironments = [...resolveEnvironments(config.environments ?? [], env, logger), ...(overrides.environments ?? [])];
+    // (e2e[0]) every allowlisted URL target (tools.httpAllowlist URL entries) is a black-box environment of this deployment
+    // (`url-<host>-<port>`; class local for loopback, else tools.urlEnvironmentClass): `hypertest run --url` targets it and
+    // its agents probe it — by URL or by id — under their env/** grant (every process derives the same set from the config)
+    const configuredEnvironments = [
+      ...operatorEnvironments,
+      ...urlTargetEnvironments(config.tools?.httpAllowlist, operatorEnvironments, config.tools?.urlEnvironmentClass !== undefined ? { remoteClass: config.tools.urlEnvironmentClass } : {}),
+    ];
     // H12: workers sharing one PostgreSQL store share the generations (and bumps by operation) in SQL — a worker never
     // validates freshness against a generation another worker already bumped; the embedded store keeps its state file
     const environments: EnvironmentRegistry =
@@ -787,8 +822,10 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
     const ledger = createOperationLedger({ ...base, db, events });
     const leases = createLeaseService({ ...base, db, events });
     const adapters = new AdapterRegistry(builtinSideEffectAdapters({ stateDir, environments }));
-    const gateway = createSideEffectGateway({ ...base, db, events, ledger, leases, adapters });
-    const reconciler = createReconciler({ ...base, db, events, ledger, leases, adapters });
+    // (F[0]) a mirrored run of a shadow release dry-runs every external effect (recorded not_applied, never dispatched)
+    const effectAdapters = shadowDryRunAdapters(adapters, shadowRunLookup((id) => runs.get(id)));
+    const gateway = createSideEffectGateway({ ...base, db, events, ledger, leases, adapters: effectAdapters });
+    const reconciler = createReconciler({ ...base, db, events, ledger, leases, adapters: effectAdapters });
     const admission = createResourceAdmission({ ...base, db, events });
     const budget = createBudgetLedger({ ...base, db, events });
 
@@ -850,7 +887,7 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
       recordResolver((lineage) => blackboard.head(lineage)),
       leaseResolver((key) => leases.current(key)),
     ]);
-    const freshness = createFreshnessGuard({ ...base, db, events, snapshots, resolvers, observations });
+    const freshness = harnessFreshness(createFreshnessGuard({ ...base, db, events, snapshots, resolvers, observations }), config);
     // (B[1]) record-effect tool calls that passed the guard and took effect (a durable replay is never refused by its own write)
     const freshnessPasses = createFreshnessPassLog({ ...base, db });
     const snapshotBuilder = createSnapshotBuilder({
@@ -912,10 +949,13 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
     // the capability secret and the store from the commands agents run, the composition is refused (fail closed) unless
     // the operator opted in, loudly (sandbox.insecureAllowUnhiddenSecrets)
     if (profile.kind === 'local') await assertSecretsHidden(config, profile, overrides.sandboxIsolation, logger);
-    const sandbox =
-      profile.kind === 'oci'
-        ? createOciSandbox({ image: profile.image! })
-        : createLocalSandbox({
+    // (wave 3, row 250) a role tier may run on the other sandbox kind (e.g. a `separate` OCI tier over a local base): both
+    // runners exist and each command goes to the one its workspace profile names
+    const tierKinds = new Set(Object.values(config.sandbox?.roles ?? {}).map((t) => t.kind ?? profile.kind));
+    const ociImage = profile.image ?? Object.values(config.sandbox?.roles ?? {}).find((t) => t.kind === 'oci')?.image;
+    const ociSandbox = profile.kind === 'oci' || tierKinds.has('oci') ? createOciSandbox({ image: ociImage! }) : undefined;
+    if (profile.kind === 'oci' && tierKinds.has('local')) await assertSecretsHidden(config, { ...profile, kind: 'local' }, overrides.sandboxIsolation, logger);
+    const localSandbox = () => createLocalSandbox({
           ...(overrides.sandboxIsolation ? { networkIsolation: overrides.sandboxIsolation } : {}),
           ...(config.sandbox?.insecureAllowUnhiddenSecrets === true ? { allowUnhiddenPaths: true } : {}),
           hiddenPaths: sandboxHiddenPaths(config, dataDir, stateDir, logger),
@@ -925,7 +965,11 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
           egress: () => sandboxEgressPolicies(environments, config.tools?.httpAllowlist),
           egressWrites: config.sandbox?.egressWrites ?? 'ledger',
         });
-    const toolOptions: BuiltinToolOptions = { sandbox, workspaces, stateDir };
+    const baseSandbox = profile.kind === 'oci' ? ociSandbox! : localSandbox();
+    const otherSandbox = profile.kind === 'oci' ? (tierKinds.has('local') ? localSandbox() : undefined) : ociSandbox;
+    const sandbox = otherSandbox ? routedSandbox(profile.kind === 'oci' ? { oci: baseSandbox, local: otherSandbox } : { local: baseSandbox, oci: otherSandbox }) : baseSandbox;
+    // (wave 3) env: operator-NAMED variables (db.introspect `database.urlEnv`) are read from the instance environment
+    const toolOptions: BuiltinToolOptions = { sandbox, workspaces, stateDir, env };
     // (B[6]) code.symbols / code.references answer from the syntax-tree symbol graph (definitions, classified writes / calls)
     // the Go `go/ast` helper lives under the state directory, which every sandboxed command finds hidden (it runs outside
     // the sandbox: an agent-writable helper path would be a sandbox escape)
@@ -937,7 +981,23 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
       toolOptions.enableBrowser = true;
       pending.push({ name: 'browser', close: () => closeBlackboxResources() });
     }
-    const registry = new ToolRegistry(builtinTools(toolOptions));
+    // (E[5]/stubs[1]/coverage[3]) configured MCP servers: `mcp.<id>.<tool>` specs (lazily connected; stopped on close)
+    // (row 246) external coding agents over ACP, run in the caller's workspace sandbox
+    const acpAgents = acpAgentConfigs(config, env, logger);
+    if (acpAgents.length > 0) toolOptions.acpAgents = acpAgents;
+    // (row 246) computer use over the configured desktop (its X connection closed with the instance)
+    const computer = computerUseOptions(config, logger);
+    if (computer) {
+      toolOptions.computer = computer;
+      pending.push({ name: 'computer use', close: async () => computer.backend.close?.() });
+    }
+    const mcpServers = mcpServerConfigs(config, env, logger);
+    if (mcpServers.length > 0) {
+      toolOptions.mcpServers = mcpServers;
+      if (!config.tools?.enableBrowser) pending.push({ name: 'mcp servers', close: () => closeBlackboxResources() });
+    }
+    // (row 246) tools delegated to remote workers keep their local classification; only their execute step runs remotely
+    const registry = new ToolRegistry(withRemoteWorkers(builtinTools(toolOptions), config, env, logger, overrides.fetch));
     // A[6]: plugin tools join the same registry AFTER the built-in and domain tools (below), so a plugin tool can never
     // take a governed tool's id (the registry refuses a duplicate id: conflict)
     const toolDeps: ToolRuntimeDeps = {
@@ -954,6 +1014,8 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
       runtimeManifestId: 'rm_pending',
       workerId,
       capabilitySecret,
+      // (wave 3, row 250) isolation tier per role (sandbox.roles) and work item (its capability requirements)
+      isolation: isolationResolver(config, blackboard),
       // E[4] / coverage[8]: brokered credentials (short-lived, scoped, minted per call); outputs redacted with it
       secrets: createSecretBroker({
         credentials: (config.environments ?? []).flatMap((e) => (e.credentials ?? []).map((c) => ({ ...c, environmentId: e.environmentId }) as BrokeredCredentialConfig)),
@@ -999,7 +1061,8 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
     if (!engines.has(defaultEngineKind)) throw invalid(`engines.default: engine '${defaultEngineKind}' is not registered`);
     const subagents = createSubagentRuntime({ ...base, db, events, agents, sessions, engines, defaultEngineKind, maxAgentsPerRun: MAX_AGENTS_PER_RUN, capabilitySecret });
     const runner = createAgentRunner({ ...base, db, events, agents, sessions, engines, subagents });
-    const roles: RoleCatalogLike = new RoleCatalog(BUILTIN_ROLES, { roles: roleOverrides(config) });
+    // (wave 3) configured tools (MCP servers) join the tool policy of the roles they are offered to
+    const roles: RoleCatalogLike = harnessRoleCatalog(new RoleCatalog(BUILTIN_ROLES, { roles: withToolRoleGrants(config, roleOverrides(config)) }), config);
 
     // ---- control plane
     const controlConfig: ControlConfig = {
@@ -1109,6 +1172,10 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
       afterCreate: (runId) => (releaseService ? releaseService.quarantineIfRolledBack(runId) : Promise.resolve(false)),
       // … and, should its creator have died before that re-check, by the first loop (or operator resume) that would drive it
       beforeDrive: (runId) => (releaseService ? releaseService.quarantineIfRolledBack(runId) : Promise.resolve(false)),
+      // (F[1]) the loop that takes a migrated run over records it (run.migration_driven): a migration's drive is verified
+      onDrive: async (runId) => {
+        if (releaseService) await releaseService.markDriven(runId);
+      },
     });
     relay.start();
     pending.push({ name: 'relay', close: () => relay.stop() });
@@ -1134,6 +1201,30 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
     const releases = createReleaseService({
       db, registry: releaseRegistry, manifest, runs, events, blackboard, leases, ledger, reconciler, agents, control: plane, durable,
       forgetPin: (runId) => pinned.forgetPin(runId), clock, logger: logger.child({ component: 'releases' }),
+      // (F[0]) shadow mirroring: decisions to compare, this instance's start (bound once `ht` exists), runtime.shadow
+      decisions, startRun: (input) => ht.start(input), ...(config.runtime?.shadow ? { shadow: { ...config.runtime.shadow } } : {}),
+      // (F[1]) Temporal: a migrated run's previous workflow on the SOURCE manifest's queue is handed over even without a
+      // worker of the source runtime (served briefly by a worker whose control plane refuses exactly that run)
+      ...(config.durable.kind === 'temporal'
+        ? {
+            handover: async ({ runId, fromManifestId, toManifestId }: { runId: string; fromManifestId: string; toManifestId: string }) => {
+              const durableConfig = config.durable as Extract<HypertestConfig['durable'], { kind: 'temporal' }>;
+              const options: TemporalDurableOptions = {
+                control: handoverControlPlane(control, runId, toManifestId), listRuns: async () => [], address: durableConfig.address,
+                taskQueue: manifestTaskQueue(durableConfig.taskQueue ?? DEFAULT_TEMPORAL_TASK_QUEUE, fromManifestId), logger: logger.child({ component: 'durable.handover', runId }),
+              };
+              if (durableConfig.namespace) options.namespace = durableConfig.namespace;
+              const rt = new TemporalDurableRuntime(options);
+              try {
+                await rt.start();
+              } catch (e) {
+                await rt.shutdown().catch(() => undefined);
+                throw e;
+              }
+              return { close: () => rt.shutdown() };
+            },
+          }
+        : {}),
     });
     releaseService = releases;
     const ctx = (runId: string, actorId: string, correlationId = runId): EventContext => ({ runId, correlationId, actorId });
@@ -1190,7 +1281,9 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
         if (overrideErrors.length > 0) throw new HypertestError('invalid_argument', `invalid run overrides:\n  - ${overrideErrors.join('\n  - ')}`, { details: { errors: overrideErrors } });
         await preflight();
         // conformance-1: a run without explicit oracles pins the configured ones (the gate's C0 needs an oracle in force)
-        const input: StartRunInput = runInput && runInput.oracleIds === undefined && configuredOracleIds.length > 0 ? { ...runInput, oracleIds: [...configuredOracleIds] } : runInput;
+        const pinnedOracles: StartRunInput = runInput && runInput.oracleIds === undefined && configuredOracleIds.length > 0 ? { ...runInput, oracleIds: [...configuredOracleIds] } : runInput;
+        // (e2e[0]) a URL target becomes the environment serving it (refused before any run exists when nothing serves it)
+        const input: StartRunInput = pinnedOracles?.target?.sutUrl !== undefined ? { ...pinnedOracles, target: resolveUrlTarget(pinnedOracles.target, environments) } : pinnedOracles;
         // startRun is idempotent for an existing runId: never drive a run created by another runtime (I11)
         const run = await control.startRun(input, { actorId: 'system:app' });
         if (run.runtimeManifestId !== manifest.manifestId && !isTerminalRun(run.status)) throw pinViolation(run, manifest.manifestId);
@@ -1241,7 +1334,7 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
       async report(runId) {
         // the control plane's report + the run's runtime-release notes (quarantine, migrations)
         const report = await control.report(runId);
-        const notes = runtimeReleaseNotes(await events.read(runId, { types: ['run.quarantined', 'run.migrated', 'run.migration_released'] }));
+        const notes = runtimeReleaseNotes(await events.read(runId, { types: ['run.quarantined', 'run.migrated', 'run.migration_released', 'run.migration_driven'] }));
         return withRuntimeReleaseNotes(report, await runs.get(runId), notes);
       },
       async verifyEvidence(runId) {

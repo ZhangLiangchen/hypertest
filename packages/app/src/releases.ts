@@ -1,22 +1,22 @@
 import { execFileSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { HypertestError, isHypertestError, sleep, type Logger, type SqlDatabase, type SqlExecutor } from '@hypertest/core';
+import { HypertestError, canonicalJson, isHypertestError, sha256Hex, sleep, type JsonValue, type Logger, type SqlDatabase, type SqlExecutor } from '@hypertest/core';
 import {
-  CLASSIFICATION_ORDER, eventFrom, isTerminalRun, type DataClassification, type DomainEvent, type EventContext, type OperationStatus, type RuntimeEpoch, type RuntimeManifest,
-  type TestRun,
+  CLASSIFICATION_ORDER, eventFrom, isTerminalRun, type DataClassification, type DomainEvent, type EventContext, type OperationStatus, type QualityDecision, type RuntimeEpoch,
+  type RuntimeManifest, type TestRun,
 } from '@hypertest/domain';
-import type { Blackboard, EventStore, RunRepository } from '@hypertest/collab';
-import type { LeaseService, OperationLedger, Reconciler } from '@hypertest/operation';
+import type { Blackboard, DecisionRepository, EventStore, RunRepository } from '@hypertest/collab';
+import type { AdapterRegistryLike, LeaseService, OperationLedger, Reconciler, SideEffectAdapter } from '@hypertest/operation';
 import type { ModelRouter } from '@hypertest/model';
 import {
-  GIT_SHA_RE, IMAGE_DIGEST_RE, runtimeCompatibility, type AgentRepository, type CanarySelection, type CompatibilitySuiteResult, type PromotionResult, type RecordSuiteInput,
-  type RollbackResult, type RuntimeRelease, type RuntimeReleaseRegistry, type SchemaMigrationAllowance,
+  GIT_SHA_RE, IMAGE_DIGEST_RE, RELEASE_GATE_SUITE_ID, SHADOW_OF_LABEL, canarySelects, runtimeCompatibility, type AgentRepository, type CanarySelection, type CompatibilitySuiteResult,
+  type PromotionResult, type RecordSuiteInput, type RollbackResult, type RuntimeRelease, type RuntimeReleaseRegistry, type SchemaMigrationAllowance, type ShadowComparison,
 } from '@hypertest/runtime';
 import type { RoleCatalogLike } from '@hypertest/agents';
-import { ControlStore, workLeaseKey, type ControlPlane, type RunReport } from '@hypertest/control';
+import { ControlStore, workLeaseKey, type ControlPlane, type RunReport, type StartRunInput } from '@hypertest/control';
 import type { DurableRuntime } from '@hypertest/durable';
-import type { MigrateRunInput, RunMigrationResult, RuntimeReleaseService, RuntimeReleaseView } from './contracts.ts';
+import type { MigrateRunInput, RunMigrationResult, RuntimeReleaseService, RuntimeReleaseView, ShadowMirrorResult } from './contracts.ts';
 
 // ------------------------------------------------------------------------------------------------ runtime BOM inputs
 
@@ -142,6 +142,12 @@ export function releaseGovernedControlPlane<C extends ControlPlane>(
      * by the rolled-back runtime — the first loop that would drive it quarantines it instead.
      */
     beforeDrive?: (runId: string) => Promise<boolean>;
+    /**
+     * (additive, F[1]) Called when this runtime's durable loop starts driving a run (after `beforeDrive`, before the
+     * wrapped `recover`): records that the target runtime of a migration really drives the migrated run
+     * (`run.migration_driven`, see RuntimeReleaseService.markDriven) — in whichever process the loop runs.
+     */
+    onDrive?: (runId: string) => Promise<void>;
   },
 ): C {
   return {
@@ -149,6 +155,7 @@ export function releaseGovernedControlPlane<C extends ControlPlane>(
     async recover(runId, signal) {
       // a run of a rolled-back release is quarantined before this loop drives it (its ticks then find it paused)
       if (options.beforeDrive && typeof runId === 'string' && runId !== '') await options.beforeDrive(runId);
+      if (options.onDrive && typeof runId === 'string' && runId !== '') await options.onDrive(runId);
       return control.recover(runId, signal);
     },
     async startRun(input, ctx) {
@@ -156,7 +163,11 @@ export function releaseGovernedControlPlane<C extends ControlPlane>(
       const runId = input.runId ?? options.newRunId();
       let admitted = false;
       if (!(await options.getRun(runId))) {
-        const admission = await options.registry.admit({ manifestId: options.manifestId, runId, labels: input.labels ?? {}, requireActive: options.requireActive });
+        // (F[0]) a mirrored run (label hypertest.shadow_of) is admitted only by a shadow release (and dispatches no effect)
+        const shadowOf = input.labels?.[SHADOW_OF_LABEL];
+        const admission = await options.registry.admit({
+          manifestId: options.manifestId, runId, labels: input.labels ?? {}, requireActive: options.requireActive, ...(typeof shadowOf === 'string' ? { shadowOf } : {}),
+        });
         if (!admission.allowed) {
           throw new HypertestError('precondition_failed', `runtime release: ${admission.reason}`, {
             details: { runId, runtimeManifestId: options.manifestId, activeManifestId: admission.activeManifestId ?? null, state: admission.state ?? null },
@@ -223,6 +234,8 @@ export function runtimeReleaseNotes(events: readonly DomainEvent<unknown>[]): Ar
         at: e.occurredAt,
         detail: `abandoned runtime migration: its checkpoint was released by ${String(p['by'])} (${String(p['reason'])}); the run continued on ${String(p['manifestId'])}`,
       });
+    } else if (e.eventType === 'run.migration_driven') {
+      notes.push({ at: e.occurredAt, detail: `the target runtime ${String(p['manifestId'])} drives the migrated run (epoch ${String(p['seq'])}, ${String(p['epochId'])})` });
     }
   }
   return notes;
@@ -238,6 +251,153 @@ export function withRuntimeReleaseNotes(report: RunReport, run: TestRun | undefi
     ? { ...report.json, recovery: JSON.parse(JSON.stringify(recovery)), runtimeRelease: { quarantined, notes: JSON.parse(JSON.stringify(notes)) } }
     : report.json;
   return { ...report, recovery, markdown: `${report.markdown.replace(/\n*$/, '\n')}${section.join('\n')}`, json };
+}
+
+// ------------------------------------------------------------------------------------------------ shadow (F[0])
+
+/** Why a dry-run operation was not applied (`not_applied` reason prefix). */
+export const DRY_RUN_REASON = 'dry_run';
+
+/**
+ * (F[0]) The adapters the SideEffectGateway (and the reconciler) dispatch through, with a DRY-RUN mode for mirrored runs:
+ * every operation of a run that `isDryRun` names (a shadow run: label `hypertest.shadow_of`) is prepared without touching
+ * the target (desired state = the request, hashed), never dispatched (the receipt is `accepted: false`, so the operation
+ * is recorded `not_applied` with reason `dry_run: …` — the ledger keeps what WOULD have been done), observed absent and
+ * never compensated. Every other run goes to the real adapter. Every external effect passes the gateway (http writes,
+ * environment control, load jobs, fault injection, sandbox egress through the relay), so a shadow run changes nothing
+ * outside Hypertest; safe reads are not effects and still happen.
+ */
+export function shadowDryRunAdapters(inner: AdapterRegistryLike, isDryRun: (runId: string) => Promise<boolean>): AdapterRegistryLike {
+  const wrapped = new Map<string, SideEffectAdapter>();
+  const reason = (runId: string) => `${DRY_RUN_REASON}: run ${runId} mirrors a production run on a shadow release — external effects are recorded, never dispatched`;
+  function wrap(real: SideEffectAdapter): SideEffectAdapter {
+    const dry = (op: { operation: { runId: string } }) => isDryRun(op.operation.runId);
+    return {
+      adapterId: real.adapterId,
+      capabilities: real.capabilities,
+      async prepare(op, input) {
+        if (!(await dry(op))) return real.prepare(op, input);
+        const desiredState = { dryRun: true, adapterId: real.adapterId, input: (input ?? null) as JsonValue };
+        return { desiredState, desiredStateHash: sha256Hex(canonicalJson(desiredState as unknown as JsonValue)), target: op.operation.target };
+      },
+      async dispatch(prepared, op) {
+        if (!(await dry(op))) return real.dispatch(prepared, op);
+        return { accepted: false, notAppliedReason: reason(op.operation.runId) };
+      },
+      async observe(op) {
+        if (!(await dry(op))) return real.observe(op);
+        return { state: 'absent' };
+      },
+      async verify(observation, desiredStateHash, op) {
+        if (!(await dry(op))) return real.verify(observation, desiredStateHash, op);
+        return { status: 'failed', reason: reason(op.operation.runId) };
+      },
+      ...(real.compensate
+        ? {
+            async compensate(op: Parameters<NonNullable<SideEffectAdapter['compensate']>>[0]) {
+              if (!(await dry(op))) return real.compensate!(op);
+              return { compensated: true, detail: `${DRY_RUN_REASON}: nothing was dispatched` };
+            },
+          }
+        : {}),
+    };
+  }
+  return {
+    has: (adapterId) => inner.has(adapterId),
+    get(adapterId) {
+      const real = inner.get(adapterId);
+      let w = wrapped.get(adapterId);
+      if (!w || (w as { real?: SideEffectAdapter }).real !== real) {
+        w = Object.assign(wrap(real), { real });
+        wrapped.set(adapterId, w);
+      }
+      return w;
+    },
+  };
+}
+
+/** True for a mirrored (shadow) run: it carries `hypertest.shadow_of` (cached per run: labels never change). */
+export function shadowRunLookup(getRun: (runId: string) => Promise<TestRun | undefined>): (runId: string) => Promise<boolean> {
+  const cache = new Map<string, boolean>();
+  return async (runId) => {
+    const hit = cache.get(runId);
+    if (hit !== undefined) return hit;
+    const run = await getRun(runId);
+    if (!run) return false; // unknown run: not cached (it may be created later)
+    const shadow = typeof run.labels?.[SHADOW_OF_LABEL] === 'string';
+    cache.set(runId, shadow);
+    if (cache.size > 10_000) cache.delete(cache.keys().next().value!);
+    return shadow;
+  };
+}
+
+/**
+ * (F[0]) The divergences of a mirrored run from the production run it mirrors (empty = equivalent): run outcome, verdict,
+ * violated and unknown criteria, human review. Ids, timestamps and evidence differ by construction and are not compared.
+ */
+export function shadowDivergences(source: { run: TestRun; decision?: QualityDecision }, shadow: { run: TestRun; decision?: QualityDecision }): string[] {
+  const out: string[] = [];
+  if (source.run.status !== shadow.run.status) out.push(`run status ${source.run.status} → ${shadow.run.status}`);
+  const sv = source.decision?.verdict ?? null;
+  const tv = shadow.decision?.verdict ?? null;
+  if (sv !== tv) out.push(`verdict ${sv ?? 'none'} → ${tv ?? 'none'}`);
+  const ids = (d: QualityDecision | undefined, f: 'violatedCriteria' | 'unknownCriteria') => [...new Set((d?.[f] ?? []).map((c) => c.criterionId))].sort();
+  for (const f of ['violatedCriteria', 'unknownCriteria'] as const) {
+    const a = ids(source.decision, f);
+    const b = ids(shadow.decision, f);
+    if (a.join(',') !== b.join(',')) out.push(`${f === 'violatedCriteria' ? 'violated' : 'unknown'} criteria [${a.join(', ')}] → [${b.join(', ')}]`);
+  }
+  if (source.decision && shadow.decision && source.decision.requiresHumanReview !== shadow.decision.requiresHumanReview) {
+    out.push(`requiresHumanReview ${source.decision.requiresHumanReview} → ${shadow.decision.requiresHumanReview}`);
+  }
+  return out;
+}
+
+/**
+ * (F[1]) The control plane a HANDOVER worker serves on the source runtime's task queue (Temporal) while a migrated run's
+ * previous workflow is still open there and no worker of the source runtime polls it: every call about the migrated run
+ * is refused `precondition_failed` (non-retryable: that workflow fails and closes — the run itself is untouched and the
+ * target runtime starts its own workflow), every other call is `unavailable` (retryable; a run workflow stands by on it),
+ * so the workflows of runs still pinned to the source runtime are never failed by the handover.
+ */
+export function handoverControlPlane(base: ControlPlane, runId: string, toManifestId: string): ControlPlane {
+  const refuse = async (first: unknown): Promise<never> => {
+    if (first === runId) {
+      throw new HypertestError('precondition_failed', `run ${runId} was migrated to runtime ${toManifestId}: its previous workflow is handed over (I11) — the target runtime drives the run`, {
+        details: { runId, runtimeManifestId: toManifestId },
+      });
+    }
+    throw new HypertestError('unavailable', 'this worker only hands over a migrated run: the runtime that owns this task queue drives every other run');
+  };
+  return new Proxy(base, {
+    get(target, prop) {
+      const v: unknown = Reflect.get(target, prop, target);
+      if (prop === 'deps' || typeof v !== 'function') return v;
+      return (first: unknown) => refuse(first);
+    },
+  });
+}
+
+/** The deterministic id of the mirror of `sourceRunId` on shadow manifest `manifestId` (a repeated mirror reuses it). */
+export function shadowRunId(sourceRunId: string, manifestId: string): string {
+  return `${sourceRunId.slice(0, 90)}.shadow-${manifestId.replace(/^rm_/, '').slice(0, 16)}`;
+}
+
+/**
+ * (F[0], e2e[5]) The manifests an eval SuiteResult's trials ran under: the binding of a compatibility / release-gate result.
+ * A trial without a recorded manifest (an infra error before its run existed, a hand-written file) makes it unbindable.
+ */
+export function evalTrialManifests(result: unknown): { manifestIds: string[]; unbound: string[] } {
+  const trials = (result as { trials?: unknown } | null)?.trials;
+  if (!Array.isArray(trials)) throw new HypertestError('invalid_argument', 'not an eval suite result (trials)');
+  const manifestIds = new Set<string>();
+  const unbound: string[] = [];
+  trials.forEach((t, i) => {
+    const x = (t ?? {}) as { runtimeManifestId?: unknown; taskId?: unknown; armId?: unknown; trial?: unknown };
+    if (typeof x.runtimeManifestId === 'string' && x.runtimeManifestId !== '') manifestIds.add(x.runtimeManifestId);
+    else unbound.push(typeof x.taskId === 'string' ? `${x.taskId}/${String(x.armId)}#${String(x.trial)}` : `trials[${i}]`);
+  });
+  return { manifestIds: [...manifestIds].sort(), unbound };
 }
 
 // ------------------------------------------------------------------------------------------------ release service
@@ -261,12 +421,43 @@ export interface ReleaseServiceDeps {
   agents: Pick<AgentRepository, 'list'>;
   /** The un-governed control plane (snapshot). */
   control: Pick<ControlPlane, 'snapshot'>;
-  durable: Pick<DurableRuntime, 'startRun'>;
+  /** (additive: awaitCompletion, signal — shadow runs and the migration's drive) */
+  durable: Pick<DurableRuntime, 'startRun'> & Partial<Pick<DurableRuntime, 'awaitCompletion' | 'signal'>>;
+  /** (additive, F[0]) Decisions of mirrored and production runs (shadow comparisons). */
+  decisions?: Pick<DecisionRepository, 'get'>;
+  /** (additive, F[0]) Starts a run on this runtime (the instance's `start`: preflight, governed admission, durable loop). */
+  startRun?: (input: StartRunInput) => Promise<TestRun>;
+  /** (additive, F[0]) `runtime.shadow` of the configuration: which production runs a shadow release mirrors. */
+  shadow?: ShadowSettings;
+  /** (additive, F[1]) How long migrate(drive) waits for this runtime's loop to take the migrated run over (default 30 000). */
+  driveTimeoutMs?: number;
+  /**
+   * (additive, F[1]) Temporal only: serves the SOURCE manifest's task queue for a moment with handoverControlPlane, so a
+   * migrated run's previous workflow ends even when no worker of the source runtime is left (closed by the caller).
+   */
+  handover?: (input: { runId: string; fromManifestId: string; toManifestId: string }) => Promise<{ close(): Promise<void> }>;
   /** Evicts a re-pinned run from the pin cache of this process's pinned control plane. */
   forgetPin: (runId: string) => void;
   clock: { isoNow(): string; nowMs(): number };
   logger: Logger;
 }
+
+/** (additive, F[0]) `runtime.shadow`: the production runs a shadow release mirrors and the production-replay threshold. */
+export interface ShadowSettings {
+  /** Share (0–100) of finished production runs mirrored (deterministic bucket of the run id). */
+  percentage?: number;
+  /** Runs carrying every one of these labels are mirrored. */
+  labels?: Record<string, string>;
+  /** Mirrored runs a production replay needs (default 1). A passing production replay has NO diverging mirrored run. */
+  minRuns?: number;
+  /** How long one mirrored run may take (default 600 000 ms; then it is cancelled and counts as diverged). */
+  timeoutMs?: number;
+}
+
+/** The default wait for one mirrored run. */
+export const DEFAULT_SHADOW_TIMEOUT_MS = 600_000;
+/** Default wait of migrate(drive) for the target runtime's loop to take the migrated run over. */
+export const DEFAULT_DRIVE_TIMEOUT_MS = 30_000;
 
 /** The rollback a quarantine belongs to: the rolled-back release, its transition, actor and reason, the restored release. */
 interface RollbackRef {
@@ -397,9 +588,74 @@ export function createReleaseService(deps: ReleaseServiceDeps): RuntimeReleaseSe
     return { status: 'paused', pauseReason: run.pauseReason ?? 'operator' };
   }
 
+  /** Whether this runtime's loop took over epoch `epochId` of the run (`run.migration_driven`, any process). */
+  async function drivenEvent(runId: string, epochId: string): Promise<boolean> {
+    return (await events.read(runId, { types: ['run.migration_driven'] })).some((e) => (e.payload as { epochId?: unknown } | null)?.epochId === epochId);
+  }
+
+  /**
+   * (F[1]) Starts this runtime's durable loop on a migrated run and waits until the loop really drives it — its first
+   * `recover` records `run.migration_driven` for the epoch (onDrive → markDriven, in whichever process the loop runs). A
+   * durable runtime whose previous loop of the run is still open (Temporal: the run workflow on the SOURCE manifest's task
+   * queue — startRun of the same workflow id is then a no-op) is woken (its next tick on a worker of the source runtime is
+   * refused by the pin and ends it) and startRun is retried until the deadline. Never reports a drive that did not happen.
+   */
+  async function driveMigrated(runId: string, epoch: RuntimeEpoch, fromManifestId: string, timeoutMs: number, signal: AbortSignal): Promise<{ driven: boolean; problem?: string }> {
+    const deadline = deps.clock.nowMs() + Math.max(0, timeoutMs);
+    let handover: { close(): Promise<void> } | undefined;
+    let handoverProblem: string | undefined;
+    try {
+      for (let attempt = 1; ; attempt++) {
+        await deps.durable.startRun(runId);
+        const until = Math.min(deadline, deps.clock.nowMs() + 2000);
+        while (deps.clock.nowMs() < until) {
+          if (await drivenEvent(runId, epoch.epochId)) return { driven: true };
+          if (signal.aborted) break;
+          await sleep(100);
+        }
+        if (await drivenEvent(runId, epoch.epochId)) return { driven: true };
+        if (signal.aborted || deps.clock.nowMs() >= deadline) break;
+        // the previous loop of the run may still be open: wake it so its next tick (refused: the run is pinned here now)
+        // ends it; when no worker of the source runtime is left to run that tick, serve its queue for the handover
+        if (attempt >= 2 && !handover && !handoverProblem && deps.handover) {
+          try {
+            handover = await deps.handover({ runId, fromManifestId, toManifestId: deps.manifest.manifestId });
+            logger.info('serving the source runtime\'s task queue to hand the migrated run\'s previous workflow over', { runId, fromManifestId });
+          } catch (e) {
+            handoverProblem = (e as Error).message;
+          }
+        }
+        if (deps.durable.signal) await deps.durable.signal(runId, { type: 'wake' }).catch(() => undefined);
+        if (attempt % 5 === 0) logger.info('waiting for the previous durable loop of the migrated run to close', { runId, attempt });
+      }
+    } finally {
+      if (handover) await handover.close().catch((e: unknown) => logger.warn('the handover worker could not be stopped cleanly', { runId, error: (e as Error).message }));
+    }
+    return {
+      driven: false,
+      problem: `run ${runId} was re-pinned to ${deps.manifest.manifestId} (epoch ${epoch.seq}) but this runtime's durable loop did not take it over within ${timeoutMs} ms: its previous loop is probably still open (Temporal: workflow run-${runId} on the task queue of ${fromManifestId}${handoverProblem ? `; the handover worker could not start: ${handoverProblem}` : ''}; it ends at its next tick on a worker of that runtime — otherwise terminate it, e.g. \`temporal workflow terminate --workflow-id run-${runId}\`) — then run \`hypertest resume\` on this runtime`,
+    };
+  }
+
   const service: RuntimeReleaseService = {
     registry,
     resolve,
+
+    async markDriven(runId) {
+      if (typeof runId !== 'string' || runId === '') return false;
+      const last = (await registry.epochs(runId)).at(-1);
+      if (!last || last.toManifestId !== deps.manifest.manifestId) return false;
+      if (await drivenEvent(runId, last.epochId)) return false;
+      const ctx: EventContext = { runId, correlationId: last.epochId, actorId: 'system:hypertest' };
+      return db.transaction(async (tx) => {
+        // under the run's lock: two loops recovering the run at once record one event
+        await runs.update(runId, {}, ctx, tx);
+        const seen = (await events.read(runId, { types: ['run.migration_driven'] })).some((e) => (e.payload as { epochId?: unknown } | null)?.epochId === last.epochId);
+        if (seen) return false;
+        await events.append([eventFrom(ctx, 'run.migration_driven', 'run', runId, { runId, epochId: last.epochId, seq: last.seq, manifestId: deps.manifest.manifestId })], tx);
+        return true;
+      });
+    },
 
     async list() {
       await retireDrained('system:hypertest');
@@ -526,12 +782,18 @@ export function createReleaseService(deps: ReleaseServiceDeps): RuntimeReleaseSe
             details: { runId, operations: unsettled.map((op) => ({ operationId: op.operationId, status: op.status })) },
           });
         }
-        const waiting = await deps.blackboard.listWorkItems({ runId, states: ['waiting'] });
+        // (item 17) an item waiting ONLY on a model pause (`model:<agentId>`) holds no turn in flight and no external effect:
+        // it migrates, its pause (ht_model_pauses, keyed by its session) carries over to the new epoch; every other wait
+        // (operations, children, approvals) must settle first
+        const waitingItems = await deps.blackboard.listWorkItems({ runId, states: ['waiting'] });
+        const modelPaused = waitingItems.filter((w) => w.waitingOn.length > 0 && w.waitingOn.every((x) => x.startsWith('model:')));
+        const waiting = waitingItems.filter((w) => !modelPaused.includes(w));
         if (waiting.length > 0) {
           throw new HypertestError('precondition_failed', `run ${runId} has work items waiting on operations or children (${waiting.map((w) => `${w.workItemId} on ${w.waitingOn.join('+') || '?'}`).join(', ')}): let them settle before migrating`, {
             details: { runId, workItems: waiting.map((w) => w.workItemId) },
           });
         }
+        const carriedModelPauses = modelPaused.map((w) => w.workItemId).sort();
         // 4 compatibility, with the engines the run's agents actually used by now (refuse before the transaction)
         refuseIncompatible(runtimeCompatibility(source, (await registry.get(to))!, { usedEngines: await usedEngines(runId) }), runId, to);
         // the pause that holds the checkpoint: the migration's own, or the one the run already had (a rollback of the
@@ -566,11 +828,17 @@ export function createReleaseService(deps: ReleaseServiceDeps): RuntimeReleaseSe
           const now = deps.clock.isoNow();
           const after = await statusAfter(cur);
           await controlStore.putManifest(targetNow.manifest, now, tx);
+          // a model-paused item that settled meanwhile is not carried; one that started waiting on something else refuses
+          const stillWaiting = await deps.blackboard.listWorkItems({ runId, states: ['waiting'] });
+          const otherWait = stillWaiting.filter((w) => !(w.waitingOn.length > 0 && w.waitingOn.every((x) => x.startsWith('model:'))));
+          if (otherWait.length > 0) throw new HypertestError('conflict', `work items ${otherWait.map((w) => w.workItemId).join(', ')} started waiting on operations or children during the migration`, { details: { runId } });
+          const carried = carriedModelPauses.filter((id) => stillWaiting.some((w) => w.workItemId === id));
           const epoch: RuntimeEpoch = await registry.recordEpoch(
             {
               runId, fromManifestId: source.manifestId, toManifestId: to, snapshotId: snapshot.snapshotId,
               reconciliation: { examined: rec.examined, verified: rec.verified, notApplied: rec.notApplied, manualReview: rec.manualReview, stillPending: rec.stillPending, failed: rec.failed ?? [] },
               compatibility: checks, statusBefore: checkpoint.statusBefore, statusAfter: after.status, migratedBy: by, reason,
+              ...(carried.length > 0 ? { carriedModelPauses: carried } : {}),
             },
             tx,
           );
@@ -581,6 +849,7 @@ export function createReleaseService(deps: ReleaseServiceDeps): RuntimeReleaseSe
               eventFrom({ ...ctx, correlationId: epoch.epochId }, 'run.migrated', 'run', runId, {
                 runId, epochId: epoch.epochId, seq: epoch.seq, fromManifestId: source.manifestId, toManifestId: to, snapshotId: snapshot.snapshotId,
                 reconciliation: epoch.reconciliation, compatibility: checks, statusBefore: checkpoint.statusBefore, statusAfter: after.status, by, reason,
+                ...(carried.length > 0 ? { carriedModelPauses: carried } : {}),
               }),
             ],
             tx,
@@ -593,12 +862,15 @@ export function createReleaseService(deps: ReleaseServiceDeps): RuntimeReleaseSe
         pausedHere = false;
         deps.forgetPin(runId);
         let driven = false;
+        let driveProblem: string | undefined;
         if (input.drive === true && to === deps.manifest.manifestId && result.run.status === 'running') {
-          await deps.durable.startRun(runId);
-          driven = true;
+          const d = await driveMigrated(runId, result.epoch, source.manifestId, input.driveTimeoutMs ?? deps.driveTimeoutMs ?? DEFAULT_DRIVE_TIMEOUT_MS, signal);
+          driven = d.driven;
+          if (d.problem) driveProblem = d.problem;
         }
         logger.info('run migrated to another runtime release', { runId, from: source.manifestId, to, epochId: result.epoch.epochId, status: result.run.status, driven });
-        return { ...result, driven };
+        if (driveProblem) logger.warn('the migrated run is not driven by this runtime yet', { runId, problem: driveProblem });
+        return { ...result, driven, ...(driveProblem ? { driveProblem } : {}) };
       } catch (e) {
         // the checkpoint this migration took is released: the run continues where it was, on its own runtime
         if (pausedHere) {
@@ -646,6 +918,154 @@ export function createReleaseService(deps: ReleaseServiceDeps): RuntimeReleaseSe
 
     epochs(runId) {
       return registry.epochs(runId);
+    },
+
+    // ---------------------------------------------------------------------------------------------- (F[0]) stage gates
+
+    async recordEvalSuite(input) {
+      const by = actorOf(input?.by, 'record-suite');
+      const manifestId = await resolve(input.manifestId);
+      if (input.kind !== 'compatibility') throw new HypertestError('invalid_argument', `recordEvalSuite: an eval SuiteResult records a compatibility result (the release gate: recordReleaseGate), not ${String(input.kind)}`);
+      const doc = input.result as { suiteId?: unknown; revision?: unknown; trials?: unknown } | null;
+      if (!doc || typeof doc.suiteId !== 'string' || !Array.isArray(doc.trials)) throw new HypertestError('invalid_argument', 'recordEvalSuite: not an eval suite result (suiteId, trials)');
+      const trials = doc.trials as Array<{ result?: unknown }>;
+      const failed = trials.filter((t) => t?.result !== 'pass').length;
+      const { manifestIds, unbound } = evalTrialManifests(doc);
+      const bound = unbound.length === 0 && manifestIds.length === 1 && manifestIds[0] === manifestId;
+      const passed = trials.length > 0 && failed === 0;
+      if (passed && !bound) {
+        throw new HypertestError('precondition_failed', `the eval result does not certify ${manifestId}: ${unbound.length > 0 ? `trials without a recorded runtime manifest (${unbound.slice(0, 5).join(', ')})` : `its trials ran under ${manifestIds.join(', ') || 'no manifest'}`} — run the suite on this runtime (eval run --arms deployment) and record that result`, {
+          details: { manifestId, trialManifests: manifestIds, unbound },
+        });
+      }
+      const record: RecordSuiteInput = {
+        manifestId, kind: 'compatibility', suiteId: doc.suiteId, passed, by,
+        summary: { total: trials.length, failed, ...(input.detail ? { detail: input.detail } : {}) },
+        reportDigest: input.digest,
+        ...(typeof doc.revision === 'string' && doc.revision !== '' ? { suiteRevision: doc.revision } : {}),
+        ...(bound ? { binding: { kind: 'eval_trials' as const, manifestIds } } : {}),
+      };
+      return registry.recordSuiteResult(record);
+    },
+
+    async recordReleaseGate(input) {
+      const by = actorOf(input?.by, 'record-suite');
+      const manifestId = await resolve(input.manifestId);
+      const doc = input.candidate as { suiteId?: unknown; revision?: unknown; trials?: unknown } | null;
+      if (!doc || typeof doc.suiteId !== 'string' || !Array.isArray(doc.trials)) throw new HypertestError('invalid_argument', 'recordReleaseGate: the candidate is not an eval suite result (suiteId, trials)');
+      // F[13]: every runtime release runs the CORE eval — no other suite opens canary → active
+      if (doc.suiteId !== RELEASE_GATE_SUITE_ID) {
+        throw new HypertestError('precondition_failed', `the release gate runs the core eval: candidate suite ${JSON.stringify(doc.suiteId)} does not count (eval run ${RELEASE_GATE_SUITE_ID} …)`, { details: { suiteId: doc.suiteId } });
+      }
+      const report = input.report;
+      if (!report || typeof report.pass !== 'boolean' || report.suiteId !== doc.suiteId) throw new HypertestError('invalid_argument', 'recordReleaseGate: the gate report does not belong to the candidate (suiteId, pass)');
+      const { manifestIds, unbound } = evalTrialManifests(doc);
+      if (unbound.length > 0 || manifestIds.length !== 1 || manifestIds[0] !== manifestId) {
+        throw new HypertestError('precondition_failed', `the core eval candidate does not certify ${manifestId}: ${unbound.length > 0 ? `trials without a recorded runtime manifest (${unbound.slice(0, 5).join(', ')})` : `its trials ran under ${manifestIds.join(', ') || 'no manifest'}`} — run the core eval on this runtime (eval run core --arms deployment)`, {
+          details: { manifestId, trialManifests: manifestIds, unbound },
+        });
+      }
+      for (const [k, v] of [['candidateDigest', input.candidateDigest], ['baselineDigest', input.baselineDigest]] as const) {
+        if (typeof v !== 'string' || !/^[0-9a-f]{64}$/.test(v)) throw new HypertestError('invalid_argument', `recordReleaseGate: ${k} must be a sha256 hex digest`);
+      }
+      const trials = doc.trials as Array<{ result?: unknown }>;
+      const failedTrials = trials.filter((t) => t?.result !== 'pass').length;
+      const failedChecks = (report.checks ?? []).filter((c) => !c.pass).map((c) => c.checkId);
+      const passed = report.pass && trials.length > 0 && failedTrials === 0;
+      const detail = [failedTrials > 0 ? `${failedTrials} candidate trial(s) did not pass` : '', failedChecks.length > 0 ? `gate checks failed: ${failedChecks.join(', ')}` : ''].filter(Boolean).join('; ') || 'every check and trial passed';
+      return registry.recordSuiteResult({
+        manifestId, kind: 'release_gate', suiteId: doc.suiteId, passed, by,
+        ...(typeof doc.revision === 'string' && doc.revision !== '' ? { suiteRevision: doc.revision } : {}),
+        summary: { total: trials.length, failed: passed ? 0 : Math.max(1, failedTrials), detail },
+        reportDigest: sha256Hex(canonicalJson(report as unknown as JsonValue)),
+        binding: { kind: 'eval_gate', manifestIds, candidateDigest: input.candidateDigest, baselineDigest: input.baselineDigest },
+      });
+    },
+
+    async mirror(sourceRunId, input) {
+      const by = actorOf(input?.by, 'shadow');
+      if (!deps.startRun || !deps.decisions || !deps.durable.awaitCompletion) throw new HypertestError('unsupported', 'this instance cannot mirror runs (no run starter / decisions / durable completion)');
+      const manifestId = deps.manifest.manifestId;
+      const release = await registry.get(manifestId);
+      if (!release || release.state !== 'shadow' || release.rolledBack) {
+        throw new HypertestError('precondition_failed', `this runtime (${manifestId}) is ${release ? `a ${release.state}${release.rolledBack ? ' (rolled back)' : ''} release` : 'not a registered release'}: only a shadow release mirrors production runs`, {
+          details: { manifestId, state: release?.state ?? null },
+        });
+      }
+      const source = await runs.get(sourceRunId);
+      if (!source) throw new HypertestError('not_found', `run ${sourceRunId} not found`);
+      if (typeof source.labels?.[SHADOW_OF_LABEL] === 'string') throw new HypertestError('precondition_failed', `run ${sourceRunId} is itself a shadow run: mirror production runs only`);
+      if (source.runtimeManifestId === manifestId) throw new HypertestError('precondition_failed', `run ${sourceRunId} ran on this shadow release: mirror runs of the production (active) release`);
+      if (!isTerminalRun(source.status)) throw new HypertestError('precondition_failed', `run ${sourceRunId} is ${source.status}: mirror a finished production run (its decision is the reference)`, { details: { runId: sourceRunId, status: source.status } });
+      const existing = (await registry.shadowComparisons(manifestId)).find((c) => c.sourceRunId === sourceRunId);
+      if (existing) return { comparison: existing, shadowRunId: existing.shadowRunId, created: false };
+      const id = shadowRunId(sourceRunId, manifestId);
+      let shadow = await runs.get(id);
+      if (!shadow) {
+        shadow = await deps.startRun({
+          runId: id, goal: source.goal, target: source.target, budget: { ...source.budget },
+          labels: { ...source.labels, [SHADOW_OF_LABEL]: sourceRunId, 'hypertest.shadow_manifest': manifestId },
+          ...(Object.keys(source.oracleRevisions).length > 0 ? { oracleIds: Object.keys(source.oracleRevisions).sort() } : {}),
+        });
+      } else if (!isTerminalRun(shadow.status)) {
+        await deps.durable.startRun(id); // a mirror interrupted by a restart continues
+      }
+      const timeoutMs = input.timeoutMs ?? deps.shadow?.timeoutMs ?? DEFAULT_SHADOW_TIMEOUT_MS;
+      let timedOut = false;
+      try {
+        await deps.durable.awaitCompletion(id, { timeoutMs });
+      } catch (e) {
+        if (!isHypertestError(e, 'timeout')) throw e;
+        timedOut = true;
+        await deps.durable.signal?.(id, { type: 'cancel', reason: `shadow mirror did not finish within ${timeoutMs} ms` }).catch(() => undefined);
+      }
+      const shadowNow = (await runs.get(id))!;
+      const decisionOf = async (r: TestRun) => (r.decisionId ? deps.decisions!.get(r.decisionId) : undefined);
+      const sourceDecision = await decisionOf(source);
+      const shadowDecision = await decisionOf(shadowNow);
+      const divergences = shadowDivergences({ run: source, ...(sourceDecision ? { decision: sourceDecision } : {}) }, { run: shadowNow, ...(shadowDecision ? { decision: shadowDecision } : {}) });
+      if (timedOut) divergences.unshift(`the shadow run did not finish within ${timeoutMs} ms (cancelled)`);
+      const comparison = await registry.recordShadowComparison({
+        manifestId, sourceRunId, sourceManifestId: source.runtimeManifestId, shadowRunId: id,
+        sourceVerdict: sourceDecision?.verdict ?? null, shadowVerdict: shadowDecision?.verdict ?? null, divergences, recordedBy: by,
+      });
+      logger.info('production run mirrored on the shadow release', { sourceRunId, shadowRunId: id, diverged: comparison.diverged });
+      return { comparison, shadowRunId: id, created: true };
+    },
+
+    async shadowCandidates(input = {}) {
+      const manifestId = deps.manifest.manifestId;
+      const pointer = await registry.activePointer();
+      if (!pointer) return [];
+      const mirrored = new Set((await registry.shadowComparisons(manifestId)).map((c) => c.sourceRunId));
+      const selection = deps.shadow ?? {};
+      const hasSelection = (selection.percentage ?? 0) > 0 || Object.keys(selection.labels ?? {}).length > 0;
+      const finished = await runs.list({ status: ['completed', 'failed', 'cancelled'] });
+      return finished
+        .filter((r) => r.runtimeManifestId === pointer.manifestId && typeof r.labels?.[SHADOW_OF_LABEL] !== 'string' && !mirrored.has(r.runId) && r.decisionId !== undefined)
+        .filter((r) => !hasSelection || canarySelects({ ...(selection.percentage !== undefined ? { percentage: selection.percentage } : {}), ...(selection.labels ? { labels: selection.labels } : {}) }, { runId: r.runId, labels: r.labels }))
+        .sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0))
+        .slice(0, input.limit ?? 10)
+        .map((r) => r.runId);
+    },
+
+    async recordProductionReplay(input) {
+      const by = actorOf(input?.by, 'record-suite');
+      const manifestId = await resolve(input.manifestId ?? 'current');
+      const comparisons: ShadowComparison[] = await registry.shadowComparisons(manifestId);
+      const minRuns = input.minRuns ?? deps.shadow?.minRuns ?? 1;
+      if (!Number.isSafeInteger(minRuns) || minRuns < 1) throw new HypertestError('invalid_argument', 'production replay: minRuns must be an integer ≥ 1');
+      // fail closed: one diverging mirrored run fails the production replay (a divergence is explained by a fix, not a quota)
+      const diverged = comparisons.filter((c) => c.diverged).length;
+      const passed = comparisons.length >= minRuns && diverged === 0;
+      const detail = comparisons.length < minRuns
+        ? `${comparisons.length} mirrored run(s), ${minRuns} required (hypertest runtime shadow on the shadow release)`
+        : `${diverged}/${comparisons.length} mirrored run(s) diverged${diverged > 0 ? `: ${comparisons.filter((c) => c.diverged).slice(0, 3).map((c) => `${c.sourceRunId} ${c.divergences.join(', ')}`).join('; ')}` : ''}`;
+      return registry.recordSuiteResult({
+        manifestId, kind: 'production_replay', suiteId: 'shadow-mirror', passed, by,
+        summary: { total: comparisons.length, failed: diverged, detail: detail.slice(0, 2000) },
+        binding: { kind: 'shadow_comparisons', comparisonIds: comparisons.map((c) => c.comparisonId) },
+      });
     },
   };
   return service;

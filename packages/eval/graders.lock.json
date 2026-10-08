@@ -1,5 +1,9 @@
 {
   "graders": {
+    "anomalyReaction": {
+      "fingerprint": "6f125f7ae73277e8f9d77820a3adcc40197dbdb4e8aef237c87e45a909c07eca",
+      "revision": "1"
+    },
     "auditReconstruction": {
       "fingerprint": "387fd015f294b62f73b61261e6241b2c42a1e770318d47812b8fcbb5d6a6d429",
       "revision": "1"
@@ -94,6 +98,10 @@
     },
     "policyViolation": {
       "fingerprint": "6fb9c6d70e71cbd673247936b3c92f14906f1d11780cd1a78a397f3f1b506ad1",
+      "revision": "1"
+    },
+    "rcaMetricsExecutorParallel": {
+      "fingerprint": "78de0b1cc7f9980ea751e3f846e9065b4f2f0518a0357f869fd76ffdf4b9addb",
       "revision": "1"
     },
     "recoveryAudit": {

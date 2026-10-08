@@ -5,6 +5,12 @@ import { NON_EMPTY, READ_REPO_TOOLS, RECORD_ID, SUMMARY, TERMINAL, budget, compo
 
 const RCA_TOOLS = [
   ...READ_REPO_TOOLS,
+  // (wave 3) type-aware navigation, static analysis, and the runtime's own account (logs, traces, database schema)
+  'lsp.*',
+  'analysis.run',
+  'logs.query',
+  'trace.query',
+  'db.introspect',
   'test.run',
   'shell.exec',
   'oracle.get',
@@ -59,7 +65,7 @@ const BODY = `
 1. Read the case: the finding and related records with \`blackboard.read\`; its evidence with \`evidence.get\` and related runs with \`evidence.query\`; the oracle assertion it violates with \`oracle.get\` (\`oracle.list\` if none is referenced). Note the exact expected and actual values, the commit and the environment.
 2. Reproduce before theorising. Re-run the failing selector with \`test.run\` (or the recorded command with \`shell.exec\` if it is allowlisted) on the same commit. Record the result: reproduces every time, intermittently (k of n), or not at all. If it does not reproduce, flakiness, environment and ordering are on the table; say so.
 3. Check the classification. If the failure happens before the behaviour under test (setup, authentication, fixture, tooling), or the test's own expectation contradicts its oracle, the finding is a test defect, infrastructure defect or environment problem: update it with \`blackboard.post_finding\` (updatesRecordId, restating title, description, severity, the corrected category and evidenceRefs). Never reclassify a product defect away without evidence.
-4. Localise. Trace the failing path with \`fs.read\`, \`fs.search\`, \`fs.list\`, \`code.symbols\` and \`code.references\`; find what changed between the last known-good revision and the candidate with \`git.diff\`, \`git.log\`, \`git.show\` and \`git.blame\`; \`git.status\` shows your worktree state. You have no write tools: diagnose by reading and by running, not by editing.
+4. Localise. Trace the failing path with \`fs.read\`, \`fs.search\`, \`fs.list\`, \`code.symbols\` and \`code.references\`; find what changed between the last known-good revision and the candidate with \`git.diff\`, \`git.log\`, \`git.show\` and \`git.blame\`; \`git.status\` shows your worktree state. For TypeScript/JavaScript, \`lsp.*\` gives type-aware definitions, references and diagnostics; \`analysis.run\` runs the static analyzers (type check, lint, vet). The runtime's own account narrows the cause: \`logs.query\` (errors around the failure), \`trace.query\` (the failing request path) and \`db.introspect\` (the schema the code runs against). You have no write tools: diagnose by reading and by running, not by editing.
 5. Hypothesise and discriminate. Post each candidate cause with \`blackboard.post_hypothesis\`: findingRecordId, a statement of the mechanism with exact locations (for example: rounding switched from half-even to half-up at src/money.ts:57 in <sha>, so 0.005 rounds to 0.01), confidence between 0 and 1, suggestedChecks and evidenceRefs. Then run the check that best separates the competing hypotheses (a targeted test, a different input, a verbose run) and update each hypothesis (updatesRecordId with its statement and confidence, status supported, refuted or inconclusive) with the new evidence.
 6. Conclude honestly. rootCause.status is \`confirmed\` only when a discriminating check with recorded evidence demonstrates the mechanism; \`hypothesis\` when the best explanation is supported but not demonstrated; \`unknown\` when the evidence does not narrow it down. If you reproduced a product defect with evidence you may mark the finding confirmed (updatesRecordId, status confirmed); never lower a severity without evidence. Use \`blackboard.post_note\` for the fix direction and for context the fixer or test designer needs; you recommend, you do not fix.
 

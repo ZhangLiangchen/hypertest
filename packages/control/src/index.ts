@@ -41,7 +41,7 @@ export {
   type ActionDescription, type AfterActionInput, type AfterActionOutcome, type PhaseGovernor, type TransitionInput,
 } from './phases.ts';
 export {
-  BASELINE_EFFECTS, CAPABILITY_REQUIREMENT_SCHEMA, ENVIRONMENT_FREE_NAMESPACES, addressesEnvironments, describeUnmet, requirementProblems, unmetRequirements, workItemConstraint,
+  BASELINE_EFFECTS, CAPABILITY_REQUIREMENT_SCHEMA, ENVIRONMENT_FREE_NAMESPACES, addressesEnvironments, describeUnmet, requirementProblems, toolGrantScopes, unmetRequirements, workItemConstraint,
   type UnmetRequirement,
 } from './capability-grant.ts';
 export {

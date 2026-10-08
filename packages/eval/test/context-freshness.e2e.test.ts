@@ -67,7 +67,7 @@ test('context-freshness: a restart between observation and write ⇒ stale_conte
   assert.equal(trial.graderRevisions?.['freshnessGuarded'], '1');
   assert.match(trial.graderRevisions?.['llmRubric'] ?? '', /^1\/verdict-consistency@1\/judge\[eval-judge-scripted=eval-judge\/eval-judge-scripted-1\]@mc_/);
   assert.match(trial.trialKey ?? '', /^tk_[0-9a-f]{32}$/);
-  assert.deepEqual([trial.suiteId, trial.suiteRevision, trial.oracleRevisions], ['context-freshness', 'core-1', { 'kv-release-marker': 1 }]);
+  assert.deepEqual([trial.suiteId, trial.suiteRevision, trial.oracleRevisions], ['context-freshness', 'core-2', { 'kv-release-marker': 1 }]);
   assert.match(trial.harness ?? '', /^hypertest-eval@h\d+\/in-process$/);
 
   // the persisted result is the release gate's input: like-for-like passes; a security violation fails it

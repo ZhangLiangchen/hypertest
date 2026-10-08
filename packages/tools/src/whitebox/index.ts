@@ -1,16 +1,17 @@
 // White-box tools, runtime, registry, workspaces, sandbox (owned by the tools-core implementer).
 export { ToolRegistry, toolIdToName, toolNameToId, assertValidToolId } from './registry.ts';
-export { createToolRuntime, evidenceExperimentId, redactSecrets, utf8Head, utf8Tail, DEFAULT_MAX_INLINE_BYTES, SECRET_KEY_PATTERN, REDACTED, SIDE_EFFECT_SETTLE_MS } from './runtime.ts';
+export { createToolRuntime, evidenceExperimentId, redactSecrets, utf8Head, utf8Tail, DEFAULT_MAX_INLINE_BYTES, INCONCLUSIVE_EVIDENCE_TYPE, isolatedWorkspace, SECRET_KEY_PATTERN, REDACTED, SIDE_EFFECT_SETTLE_MS } from './runtime.ts';
 export { UsageMeter, currentMeter, meteredArtifacts, meteredSandbox, runMetered } from './usage-meter.ts';
 export { createEnvironmentRegistry } from './environments.ts';
 export { createSqlEnvironmentRegistry, toolsMigrations } from './sql-environments.ts';
 export { RECORD_EFFECT_ADAPTER_ID, RECORD_EFFECT_RESENDABLE_ADAPTER_ID, bindRecordEffect, recordEffectAdapters, type RecordedToolOutcome } from './record-effects.ts';
 export { createWorkspaceManager, workspaceIdFor } from './workspaces.ts';
 export { confineExisting, normalizeRel, workspaceResource } from './paths.ts';
+export { routedSandbox, egressAllowlist, withResourceLimits } from './sandbox.ts';
 export { createLocalSandbox, createOciSandbox, buildDockerArgs, dockerNetwork, dockerCliEnv, dockerContainerEnv, allowlistedEnv, sandboxCwd, loopbackEndpoints, loopbackEndpointPolicies, SANDBOX_BASE_ENV, SANDBOX_MARKER_ENV, DOCKER_CLI_ENV_KEYS } from './sandbox.ts';
 export {
   EGRESS_OPERATION_HEADER, MAX_EGRESS_BODY_BYTES, METHOD_OVERRIDE_HEADERS, SAFE_EGRESS_METHODS, SANDBOX_HTTP_OPERATION, createEgressHttpServer, currentEgressContext, effectiveMethod, egressResource,
-  runWithEgressContext, type EgressCallContext, type EgressWrite,
+  runWithEgressContext, MAX_CAPTURED_EXCHANGES, type CapturedExchange, type EgressCallContext, type EgressWrite,
 } from './egress-relay.ts';
 export { networkIsolation, probeNetworkIsolation, resolveProgram, type IsolationSpec, type NetworkIsolation, type NetworkIsolationOptions } from './netns.ts';
 export { argumentPathDenial, argumentPathTokens } from './argv-guard.ts';
@@ -30,3 +31,5 @@ export { assertNotGitMetadata } from './tools/common.ts';
 export { selectRunner, TEST_FILE_PATTERNS, isTestFilePath, workspaceDelta } from './tools/testing.ts';
 export { extractSymbols, type SymbolHit, type SymbolKind } from './tools/code.ts';
 export { builtinTools, whiteboxTools } from './builtin.ts';
+export { lspDefinitionsTool, lspReferencesTool, lspDiagnosticsTool, openTsProject, projectDiagnostics, loadTypeScript, type TsProject, type TsDiagnostic } from './tools/lsp.ts';
+export { analysisRunTool, ANALYZERS, type AnalyzerName, type AnalyzerRun, type StaticFinding } from './tools/analysis.ts';

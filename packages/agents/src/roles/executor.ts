@@ -15,6 +15,12 @@ const EXECUTOR_TOOLS = [
   'metrics.*',
   'load.*',
   'browser.*',
+  // (wave 3) gRPC endpoints, environment logs / traces / packet capture, the environment database's schema
+  'grpc.*',
+  'logs.query',
+  'trace.query',
+  'net.capture',
+  'db.introspect',
   'experiment.define',
   'experiment.stop',
   'blackboard.read',
@@ -69,7 +75,8 @@ const BODY = `
 
 ## Running
 - White-box: \`test.run\` with the registered runner and selector, unchanged. Never narrow the selection, change timeouts, add retries or alter environment variables unless the specification says so. \`shell.exec\` only for the allowlisted build or setup commands the specification names. \`coverage.collect\` when coverage evidence is required.
-- Black-box HTTP: \`http.request\` with the exact method, path, headers and body from the specification; compare the exact status and body with the oracle.
+- Black-box HTTP: \`http.request\` with the exact method, path, headers and body from the specification; compare the exact status and body with the oracle. gRPC: \`grpc.*\` (describe, call; declared read-only methods via grpc.query).
+- Observation: \`logs.query\`, \`trace.query\`, \`net.capture\` (pcap) and \`db.introspect\` (schema, read-only) explain failures, never replace the oracle's check; captureNetwork on test.run / shell.exec records every HTTP exchange.
 - Experiments: Every write to an environment, load run and fault injection (\`http.request\` with a mutating method, \`browser.click\`/\`browser.fill\`, \`load.start\`, environment restarts and faults) runs only for an ACTIVE experiment of your work item — one your inputs declare (kind experiment) or one you define with \`experiment.define\` (hypothesis, environment, workload / fault plan, stop conditions, evidence requirements, budget); without one the call is refused (experiment_required). Stay inside its fault plan and workload; once a stop condition is met (or you call \`experiment.stop\`) or its budget is spent, its actions are refused.
 - Load and performance: only under a defined experiment. \`load.start\` with the specified rate, duration and concurrency; \`load.observe\` until the stop condition; always \`load.stop\` what you started, including after errors. Query the metrics the oracle names for the exact experiment window with \`metrics.query\` (or \`metrics.scrape\` for a raw exposition endpoint).
 - UI: \`browser.navigate\`, \`browser.fill\` and \`browser.click\`, then \`browser.text\` and \`browser.screenshot\` as evidence of the observed state.

@@ -164,7 +164,16 @@ test('host allowlist: non-loopback host without allowlist is denied before any r
 });
 
 test('host allowlist: loopback is allowed only for environment class local', async () => {
-  const envs = createEnvironmentRegistry([{ environmentId: 'env_stage', environmentClass: 'staging', generation: 1, baseUrl: server.url }]);
+  // (e2e[0]) a URL on the origin of exactly ONE registered environment is a call on that environment (its resource, class
+  // and trusted origins — governed by the capability like the environmentId form); a loopback origin whose owner is
+  // ambiguous (environments of different classes) has no class: refused unless allowlisted
+  const owned = createEnvironmentRegistry([{ environmentId: 'env_stage', environmentClass: 'staging', generation: 1, baseUrl: server.url }]);
+  assert.deepEqual(tool.resources({ method: 'GET', url: `${server.url}/ok` }, { workspace: fakeContext().ctx.workspace, runId: 'run_bb', environments: owned }), ['env/env_stage']);
+  assert.equal(tool.environmentClass!({ method: 'GET', url: `${server.url}/ok` }, { environments: owned }), 'staging');
+  const envs = createEnvironmentRegistry([
+    { environmentId: 'env_stage', environmentClass: 'staging', generation: 1, baseUrl: server.url },
+    { environmentId: 'env_dev', environmentClass: 'local', generation: 1, baseUrl: `${server.url}/dev` },
+  ]);
   const { ctx } = fakeContext({ environments: envs });
   const before = server.requests.length;
   const denied = await tool.execute({ method: 'GET', url: `${server.url}/ok` }, ctx);
