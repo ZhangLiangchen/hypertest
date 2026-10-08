@@ -83,3 +83,16 @@ export function parseModelWaitOperationId(operationId: string): string | undefin
 export function isModelPaused(item: Pick<WorkItem, 'state' | 'waitingOn'>): boolean {
   return item.state === 'waiting' && item.waitingOn.some((op) => parseModelWaitOperationId(op) !== undefined);
 }
+
+/**
+ * (additive) A work item whose model call the RUN budget refused under `onBudgetExhausted: 'pause'` waits on
+ * `budget:<runId>` (not an operation of the ledger): it resumes when the run is resumed with room for the call.
+ */
+export function budgetWaitOperationId(runId: string): string {
+  return `budget:${runId}`;
+}
+
+/** A work item paused because the run budget refused its agent's model call. */
+export function isBudgetPaused(item: Pick<WorkItem, 'state' | 'waitingOn'>): boolean {
+  return item.state === 'waiting' && item.waitingOn.some((op) => op.startsWith('budget:'));
+}

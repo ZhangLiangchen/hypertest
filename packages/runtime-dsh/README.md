@@ -129,7 +129,10 @@ replay registers exactly the tools the recorded response calls and never consult
 (only `dispatch` and `isParallelSafe`).
 
 **Resume.** `resumeChild` validates everything `runTurn` would refuse before it reactivates an `interrupted` or
-`waiting` session: the session and the ref must be `dsh`, and the limits valid.
+`waiting` session: the session and the ref must be `dsh`, and the limits valid. (A[4]) It reactivates `interrupted`, `waiting` and
+`completed` sessions (a continuable child's next task) and refuses `failed` / `disposed` ones (`precondition_failed`);
+the control plane resumes continuable children through it, and the shared contract suite covers it ("resumeChild
+(A[4])").
 
 **Abort / interrupt.** Identical to NativeEngine:
 - A result arriving while aborting is not settled, and later calls are not dispatched.
@@ -202,6 +205,9 @@ None of this reaches a model, because the host context is what the model sees.
 This is a new package. It adds the `DshEngineDeps` type (= `NativeEngineDeps`) and the exports `DshEngine` (with the
 additive `adapterVersion`, `close()` and `liveDshSessions()`), `DSH_ENGINE_KIND`, `DSH_AGENT_VERSION`,
 `SUPPORTED_DSH_VERSION`, `DSH_PINS` and `RUNTIME_DSH_PACKAGE_VERSION`. The ABI of `@hypertest/runtime` is unchanged.
+
+(unit model-runtime, wave 1; behaviour) `resumeChild` also reactivates a `completed` session and refuses `failed` /
+`disposed` sessions with `precondition_failed`; no type changes.
 
 ## Testing
 

@@ -2,7 +2,8 @@ import { HypertestError, type JsonValue } from '@hypertest/core';
 import { EVENT_TYPES, RISK_ORDER, eventFrom, type ActionCapability, type AgentInstance, type EventContext } from '@hypertest/domain';
 import { resourcePatternCovers, toolPatternCovers, verifyCapability } from '@hypertest/policy';
 import type { CreateSessionRequest, EngineSessionRef, SpawnRequest, SubagentDeps, SubagentResult, SubagentRuntime } from './contracts.ts';
-import { selectAgent } from './agents.ts';
+import { SETTLED_TURN_STATUSES, selectAgent, setResumePending } from './agents.ts';
+import { childModes } from './capabilities.ts';
 import { validateBudget } from './runner.ts';
 import { assertNonEmpty, jsonParam, parseJson, sameJson } from './util.ts';
 
@@ -173,6 +174,9 @@ export function createSubagentRuntime(deps: SubagentDeps): SubagentRuntime {
       }
       const engineKind = request.engineKind ?? deps.defaultEngineKind;
       const engine = engines.get(engineKind);
+      // A[4]: the engine's capabilities choose how the child exists — what it lacks is emulated by the host, what cannot
+      // be emulated is refused (precondition_failed, before anything is created)
+      const modes = childModes(engine, { continuable: request.continuable === true, background: request.background === true });
 
       const agent = await db.transaction(async (tx) => {
         // I12: agent-count cap, serialized per run so concurrent spawns cannot overshoot it.
@@ -220,6 +224,7 @@ export function createSubagentRuntime(deps: SubagentDeps): SubagentRuntime {
           continuable: created.continuable,
           background: created.background,
           budget: request.budget,
+          modes,
         }, tx);
         return created;
       });
@@ -234,17 +239,29 @@ export function createSubagentRuntime(deps: SubagentDeps): SubagentRuntime {
         if (agent.status === 'active') return agent;
         if (agent.status === 'disposed' || agent.status === 'failed') throw new HypertestError('precondition_failed', `agent ${agentId} is ${agent.status} and cannot be resumed`);
         if (agent.status === 'completed' && !agent.continuable) throw new HypertestError('precondition_failed', `agent ${agentId} is completed and not continuable`);
-        // One transaction: the session and the agent are reactivated together, and the previous settled result is
-        // cleared — the continuation settles a NEW result (collect never returns the stale one as current).
-        await sessions.setStatus(agent.sessionId, 'active');
+        // One transaction: the agent is reactivated, and the previous settled result is cleared — the continuation
+        // settles a NEW result (collect never returns the stale one as current). A[4]: an engine with continuable
+        // children reactivates its child session itself (engine.resumeChild at the agent's next step: resume_pending);
+        // for an engine without them the host emulates it (the session is reactivated here).
+        const engine = engines.get(agent.engineKind);
+        const viaEngine = engine.capabilities?.continuableChild === true && typeof engine.resumeChild === 'function';
+        if (!viaEngine) await sessions.setStatus(agent.sessionId, 'active');
         await tx.query(`UPDATE ht_agents SET result = NULL WHERE agent_id = $1`, [agentId]);
+        // the session's last SETTLED turn now (an interrupted turn left mid-dispatch is not: the resume replays it): a
+        // settled turn after it means the engine took the resume over (crash recovery, see the runner's pendingResume)
+        let afterTurn: number | undefined;
+        if (viaEngine) {
+          const last = await sessions.lastTurn(agent.sessionId);
+          afterTurn = last === undefined ? 0 : SETTLED_TURN_STATUSES.has(last.status) ? last.turn : Math.max(0, last.turn - 1);
+        }
+        await setResumePending(tx, agentId, viaEngine, afterTurn);
         const resumed = await agents.update(agentId, { status: 'active' });
         // (I10) the reactivation (e.g. a continuable child resumed for its parent's follow-up) is on L0 with the state change
         await emit(
           { runId: agent.runId, correlationId: agent.workItemId, actorId: 'system:runtime', workItemId: agent.workItemId },
           EVENT_TYPES.agentResumed,
           resumed,
-          { agentId, from: agent.status, continuable: agent.continuable, background: agent.background, sessionId: agent.sessionId },
+          { agentId, from: agent.status, continuable: agent.continuable, background: agent.background, sessionId: agent.sessionId, via: viaEngine ? 'engine.resumeChild' : 'host_emulated' },
           tx,
         );
         return resumed;
@@ -255,6 +272,10 @@ export function createSubagentRuntime(deps: SubagentDeps): SubagentRuntime {
       const agent = await mustGet(agentId);
       if (agent.status === 'disposed' || agent.status === 'failed' || (agent.status === 'completed' && !agent.continuable)) {
         throw new HypertestError('precondition_failed', `agent ${agentId} is ${agent.status}; it cannot receive messages`);
+      }
+      // A[4]: queued input reaches the model only through an engine that drains the session inbox (peerMessaging)
+      if (engines.get(agent.engineKind).capabilities?.peerMessaging === false) {
+        throw new HypertestError('precondition_failed', `agent ${agentId} runs on engine ${agent.engineKind}, which cannot receive messages (peerMessaging: false)`);
       }
       await sessions.enqueueInput(agent.sessionId, [message]);
     },

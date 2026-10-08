@@ -71,10 +71,29 @@ export function manifestContent(input: ManifestContent): ManifestContent {
     assertText(input.protocol.version, 'protocol.version');
     assertText(input.protocol.digest, 'protocol.digest');
   }
+  if (input.modelScores !== undefined) {
+    // coverage[7]: the eval-derived scores a run is routed with are pinned with it (I11)
+    assertMatch(input.modelScores?.digest, /^[0-9a-f]{64}$/, 'modelScores.digest', 'a sha256 (64 lowercase hex)');
+    if (!Array.isArray(input.modelScores.routes)) throw new HypertestError('invalid_argument', 'runtime manifest: modelScores.routes must be an array');
+    input.modelScores.routes.forEach((r, i) => assertText(r, `modelScores.routes[${i}]`));
+  }
+  if (input.plugins !== undefined) {
+    // A[6]: every kernel plugin is pinned by its digest
+    if (!Array.isArray(input.plugins)) throw new HypertestError('invalid_argument', 'runtime manifest: plugins must be an array');
+    input.plugins.forEach((p, i) => {
+      assertText(p?.id, `plugins[${i}].id`);
+      assertText(p.version, `plugins[${i}].version`);
+      assertText(p.kind, `plugins[${i}].kind`);
+      assertMatch(p.digest, /^sha256:[0-9a-f]{64}$/, `plugins[${i}].digest`, 'sha256:<64 lowercase hex>');
+      if (!Array.isArray(p.capabilities)) throw new HypertestError('invalid_argument', `runtime manifest: plugins[${i}].capabilities must be an array`);
+    });
+  }
   const { manifestId: _id, createdAt: _at, ...rest } = input as ManifestContent & { manifestId?: unknown; createdAt?: unknown };
   const copy = jsonClone(rest) as ManifestContent;
   copy.agentEngines = byCanonical(copy.agentEngines);
   copy.providerAdapters = byCanonical(copy.providerAdapters);
+  if (copy.modelScores) copy.modelScores.routes = [...copy.modelScores.routes].sort();
+  if (copy.plugins) copy.plugins = byCanonical(copy.plugins.map((p) => ({ ...p, capabilities: [...p.capabilities].sort() })));
   return copy;
 }
 

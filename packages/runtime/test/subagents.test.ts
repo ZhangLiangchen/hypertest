@@ -5,7 +5,7 @@ import { InMemoryEventSink, type ActionCapability, type ChatMessage, type EventC
 import { attenuateCapability, createRootCapability } from '@hypertest/policy';
 import { createTestDatabase } from '@hypertest/store';
 import {
-  EngineRegistry, FakeDispatcher, FakeModelInvoker, NativeEngine, createAgentRepository, createSessionStore, createSubagentRuntime, fakeHost, runtimeMigrations,
+  EngineRegistry, FakeDispatcher, FakeModelInvoker, NativeEngine, createAgentRepository, createSessionStore, createSubagentRuntime, fakeHost, resumePending, runtimeMigrations,
   type AgentRepository, type SessionStore, type SpawnRequest, type SubagentRuntime,
 } from '../src/index.ts';
 import { baseDeps, faultyDb } from './helpers.ts';
@@ -111,6 +111,7 @@ describe('SubagentRuntime', () => {
       agentId: child.agentId, role: 'executor', workItemId: 'wi_c', parentAgentId: root.agentId, depth: 1, engineKind: 'native', sessionId: child.sessionId,
       capabilityId: child.capabilityId, contextSnapshotId: 'cs_1', continuable: false, background: false,
       budget: { maxTurns: 5, maxTokens: 10_000, maxToolCalls: 10, maxWallClockMs: 60_000 },
+      modes: { continuable: null, background: null },
     });
     assert.equal(spawned[1]!.agentId, child.agentId);
     assert.equal(spawned[1]!.correlationId, `corr_${runId}`);
@@ -262,9 +263,11 @@ describe('SubagentRuntime', () => {
     // interrupting again is a no-op
     await subagents.interrupt(root.agentId, 'again', ctx(runId));
     assert.equal(deps.events.events.slice(before).filter((e) => e.eventType === 'agent.interrupted').length, 3);
-    // resume reactivates one agent (not the subtree)
+    // resume reactivates one agent (not the subtree); A[4]: its ENGINE reactivates the session (engine.resumeChild at the
+    // agent's next step — the native engine has continuable children), the host only marks the resume pending
     assert.equal((await subagents.resume(child.agentId)).status, 'active');
-    assert.equal((await sessions.get(child.sessionId))?.status, 'active');
+    assert.equal((await sessions.get(child.sessionId))?.status, 'interrupted', 'not reactivated behind the engine\'s back');
+    assert.equal(await resumePending(db, child.agentId), true);
     assert.equal((await agents.get(grandchild.agentId))?.status, 'interrupted');
   });
 
@@ -407,7 +410,9 @@ describe('SubagentRuntime', () => {
     assert.equal((await rt.resume(child.agentId)).status, 'active', 'resuming an active agent is a no-op');
     const resumed = sink.events.filter((e) => e.eventType === 'agent.resumed' && e.aggregateId === child.agentId);
     assert.equal(resumed.length, 1);
-    assert.deepEqual(resumed[0]!.payload, { agentId: child.agentId, from: 'completed', continuable: true, background: true, sessionId: child.sessionId });
+    assert.deepEqual(resumed[0]!.payload, { agentId: child.agentId, from: 'completed', continuable: true, background: true, sessionId: child.sessionId, via: 'engine.resumeChild' });
+    // A[4]: the engine's capabilities chose the child's modes (native continuable children; background emulated by the host)
+    assert.deepEqual((spawned.payload as { modes: unknown }).modes, { continuable: 'engine', background: 'host_emulated' });
     assert.deepEqual([resumed[0]!.workItemId, resumed[0]!.agentId, resumed[0]!.runId], ['wi_bg', child.agentId, runId]);
     // depth/count caps are unchanged for background children: depth 2 under a maxDepth-1 cap is refused
     await assert.rejects(

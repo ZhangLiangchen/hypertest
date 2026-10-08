@@ -2,13 +2,13 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { HypertestError, isHypertestError, type JsonValue } from '@hypertest/core';
 import {
-  EVENT_TYPES, isTerminalWorkState, type ActionCapability, type AgentInstance, type ChatMessage, type EventContext, type ModelPolicy, type PermissionProfile, type TestRun,
+  EVENT_TYPES, estimateTokens, isTerminalWorkState, type ActionCapability, type AgentInstance, type ChatMessage, type EventContext, type ModelPolicy, type PermissionProfile, type TestRun,
   type WorkItem, type WorkResult,
 } from '@hypertest/domain';
 import {
   PERMISSION_PROFILES, attenuateCapability, createRootCapability, intersectPatterns, resourcePatternCovers, signCapability, type CapabilityConstraints, type PermissionProfileName,
 } from '@hypertest/policy';
-import { createModelInvoker, type EngineHost, type ModelInvocation, type ModelInvoker, type ModelPause, type SpawnRequest } from '@hypertest/runtime';
+import { createModelInvoker, createTokenCalibration, type EngineHost, type ModelBudgetRefusal, type ModelInvocation, type ModelInvoker, type ModelPause, type SpawnRequest } from '@hypertest/runtime';
 import type { RoleDefinition } from '@hypertest/agents';
 import type { WorkspaceHandle } from '@hypertest/tools';
 import type { ExecuteTurnOptions, TurnOutcome } from './contracts.ts';
@@ -19,7 +19,8 @@ import { createToolDispatcher, offeredRisk } from './dispatcher.ts';
 import { createPhaseGovernor } from './phases.ts';
 import { describeUnmet, unmetRequirements, workItemConstraint, type UnmetRequirement } from './capability-grant.ts';
 import {
-  delegationChatMessage, delegationSettled, inputWaitOperationId, isAwaitingInput, isModelPaused, modelWaitOperationId, parseDelegationOperationId, unreadMessages,
+  budgetWaitOperationId, delegationChatMessage, delegationSettled, inputWaitOperationId, isAwaitingInput, isBudgetPaused, isModelPaused, modelWaitOperationId, parseDelegationOperationId,
+  unreadMessages,
 } from './delegation.ts';
 import { workLeaseKey, yieldWorkClaim } from './scheduler.ts';
 import { runExperimentIds } from './isolation.ts';
@@ -85,6 +86,13 @@ export interface AgentWorkerHooks {
   onClaim?(workItemId: string, fencingToken: number): void;
 }
 
+/** (A[6]) Characters of one plugin context-hook section that reach the model (bounded, I9). */
+export const CONTEXT_HOOK_MAX_CHARS = 4000;
+/** Budget-aware condensation never shrinks the working view below this (the turn would lose its recent work). */
+export const MIN_BUDGET_VIEW_TOKENS = 2000;
+/** Sessions whose prompt overhead the worker remembers for the budget-relative view cap (oldest dropped first). */
+const MAX_TRACKED_SESSIONS = 4096;
+
 /** Spawn refusals that are final for the work item (retrying the same spawn fails the same way). */
 const FINAL_SPAWN_ERRORS: ReadonlySet<string> = new Set(['budget_exhausted', 'permission_denied', 'precondition_failed', 'invalid_argument', 'not_found']);
 
@@ -98,6 +106,10 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
   const phases = createPhaseGovernor(deps, config);
   /** (A[0]) The last model invocation of each session's current turn (its exact failure reason / pause), read once. */
   const lastInvocations = new Map<string, ModelInvocation>();
+  /** The token estimator measured against provider-reported usage, per route, for every agent of this worker process. */
+  const calibration = createTokenCalibration();
+  /** Per session: the prompt/tool overhead (tokens beyond the working view) of its last assembly (budget-relative view cap). */
+  const budgetOverheads = new Map<string, number>();
 
   /** (A[3] cost switch) The tightest USD budget left for an item's model calls (run and work scopes with a cost limit). */
   async function costPressure(runId: string, workItemId: string): Promise<{ remainingUsd: number; limitUsd: number } | undefined> {
@@ -396,6 +408,7 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
       costBudgeted,
       ...(costBudgeted ? { costPressure: () => costPressure(run.runId, item.workItemId) } : {}),
       providerSwitch: engineCaps?.providerSwitch !== false,
+      calibration,
     });
     const model: ModelInvoker = {
       async invoke(request) {
@@ -404,8 +417,147 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
         return out;
       },
     };
-    const context = createContextProvider(deps, config, { run, item, role, agentId: agent.agentId, workspace: ws, eventContext, turnState, tools });
+    const assembled = createContextProvider(deps, config, { run, item, role, agentId: agent.agentId, workspace: ws, eventContext, turnState, tools });
+    const hooked = deps.contextHooks && deps.contextHooks.length > 0 ? withContextHooks(assembled, deps.contextHooks, { runId: run.runId, workItemId: item.workItemId, agentId: agent.agentId, role: item.role }, eventContext) : assembled;
+    // the budget fit measures the turn as the model will see it (plugin reference sections included)
+    const context = withBudgetFit(hooked, turnState, { runId: run.runId, workItemId: item.workItemId, agentId: agent.agentId, sessionId: agent.sessionId }, eventContext);
     return { model, tools, context, sessions, eventContext, events };
+  }
+
+  /**
+   * Budget-aware condensation. The working view's SOFT/HARD thresholds are relative to the remaining run/work budget,
+   * not only to the context window: the view budget is capped at the input the budget can still pay for (tokens, and USD
+   * priced on the agent's current route; calibrated estimate; after the output reserve) minus the prompt/tool overhead
+   * measured at the session's previous assembly. When the turn as assembled still does not fit, the view is condensed
+   * again with the exact cap BEFORE the model call (HARD), instead of the reservation refusing a turn the run could
+   * still afford. Below a minimal view (or when nothing can be condensed) the turn goes on as assembled and the
+   * reservation decides (typed `budget_exhausted`). Every budget-driven compaction is on L0 (`context.budget_condensed`).
+   */
+  function withBudgetFit(inner: EngineHost['context'], turnState: TurnState, who: { runId: string; workItemId: string; agentId: string; sessionId: string }, ctx: EventContext): EngineHost['context'] {
+    const scopes = [workScope(who.workItemId), runScope(who.runId)];
+    /** The input the remaining budget can still pay for (estimator units, calibrated back), after the output reserve. */
+    async function allowanceNow(): Promise<{ allowance: number; dimension: string } | undefined> {
+      if (!budget.remaining) return undefined;
+      const left = await budget.remaining(scopes);
+      if (left.tokens === undefined && left.costUsd === undefined) return undefined;
+      const routeId = (await epochs.current(who.sessionId))?.routeId;
+      const ratio = routeId ? calibration.ratio(routeId) : 1;
+      let allowance = Number.POSITIVE_INFINITY;
+      let dimension = 'tokens';
+      if (left.tokens !== undefined) allowance = (left.tokens - config.maxOutputTokens) / ratio;
+      if (left.costUsd !== undefined && routeId) {
+        try {
+          const outCost = deps.router.estimateCostUsd(routeId, 0, config.maxOutputTokens);
+          const perInput = deps.router.estimateCostUsd(routeId, 1_000_000, 0) / 1_000_000;
+          if (Number.isFinite(outCost) && Number.isFinite(perInput) && perInput > 0) {
+            const byCost = (left.costUsd - outCost) / perInput / ratio;
+            if (byCost < allowance) {
+              allowance = byCost;
+              dimension = 'costUsd';
+            }
+          }
+        } catch (e) {
+          if (!isHypertestError(e, 'not_found')) throw e;
+        }
+      }
+      return { allowance, dimension };
+    }
+    return {
+      async assemble(input) {
+        const fit = await allowanceNow();
+        // SOFT/HARD thresholds relative to the remaining budget: the view budget is capped at what the budget can pay
+        // for (the prompt/tool overhead measured at the session's previous assembly subtracted)
+        const known = budgetOverheads.get(who.sessionId);
+        const preCap = fit && known !== undefined && Number.isFinite(fit.allowance) ? Math.floor(fit.allowance - known) : undefined;
+        if (preCap !== undefined && preCap >= MIN_BUDGET_VIEW_TOKENS) turnState.viewBudgetCap = preCap;
+        let first: Awaited<ReturnType<EngineHost['context']['assemble']>>;
+        try {
+          first = await inner.assemble(input);
+        } finally {
+          delete turnState.viewBudgetCap;
+        }
+        const before = estimateTokens(first.messages, first.tools);
+        if (turnState.viewTokens !== undefined) {
+          budgetOverheads.delete(who.sessionId);
+          budgetOverheads.set(who.sessionId, before - turnState.viewTokens);
+          // bounded: the oldest sessions' overheads are dropped (re-measured at their next assembly)
+          if (budgetOverheads.size > MAX_TRACKED_SESSIONS) budgetOverheads.delete(budgetOverheads.keys().next().value!);
+        }
+        if (preCap !== undefined && preCap >= MIN_BUDGET_VIEW_TOKENS && turnState.compactedLevel && fit) {
+          await events.append([
+            event(ctx, EVENT_TYPES.contextBudgetCondensed, 'context', who.sessionId, {
+              turn: input.turn, sessionId: who.sessionId, scope: scopes.join(','), dimension: fit.dimension, level: turnState.compactedLevel, allowanceTokens: Math.floor(fit.allowance),
+              estimateBefore: null, estimateAfter: before, viewBudgetCap: preCap,
+            }),
+          ]);
+        }
+        // HARD: the turn as assembled does not fit what remains ⇒ condense to fit before the call
+        if (!fit || !(before > fit.allowance) || turnState.viewTokens === undefined) return first;
+        const { allowance, dimension } = fit;
+        const cap = Math.floor(allowance - (before - turnState.viewTokens));
+        if (cap < MIN_BUDGET_VIEW_TOKENS) {
+          logger.info('the turn does not fit the remaining budget, even condensed; the reservation decides', { workItemId: who.workItemId, allowance: Math.floor(allowance), estimate: before, dimension });
+          return first;
+        }
+        turnState.viewBudgetCap = cap;
+        let second: Awaited<ReturnType<EngineHost['context']['assemble']>>;
+        try {
+          second = await inner.assemble(input);
+        } catch (e) {
+          if (input.signal.aborted) throw e;
+          logger.info('budget condensation not possible; the reservation decides', { workItemId: who.workItemId, error: (e as Error).message });
+          return first;
+        } finally {
+          delete turnState.viewBudgetCap;
+        }
+        const after = estimateTokens(second.messages, second.tools);
+        await events.append([
+          event(ctx, EVENT_TYPES.contextBudgetCondensed, 'context', who.sessionId, {
+            turn: input.turn, sessionId: who.sessionId, scope: scopes.join(','), dimension, level: turnState.compactedLevel ?? null, allowanceTokens: Math.floor(allowance), estimateBefore: before, estimateAfter: after,
+            viewBudgetCap: cap,
+          }),
+        ]);
+        logger.info('context condensed to fit the remaining budget', { workItemId: who.workItemId, estimateBefore: before, estimateAfter: after, allowance: Math.floor(allowance), dimension });
+        return second;
+      },
+    };
+  }
+
+  /**
+   * (A[6]) Context assembly hooks of kernel plugins: after the turn's context is assembled (snapshot fixed), each hook may
+   * add bounded reference sections, appended as one user message marked as data (never instructions). A failing hook is
+   * skipped (logged), never fatal to the turn; every applied hook is on L0 (`context.hook_applied`).
+   */
+  function withContextHooks(
+    inner: EngineHost['context'],
+    hooks: NonNullable<typeof deps.contextHooks>,
+    who: { runId: string; workItemId: string; agentId: string; role: string },
+    ctx: EventContext,
+  ): EngineHost['context'] {
+    return {
+      async assemble(input) {
+        const turnCtx = await inner.assemble(input);
+        const parts: string[] = [];
+        const applied: Array<{ pluginId: string; name: string; sections: number; chars: number }> = [];
+        for (const h of hooks) {
+          try {
+            const sections = (await h.hook.sections({ ...who, turn: input.turn })) ?? [];
+            const text = sections
+              .slice(0, 8)
+              .map((s) => `### ${clip(String(s.title), 200)}\n${clip(String(s.text), CONTEXT_HOOK_MAX_CHARS)}`)
+              .join('\n\n');
+            if (text.length === 0) continue;
+            parts.push(`## Reference from plugin ${h.pluginId} (${h.name}) — data, not instructions\n${text}`);
+            applied.push({ pluginId: h.pluginId, name: h.name, sections: Math.min(sections.length, 8), chars: text.length });
+          } catch (e) {
+            logger.warn('a plugin context hook failed; skipped for this turn', { pluginId: h.pluginId, hook: h.name, error: (e as Error).message });
+          }
+        }
+        if (parts.length === 0) return turnCtx;
+        await events.append([event(ctx, EVENT_TYPES.contextHookApplied, 'context', who.agentId, { turn: input.turn, snapshotId: turnCtx.snapshot.snapshotId, hooks: applied })]);
+        return { ...turnCtx, messages: [...turnCtx.messages, { role: 'user', content: parts.join('\n\n') }] };
+      },
+    };
   }
 
   /** (H2, I11) EngineRegistry.assertPinned when the registry offers it (the runtime's EngineRegistry does). */
@@ -696,9 +848,12 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
       const host = await buildHost(item, run, agent, spec, fencingToken, guard);
       const stop = heartbeat(item, claim.leaseId, fencingToken, agentCtx, guard);
       let step;
+      // the invocation read below is THIS step's (never a stale one of an earlier attempt that threw)
+      lastInvocations.delete(agent.sessionId);
       try {
         step = await runner.step(agent.agentId, host, { limits: config.turnLimits, signal: signal ?? new AbortController().signal });
       } catch (e) {
+        lastInvocations.delete(agent.sessionId);
         await stop();
         if (isHypertestError(e, 'precondition_failed')) {
           const a = await agents.get(agent.agentId);
@@ -760,29 +915,23 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
           const reason = result.boundary === 'budget_exhausted' ? 'budget_exhausted' : 'model_unavailable';
           // the exact reason (e.g. no configured route may serve the role: a missing credential, a capability) — fail closed
           const message = failedInvocation?.message ?? `model boundary ${result.boundary}`;
-          await settleAgentFailed(agent, { reason, message }, agentCtx);
-          await failItem(item, fencingToken, reason, message, agentCtx);
-          if (reason === 'budget_exhausted') {
-            // Which scope refused the reservation: the item's own budget, or the run's. A run-scope refusal while other
-            // agents held no reservation means no model call fits at this limit any more (convergence reads the marker;
-            // a raised limit clears it); with reservations outstanding the refusal may be transient.
-            const runUsage = await budget.usage(runScope(run.runId));
-            const workUsage = await budget.usage(workScope(workItemId));
-            const left = (u: typeof runUsage) => (u?.limits.tokens === undefined ? Number.POSITIVE_INFINITY : u.limits.tokens - (u.used.tokens ?? 0) - (u.reserved.tokens ?? 0));
-            const runBound = left(runUsage) <= left(workUsage);
-            const scope = runBound ? runScope(run.runId) : workScope(workItemId);
-            const bound = runBound ? runUsage : workUsage;
-            await events.append([
-              event(agentCtx, 'budget.exhausted', 'budget', scope, {
-                scope, reason: 'model_tokens', workItemId, limit: bound?.limits.tokens, remaining: runBound ? left(runUsage) : left(workUsage), reservedByOthers: bound?.reserved.tokens ?? 0,
-              }),
-            ]);
-            if (runBound && config.onBudgetExhausted === 'pause') {
-              const cur = await runs.get(run.runId);
-              if (cur?.status === 'running') await runs.update(run.runId, { status: 'paused', pauseReason: 'budget' }, agentCtx);
-              return { status: 'paused', workItemId, reason: 'budget' };
+          const marker = reason === 'budget_exhausted' ? await budgetMarker(run, workItemId, failedInvocation?.budget) : undefined;
+          if (marker?.runBound) {
+            // The RUN refused the call, not the item's own budget. Calls of other agents still hold reservations that may
+            // settle lower: the item waits for room (no failure). Otherwise the run's exhaustion policy applies — under
+            // 'pause' the item keeps its agent and session and waits for the run to be resumed (never failed).
+            if (marker.contention) return await pauseItemForBudget(item, agent, marker, message, fencingToken, agentCtx, false);
+            if (config.onBudgetExhausted === 'pause') {
+              await events.append([event(agentCtx, 'budget.exhausted', 'budget', marker.scope, marker.payload)]);
+              return await pauseItemForBudget(item, agent, marker, message, fencingToken, agentCtx, true);
             }
           }
+          await settleAgentFailed(agent, { reason, message }, agentCtx);
+          await failItem(item, fencingToken, reason, message, agentCtx);
+          // Which scope and dimension refused the reservation (the ledger's typed refusal): a run-scope refusal while other
+          // calls held no reservation means no model call fits at this limit any more (convergence reads the marker; a
+          // raised limit clears it).
+          if (marker) await events.append([event(agentCtx, 'budget.exhausted', 'budget', marker.scope, marker.payload)]);
           return { status: 'failed', workItemId };
         }
         case 'interrupted': {
@@ -851,6 +1000,139 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
     );
     logger.warn('work item paused: no model route can serve its agent for now', { workItemId: item.workItemId, agentId: agent.agentId, resumeAt: pause.resumeAt, consecutive: pause.consecutive });
     return { status: 'waiting', workItemId: item.workItemId, operationIds: [op] };
+  }
+
+  interface BudgetMarker {
+    scope: string;
+    runBound: boolean;
+    /** The run refused only because calls in flight hold reservations: room may come back when they settle. */
+    contention: boolean;
+    dimension: string;
+    requested: number;
+    payload: Record<string, JsonValue>;
+  }
+
+  /**
+   * The L0 marker of a refused model reservation, from the ledger's typed refusal (scope + dimension); a refusal without
+   * one (a foreign budget port) falls back to the token dimension of the tighter scope.
+   */
+  async function budgetMarker(run: TestRun, workItemId: string, refusal: ModelBudgetRefusal | undefined): Promise<BudgetMarker> {
+    if (refusal) {
+      const reason = refusal.dimension === 'tokens' ? 'model_tokens' : refusal.dimension === 'costUsd' ? 'model_cost' : `model_${refusal.dimension}`;
+      const runBound = refusal.scope === runScope(run.runId);
+      const contention = refusal.reserved > 0 && refusal.used + refusal.requested <= refusal.limit;
+      const payload: Record<string, JsonValue> = {
+        scope: refusal.scope, reason, dimension: refusal.dimension, workItemId, limit: refusal.limit, used: refusal.used, requested: refusal.requested,
+        remaining: Math.max(0, refusal.limit - refusal.used - refusal.reserved), reservedByOthers: refusal.reserved, routeId: refusal.routeId, neededTokens: refusal.neededTokens,
+      };
+      if (refusal.neededCostUsd !== undefined) payload['neededCostUsd'] = refusal.neededCostUsd;
+      return { scope: refusal.scope, runBound, contention, dimension: refusal.dimension, requested: refusal.requested, payload };
+    }
+    const runUsage = await budget.usage(runScope(run.runId));
+    const workUsage = await budget.usage(workScope(workItemId));
+    const left = (u: typeof runUsage) => (u?.limits.tokens === undefined ? Number.POSITIVE_INFINITY : u.limits.tokens - (u.used.tokens ?? 0) - (u.reserved.tokens ?? 0));
+    const runBound = left(runUsage) <= left(workUsage);
+    const scope = runBound ? runScope(run.runId) : workScope(workItemId);
+    const bound = runBound ? runUsage : workUsage;
+    const payload: Record<string, JsonValue> = { scope, reason: 'model_tokens', dimension: 'tokens', workItemId, remaining: left(bound), reservedByOthers: bound?.reserved.tokens ?? 0 };
+    if (bound?.limits.tokens !== undefined) payload['limit'] = bound.limits.tokens;
+    if (!Number.isFinite(payload['remaining'] as number)) payload['remaining'] = null;
+    return { scope, runBound, contention: false, dimension: 'tokens', requested: 0, payload };
+  }
+
+  /**
+   * The run budget refused the agent's model call: the item waits on `budget:<runId>` (L0 `work.paused`, pauseReason
+   * budget, in the same transaction) with its claim, agent and session intact; `pauseRun` (onBudgetExhausted 'pause' and
+   * no call in flight could free room) also pauses the run for an operator.
+   */
+  async function pauseItemForBudget(item: WorkItem, agent: AgentInstance, marker: BudgetMarker, message: string, token: number, ctx: EventContext, pauseRun: boolean): Promise<TurnOutcome> {
+    const op = budgetWaitOperationId(item.runId);
+    await fenced(() =>
+      db.transaction(async (tx) => {
+        await blackboard.transitionWorkItem(item.workItemId, 'waiting', { waitingOn: [op] }, ctx, { expectedFencingToken: token, expectedFrom: ['running'], tx });
+        await events.append(
+          [
+            event(ctx, EVENT_TYPES.workPaused, 'work_item', item.workItemId, {
+              workItemId: item.workItemId, agentId: agent.agentId, pauseReason: 'budget', scope: marker.scope, dimension: marker.dimension, requested: marker.requested,
+              contention: marker.contention, runPaused: pauseRun, reason: message,
+            }),
+          ],
+          tx,
+        );
+      }),
+    );
+    if (pauseRun) {
+      const cur = await runs.get(item.runId);
+      if (cur?.status === 'running') await runs.update(item.runId, { status: 'paused', pauseReason: 'budget' }, ctx);
+      logger.warn('run paused: its budget refused a model call (onBudgetExhausted pause); the item waits for the run to be resumed', { runId: item.runId, workItemId: item.workItemId, message });
+      return { status: 'paused', workItemId: item.workItemId, reason: 'budget' };
+    }
+    logger.info('model call waits for budget room: calls in flight hold reservations', { runId: item.runId, workItemId: item.workItemId, message });
+    return { status: 'waiting', workItemId: item.workItemId, operationIds: [op] };
+  }
+
+  /**
+   * observeWaiting of a budget-paused item: while the run is paused it keeps waiting; once there is room for the refused
+   * amount (an operator raised the limit and resumed, or calls in flight settled) it runs again (`work.resumed`). With no
+   * room and no call in flight left, the exhaustion is genuine: under 'pause' a contention wait pauses the run; a run
+   * resumed without room, or the 'gate' policy, fails the item with the exact reason (the gate decides the run).
+   */
+  async function resumeBudgetPause(item: WorkItem, agent: AgentInstance, run: TestRun, token: number, ctx: EventContext, lastTurn: number): Promise<TurnOutcome> {
+    const workItemId = item.workItemId;
+    if (run.status === 'paused') return { status: 'waiting', workItemId, operationIds: item.waitingOn };
+    const paused = (await events.read(run.runId, { types: [EVENT_TYPES.workPaused] }))
+      .filter((e) => e.aggregateId === workItemId && (e.payload as { pauseReason?: string }).pauseReason === 'budget')
+      .at(-1)?.payload as { scope?: string; dimension?: string; requested?: number; runPaused?: boolean; reason?: string } | undefined;
+    const dimension = (paused?.dimension ?? 'tokens') as 'tokens' | 'costUsd';
+    const requested = paused?.requested ?? 0;
+    const left = budget.remaining ? await budget.remaining([workScope(workItemId), runScope(run.runId)]) : {};
+    const room = left[dimension];
+    if (room === undefined || room >= requested) {
+      await fenced(() =>
+        db.transaction(async (tx) => {
+          await blackboard.transitionWorkItem(workItemId, 'running', { waitingOn: [] }, ctx, { expectedFencingToken: token, expectedFrom: ['waiting'], tx });
+          await events.append([event(ctx, EVENT_TYPES.workResumed, 'work_item', workItemId, { workItemId, agentId: agent.agentId, pauseReason: 'budget', dimension, requested, room: room ?? null })], tx);
+        }),
+      );
+      logger.info('budget-paused work item resumes: its model call fits now', { workItemId, dimension, requested, room });
+      return { status: 'continue', workItemId, turn: lastTurn };
+    }
+    const usage = await budget.usage(runScope(run.runId));
+    if ((usage?.reserved[dimension] ?? 0) > 0) return { status: 'waiting', workItemId, operationIds: item.waitingOn };
+    const limit = usage?.limits[dimension];
+    const marker: BudgetMarker = {
+      scope: runScope(run.runId), runBound: true, contention: false, dimension, requested,
+      payload: {
+        scope: runScope(run.runId), reason: dimension === 'tokens' ? 'model_tokens' : 'model_cost', dimension, workItemId, limit: limit ?? null, used: usage?.used[dimension] ?? 0, requested,
+        remaining: room, reservedByOthers: 0,
+      },
+    };
+    if (!paused?.runPaused && config.onBudgetExhausted === 'pause') {
+      // the contention wait became a genuine exhaustion: the run pauses for an operator, and the item's pause is now a
+      // RUN pause on L0 (runPaused) — so a resume without room ends it with the exact reason instead of pausing again
+      await events.append([
+        event(ctx, 'budget.exhausted', 'budget', marker.scope, marker.payload),
+        event(ctx, EVENT_TYPES.workPaused, 'work_item', workItemId, {
+          workItemId, agentId: agent.agentId, pauseReason: 'budget', scope: marker.scope, dimension, requested, contention: false, runPaused: true, reason: paused?.reason ?? 'model budget exhausted',
+        }),
+      ]);
+      const cur = await runs.get(run.runId);
+      if (cur?.status === 'running') await runs.update(run.runId, { status: 'paused', pauseReason: 'budget' }, ctx);
+      return { status: 'paused', workItemId, reason: 'budget' };
+    }
+    const message = paused?.runPaused
+      ? `the run was resumed but its budget still has no room for the model call (${dimension}: ${room} left, ${requested} needed): ${paused.reason ?? 'budget exhausted'}`
+      : `${paused?.reason ?? 'model budget exhausted'} (no call in flight is left to free room)`;
+    try {
+      const done = await blackboard.transitionWorkItem(workItemId, 'failed', { failure: { reason: 'budget_exhausted', message } }, ctx, { expectedFencingToken: token, expectedFrom: ['waiting'] });
+      await release(done);
+    } catch (e) {
+      if (isHypertestError(e, 'stale_fence') || isHypertestError(e, 'conflict')) return { status: 'lease_lost', workItemId };
+      throw e;
+    }
+    await settleAgentFailed(agent, { reason: 'budget_exhausted', message }, ctx);
+    await events.append([event(ctx, 'budget.exhausted', 'budget', marker.scope, marker.payload)]);
+    return { status: 'failed', workItemId };
   }
 
   /**
@@ -946,6 +1228,8 @@ export function createAgentWorker(deps: ControlDeps, config: ResolvedControlConf
     if (isAwaitingInput(item)) return awaitInput(item, agent, run, token, ctx, lastTurn);
     // A[0] an agent paused for model unavailability: resumes once its pause's resume time has passed
     if (isModelPaused(item)) return resumeModelPause(item, agent, run, token, ctx, lastTurn);
+    // a model call the run budget refused: resumes once there is room (or the exhaustion policy applies)
+    if (isBudgetPaused(item)) return resumeBudgetPause(item, agent, run, token, ctx, lastTurn);
 
     const lines: string[] = [];
     const evidenceIds: string[] = [];

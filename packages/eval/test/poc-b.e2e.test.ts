@@ -68,7 +68,9 @@ test('PoC B: finding.created wakes RCA and the test designer without the lead; d
   // Blackboard — finding, hypothesis and regression test are separate records
   assert.deepEqual(a.findings, [{ title: 'POST /transfers accepts a negative amount and moves money backwards', status: 'confirmed', evidence: ['api-response', 'stdout'] }]);
   assert.deepEqual(a.hypotheses, [{ status: 'supported', lineage: true, evidence: true }]);
-  assert.deepEqual(a.artifacts, ['regression/negative-transfer.test.mjs:validated']);
+  // D-1: known-bad on the defective service, known-good recorded as unavailable (no fixed deployment), independent oracle
+  // consistency review ⇒ approved (it can never support a P0/P1 assertion on its own)
+  assert.deepEqual(a.artifacts, ['regression/negative-transfer.test.mjs:approved']);
   // Duplicate event — delivered twice, yet no duplicate work (unique fingerprints) and every external effect exactly once
   assert.equal(a.duplicateDelivery, true);
   assert.equal(a.fingerprints, true);

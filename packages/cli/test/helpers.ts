@@ -73,6 +73,9 @@ export const SUM_ORACLE = {
   oracleId: 'sum-contract',
   scope: { components: ['sum'], description: 'the sum module adds numbers' },
   assertions: [{ assertionId: 'suite-passes', description: 'every case of the sum suite passes', kind: 'requirement', severity: 'P1', check: { type: 'test_outcome', testSelector: '*', expected: 'pass' } }],
+  // D-7: the oracle's judge policy governs the gate — its authority states that this deterministic suite needs no
+  // independent reviewer (the gate's own requireIndependentReview still applies)
+  judgePolicy: { independentReviewerRequired: false },
   establishedBy: 'alice',
 };
 

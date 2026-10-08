@@ -80,10 +80,13 @@ export function condenserPrivacyFloor(router: ModelRouter, classificationOf: (ag
   };
   const route: ModelRouter['route'] = async (request, ctx) => router.route(await raise(request), ctx);
   const invoke: ModelRouter['invoke'] = async (request, routeRequest) => router.invoke(request, await raise(routeRequest));
+  // A[3]: the boundary re-check of a switch sees the same raised classification as the call it precedes
+  const validate: ModelRouter['validate'] = router.validate ? async (decision, routeRequest) => router.validate!(decision, await raise(routeRequest)) : undefined;
   return new Proxy(router, {
     get(target, prop) {
       if (prop === 'route') return route;
       if (prop === 'invoke') return invoke;
+      if (prop === 'validate' && validate) return validate;
       const v: unknown = Reflect.get(target, prop, target);
       return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
     },

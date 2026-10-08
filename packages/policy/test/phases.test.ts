@@ -187,7 +187,7 @@ describe('decision log: the phase is on L0 and every phase decision is replayabl
 const RUN = 'run_accept';
 const run: TestRun = {
   runId: RUN, goal: 'g', target: {}, status: 'gating', budget: { maxWallClockMs: 1, maxAgentConcurrency: 1, maxModelTokens: 1, maxToolCalls: 1, maxWorkItems: 1, maxAgentDepth: 1, maxPlanRevisions: 1 },
-  runtimeManifestId: 'rm_1', policyRevision: 'builtin@1', currentPlanRevision: 1, oracleRevisions: {}, experimentIds: [], labels: {}, createdAt: NOW, updatedAt: NOW,
+  runtimeManifestId: 'rm_1', policyRevision: 'builtin@1', currentPlanRevision: 1, systemModelRevision: 1, oracleRevisions: {}, experimentIds: [], labels: {}, createdAt: NOW, updatedAt: NOW,
 };
 
 function evidence(evidenceId: string, seq: number, evidenceType: string, structured: JsonValue): EvidenceRecord {
@@ -203,6 +203,13 @@ function gateInput(): GateInput {
     run, gate: { ...DEFAULT_GATE_SPEC, requireIndependentReview: false, requireOracle: false }, objectives: [], oracles: [], experiments: [], findings: [], risks: [], reviews: [], coverageGaps: [],
     testArtifacts: [], evidence: ev, evidenceRoot: { rootHash: 'root', count: ev.length }, workItems: [], claims: [], exceptions: [], runtimeManifestId: 'rm_1', policyRevision: 'builtin@1',
     decisionId: 'qd_1', now: NOW,
+    // coverage-1: the run's SystemModel; no write/fault/load action; no environment in use
+    systemModel: {
+      systemModelId: `sm_${RUN}`, runId: RUN, revision: 1, subject: { repoRefs: [], commitDigests: [], buildDigests: [] }, components: [{ componentId: 'c', name: 'c', kind: 'module', paths: ['src'], riskTags: [] }],
+      interfaces: [], dependencies: [], stateMachines: [], invariants: [], changedComponents: [], riskTags: [], sources: [], createdBy: 'agent_a', createdAt: NOW,
+    },
+    operations: [],
+    environments: [],
   };
 }
 

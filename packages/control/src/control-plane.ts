@@ -12,6 +12,7 @@ import { environmentReadSet, targetEnvironment } from './context-provider.ts';
 import { claimLeaseOwner } from './dispatcher.ts';
 import { createConvergenceMonitor, type ConvergenceMonitor } from './convergence.ts';
 import { createDomainTools } from './domain-tools/index.ts';
+import type { ModelSwitchRequest } from '@hypertest/runtime';
 import { releaseStrandedReservations } from './isolation.ts';
 import { createReactorService, REACTOR_CONSUMER, REACTOR_SUBJECTS, type ReactorService } from './reactors.ts';
 import { createReportBuilder } from './report.ts';
@@ -243,11 +244,14 @@ export function createControlPlane(deps: ControlDeps): ControlPlaneInternals {
   async function releaseModelPauses(runId: string, by: string): Promise<string[]> {
     await mustRun(runId);
     if (!deps.epochs.releaseModelPauses) return [];
+    const routes = [...new Set((deps.epochs.listModelPauses ? await deps.epochs.listModelPauses(runId) : []).flatMap((p) => p.routes))].sort();
     const released = await deps.epochs.releaseModelPauses(runId, clock.isoNow());
     if (released.length > 0) {
-      await events.append([event(runCtx(runId, config.workerId), EVENT_TYPES.modelPausesReleased, 'run', runId, { sessions: released, by })]);
+      // the open circuits of the paused routes may probe now (one call each; the breaker's verdict still decides)
+      const probed = routes.length > 0 ? (deps.router.probeNow?.(routes) ?? []) : [];
+      await events.append([event(runCtx(runId, config.workerId), EVENT_TYPES.modelPausesReleased, 'run', runId, { sessions: released, by, routes, probedCircuits: probed })]);
       idle.delete(runId);
-      logger.info('model pauses released', { runId, sessions: released.length, by });
+      logger.info('model pauses released', { runId, sessions: released.length, by, probedCircuits: probed });
     }
     return released;
   }
@@ -684,6 +688,30 @@ export function createControlPlane(deps: ControlDeps): ControlPlaneInternals {
 
     releaseModelPauses(runId, by) {
       return releaseModelPauses(runId, by ?? 'operator');
+    },
+
+    async requestModelSwitch(runId, target, routeId, requestedBy, reason) {
+      const run = await mustRun(runId);
+      if (isTerminalRunStatus(run.status)) throw new HypertestError('conflict', `run ${runId} is ${run.status}: no model switch applies`, { details: { runId, status: run.status } });
+      if (!deps.epochs.requestSwitch) throw new HypertestError('unsupported', 'the EpochManager cannot record model switch requests');
+      if (typeof routeId !== 'string' || routeId === '') throw new HypertestError('invalid_argument', 'routeId must be a non-empty string');
+      if (deps.catalog && !deps.catalog.get(routeId)) {
+        throw new HypertestError('invalid_argument', `route ${routeId} is not in the model catalog (${deps.catalog.list().map((p) => p.routeId).join(', ')})`, { details: { routeId } });
+      }
+      if (typeof requestedBy !== 'string' || requestedBy.trim() === '') throw new HypertestError('invalid_argument', 'requestedBy must name who asks for the switch');
+      const agent = await agents.get(target);
+      let switchTarget: ModelSwitchRequest['target'];
+      if (agent) {
+        if (agent.runId !== runId) throw new HypertestError('invalid_argument', `agent ${target} belongs to run ${agent.runId}, not ${runId}`);
+        switchTarget = { kind: 'agent', agentId: target };
+      } else if (deps.roles.get(target)) switchTarget = { kind: 'role', role: target };
+      else throw new HypertestError('invalid_argument', `${target} is neither an agent of run ${runId} nor a role`, { details: { target } });
+      const request: Parameters<NonNullable<typeof deps.epochs.requestSwitch>>[0] = { runId, target: switchTarget, routeId, requestedBy };
+      if (reason !== undefined && reason !== '') request.reason = reason;
+      const out = await deps.epochs.requestSwitch(request, runCtx(runId, requestedBy));
+      idle.delete(runId);
+      logger.info('manual model switch requested; applied at the target agents\' next safe turn boundary', { runId, target: switchTarget, routeId, switchId: out.switchId });
+      return out;
     },
 
     async snapshot(runId) {

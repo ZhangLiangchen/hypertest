@@ -43,7 +43,14 @@ describe('domain tools on the real pipeline: specs, oracles, experiments, approv
         lead: recorder(results, (step) => {
           switch (step) {
             case 0:
-              return call('system_model.record', { components: [{ componentId: 'pricing', name: 'pricing', kind: 'module', paths: ['src/pricing.js'] }], changedComponents: ['pricing'], invariants: ['discounts never increase a price'] });
+              return call('system_model.record', {
+                components: [{ componentId: 'pricing', name: 'pricing', kind: 'module', paths: ['src/pricing.js'] }],
+                changedComponents: ['pricing'],
+                invariants: ['discounts never increase a price'],
+                dataAssets: [{ assetId: 'prices', name: 'price table', kind: 'table', componentId: 'pricing', classification: 'internal' }],
+                securityBoundaries: [{ boundaryId: 'api', name: 'public api', kind: 'authentication', components: ['pricing'] }],
+                sources: [{ kind: 'file', id: 'src/pricing.js' }, { kind: 'file', id: 'src/pricing.js' }, { kind: 'commit', id: 'abc1234' }],
+              });
             case 1:
               return call('oracle.list', {});
             case 2:
@@ -75,10 +82,17 @@ describe('domain tools on the real pipeline: specs, oracles, experiments, approv
     const t = await h.control.tick(run.runId);
     assert.equal(await runItem(h.control, t.dispatched[0]!.workItemId, t.dispatched[0]!.fencingToken), 'completed');
     const [sm, list, get, exp, appr, prop1, prop2, prop3, plan] = results;
-    assert.deepEqual(parsed(sm!.content), { systemModelId: `sm_${run.runId}`, revision: 1 });
+    // (coverage-12) the model carries data assets, security boundaries, its sources (deduplicated) and the build digests of
+    // the registered environment (none registered here)
+    assert.deepEqual(parsed(sm!.content), { systemModelId: `sm_${run.runId}`, revision: 1, buildDigests: [], sources: 2 });
     const after = (await h.deps.runs.get(run.runId))!;
     assert.equal(after.systemModelRevision, 1);
-    assert.equal((await h.deps.specs.latestSystemModel(run.runId))!.changedComponents[0], 'pricing');
+    const model = (await h.deps.specs.latestSystemModel(run.runId))!;
+    assert.equal(model.changedComponents[0], 'pricing');
+    assert.deepEqual(model.dataAssets, [{ assetId: 'prices', name: 'price table', kind: 'table', componentId: 'pricing', classification: 'internal' }]);
+    assert.deepEqual(model.securityBoundaries?.map((b) => b.boundaryId), ['api']);
+    assert.deepEqual(model.sources, [{ kind: 'file', id: 'src/pricing.js' }, { kind: 'commit', id: 'abc1234' }]);
+    assert.deepEqual(model.subject.buildDigests, []);
     assert.deepEqual((parsed(list!.content)['pinned'] as Array<{ oracleId: string; revision: number }>).map((o) => [o.oracleId, o.revision]), [['oracle.pricing', 1]]);
     assert.equal(parsed(get!.content)['pinnedByRun'], true);
     const experimentId = parsed(exp!.content)['experimentId'] as string;
@@ -144,6 +158,9 @@ describe('evidence claims, oracle change proposals and artifact validation refus
             case 2:
               return call('evidence.claim', { statement: 'stdout is a test result', evidenceRefs: [out!], evidenceQuery: { evidenceType: 'test-result' } });
             case 3:
+              // area-C-0 (review): a critical claim whose fact is only in the prose of its statement is refused
+              return call('evidence.claim', { statement: 'all 42 pricing tests pass', evidenceRefs: [tr!], critical: true, evidenceQuery: { evidenceType: 'test-result' } });
+            case 4:
               return call('evidence.get', { evidenceId: tr! });
             default:
               return call('complete_work', { summary: 'claimed', evidenceRefs: [tr!], output: { summary: 'claimed', executed: [{ selector: 'all', passed: false, outcome: 'failed', evidenceIds: [tr!] }], findings: [] } });
@@ -162,6 +179,9 @@ describe('evidence claims, oracle change proposals and artifact validation refus
               return call('test_artifact.register', { path: 'test/pricing.test.js', sourceType: 'existing', runner: { framework: 'node_test', selector: 'test/pricing.test.js' }, oracleRefs: [] });
             case 2:
               return call('test_artifact.validate', { artifactId: parsed(design[1]!.content)['artifactId'] as string, knownGoodEvidenceId: out!.evidenceId, knownBadEvidenceId: tr!.evidenceId });
+            case 3:
+              // the whole-suite run the executor made: it names no file per case (node junit), so it is bound to no artifact
+              return call('test_artifact.validate', { artifactId: parsed(design[1]!.content)['artifactId'] as string, knownBadEvidenceId: tr!.evidenceId });
             default:
               return call('complete_work', { summary: 'nothing validated', output: { summary: 'nothing validated', testArtifacts: [] } });
           }
@@ -182,12 +202,14 @@ describe('evidence claims, oracle change proposals and artifact validation refus
   });
 
   test('evidence.claim stores only claims supported by matching, intact evidence; critical claims reach the gate input', async () => {
-    const [ran, claimed, refused, got] = exec;
+    const [ran, claimed, refused, prose, got] = exec;
     assert.match(ran!.content, /NOT PASSED/);
     assert.equal(claimed!.isError, false, claimed!.content);
     assert.equal(parsed(claimed!.content)['critical'], true);
     assert.equal(refused!.isError, true);
     assert.match(refused!.content, /unsupported_claim: claim not supported by its evidence: evidence ev_\w+ has type stdout, claim requires test-result/);
+    assert.equal(prose!.isError, true);
+    assert.match(prose!.content, /unsupported_claim: a critical claim must state its value with evidenceQuery\.field .*: no value is stated — a statement alone is not machine-verifiable/);
     const claims = await new ControlStore(h.db).claims(runId);
     assert.equal(claims.length, 1);
     assert.equal(claims[0]!.statement, 'the pricing suite fails on the candidate');
@@ -197,24 +219,26 @@ describe('evidence claims, oracle change proposals and artifact validation refus
     assert.match(view['preview'] as string, /"passed":false/);
     const report = await h.control.report(runId);
     assert.equal(report.claims.length, 1);
-    assert.match(report.markdown, /- \*\*critical\*\* the pricing suite fails on the candidate = false — evidence ev_\w+ — provenance complete/);
+    assert.match(report.markdown, /- \*\*critical\*\* the pricing suite fails on the candidate = false \(evaluated: value of passed\) — evidence ev_\w+ — provenance complete/);
   });
 
-  test('an agent may only propose an oracle change (pending, attributed to its provider); weak validations keep an artifact draft', async () => {
-    const [proposal, registered, validation] = design;
+  test('an agent may only propose an oracle change (pending, attributed to its provider); foreign or unbound evidence is refused and the artifact stays draft', async () => {
+    const [proposal, registered, validation, unbound] = design;
     assert.equal(proposal!.isError, false, proposal!.content);
     const p = (await h.deps.specs.getOracleProposal(parsed(proposal!.content)['proposalId'] as string))!;
     assert.equal(p.status, 'pending');
     assert.deepEqual(p.proposedBy, { kind: 'agent', id: p.proposedBy.id, role: 'test_designer', modelProvider: 'alpha' });
     assert.equal((await h.deps.specs.getOracle('oracle.pricing'))!.revision, 1, 'the oracle is unchanged until an independent approval');
     assert.equal(parsed(registered!.content)['sourceType'], 'generated');
-    const v = parsed(validation!.content);
-    assert.equal(v['approvalState'], 'draft');
-    const reasons = v['reasons'] as string[];
-    assert.equal(reasons.length, 3);
-    assert.equal(reasons[0], 'known-good: known-good evidence must be a test-result (got stdout)');
-    assert.match(reasons[1]!, /^known-bad: test-result ev_\w+ does not run artifact ta_\w+ \(test\/pricing\.test\.js\)$/);
-    assert.equal(reasons[2], 'sensitivity not demonstrated (needs a failing known-bad run or a killed mutant)');
+    // D-0 (changed with gate-governance: these validations used to be recorded as failed stages of a draft; evidence that
+    // does not provably execute the artifact's file and content is now refused outright, with the exact reason)
+    assert.equal(validation!.isError, true);
+    assert.match(validation!.content, /foreign_evidence: validation refused: known-good evidence ev_\w+ must be a test-result \(got stdout\)/);
+    assert.equal(unbound!.isError, true);
+    assert.match(unbound!.content, /foreign_evidence: validation refused: known-bad evidence ev_\w+ did not execute test\/pricing\.test\.js \(artifact ta_\w+\); it executed no attributable file — foreign evidence never proves this artifact/);
+    const artifact = (await h.deps.specs.getTestArtifact(parsed(registered!.content)['artifactId'] as string))!;
+    assert.equal(artifact.approvalState, 'draft');
+    assert.deepEqual(artifact.validations, {});
   });
 });
 
@@ -231,6 +255,9 @@ describe('test_artifact.validate binds sensitivity proofs to the artifact\'s own
     };
     const failed = (file: string) => ({ id: `${file}::t`, name: 't', file, status: 'failed' });
     const passed = (file: string) => ({ id: `${file}::t`, name: 't', file, status: 'passed' });
+    // the execution binding test.run records (D-0): which files ran with which content, and on which code
+    const ran = (files: Array<[string, string]>) => ({ attribution: 'complete', unattributedCases: 0, files: files.map(([path, sha256]) => ({ path, sha256, cases: 1, staticCheck: { checker: 'node --check', ok: true } })) });
+    const code = (tree: string) => ({ kind: 'workspace', baseCommit: repo.head, treeDigest: tree.repeat(64) });
     h = await createHarness({
       brains: {
         lead: (v) => {
@@ -244,18 +271,24 @@ describe('test_artifact.validate binds sensitivity proofs to the artifact\'s own
               return call('fs.write', { path: 'test/a.test.js', content: "import { test } from 'node:test';\ntest('t', () => {});\n" });
             case 1:
               return call('test_artifact.register', { path: 'test/a.test.js', sourceType: 'generated', runner: { framework: 'node_test', selector: 'test/a.test.js' }, oracleRefs: [] });
-            case 2:
-              await seed(v.runId, 'suffix', { passed: false, totals: { failed: 1 }, cases: [failed('test/data.test.js')] });
-              await seed(v.runId, 'mislinked', { passed: false, totals: { failed: 1 }, testArtifactId: artifactId, cases: [failed('test/data.test.js')] });
-              await seed(v.runId, 'mixed', { passed: false, totals: { failed: 1 }, cases: [passed('test/a.test.js'), failed('test/data.test.js')] });
-              await seed(v.runId, 'own', { passed: false, totals: { failed: 1 }, cases: [passed('test/data.test.js'), failed('/abs/ws/test/a.test.js')] });
+            case 2: {
+              const digest = (await h.deps.specs.getTestArtifact(artifactId))!.artifactDigest;
+              const other = 'f'.repeat(64);
+              await seed(v.runId, 'suffix', { passed: false, totals: { failed: 1 }, cases: [failed('test/data.test.js')], executedTests: ran([['test/data.test.js', other]]), codeRevision: code('b') });
+              await seed(v.runId, 'mislinked', { passed: false, totals: { failed: 1 }, testArtifactId: artifactId, cases: [failed('test/data.test.js')], executedTests: ran([['test/data.test.js', other]]), codeRevision: code('b') });
+              await seed(v.runId, 'mixed', { passed: false, totals: { failed: 1 }, cases: [passed('test/a.test.js'), failed('test/data.test.js')], executedTests: ran([['test/a.test.js', digest], ['test/data.test.js', other]]), codeRevision: code('b') });
+              await seed(v.runId, 'own', { passed: false, totals: { failed: 1 }, cases: [passed('test/data.test.js'), failed('/abs/ws/test/a.test.js')], executedTests: ran([['test/data.test.js', other], ['/abs/ws/test/a.test.js', digest]]), codeRevision: code('b') });
+              await seed(v.runId, 'good', { passed: true, totals: { passed: 1 }, cases: [passed('test/a.test.js')], executedTests: ran([['test/a.test.js', digest]]), codeRevision: code('g') });
               return call('test_artifact.validate', { artifactId, knownBadEvidenceId: ev['suffix']! });
+            }
             case 3:
               return call('test_artifact.validate', { artifactId, knownBadEvidenceId: ev['mislinked']! });
             case 4:
               return call('test_artifact.validate', { artifactId, knownBadEvidenceId: ev['mixed']! });
             case 5:
               return call('test_artifact.validate', { artifactId, knownBadEvidenceId: ev['own']! });
+            case 6:
+              return call('test_artifact.validate', { artifactId, knownGoodEvidenceId: ev['good']! });
             default:
               return call('complete_work', { summary: 'validated', output: { summary: 'validated', testArtifacts: [] } });
           }
@@ -265,17 +298,29 @@ describe('test_artifact.validate binds sensitivity proofs to the artifact\'s own
     try {
       const run = await h.control.startRun({ goal: 'sensitivity', target: { repoPath: repo.path, commit: repo.head } });
       for (let i = 0; i < 2; i++) for (const d of (await h.control.tick(run.runId)).dispatched) await runItem(h.control, d.workItemId, d.fencingToken);
-      const [, registered, suffix, mislinked, mixed, own] = design;
+      const [, registered, suffix, mislinked, mixed, own, good] = design;
       assert.equal(registered!.isError, false, registered!.content);
+      // D-0 (changed with gate-governance: foreign evidence used to be recorded as a failed stage of a draft; it is refused)
       for (const r of [suffix, mislinked]) {
-        assert.equal(parsed(r!.content)['approvalState'], 'draft');
-        assert.match(r!.content, /known-bad: test-result ev_\w+ does not run artifact ta_\w+ \(test\/a\.test\.js\)/);
+        assert.equal(r!.isError, true);
+        assert.match(r!.content, /foreign_evidence: validation refused: known-bad evidence ev_\w+ did not execute test\/a\.test\.js \(artifact ta_\w+\); it executed test\/data\.test\.js — foreign evidence never proves this artifact/);
       }
+      // the mixed run did execute the artifact, but its own case passed: bound, insensitive
       assert.equal(parsed(mixed!.content)['approvalState'], 'draft');
       assert.match(mixed!.content, /known-bad: the test did not fail with an assertion failure on the known-bad code/);
-      assert.equal(parsed(own!.content)['approvalState'], 'validated', own!.content);
-      const v = parsed(own!.content)['validations'] as { knownBad: { detail: string } };
+      // the artifact's own failing case: sensitive, but not yet validated (no known-good run)
+      assert.equal(parsed(own!.content)['approvalState'], 'draft', own!.content);
+      const v = parsed(own!.content)['validations'] as { knownBad: { detail: string; artifactDigest: string } };
       assert.equal(v.knownBad.detail, 'failed on known-bad code (1 failed cases of this artifact)');
+      assert.match(own!.content, /known-good missing: run the test on the base revision/);
+      // known-good on other code completes the lifecycle up to the review: validated, and a review is requested — (review)
+      // a known-good pass on WORKSPACE code (not the base revision) never gives the artifact P0/P1 support, and says so
+      assert.equal(parsed(good!.content)['approvalState'], 'validated', good!.content);
+      assert.deepEqual(parsed(good!.content)['stages'], { static: 'passed', knownGood: 'passed (workspace: no P0/P1 support)', knownBad: 'passed', mutation: 'missing', oracleReview: 'pending' });
+      assert.match(good!.content, /It will never support or violate a P0\/P1 assertion \(its known-good run is not a pass on the base revision\)/);
+      const artifactId = parsed(registered!.content)['artifactId'] as string;
+      const requested = (await h.deps.events.read(run.runId, { types: ['review.requested'] })).filter((e) => (e.payload as { subjectRef?: { kind: string; id: string } }).subjectRef?.id === artifactId);
+      assert.equal(requested.length, 1);
     } finally {
       await h.dispose();
       await repo.cleanup();
@@ -295,7 +340,11 @@ describe('conformance-10: sensitivity validation is bound to the artifact conten
       ev[key] = (await h.deps.evidence.append({ runId, evidenceType: 'test-result', artifact, summary: key, structured: structured as never, producer: { workerId: 'seed', runtimeManifestId: run.runtimeManifestId }, provenance: {} })).evidenceId;
     };
     const cases = (status: string) => [{ id: 'test/a.test.js::t', name: 't', file: 'test/a.test.js', status }];
-    const delta = (sha256: string, tree: string) => ({ status: 'computed', readOnly: false, baseCommit: repo.head, treeDigest: tree.repeat(64), changedFiles: 1, testFiles: [{ path: 'test/a.test.js', change: 'added', sha256 }] });
+    // the execution binding test.run records (D-0): the executed file's content digest and the code (tree) it ran on
+    const delta = (sha256: string, tree: string) => ({
+      executedTests: { attribution: 'complete', unattributedCases: 0, files: [{ path: 'test/a.test.js', sha256, cases: 1, staticCheck: { checker: 'node --check', ok: true } }] },
+      codeRevision: { kind: 'workspace', baseCommit: repo.head, treeDigest: tree.repeat(64) },
+    });
     h = await createHarness({
       brains: {
         lead: (v) => {
@@ -311,10 +360,10 @@ describe('conformance-10: sensitivity validation is bound to the artifact conten
               return call('test_artifact.register', { path: 'test/a.test.js', sourceType: 'generated', runner: { framework: 'node_test', selector: 'test/a.test.js' }, oracleRefs: [] });
             case 2: {
               const digest = (await h.deps.specs.getTestArtifact(artifactId))!.artifactDigest;
-              await seed(v.runId, 'tampered', { passed: false, totals: { failed: 1 }, cases: cases('failed'), workspaceDelta: delta('0'.repeat(64), 'b') });
-              await seed(v.runId, 'goodSame', { passed: true, totals: { passed: 1 }, cases: cases('passed'), workspaceDelta: delta(digest, 'c') });
-              await seed(v.runId, 'badSame', { passed: false, totals: { failed: 1 }, cases: cases('failed'), workspaceDelta: delta(digest, 'c') });
-              await seed(v.runId, 'badOther', { passed: false, totals: { failed: 1 }, cases: cases('failed'), workspaceDelta: delta(digest, 'd') });
+              await seed(v.runId, 'tampered', { passed: false, totals: { failed: 1 }, cases: cases('failed'), ...delta('0'.repeat(64), 'b') });
+              await seed(v.runId, 'goodSame', { passed: true, totals: { passed: 1 }, cases: cases('passed'), ...delta(digest, 'c') });
+              await seed(v.runId, 'badSame', { passed: false, totals: { failed: 1 }, cases: cases('failed'), ...delta(digest, 'c') });
+              await seed(v.runId, 'badOther', { passed: false, totals: { failed: 1 }, cases: cases('failed'), ...delta(digest, 'd') });
               return call('test_artifact.validate', { artifactId, knownBadEvidenceId: ev['tampered']! });
             }
             case 3:
@@ -332,8 +381,9 @@ describe('conformance-10: sensitivity validation is bound to the artifact conten
       for (let i = 0; i < 2; i++) for (const d of (await h.control.tick(run.runId)).dispatched) await runItem(h.control, d.workItemId, d.fencingToken);
       const [, registered, tampered, same, other] = design;
       assert.equal(registered!.isError, false, registered!.content);
-      assert.equal(parsed(tampered!.content)['approvalState'], 'draft');
-      assert.match(tampered!.content, /known-bad: test-result ev_\w+ executed test\/a\.test\.js with content 000000000000…, not the registered artifact content/);
+      // changed with gate-governance: a run of other content is refused (foreign evidence), not recorded as a failed stage
+      assert.equal(tampered!.isError, true);
+      assert.match(tampered!.content, /foreign_evidence: validation refused: known-bad evidence ev_\w+ executed test\/a\.test\.js with content 000000000000…, not the registered artifact content [0-9a-f]{12}… \(the file changed after registration: re-register it and validate the new content\)/);
       assert.equal(parsed(same!.content)['approvalState'], 'draft');
       assert.match(same!.content, /known-bad: known-good and known-bad ran on the same code \(tree cccccccccccc…\)/);
       assert.equal(parsed(other!.content)['approvalState'], 'validated', other!.content);

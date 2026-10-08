@@ -228,23 +228,29 @@ function paginationDesigner(v: BrainView) {
       const artifactId = str(jsonOf(resultText(v, 2)), 'artifactId')!;
       return toolCall('test.run', { framework: 'node_test', selector: PAGINATION_TEST_PATH, testArtifactIds: [artifactId] });
     }
-    case 4: {
+    case 4:
+      // D-1: the known-good run of a regression test is its run on the BASE revision (product code restored)
+      return toolCall('test.run', { framework: 'node_test', selector: PAGINATION_TEST_PATH, revision: 'base' });
+    case 5: {
       const artifactId = str(jsonOf(resultText(v, 2)), 'artifactId')!;
       const run = resultText(v, 3);
       const ev = evIds(run).at(-1)!;
-      // the test fails on the defective candidate: that run is the known-bad half of the sensitivity proof
-      return toolCall('test_artifact.validate', /NOT PASSED/.test(run) ? { artifactId, knownBadEvidenceId: ev } : { artifactId, knownGoodEvidenceId: ev });
+      const good = evIds(resultText(v, 4)).at(-1)!;
+      // the test fails on the defective candidate (known-bad) and passes on the base revision (known-good)
+      return toolCall('test_artifact.validate', /NOT PASSED/.test(run) ? { artifactId, knownBadEvidenceId: ev, knownGoodEvidenceId: good } : { artifactId, knownGoodEvidenceId: ev });
     }
     default: {
       const artifactId = str(jsonOf(resultText(v, 2)), 'artifactId')!;
       const ev = evIds(resultText(v, 3)).at(-1)!;
-      const summary = `Registered ${PAGINATION_TEST_PATH} (artifact ${artifactId}) for ledger-contract A1; it FAILS on the candidate (known-bad evidence ${ev}); the known-good run awaits a fix.`;
-      return toolCall('complete_work', { summary, evidenceRefs: [ev], output: { summary, testArtifacts: [{ artifactId, path: PAGINATION_TEST_PATH, covers: [OBJECTIVE.objectiveId], evidenceRefs: [ev] }] } });
+      const good = evIds(resultText(v, 4)).at(-1)!;
+      const state = str(jsonOf(resultText(v, 5)), 'approvalState') ?? 'draft';
+      const summary = `Registered ${PAGINATION_TEST_PATH} (artifact ${artifactId}) for ledger-contract A1; it FAILS on the candidate (known-bad evidence ${ev}) and passes on the base revision (known-good evidence ${good}): ${state}, oracle consistency review requested.`;
+      return toolCall('complete_work', { summary, evidenceRefs: [ev, good], output: { summary, testArtifacts: [{ artifactId, path: PAGINATION_TEST_PATH, covers: [OBJECTIVE.objectiveId], evidenceRefs: [ev, good] }] } });
     }
   }
 }
 
-/** Planned designer B (transfer, A2): write → commit → register → run (passes: known-good) → mutation run → validate → complete. */
+/** Planned designer B (transfer, A2): write → commit → register → run → run on the base revision (known-good) → mutation run → validate → complete. */
 function transferDesigner(v: BrainView) {
   switch (v.step) {
     case 0:
@@ -261,16 +267,19 @@ function transferDesigner(v: BrainView) {
       return toolCall('test.run', { framework: 'node_test', selector: TRANSFER_TEST_PATH, testArtifactIds: [artifactId] });
     }
     case 4:
+      // D-1 (review): the known-good run is the run on the BASE revision (only it lets the artifact decide A2, a P1 assertion)
+      return toolCall('test.run', { framework: 'node_test', selector: TRANSFER_TEST_PATH, revision: 'base' });
+    case 5:
       return toolCall('mutation.run', { file: 'src/ledger.js', testSelector: TRANSFER_TEST_PATH, maxMutants: 12, operators: ['arithmetic'], framework: 'node_test' });
-    case 5: {
+    case 6: {
       const artifactId = str(jsonOf(resultText(v, 2)), 'artifactId')!;
-      return toolCall('test_artifact.validate', { artifactId, knownGoodEvidenceId: evIds(resultText(v, 3)).at(-1)!, mutationEvidenceId: evIds(resultText(v, 4)).at(-1)! });
+      return toolCall('test_artifact.validate', { artifactId, knownGoodEvidenceId: evIds(resultText(v, 4)).at(-1)!, mutationEvidenceId: evIds(resultText(v, 5)).at(-1)! });
     }
     default: {
       const artifactId = str(jsonOf(resultText(v, 2)), 'artifactId')!;
       const run = evIds(resultText(v, 3)).at(-1)!;
-      const mutation = evIds(resultText(v, 4)).at(-1)!;
-      const validated = str(jsonOf(resultText(v, 5)), 'approvalState') === 'validated';
+      const mutation = evIds(resultText(v, 5)).at(-1)!;
+      const validated = str(jsonOf(resultText(v, 6)), 'approvalState') === 'validated';
       const summary = `Registered ${TRANSFER_TEST_PATH} (artifact ${artifactId}) for ledger-contract A2: passes on the candidate (${run}) and kills mutants (${mutation}); ${validated ? 'validated' : 'still a draft'}.`;
       const artifact: Record<string, JsonValue> = { artifactId, path: TRANSFER_TEST_PATH, covers: [OBJECTIVE.objectiveId], evidenceRefs: [run, mutation] };
       if (validated) artifact['validated'] = true;
@@ -450,9 +459,45 @@ export function isRunReview(v: BrainView): boolean {
   return v.role === 'reviewer' && /subjectRef \{"kind":"run","id":"/.test(v.userText) && inputRecord(v, 'finding') === undefined;
 }
 
-/** The reviewer of a PoC: run-level review requests go to `run`, finding reviews to `finding`. */
+/** (D-1) An oracle consistency review request of a validated test artifact. */
+export function isArtifactReview(v: BrainView): boolean {
+  return v.role === 'reviewer' && /subjectRef \{"kind":"test_artifact","id":"ta_/.test(v.userText);
+}
+
+/**
+ * (D-1) The oracle consistency review of a validated test artifact: fetches the validation evidence the request cites
+ * (evidence.get) and approves only when a fetched run executed exactly the artifact's file (its execution binding);
+ * otherwise it asks for more evidence. Never the designer's narrative.
+ */
+export const artifactReviewer: RoleBrain = (v) => {
+  const m = /oracle consistency of test artifact (ta_\w+) \(([^,)]+)/.exec(v.userText);
+  if (!m) return toolCall('fail_work', { reason: 'agent_failed', message: 'the review request names no test artifact' });
+  const [, artifactId, path] = m as unknown as [string, string, string];
+  const cited = (/citing the validation evidence you inspected \(([^)]*)\)/.exec(v.userText)?.[1] ?? '').split(',').map((x) => x.trim()).filter((x) => x.startsWith('ev_')).slice(0, 3);
+  const fetched = v.step;
+  if (fetched < cited.length) return toolCall('evidence.get', { evidenceId: cited[fetched]! });
+  const inspected = cited.slice(0, fetched);
+  const binding = inspected.filter((_id, i) => {
+    const files = (jsonOf(resultText(v, i))['structured'] as { executedTests?: { files?: Array<{ path?: string }> } } | undefined)?.executedTests?.files ?? [];
+    return files.some((f) => f.path === path);
+  });
+  const verdict = binding.length > 0 ? 'approve' : 'needs_more_evidence';
+  if (v.step === cited.length) {
+    return toolCall('blackboard.post_review', {
+      subjectRef: { kind: 'test_artifact', id: artifactId },
+      verdict,
+      rationale: binding.length > 0 ? `The validation runs ${binding.join(', ')} executed ${path} itself; its assertions encode the oracle assertions it names.` : `None of ${inspected.join(', ') || 'the cited evidence'} executed ${path}.`,
+      checkedEvidenceRefs: inspected,
+    });
+  }
+  const review = str(jsonOf(resultText(v, cited.length)), 'recordId')!;
+  const summary = `Oracle consistency review of ${artifactId} (${path}): ${verdict}.`;
+  return toolCall('complete_work', { summary, evidenceRefs: inspected, recordRefs: [review], output: { summary, verdict, reviews: [review], checkedEvidenceIds: inspected } });
+};
+
+/** The reviewer of a PoC: artifact reviews to `artifactReviewer`, run-level review requests to `run`, finding reviews to `finding`. */
 export function pocReviewer(finding: RoleBrain, run: RoleBrain): RoleBrain {
-  return (v) => (isRunReview(v) ? run(v) : finding(v));
+  return (v) => (isArtifactReview(v) ? artifactReviewer(v) : isRunReview(v) ? run(v) : finding(v));
 }
 
 /** A test-result whose recorded cases show `name` with status failed. */

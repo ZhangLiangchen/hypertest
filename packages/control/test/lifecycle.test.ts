@@ -108,8 +108,10 @@ describe('convergence: replans, gate feedback loop, caps, exhaustion', () => {
       const gateTicks = r.ticks.filter((t) => t.decision);
       assert.deepEqual(gateTicks.map((t) => [t.decision!.verdict, t.final, t.status]), [['inconclusive', false, 'running'], ['inconclusive', true, 'completed']]);
       const [first, second] = gateTicks.map((t) => t.decision!);
-      // C0: no oracle is pinned by this run either (conformance-1) — reported first, in criterion order
-      assert.deepEqual(first!.unknownCriteria.map((c) => c.criterionId), ['C0', 'C1', 'C4']);
+      // C0: no oracle is pinned by this run either (conformance-1) — reported first, in criterion order; C12: the run has
+      // no SystemModel (coverage-1: missing domain contracts are unknown, never pass)
+      assert.deepEqual(first!.unknownCriteria.map((c) => c.criterionId), ['C0', 'C1', 'C4', 'C12']);
+      assert.ok(first!.reasons.some((r) => /the run has no SystemModel revision: record the system under test \(system_model\.record\) before judging it/.test(r)), first!.reasons.join('\n'));
       assert.equal(second!.revision, 2);
       assert.equal(second!.supersedes, first!.decisionId);
       assert.equal((await h.deps.decisions.latestForRun(run.runId))!.decisionId, second!.decisionId);
@@ -201,29 +203,33 @@ describe('convergence: replans, gate feedback loop, caps, exhaustion', () => {
     }
   });
 
-  test("model budget boundary with onBudgetExhausted 'pause': the item fails, the run pauses; resume ⇒ gate", async () => {
+  test("model budget boundary with onBudgetExhausted 'pause': the item waits (never failed), the run pauses; resume without room ⇒ the exact reason, gate", async () => {
     const h = await createHarness({ brains: { lead: NO_PLAN }, config: { onBudgetExhausted: 'pause' } });
     try {
       const run = await h.control.startRun({ goal: 'tokens', target: {}, budget: { maxModelTokens: 6000 } });
       const t = await h.control.tick(run.runId);
       const out = await h.control.executeTurn(t.dispatched[0]!.workItemId, t.dispatched[0]!.fencingToken);
       assert.deepEqual(out, { status: 'paused', workItemId: t.dispatched[0]!.workItemId, reason: 'budget' });
+      // the RUN ran out, not the item: it waits for the run to be resumed with its agent and session intact
       const item = (await h.deps.blackboard.getWorkItem(t.dispatched[0]!.workItemId)) as WorkItem;
-      assert.equal(item.state, 'failed');
-      assert.equal(item.failure!.reason, 'budget_exhausted');
+      assert.deepEqual([item.state, item.waitingOn], ['waiting', [`budget:${run.runId}`]]);
       const paused = (await h.deps.runs.get(run.runId))!;
       assert.equal(paused.status, 'paused');
       assert.equal(paused.pauseReason, 'budget');
       const agent = (await h.deps.agents.byWorkItem(item.workItemId))!;
-      assert.equal(agent.status, 'failed');
+      assert.notEqual(agent.status, 'failed');
       assert.equal(h.calls.length, 0, 'no model call was made beyond the budget');
       const idle = await h.control.tick(run.runId);
       assert.equal(idle.status, 'paused');
       assert.deepEqual(idle.dispatched, []);
+      // resumed WITHOUT raising the limit: still no room ⇒ the item ends with the exact reason and the gate decides
       await h.control.resumeRun(run.runId);
       const r = await drive(h, run.runId, 5);
       assert.deepEqual(r.final!.convergence, { state: 'exhausted', reason: 'budget' });
       assert.equal(r.final!.decision!.verdict, 'inconclusive');
+      const ended = (await h.deps.blackboard.getWorkItem(item.workItemId)) as WorkItem;
+      assert.equal(ended.failure!.reason, 'budget_exhausted');
+      assert.match(ended.failure!.message, /^the run was resumed but its budget still has no room for the model call \(tokens: \d+ left, \d+ needed\): model budget exhausted at run:run_\w+ on tokens: /);
     } finally {
       await h.dispose();
     }

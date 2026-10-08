@@ -111,7 +111,9 @@ artifacts: { kind: s3, region: eu-central-1, bucket: hypertest-evidence, prefix:
 | REST API | `127.0.0.1`，无令牌 | 始终在 `HYPERTEST_API_TOKEN` 中设置至少 16 个字符的令牌（或用 `--token-env` 指定其他变量）。非 loopback 的 `--host` 必须有令牌。通过 API 做人工决定始终需要令牌，因为 Agent 能访问 loopback 服务。远程使用时请在前面加 TLS。 |
 | 人工决定 | CLI 或 API | `approve`、`oracle establish`、`oracle decide`、`waive`、`experience review` 以及运行时发布决定（`runtime register`、`record-suite`、`promote`、`rollback`、`migrate`）需要 `--by <name>`（命令要求时还需 `--reason`），并记录为 `human:<name>`（由 CI 执行的发布步骤使用 `--by ci:<pipeline>`）。请求者永远不能决定自己的请求。设置了 `HYPERTEST_SANDBOX` 时这些命令全部被拒绝，而两种沙箱都会在每条命令中设置它，因此 Agent 永远无法晋级评判它自己的运行时。 |
 | 许可 | 内置规则 | 允许读取与记录；写入与执行只允许在工作区内。外部效果在 `local`/`sandbox` 环境中允许，在 `staging` 需要批准。破坏性效果在 `staging` 需要批准，在 `sandbox` 上高风险时需要批准，任何环境中的关键风险都需要批准。`production` 上高于读取的操作一律拒绝，Agent 永远不能决定审批或 oracle 变更。可通过 `policy.rules` 或 OPA 收紧。 |
-| 环境 | 无 | 在 `environments:` 中注册黑盒目标并设置 `environmentClass`。控制面令牌来自 `control.tokenEnv`，从不写入文件。 |
+| 环境 | 无 | 在 `environments:` 中注册黑盒目标并设置 `environmentClass`。控制面令牌来自 `control.tokenEnv`，从不写入文件。对环境的写入、负载与故障只能在工作项的实验下执行（否则为 `experiment_required`）。用 `isolation: { dedicated: true, namespace?, database?, account? }` 注册只属于你的环境：只有这样，实验才能使用隔离模式 `dedicated_environment`（它独占整个环境，并记录 namespace/database/account）。 |
+| 模型凭据 | 失败即关闭 | `apiKeyEnv` 指定的环境变量未设置或为空的提供方不可用：其路由永远不会被选中，也不会发出任何请求。若某运行的角色没有其他路由，运行会在启动时以确切原因被拒绝；`doctor` 会报告该提供方。 |
+| 内核插件 | 无 | `plugins:` 加载以 `digest: sha256:<hex>` 固定的本地 ES 模块；文件被改动则拒绝启动（插件的任何部分都不会被加载）。插件工具与内置工具一样经过能力检查、策略许可、操作台账与证据。插件工具不得复用内置工具或领域工具的 id（否则拒绝启动）。摘要只固定入口文件：请把插件打包为单个文件发布（它导入的模块不被固定）。固定摘要前请审查插件代码：它运行在 Hypertest 进程中。 |
 
 使用 PGlite 时，暂停的运行持有存储锁，人无法从第二个进程批准。请停止前台命令（Ctrl-C；运行仍可恢复），执行
 `hypertest approve …`，再执行 `hypertest resume`；或者使用 `serve` 与 API。
@@ -126,8 +128,15 @@ artifacts: { kind: s3, region: eu-central-1, bucket: hypertest-evidence, prefix:
 | 出现指明持锁者的 `precondition_failed`（PGlite） | 本机已退出进程留下的锁会被自动接管 | 如果持锁者在另一台已下线的主机上，删除 `<dataDir>/db.lock` |
 | 某个操作进入 `manual_review` | 永不自动重试：其结果无法确认，或该操作不可重复 | `hypertest events <runId> --types operation.manual_review,operation.late_receipt`；用 operation id（即幂等键与任务标签）检查目标系统；手工清理；发起新运行。台账条目作为审计记录保留 |
 | 已批准一个会翻转已记录失败的 oracle 变更 | 依赖旧修订的决定被标记；历史不会被改写 | `hypertest status <runId>` 会显示重新评估标记；发起新运行，它会固定新修订 |
-| 运行期间固定的 oracle 被取代 | 门禁准则 C0 为 `unknown`，结论为 `inconclusive` | 发起新运行 |
+| 运行期间固定的 oracle 被取代 | 运行以追加方式重新固定到新批准的修订（`run.oracle_repinned`），之前的决定被标记为需要重新评估，lead 重规划（`oracle_changed`）以定义新实验；门禁按新修订判定 | 无需操作；`hypertest events <runId> --types run.oracle_repinned,replan.triggered` 显示变更 |
+| 运行为 `inconclusive`，且 C12 domain_contracts 为 unknown | 运行没有记录 SystemModel，或某个写入/故障/负载动作不属于任何 ExperimentSpec | 确保 lead 记录被测系统（`system_model.record`）且写入在实验下执行；`gate: { requireContracts: false }` 是一次被记录、需授权的放宽（`gateOverrideBy`） |
+| 某个 oracle 修订被证实有误 | – | `hypertest oracle invalidate <oracleId> --revision <n> --by <name> --reason "…"`：追加一个 `invalid` 修订；基于它的决定被标记为需要重新评估；固定到它的运行在修正后的修订经 `oracle decide` 批准之前至多为 `inconclusive`（C0），批准后运行被重新固定并重规划。在旧修订下运行的实验不再计入：其准则在新实验重跑之前保持未证明 |
+| 生成的测试已通过，C3 仍为 unknown（`… neither satisfy nor violate a critical assertion`） | 生成的测试只有在完成整个生命周期、其已知正确运行在**基线**修订上（`test.run` revision "base"）且敏感度在产品代码上得到证明之后，才能支持或违反 P0/P1 断言；已知正确只在候选本身上通过、或记录了“已知正确不可用”原因的测试不参与 P0/P1 判定 | 查看 `hypertest report <runId>`（被忽略的证据）以及该资产的各阶段；为运行提供 `target.baseCommit`，使回归测试能在基线修订上验证 |
 | 运行预算耗尽 | 运行带着已有证据进入门禁（绝不静默降级）；证据缺口使结论为 `inconclusive` | 在配置（或 `POST /runs`）中提高 `budget`，发起新运行 |
+| 运行处于暂停状态 `budget`（`onBudgetExhausted: pause`） | 运行预算拒绝了一次模型调用；等待中的工作项保留其 Agent 与会话（`budget.exhausted` 指明作用域与维度：`model_tokens` 或 `model_cost`） | 提高限额并执行 `hypertest resume <runId>`：同一个 Agent 继续。若未留出余量就恢复，工作项以确切原因结束，由门禁决定 |
+| Agent 因模型不可用而暂停（`work.paused`，pauseReason `model_unavailable`） | 当前没有路由能服务它们（熔断打开、重试后仍限流或超时）；它们会在半开时间 / Retry-After / 退避后自行恢复，重启后也是如此。永远不能服务该角色的路由（安全、能力、缺失凭据）则以确切原因失败即关闭 | 等待，或执行 `hypertest resume <runId>`（`POST /runs/:id/resume`，需要 API 令牌）让它们立即重试。`hypertest status <runId>` 显示每个 Agent 的暂停 |
+| 提供方调整了价格 | 设置了 `models.priceGuard.maxIncreasePct` 时，超出该幅度的观测价格会打开该路由的熔断（`model.circuit_opened`，原因 `price_change`）；由其他合格路由服务 | `hypertest model prices set <routeId> --input <usd> --output <usd>`；之后清除或更正（`model prices clear`），熔断会在下一个回合边界关闭 |
+| 某运行的 Agent 应改用另一条模型路由 | – | `hypertest model switch <runId> <角色或 agentId> <routeId> --by <name> --reason "…"`（或携带令牌调用 `POST /runs/:id/model-switch`）：在权限复核后于下一个安全回合边界生效，或被拒绝（`model.switch_refused`） |
 | 运行中的任务固定在另一个运行时清单上 | 不会被恢复；控制平面拒绝驱动它 | 用其所属运行时完成它、迁移它（`hypertest runtime migrate`，见 5.3 节），或执行 `hypertest cancel <runId> --reason "…"` |
 | `hypertest run` 失败并报告 `runtime release: … new runs are created only under the active release …`（`precondition_failed`） | 本运行时不是 active 发布（或是未选中该运行的 canary、已回滚的发布，或在设置了 `runtime.requireActiveRelease` 时没有 active 发布）；没有创建运行 | 在部署了 active 发布的地方运行，或发布本运行时（见 5.2 节） |
 | 某个运行时发布表现异常（canary 或 active） | – | `hypertest runtime rollback [<manifestId>] --by <name> --reason "…"`（见 5.3 节）；然后针对 active 发布重新运行套件 |
@@ -240,6 +249,20 @@ hypertest resume            # 在目标运行时上执行：迁移本身从不�
 - `hypertest events <runId> [--follow] [--types a,b]` 与 `GET /runs/:id/events`（SSE）输出 L0 事件：模型路由、工具
   调用、许可、操作、准入与门禁评估，带 correlation 与 causation id。
 - 没有 OpenTelemetry 导出，事件不携带 `traceId`。
+
+## 6a. 模型治理
+
+- **价格。** 目录价格是路由的 `costPerMillionInputUsd` / `costPerMillionOutputUsd`（两者未同时声明的路由成本未知，
+  有美元预算的运行或工作项永远不会使用它）。观测价格保存在 `models.pricesFile`（默认
+  `<dataDir>/state/model-prices.json`）：`hypertest model prices set|clear|list`。设置
+  `models.priceGuard.maxIncreasePct` 后，观测价格超出目录价格该幅度会打开该路由的熔断。
+- **评测分数。** 先 `hypertest eval run <suite> --out result.json`，再 `hypertest eval apply-scores result.json --out
+  scores.json`，然后设置 `models.scoresFile: scores.json`：下次启动按这些分数路由，RuntimeManifest 会记录它们
+  （`modelScores`：摘要、路由、来源），因此分数变化即是新的清单。
+- **预算临近耗尽。** 每个回合之前，工作上下文会被压缩到剩余运行/工作项预算能支付的大小
+  （`context.budget_condensed`），调用的输出预留会缩小到剩余额度（不低于 1024 token），并且在预算压力下 Agent
+  会切换到更便宜的合格路由（`cost` epoch）。预留使用按提供方实际报告校准过的 token 估算（`model.invoked` 在
+  `usage.inputTokens` 旁记录 `estimatedInputTokens`）。
 
 ## 7. 供应链检查
 

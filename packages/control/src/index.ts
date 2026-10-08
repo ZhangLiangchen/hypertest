@@ -28,7 +28,7 @@ export {
   experimentEffectsRunning, experimentResourceProblem, heldClaims, onToolBudgetExhausted, qpsInvocationId, qpsJobMayRun, qpsKey, releaseRunIsolation, releaseStrandedReservations, resourceAliases, runExperimentIds,
   settleExternalQps, syncExperimentClaims, type ExperimentResourceVerdict, type ExperimentSync,
 } from './isolation.ts';
-export { defaultContaminationRules, defaultStopConditions, experimentIsolation } from './domain-tools/specs.ts';
+export { artifactReviewRequestEventId, claimsWithRules, defaultContaminationRules, defaultStopConditions, experimentIsolation, experimentScope, experimentStopEventId } from './domain-tools/specs.ts';
 export {
   EXECUTION_EVIDENCE_TYPES, GATE_AUTHORITY_KINDS, assertRunPinned, authorizedGateWeakenings, gateReference, gateSpecProblems, gateWeakenings, tightenModelPolicy,
   type GateAuthorityJudgement,

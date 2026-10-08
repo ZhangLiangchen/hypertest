@@ -504,7 +504,12 @@ export class NativeEngine implements AgentEngine {
       });
     }
     validateLimits(request.limits);
-    if (record.status === 'interrupted' || record.status === 'waiting') await this.#deps.sessions.setStatus(record.sessionId, 'active');
+    // A[4]: the engine resumes its child — an interrupted or waiting session, or a continuable child's completed task
+    // (the host resumes it only for continuable children); a failed or disposed session is never reactivated
+    if (record.status === 'failed' || record.status === 'disposed') {
+      throw new HypertestError('precondition_failed', `child session ${record.sessionId} is ${record.status}; it cannot be resumed`, { details: { sessionId: record.sessionId, status: record.status } });
+    }
+    if (record.status === 'interrupted' || record.status === 'waiting' || record.status === 'completed') await this.#deps.sessions.setStatus(record.sessionId, 'active');
     const run: RunTurnRequest = { session: request.child, host: request.host, limits: request.limits, signal: request.signal };
     if (request.input !== undefined) run.input = request.input;
     return this.runTurn(run);

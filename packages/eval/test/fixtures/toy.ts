@@ -57,10 +57,14 @@ const OBJECTIVE = {
   acceptanceCriteria: ['the check ran on the candidate with recorded execution evidence'],
 };
 
+/** coverage-1 (gate C12): the toy leads record the system under test before they plan. */
+const SYSTEM_MODEL = { components: [{ componentId: 'toy', name: 'toy candidate', kind: 'module', paths: ['src'] }], sources: [{ kind: 'record', id: 'eval-toy' }] };
+
 function leadBrain(plan: { title: string; objective: string; evidenceType: string }, evidenceType: string): RoleBrain {
   return (v) => {
     if (v.kind === 'initial_plan') {
-      if (v.step === 0) {
+      if (v.step === 0) return toolCall('system_model.record', SYSTEM_MODEL);
+      if (v.step === 1) {
         return toolCall('plan.propose_revision', {
           rationale: 'Execute the release check on the candidate.',
           objectives: [OBJECTIVE],
@@ -172,15 +176,17 @@ const SERVICE_SOURCE = "setTimeout(() => require('node:http').createServer((q, s
  * evidence) → complete with the verified action.
  */
 const restartOperator: RoleBrain = (v) => {
-  if (v.step === 0) return toolCall('env.restart', { environmentId: TOY_ENV_ID, reason: 'planned restart of the candidate before the check' });
-  const restarted = v.toolResults[0]?.content ?? '';
+  // D-4: a restart is a fault-like action on the environment — it runs only for an experiment that plans it
+  if (v.step === 0) return toolCall('experiment.define', { hypothesis: 'toy-svc serves again after one planned restart', environmentId: TOY_ENV_ID, faultPlan: [{ kind: 'restart', target: TOY_ENV_ID }] });
+  if (v.step === 1) return toolCall('env.restart', { environmentId: TOY_ENV_ID, reason: 'planned restart of the candidate before the check' });
+  const restarted = v.toolResults[1]?.content ?? '';
   // a pending restart (the item waited) is settled by the "Results of pending operations" message of the resumed turn
   const settled = /^\[pending\]/.test(restarted) ? (/- operation op_\w+ \(env\.restart\) (\w+)/.exec(v.userText)?.[1] ?? 'pending') : /^\[(\w+)\]/.exec(restarted)?.[1] ?? 'verified';
-  if (v.step === 1) {
+  if (v.step === 2) {
     if (settled !== 'verified') return toolCall('fail_work', { reason: 'agent_failed', message: `env.restart did not verify (${settled}): ${restarted.slice(0, 300)}` });
     return toolCall('http.request', { method: 'GET', environmentId: TOY_ENV_ID, path: '/' });
   }
-  const ids = evidenceIdsIn(v.toolResults[1]?.content ?? '');
+  const ids = evidenceIdsIn(v.toolResults[2]?.content ?? '');
   const op = operationIdsIn(`${restarted}\n${v.userText}`)[0];
   const action: Record<string, JsonValue> = { action: 'env.restart', target: TOY_ENV_ID, status: 'verified', evidenceIds: ids };
   if (op) action['operationId'] = op;
@@ -193,7 +199,8 @@ const restartOperator: RoleBrain = (v) => {
 export function restartBrains(): Record<string, ScriptedBrain> {
   const lead: RoleBrain = (v) => {
     if (v.kind === 'initial_plan') {
-      if (v.step === 0) {
+      if (v.step === 0) return toolCall('system_model.record', SYSTEM_MODEL);
+      if (v.step === 1) {
         return toolCall('plan.propose_revision', {
           rationale: 'Restart the candidate service once and verify it serves.',
           objectives: [OBJECTIVE],

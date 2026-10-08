@@ -188,29 +188,58 @@ function artifact(extra: Partial<TestArtifact>): TestArtifact {
   };
 }
 
-describe('generatedTestsGoverned', () => {
-  const mutation = (killed: number) => evidence('ev_mut', 'mutation-result', { structured: { selector: 'tests/p.test.js', killed, total: 6, survived: 6 - killed } });
+describe('generatedTestsGoverned (revision 2: bound sensitivity + complete lifecycle)', () => {
+  // the execution binding mutation.run / test.run record (D-0): which file ran with which content, on which code
+  const bound = (path: string, sha256: string) => ({ executedTests: { attribution: 'complete', unattributedCases: 0, files: [{ path, sha256, cases: 1 }] }, codeRevision: { kind: 'workspace', treeDigest: 'tree1' } });
+  const mutation = (killed: number, path = 'tests/p.test.js', sha256 = 'dig1') => evidence('ev_mut', 'mutation-result', { structured: { file: 'src/p.js', mutatedFile: { path: 'src/p.js', isTestFile: false, changedSinceBase: false }, selector: path, killed, total: 6, survived: 6 - killed, baseline: { passed: true }, ...bound(path, sha256) } });
   const run = evidence('ev_run', 'test-result', { structured: { passed: true, workspaceDelta: { status: 'computed', testFiles: [{ path: 'tests/p.test.js', change: 'added', sha256: 'dig1' }] } } });
   const ht = (a: TestArtifact) => ({ services: { specs: { listTestArtifacts: async () => [a] } } });
+  /** A generated artifact that went through the whole recorded lifecycle (static, known-good, mutation, approving review). */
+  const complete = (extra: Partial<TestArtifact> = {}): TestArtifact => artifact({
+    approvalState: 'approved',
+    validations: { static: { status: 'passed', evidenceRefs: ['ev_mut'] }, knownGood: { status: 'passed', evidenceRefs: ['ev_run'] }, mutation: { status: 'passed', evidenceRefs: ['ev_mut'] }, mutationScore: 0.5 },
+    oracleReview: { reviewRecordId: 'rec_r', reviewerAgentId: 'ag_rev', reviewerRole: 'reviewer', verdict: 'approve', artifactDigest: 'dig1', oracleRevisions: {}, at: new Date(T0).toISOString() },
+    ...extra,
+  });
 
-  test('a validated test that killed seeded mutants is eligible and may support a release', async () => {
-    const a = artifact({ approvalState: 'validated', validations: { knownGood: { status: 'passed', evidenceRefs: ['ev_run'] }, mutationScore: 0.5 } });
+  test('an approved test whose BOUND mutation run killed seeded mutants is eligible and may support a release', async () => {
     const d = data({ evidence: [run, mutation(3)], decision: decision('pass', { satisfiedCriteria: [{ criterionId: 'C3', description: '', status: 'satisfied', evidenceRefs: ['ev_run'] }] }) });
-    const r = await grade(generatedTestsGovernedGrader, ctx(d, task(), ht(a)));
+    const r = await grade(generatedTestsGovernedGrader, ctx(d, task(), ht(complete())));
     assert.equal(r.pass, true, r.detail);
     assert.equal(outcomeMetrics(task(), d)['mutationScore'], 0.5);
   });
 
+  test('D-0: a mutation result of ANOTHER file (or of other content) proves nothing — an artifact eligible on it fails the grader', async () => {
+    for (const foreign of [mutation(3, 'tests/other.test.js', 'dig9'), mutation(3, 'tests/p.test.js', 'dig-old')]) {
+      const r = await grade(generatedTestsGovernedGrader, ctx(data({ evidence: [run, foreign] }), task(), ht(complete())));
+      assert.equal(r.pass, false);
+      assert.match(r.detail, /eligible exactly when it proved sensitivity and completed its lifecycle: eligible true \(approved\), lifecycle complete, killed 0 bound seeded mutant\(s\)/);
+    }
+  });
+
+  test('D-1: a sensitive test that has not completed its lifecycle (no review, no known-good) is correctly ineligible', async () => {
+    const validatedOnly = artifact({ approvalState: 'validated', validations: { static: { status: 'passed', evidenceRefs: ['ev_mut'] }, knownGood: { status: 'passed', evidenceRefs: ['ev_run'] }, mutation: { status: 'passed', evidenceRefs: ['ev_mut'] } } });
+    const r = await grade(generatedTestsGovernedGrader, ctx(data({ evidence: [run, mutation(3)] }), task(), ht(validatedOnly)));
+    assert.equal(r.pass, true, r.detail);
+    // but a release resting on it fails: it is not gate evidence yet
+    const released = data({ evidence: [run, mutation(3)], decision: decision('pass', { satisfiedCriteria: [{ criterionId: 'C3', description: '', status: 'satisfied', evidenceRefs: ['ev_run'] }] }) });
+    const r2 = await grade(generatedTestsGovernedGrader, ctx(released, task(), ht(validatedOnly)));
+    assert.equal(r2.pass, false);
+    assert.match(r2.detail, /no satisfied criterion rests on evidence of an ineligible generated test: ev_run/);
+    assert.match(r2.detail, /a release needs an eligible generated test: verdict pass with 0 eligible/);
+  });
+
   test('an insensitive test (no mutant killed) that is eligible anyway, or whose evidence supported a criterion, fails; a release without an eligible test fails', async () => {
-    const eligibleAnyway = artifact({ approvalState: 'validated', validations: { knownGood: { status: 'passed', evidenceRefs: ['ev_run'] }, mutationScore: 0.2 } });
-    const r1 = await grade(generatedTestsGovernedGrader, ctx(data({ evidence: [run, mutation(0)] }), task(), ht(eligibleAnyway)));
-    assert.equal(r1.pass, false);
-    assert.match(r1.detail, /eligible exactly when it proved sensitivity: eligible true \(validated\), killed 0/);
+    // recorded as sensitive (mutation passed) and approved, but no bound mutation run killed anything: eligible anyway ⇒ fail
+    const insensitiveEligible = complete();
+    const r1b = await grade(generatedTestsGovernedGrader, ctx(data({ evidence: [run, mutation(0)] }), task(), ht(insensitiveEligible)));
+    assert.equal(r1b.pass, false);
+    assert.match(r1b.detail, /eligible true \(approved\), lifecycle complete, killed 0/);
     const draft = artifact({ approvalState: 'draft', validations: { knownGood: { status: 'passed', evidenceRefs: ['ev_run'] } } });
     const counted = data({ evidence: [run, mutation(0)], decision: decision('pass', { satisfiedCriteria: [{ criterionId: 'C3', description: '', status: 'satisfied', evidenceRefs: ['ev_run'] }] }) });
     const r2 = await grade(generatedTestsGovernedGrader, ctx(counted, task(), ht(draft)));
     assert.equal(r2.pass, false);
-    assert.match(r2.detail, /no satisfied criterion rests on evidence of an insensitive generated test: ev_run/);
+    assert.match(r2.detail, /no satisfied criterion rests on evidence of an ineligible generated test: ev_run/);
     assert.match(r2.detail, /a release needs an eligible generated test/);
     // a review citing the evidence it inspected (C6) is not correctness support
     const reviewed = data({ evidence: [run, mutation(0)], decision: decision('inconclusive', { satisfiedCriteria: [{ criterionId: 'C6', description: '', status: 'satisfied', evidenceRefs: ['ev_run'] }] }) });

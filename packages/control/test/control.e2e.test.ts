@@ -19,7 +19,16 @@ const OBJECTIVE = { objectiveId: 'obj-discount', description: 'Decide whether th
 const lead: RoleBrain = (v) => {
   const ordinal = Number(/Replan #(\d+)/.exec(v.userText)?.[1] ?? '0');
   if (v.kind === 'initial_plan') {
+    // coverage-1 (C12): the run records its SystemModel before it is judged
     if (v.step === 0) {
+      return call('system_model.record', {
+        components: [{ componentId: 'pricing', name: 'pricing', kind: 'module', paths: ['src/pricing.js'] }],
+        changedComponents: ['pricing'],
+        invariants: ['a discount is applied once'],
+        sources: [{ kind: 'file', id: 'src/pricing.js' }],
+      });
+    }
+    if (v.step === 1) {
       return call('plan.propose_revision', {
         rationale: 'Analyse the change and its history in parallel before designing execution.',
         objectives: [OBJECTIVE],
@@ -246,7 +255,7 @@ describe('full mini run (e2e): plan v1 → v2 → reactors → v3 → gate fail'
       code_change_analyst: 'alpha-large', executor: 'beta-exec', historical_bug_analyst: 'alpha-large', lead: 'alpha-large', rca: 'beta-exec', test_designer: 'alpha-large',
       reviewer: 'gamma-review',
     });
-    assert.equal(report.models.find((m) => m.role === 'lead')!.turns, 6);
+    assert.equal(report.models.find((m) => m.role === 'lead')!.turns, 7);
     assert.equal(report.evidence.sealed, true);
     assert.equal(report.evidence.rootHash, decision.evidenceRootHash);
     assert.match(report.markdown, /- \*\*Verdict:\*\* FAIL \(decision qd_\w+, revision 1, signed by ed25519:\w+\)/);

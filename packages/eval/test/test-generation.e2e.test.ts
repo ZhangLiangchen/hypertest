@@ -42,7 +42,8 @@ test('test-generation: only generated tests that kill seeded mutants are eligibl
   assert.deepEqual(['test-generation', 'test-generation-insensitive', 'test-generation-defect'].map((id) => by.get(id)?.verdict), ['pass', 'inconclusive', 'inconclusive']);
 
   const sensitive = seen.get('test-generation')!;
-  assert.deepEqual(sensitive.states, ['validated']);
+  // D-1: validated (static, known-good, bound mutation kills) and then approved by the independent oracle consistency review
+  assert.deepEqual(sensitive.states, ['approved']);
   assert.ok(sensitive.killed[0]! >= 1, 'the sensitive test killed seeded mutants');
   assert.ok(by.get('test-generation')!.outcomeMetrics['mutationScore']! > 0);
   for (const id of ['test-generation-insensitive', 'test-generation-defect']) {

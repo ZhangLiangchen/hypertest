@@ -19,7 +19,7 @@ and `agents` (implemented packages; their real behaviour is relied on). The bind
 | `controlMigrations` | `control/001-control`: `ht_manifests`, `ht_run_gates`, `ht_reactor_cursors`, `ht_claims`, `ht_replans`, `ht_agent_hosts`; `control/002-governance`: gate authority columns of `ht_run_gates`, `ht_delegations` (PGlite + PostgreSQL 16). |
 | `validatePlan(input)` | Pure Plan IR validation (see below). |
 | `createScheduler`, `createReactorService`, `createConvergenceMonitor`, `createAgentWorker` | The parts (exported for durable runtimes and tests). |
-| `createDomainTools(deps)` | `blackboard.*`, `plan.read`, `plan.propose_revision`, `work.propose`, `system_model.record`, `oracle.get|list|propose_change`, `experiment.define`, `test_artifact.register|validate`, `evidence.get|query|claim`, `delegate`, `delegate.status|collect|message|release`, `request_approval`, `complete_work`, `fail_work` — exactly `DOMAIN_TOOL_IDS` of `@hypertest/agents`. |
+| `createDomainTools(deps)` | `blackboard.*`, `plan.read`, `plan.propose_revision`, `work.propose`, `system_model.record`, `oracle.get|list|propose_change`, `experiment.define|stop`, `test_artifact.register|validate`, `evidence.get|query|claim`, `delegate`, `delegate.status|collect|message|release`, `request_approval`, `complete_work`, `fail_work` — exactly `DOMAIN_TOOL_IDS` of `@hypertest/agents`. |
 | `createPhaseGovernor(deps, config)` | BUGate time points evaluated by the control plane: `afterAction`, `beforeTransition`, `beforeAcceptance`, `flaggedActions` (see below). `TOOL_EVIDENCE_TYPES` / `declaredEvidenceTypes`, `POLICY_FLAGGED_EVENT`, `flagEventId`. |
 | `workItemConstraint`, `unmetRequirements`, `describeUnmet`, `requirementProblems`, `addressesEnvironments`, `ENVIRONMENT_FREE_NAMESPACES`, `BASELINE_EFFECTS`, `CAPABILITY_REQUIREMENT_SCHEMA` | I2: the work item's share of parent ∩ role ∩ work item ∩ environment, and the report of what exceeds the grant. |
 | `gateWeakenings(base, effective)`, `EXECUTION_EVIDENCE_TYPES`, `authorizedGateWeakenings(reference, effective, recorded)`, `gateReference`, `GATE_AUTHORITY_KINDS` | conformance-9: the fields in which a run's gate is weaker than its base (DEFAULT_GATE_SPEC ⊕ config), and which of them a recorded human/system authority covers (the gate path and the report judge alike). |
@@ -187,8 +187,11 @@ agent cap, capability/depth violation, parent gone — fails the item: `budget_e
 one `runner.step` with a lease heartbeat. Result mapping: continue ⇒ fence re-check (`lease_lost` if reassigned),
 work budget (turns, tool calls, tokens, cost, wall clock ⇒ agent + item failed `budget_exhausted`); completed ⇒
 item completed with `{summary, output, evidenceRefs, recordRefs}`; failed ⇒ failed (reason mapped onto
-`WorkFailureReason`); waiting ⇒ `running → waiting` (`waitingOn`); boundary retry ⇒ continue, budget ⇒ failed (+ run
-paused with `onBudgetExhausted: 'pause'` when the run scope refused), model_unavailable ⇒ failed; an explicit
+`WorkFailureReason`); waiting ⇒ `running → waiting` (`waitingOn`); boundary retry ⇒ continue; budget ⇒ see **Model
+budget boundary** below; model_unavailable ⇒ PAUSE (a transient unavailability: the item waits on `model:<agentId>`,
+L0 `work.paused` pauseReason `model_unavailable`, resumed by `observeWaiting` after the pause's resumeAt — durable in
+the local and Temporal runtimes, which poll waiting items — or by an operator resume; bounded by the item's and run's
+wall clock) or failed closed with the exact reason (no configured route may ever serve the role); an explicit
 interrupt ⇒ cancelled; a plain abort ⇒ `HypertestError('cancelled')` (the turn replays). Every item write uses
 `expectedFencingToken` (stale_fence ⇒ `lease_lost`); a write refused because the item ended meanwhile (cancelled by a
 plan revision or cancelRun mid-turn — the claim is kept for the audit) reports that terminal state instead of
@@ -215,8 +218,9 @@ FIRST line is `[hypertest role=<role> work_item=<id> kind=<kind> run=<runId>]` f
 prepared BUGate protocol context; sections Task (required), Plan & objectives (lead, reviewer), Blackboard digest +
 full input records, Relevant code (analysis/design roles, `retrieverFactory(root)`), Approved experience, Evidence
 of this item, Oracles; the L2 view (`maxInlineContextTokens` or route window × 0.6). **HARD** pressure ⇒ mandatory
-condensation: LLM condenser (role `condenser` through the router; deterministic summarizer on any failure) ⇒
-`sessions.addCompaction` ⇒ `context.compacted` (with its level). **SOFT** pressure ⇒ deferrable condensation, only when
+condensation: LLM condenser (role `condenser` through the router; deterministic summarizer on any failure; its call is
+charged to the run budget with its tokens AND its USD cost) ⇒ `sessions.addCompaction` ⇒ `context.compacted` (with its
+level). **SOFT** pressure ⇒ deferrable condensation, only when
 `softCondensationDue` (≥ keepRecentTurns + 2 turns since the last cut) and only through the LLM condenser
 (`condenserSummarizer(…, { fallback: false })`) within `SOFT_CONDENSE_TIMEOUT_MS` (60 s): any failure (no route, a failed
 or empty answer, nothing to condense, the deadline) defers it — the turn goes on — and records
@@ -329,6 +333,34 @@ such, never as the verdict), decision + reasons, findings table (ids, severity, 
 and provenance completeness for critical claims (`provenance.traceClaim`), plan evolution, work items by role, model
 routes per role from the epochs (turns), evidence count/root/seal (verified), recovery log.
 
+## Model budget boundary
+
+The model invoker reserves the calibrated input estimate + the output reserve (see `@hypertest/runtime`); a refusal
+carries the ledger's typed refusal, so the worker knows WHICH scope and dimension refused:
+
+- **Fit before refusing.** The worker's context wrapper measures the remaining run/work budget (tokens, and USD priced
+  on the agent's current route) before each assembly: the working view's SOFT/HARD condensation thresholds are
+  relative to `min(context window budget, what the budget can still pay for)` (the prompt/tool overhead measured at the
+  session's previous assembly subtracted), and a turn that still does not fit is condensed again with the exact cap
+  BEFORE the model call (`context.budget_condensed`, plus the usual `context.compacted`). The invoker shrinks the
+  call's output reserve to what remains (≥ `minOutputTokens`), and under budget pressure switches to a cheaper eligible
+  route (`cost` epoch).
+- **Work-scope refusal** (the item's own budget): agent + item failed `budget_exhausted` with the exact message.
+- **Run-scope refusal while other calls hold reservations** (`used + requested ≤ limit`): contention, not exhaustion —
+  the item waits on `budget:<runId>` (L0 `work.paused`, pauseReason `budget`, `contention: true`); `observeWaiting`
+  resumes it when the room is back (`work.resumed`); if the other calls settle without freeing room the exhaustion
+  policy applies (under `'pause'` the run pauses once and the item's pause is recorded as a run pause — `work.paused`
+  `runPaused: true` — so a resume without room ends the item with the exact reason instead of pausing again).
+- **Run-scope exhaustion**: L0 `budget.exhausted` `{ scope: run:<id>, reason: model_tokens | model_cost, dimension,
+  limit, used, requested, remaining, reservedByOthers, routeId, neededTokens, neededCostUsd }`. Under
+  `onBudgetExhausted: 'pause'` the item is NEVER failed: it waits on `budget:<runId>` with its agent and session, and the
+  run pauses (`pauseReason: 'budget'`); after an operator raised the limit and resumed, `observeWaiting` resumes the SAME
+  agent; resumed without room, the item fails with the exact reason ("the run was resumed but its budget still has no
+  room …") and the gate decides. Under `'gate'` the item fails with the exact reason and convergence gates the run —
+  limit: the convergence monitor (another unit's `convergence.ts`) reads only `model_tokens` refusal markers, so a
+  run-scope USD exhaustion (`model_cost`) reaches the gate through the replan livelock guard instead of
+  `exhausted (budget)` (or once `used ≥ limit`).
+
 ## Experiments and budget leases (unit B2)
 
 **experiment.define (conformance-6)** — records the environment the experiment runs against (the authoritative
@@ -403,6 +435,55 @@ job may run (`qpsJobMayRun`: an operation recorded and not ended, or the ledger 
 a claim taken from a dead worker (durability-1) EXCEPT these QPS reservations (`releaseStrandedReservations`): the
 external job outlives its worker (recovery re-attaches it), so its rate stays reserved until the job ends.
 
+## Gate governance (unit gate-governance)
+
+**Experiments govern every write, load and fault (D-3/D-4)** — a call whose effect is `external` or `destructive`
+(except `load.stop`) needs an experiment of its work item: none ⇒ `experiment_required` (a resource another experiment
+holds is named first: `experiment_resource_conflict`); several, none of which alone covers the call ⇒
+`experiment_ambiguous`. The attributed experiment must be ACTIVE (`experimentActionCheck`): not stopped
+(`experiment.stop`, or a stop condition — duration since its first action, `error_rate_above`, `metric_threshold` —
+evaluated deterministically on its evidence and ledger operations before the call and then recorded once,
+`experiment.stopped`, deterministic id) ⇒ `experiment_stopped`; inside its plan (a fault in its fault plan, load within
+its workload) ⇒ else `experiment_plan_violation`; inside its budget (`maxWallClockMs` since definition, `maxToolCalls`
+charged on the scope `experiment:<id>` under the run's; `maxExternalQps` reserved and `maxComputeMinutes` settled on
+that scope too) ⇒ else `experiment_budget_exhausted` (`budget.exhausted`, reason `experiment_*`). Each admitted action
+is recorded once per invocation (`experiment.action`: kind, target, params, rate, duration, concurrency) — the facts the
+gate compares with the plan (C10). `experiment.define` also accepts `budget`; contamination rules beyond the defaults
+become admitted claims (`claimsWithRules`: write_exclusive, or read_shared for a read-only experiment); the isolation
+records its `plan` (contamination checks; for `dedicated_environment` — refused unless the environment is REGISTERED
+dedicated, `environments[].isolation.dedicated` — the dedicated namespace/database/account). An item's own claims and
+the experiments its agent defined are mutually compatible (`runExperimentIds` with `agents`).
+
+**Test artifacts (D-0/D-1)** — `test_artifact.register` checks the oracle refs exist, addresses the run's artifact of
+the same path (unchanged content ⇒ the current revision, `unchanged: true`, never demoted; changed content ⇒ a new
+draft revision, `contentChanged: true`, with a message). `test_artifact.validate` refuses evidence that did not execute
+exactly the artifact's file and content (`foreign_evidence`, the policy's `sensitivityBinding` text) and a base-revision
+known-good of another base commit; it records static / known-good (or `knownGoodUnavailableReason`) / known-bad /
+mutation stages bound to the artifact digest and code; a complete validation requests the oracle consistency review
+(`review.requested`, subjectRef `test_artifact`, once per revision) which the reviewer answers with
+`blackboard.post_review` (approve ⇒ `approved` + `oracleReview`, never by the creator agent or role, only with oracle
+refs in force; reject ⇒ draft; `test_artifact.reviewed`). (Review) A review applies only to the content it was
+requested for (`reviewedArtifactDigest`: the revision named by the reviewer item's `review.requested`): a review of
+content that changed meanwhile is recorded but not applied, with the exact reason; register / validate / review write
+the next artifact revision compare-and-set (`supersedes`), so a concurrent write is a conflict, never a lost update. A
+known-good pass on workspace (candidate) code is accepted but reported as `passed (workspace: no P0/P1 support)`. The
+dispatcher injects the run's `target.baseCommit` into `test.run` revision `base` (none ⇒ `no_base_revision`) and appends
+a precise `[test artifact mismatch: …]` hint when a run executed a registered file whose content changed. `load.stop` is
+attributed to the experiment of the job it ends, whoever calls it (C12). `evidence.claim` refuses a critical claim that
+states no value with `evidenceQuery.field`, and the report labels each claim `evaluated` or `reference only`.
+
+**Gate input and replanning (D-9/D-10/D-11, coverage-1/-17)** — the gate input carries the run's SystemModel, every
+external/destructive operation with its experiment and recorded action (`gateOperations`), admission lapses and stops
+(`experimentFacts`), the environments used with their registered generation and dedication (`environmentFacts`), the
+data of JSON artifacts cited by claims (`claimData`), superseded findings/reviews and an `invalid` latest oracle
+revision. `system_model.record` validates data assets / security boundaries against the declared components and records
+the registered environment's build digest. Before every replan decision the run is re-pinned to a newly approved oracle
+revision (`repinOracles`: `run.oracle_repinned`, this run's decisions on the old revision ⇒ needs_reassessment) and a
+lead replan with reason `oracle_changed` follows (deduplicated; `replan.triggered`). A new unresolved P0/P1 product
+finding (`finding.created`/`updated`) schedules one replan with reason `critical_finding`; its event ids are consumed
+through the inbox (consumer `lead-replan:critical-finding`), so redelivery never replans twice. Gate feedback now also
+covers C10–C12.
+
 ## Invariants and where they are proven
 
 | Invariant | Test |
@@ -438,6 +519,8 @@ external job outlives its worker (recovery re-attaches it), so its rate stays re
 | conformance-6 (chaos: two fault experiments compete): admission rejects the second (not created, holder named, audited) — also when both are defined concurrently (exactly one holder); a different service is admitted; recorded environment/fixtures/seed/stop/contamination/default claims; replay admits once; insufficient isolation refused; write/fault tools refused while claims are lapsed/taken/released or the experiment is read-only / unknown / foreign, reads and load.stop still run, calls name the experiment; claims renewed/re-admitted while an owner lives, lapse recorded once, released when owners end or the run ends; same-run items share claims, foreign items do not; (review B2) a write/fault call outside the experiment's claims (another environment, a bare URL, an abstract-service claim for an environment fault) is refused and a covered one is attributed to its covering experiment; a write/fault call on a resource another experiment holds is refused for every work item (also one running for no experiment), reads still run; a failure after the experiment was saved keeps its claims and the replay records it on the run; the claims outlive the owners while the experiment's load job runs (a competing experiment stays refused) and are released when it ends | `test/isolation-budget.test.ts` |
 | conformance-5: run scope limits; real sandbox metering charged to work + run; compute headroom caps / refuses execute tools, recorded in full, convergence `budget`; artifact headroom passed as limits, exhaustion recorded; pause policy pauses the run; externalQps reserved across concurrent jobs (typed refusal, transient), released on settle / stop / not-applied / observe / run end; recovery from a dead worker keeps a running job's QPS reservation (a job over the cap stays refused) while releasing its stranded model reservations; (review B2) an execution that throws after its job was dispatched keeps the job's rate, and a replayed load.start whose reservation was already given back reserves again (never a job on a released rate); a spent artifact budget refuses write/fault calls before they act (reads and load.stop still run) | `test/isolation-budget.test.ts` |
 | Full product loop: plan v1 (parallel analysts) → drain replan v2 (executor, real node:test in a git repo) → finding → RCA + TestDesigner via reactors → v3 readyForGate → verdict fail; report | `test/control.e2e.test.ts` |
+| Gate governance: the D-0 audit scenario on real tools (foreign mutation evidence refused, the insensitive test stays draft, never pass) and the positive path (bound known-bad, base-revision known-good, independent review ⇒ approved, eligible, C3 violated by its failure, contract revisions on the decision); re-registration and the drift hint; manual stop, met stop condition, plan violation, experiment budget, ambiguity; dedicated environments; oracle re-pin + needs_reassessment; critical-finding replan deduplicated by event id | `test/gate-governance.test.ts` |
+| Experiment requirement and rule-claims: writes/faults/load without an experiment refused (also after a contamination conflict is ruled out); rule resources admitted as claims (read_shared for read-only experiments); validation refusals of foreign / content-mismatched evidence; system model fields | `test/isolation-budget.test.ts`, `test/domain-tools.test.ts`, `test/test-governance.test.ts`, `test/operations.test.ts` |
 
 ## How to run
 
@@ -558,6 +641,27 @@ observeWaiting). `test/fixture.ts` is a git repo with a seeded pricing regressio
   `QPS_REASON_PREFIX`. New L0 event strings (not in the domain
   catalog): `admission.released`; `admission.granted|refused|lapsed` are also emitted with aggregate `experiment`.
   No change to `src/contracts.ts`.
+
+- (unit model-runtime, wave 1) `ControlPlane.releaseModelPauses?(runId, by?)` and `requestModelSwitch?(runId,
+  target, routeId, requestedBy, reason?)` (contracts); `ControlDeps.contextHooks?` (kernel plugin context hooks:
+  bounded reference sections appended as data, L0 `context.hook_applied`). New exports in `delegation.ts`:
+  `modelWaitOperationId`, `parseModelWaitOperationId`, `isModelPaused`, `budgetWaitOperationId`, `isBudgetPaused`; in
+  `worker.ts`: `CONTEXT_HOOK_MAX_CHARS`, `MIN_BUDGET_VIEW_TOKENS`; `TurnState` (context-provider) gains
+  `viewBudgetCap?`, `viewTokens?`, `compactedLevel?`. **Behaviour:** a transient model unavailability PAUSES the item
+  (never fails it); `resumeRun` releases model pauses (and probes the paused routes' circuits); the model budget
+  boundary as described above (the previous behaviour — the item failed, the scope and the `model_tokens` reason guessed
+  from the token dimension — reported a run-scope USD exhaustion as the item's own token exhaustion).
+
+(gate-governance) Domain tool `experiment.stop`; `experiment.define` input `budget`; `test_artifact.validate` input
+`knownGoodUnavailableReason` and output `stages`; `test_artifact.register` output `unchanged` / `contentChanged`;
+`system_model.record` input `dataAssets` / `securityBoundaries` / `sources` and output `buildDigests` / `sources`;
+`blackboard.post_review` on subjectRef kind `test_artifact`. New exports: `experimentScope`, `experimentStopEventId`,
+`artifactReviewRequestEventId`, `claimsWithRules`; `runExperimentIds(deps, item)` also returns the experiments the
+item's agent defined when `deps.agents` is given. `ReplanReason` gains `critical_finding` and `oracle_changed`. Events
+`experiment.action`, `experiment.stopped`, `test_artifact.reviewed`, `run.oracle_repinned`, `replan.triggered`.
+Behaviour changes (each the correct behaviour per the audit; the tests that encoded the old one were rewritten): a
+write/fault/load call needs an active experiment; validation evidence must be bound; a run needs a SystemModel to pass
+(gate C12, unless `requireContracts: false`).
 
 ## Notes for integrators
 

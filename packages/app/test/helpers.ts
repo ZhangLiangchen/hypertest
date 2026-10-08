@@ -66,7 +66,7 @@ export const OBJECTIVE = {
 };
 
 /**
- * The tiny product loop: lead Plan v1 = one executor item (critical test-result evidence) → the executor runs the real
+ * The tiny product loop: lead records the SystemModel, Plan v1 = one executor item (critical test-result evidence) → the executor runs the real
  * node:test suite and completes with its evidence → plan drained → the lead queries the test-result evidence and
  * proposes Plan v2 readyForGate → QualityGate.
  */
@@ -74,7 +74,9 @@ export function tinyRunBrains(): Record<string, RoleBrain> {
   return {
     lead: (v) => {
       if (v.kind === 'initial_plan') {
-        if (v.step === 0) {
+        // coverage-1 (gate C12): the run records the system it tests before it is judged
+        if (v.step === 0) return call('system_model.record', { components: [{ componentId: 'sum', name: 'sum module', kind: 'module', paths: ['src/sum.js'] }], sources: [{ kind: 'file', id: 'src/sum.js' }] });
+        if (v.step === 1) {
           return call('plan.propose_revision', {
             rationale: 'Execute the existing suite on the candidate commit.',
             objectives: [OBJECTIVE],
@@ -166,6 +168,9 @@ export const SUM_ORACLE = {
   oracleId: 'sum-contract',
   scope: { components: ['sum'], description: 'the sum module adds numbers' },
   assertions: [{ assertionId: 'suite-passes', description: 'every case of the sum suite passes', kind: 'requirement', severity: 'P1', check: { type: 'test_outcome', testSelector: '*', expected: 'pass' } }],
+  // D-7: the oracle's judge policy governs the gate — its authority (alice) states that no independent reviewer is
+  // required for this deterministic suite (the configured default requires one; the tiny run has no reviewer)
+  judgePolicy: { independentReviewerRequired: false },
   establishedBy: 'alice',
 } as const;
 

@@ -23,8 +23,14 @@ after(async () => {
 
 const producer = { workerId: 'worker-1', runtimeManifestId: 'rm_1' };
 
+/** A reference claim (no value: it asserts that its evidence exists and matches the query). */
 function claim(evidenceRefs: string[], evidenceQuery: ReportClaim['evidenceQuery'] = {}): ReportClaim {
-  return { claimId: 'claim_1', statement: 'p95 latency is 120ms', value: 120, evidenceQuery, evidenceRefs, critical: true };
+  return { claimId: 'claim_1', statement: 'p95 latency is measured', evidenceQuery, evidenceRefs, critical: true };
+}
+
+/** A value claim (area-C-0: evaluated against its evidence). */
+function valued(value: NonNullable<ReportClaim['value']>, evidenceRefs: string[], evidenceQuery: ReportClaim['evidenceQuery']): ReportClaim {
+  return { claimId: 'claim_v', statement: `the value is ${JSON.stringify(value)}`, value, evidenceQuery, evidenceRefs, critical: true };
 }
 
 test('recordEvidence: puts the bytes and appends a record referencing them', async () => {
@@ -55,7 +61,39 @@ test('resolveClaim: supported when every reference exists in one run and matches
   assert.equal(res.supported, true);
   assert.deepEqual(res.problems, []);
   assert.deepEqual(res.evidence.map((e) => e.evidenceId), [m1.evidenceId, m2.evidenceId]);
+  assert.equal(res.evaluation?.status, 'reference');
   assert.equal((await resolveClaim(ledger, claim([m1.evidenceId]))).supported, true, 'no query constraints, single run');
+  // a value claim is supported only when its aggregation over the evidence equals the value (area-C-0)
+  const max = await resolveClaim(ledger, valued(120, [m1.evidenceId, m2.evidenceId], { evidenceType: 'metric', field: 'latency.p95', aggregation: 'max' }), { runId });
+  assert.equal(max.supported, true, max.problems.join('; '));
+  assert.equal(max.evaluation?.status, 'match');
+  assert.equal((await resolveClaim(ledger, valued(119, [m1.evidenceId, m2.evidenceId], { evidenceType: 'metric', field: 'latency.p95', aggregation: 'avg' }), { runId })).supported, true);
+});
+
+test('area-C-0: an invented number backed by a real evidence id is rejected (the claim is evaluated, not only referenced)', async () => {
+  const runId = 'run_claims_value';
+  const m = await recordEvidence(ledger, artifacts, { runId, evidenceType: 'metric', data: '{"avg_tps":103215}', mimeType: 'application/json', summary: 'tps', structured: { avg_tps: 103215 }, producer, provenance: {} });
+  const invented = await resolveClaim(ledger, { claimId: 'c1', statement: 'avg TPS is 999999', value: 999999, evidenceQuery: { evidenceType: 'metric', field: 'avg_tps', aggregation: 'avg' }, evidenceRefs: [m.evidenceId], critical: true }, { runId });
+  assert.equal(invented.supported, false);
+  assert.equal(invented.evaluation?.status, 'mismatch');
+  assert.deepEqual(invented.problems, ['claim value contradicts its evidence: claimed 999999 but avg of avg_tps over 1 value(s) = 103215 (tolerance 0.5%)']);
+  const honest = await resolveClaim(ledger, { claimId: 'c2', statement: 'avg TPS is 103215', value: 103215, evidenceQuery: { evidenceType: 'metric', field: 'avg_tps', aggregation: 'avg' }, evidenceRefs: [m.evidenceId], critical: true }, { runId });
+  assert.equal(honest.supported, true);
+  // a value without a field to evaluate is unevaluable ⇒ never supported
+  const vague = await resolveClaim(ledger, { claimId: 'c3', statement: 'fast', value: 103215, evidenceQuery: { evidenceType: 'metric' }, evidenceRefs: [m.evidenceId], critical: true }, { runId });
+  assert.equal(vague.supported, false);
+  assert.equal(vague.evaluation?.status, 'unevaluable');
+  assert.match(vague.problems[0]!, /cannot be evaluated against its evidence: the claim states a value but its evidenceQuery names no field/);
+});
+
+test('area-C-0: a field missing from the structured payload is read from the JSON artifact (digest-checked by the store)', async () => {
+  const runId = 'run_claims_artifact';
+  const m = await recordEvidence(ledger, artifacts, { runId, evidenceType: 'metric', data: '{"latency":{"p99":310}}', mimeType: 'application/json', summary: 'latency', structured: { note: 'summary only' }, producer, provenance: {} });
+  const q = { evidenceType: 'metric', field: 'latency.p99' };
+  assert.equal((await resolveClaim(ledger, valued(310, [m.evidenceId], q), { runId })).supported, false, 'without the artifact store the field is missing');
+  const r = await resolveClaim(ledger, valued(310, [m.evidenceId], q), { runId, artifacts });
+  assert.equal(r.supported, true, r.problems.join('; '));
+  assert.equal((await resolveClaim(ledger, valued(250, [m.evidenceId], q), { runId, artifacts })).evaluation?.status, 'mismatch');
 });
 
 test('resolveClaim: unsupported — no references, unknown reference, wrong type, wrong work item, missing field', async () => {
@@ -100,14 +138,14 @@ test('resolveClaim: a referenced record rewritten behind the ledger does not sup
   const good = await recordEvidence(ledger, artifacts, { runId, evidenceType: 'metric', data: 'good', mimeType: 'text/plain', summary: 'p95 = 480ms', structured: { p95: 480 }, producer, provenance: {} });
   const edited = await recordEvidence(ledger, artifacts, { runId, evidenceType: 'metric', data: 'edited', mimeType: 'text/plain', summary: 'p95 = 480ms', structured: { p95: 480 }, producer, provenance: {} });
   const rehashed = await recordEvidence(ledger, artifacts, { runId, evidenceType: 'metric', data: 'rehashed', mimeType: 'text/plain', summary: 'p95 = 480ms', structured: { p95: 480 }, producer, provenance: {} });
-  assert.equal((await resolveClaim(ledger, claim([good.evidenceId, edited.evidenceId, rehashed.evidenceId], { evidenceType: 'metric', field: 'p95' }), { runId })).supported, true);
+  assert.equal((await resolveClaim(ledger, valued(480, [good.evidenceId, edited.evidenceId, rehashed.evidenceId], { evidenceType: 'metric', field: 'p95' }), { runId })).supported, true);
 
   // The numbers are rewritten to make a latency claim pass; the second attacker also fixes metadata_hash.
   await asAttacker(db, `UPDATE ht_evidence SET structured = '{"p95": 120}'::jsonb WHERE evidence_id = $1`, [edited.evidenceId]);
   const forged = computeMetadataHash({ ...rehashed, structured: { p95: 120 } });
   await asAttacker(db, `UPDATE ht_evidence SET structured = '{"p95": 120}'::jsonb, metadata_hash = $1 WHERE evidence_id = $2`, [forged, rehashed.evidenceId]);
 
-  const res = await resolveClaim(ledger, claim([good.evidenceId, edited.evidenceId, rehashed.evidenceId], { evidenceType: 'metric', field: 'p95' }), { runId });
+  const res = await resolveClaim(ledger, valued(120, [good.evidenceId, edited.evidenceId, rehashed.evidenceId], { evidenceType: 'metric', field: 'p95' }), { runId });
   assert.equal(res.supported, false);
   assert.deepEqual(res.problems, [
     `evidence ${edited.evidenceId} fails its integrity check (metadata hash mismatch)`,

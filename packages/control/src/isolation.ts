@@ -1,11 +1,13 @@
-import { isHypertestError } from '@hypertest/core';
+import { isHypertestError, sha256Hex, type JsonValue } from '@hypertest/core';
 import {
   EVENT_TYPES, isTerminalWorkState,
   type EventContext, type ExperimentSpec, type OperationStatus, type ResourceClaim, type TestRun, type ToolEffect, type WorkItem,
 } from '@hypertest/domain';
 import type { BudgetExhaustion, OpenReservation } from '@hypertest/operation';
+import { FAULT_TOOL_IDS, LOAD_TOOL_IDS, evaluateStopConditions, planViolation, type ExperimentActionFacts } from '@hypertest/policy';
 import type { EnvironmentRegistry } from '@hypertest/tools';
 import type { ControlDeps, ResolvedControlConfig } from './deps.ts';
+import { experimentScope, experimentStopEventId, recordExperimentStop } from './domain-tools/specs.ts';
 import { runScope, workScope } from './work-factory.ts';
 import { event, isTerminalRunStatus, runCtx } from './util.ts';
 
@@ -40,14 +42,22 @@ export function declaredExperimentIds(item: Pick<WorkItem, 'inputRefs'>): string
 }
 
 /**
- * The declared experiments of a work item that are experiments OF ITS RUN (the only ones whose claims it may share:
- * declaring another run's experiment id never lets an item past that experiment's claims).
+ * The experiments OF ITS RUN a work item runs for (the only ones whose claims it may share: declaring another run's
+ * experiment id never lets an item past that experiment's claims): the ones it declares, and — when `agents` is given
+ * (D-4) — the ones its own agent defined (the experiment already shares its claims with its defining item, so the item's
+ * own claims must share them back, or the item would lose its resources to its own experiment).
  */
-export async function runExperimentIds(deps: Pick<ControlDeps, 'specs'>, item: Pick<WorkItem, 'inputRefs' | 'runId'>): Promise<string[]> {
+export async function runExperimentIds(deps: Pick<ControlDeps, 'specs'> & Partial<Pick<ControlDeps, 'agents'>>, item: Pick<WorkItem, 'inputRefs' | 'runId'> & Partial<Pick<WorkItem, 'workItemId'>>): Promise<string[]> {
   const out: string[] = [];
   for (const id of declaredExperimentIds(item)) {
     const spec = await deps.specs.getExperiment(id);
     if (spec && spec.runId === item.runId) out.push(id);
+  }
+  if (deps.agents && item.workItemId !== undefined) {
+    const agent = await deps.agents.byWorkItem(item.workItemId);
+    if (agent && agent.runId === item.runId) {
+      for (const e of await deps.specs.listExperiments(item.runId)) if (e.createdBy === agent.agentId && !out.includes(e.experimentId)) out.push(e.experimentId);
+    }
   }
   return out;
 }
@@ -287,6 +297,96 @@ export async function syncExperimentClaims(
     }
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------------------------------- experiment governance
+
+/** (D-3) Deterministic event id of the `experiment.action` record of one tool invocation. */
+export function experimentActionEventId(invocationId: string): string {
+  return `evt_expact_${sha256Hex(`experiment.action\u0000${invocationId}`).slice(0, 32)}`;
+}
+
+/** (D-3) What a write/fault/load call is about to do, from its (validated) arguments — compared with the experiment's plan. */
+export function actionFacts(toolId: string, args: Record<string, unknown>): ExperimentActionFacts {
+  const out: ExperimentActionFacts = {};
+  const env = typeof args['environmentId'] === 'string' ? (args['environmentId'] as string) : undefined;
+  if (toolId === 'env.inject_fault') {
+    if (typeof args['kind'] === 'string') out.kind = args['kind'] as string;
+    if (env !== undefined) out.target = env;
+    if (args['params'] && typeof args['params'] === 'object' && !Array.isArray(args['params'])) out.params = args['params'] as Record<string, JsonValue>;
+    if (typeof args['durationMs'] === 'number') out.durationMs = args['durationMs'] as number;
+  } else if (toolId === 'env.restart' || toolId === 'env.deploy') {
+    out.kind = toolId === 'env.restart' ? 'restart' : 'deploy';
+    if (env !== undefined) out.target = env;
+  } else if (toolId === 'load.start') {
+    out.kind = 'http_load';
+    if (typeof args['targetUrl'] === 'string') out.target = args['targetUrl'] as string;
+    else if (env !== undefined) out.target = `env/${env}`;
+    for (const k of ['ratePerSecond', 'durationMs', 'concurrency'] as const) if (typeof args[k] === 'number') out[k] = args[k] as number;
+  } else {
+    if (env !== undefined) out.target = env;
+    else if (typeof args['url'] === 'string') out.target = args['url'] as string;
+  }
+  return out;
+}
+
+export type ExperimentActionVerdict = { ok: true } | { ok: false; code: 'experiment_stopped' | 'experiment_plan_violation' | 'experiment_budget_exhausted'; problem: string };
+
+/**
+ * (D-3 / D-4) Whether experiment `spec` is ACTIVE for one more write/fault/load call `toolId` (invocation `invocationId`):
+ * not stopped (a recorded stop, or a stop condition met now — evaluated deterministically on its evidence and actions and
+ * then recorded), within its declared plan (a fault must be in the fault plan, load within the workload), and within its
+ * budget (wall clock since definition; tool calls charged to `experiment:<id>`). On success the call is recorded as an
+ * `experiment.action` (one per invocation) — the facts the QualityGate compares with the plan (C10).
+ */
+export async function experimentActionCheck(
+  deps: ControlDeps,
+  ctx: EventContext,
+  spec: ExperimentSpec,
+  call: { toolId: string; invocationId: string; args: Record<string, unknown>; workItemId: string },
+): Promise<ExperimentActionVerdict> {
+  const id = spec.experimentId;
+  const stopped = await deps.events.get(experimentStopEventId(id));
+  if (stopped) {
+    const p = (stopped.payload ?? {}) as { condition?: string; reason?: string };
+    return { ok: false, code: 'experiment_stopped', problem: `experiment ${id} was stopped (${p.condition ?? 'manual'}: ${p.reason ?? ''}); its write, load and fault calls are refused — define a new experiment to continue` };
+  }
+  const evidence = (await deps.evidence.query({ runId: spec.runId })).filter((e) => (e.provenance as { experimentId?: string } | undefined)?.experimentId === id);
+  const actions = await deps.ledger.list({ runId: spec.runId, experimentId: id });
+  const stop = evaluateStopConditions(spec, evidence, actions, deps.clock.isoNow());
+  if (stop.met) {
+    await recordExperimentStop(deps, ctx, spec, { condition: stop.condition.kind, reason: `stop condition ${stop.condition.kind} met`, observed: stop.observed, at: stop.at });
+    return { ok: false, code: 'experiment_stopped', problem: `stop condition ${stop.condition.kind} of experiment ${id} is met (${stop.observed}); the experiment is stopped and its write, load and fault calls are refused` };
+  }
+  const facts = actionFacts(call.toolId, call.args);
+  if (FAULT_TOOL_IDS.includes(call.toolId) || LOAD_TOOL_IDS.includes(call.toolId)) {
+    const v = planViolation(spec, call.toolId, facts);
+    if (v) return { ok: false, code: 'experiment_plan_violation', problem: v };
+  }
+  const b = spec.budget;
+  if (b?.maxWallClockMs !== undefined && deps.clock.nowMs() - Date.parse(spec.createdAt) > b.maxWallClockMs) {
+    const scope = experimentScope(id);
+    await deps.events.append([event(ctx, EVENT_TYPES.budgetExhausted, 'budget', scope, { scope, dimension: 'wallClockMs', limit: b.maxWallClockMs, used: deps.clock.nowMs() - Date.parse(spec.createdAt), reserved: 0, requested: 0, reason: 'experiment_wall_clock', experimentId: id, toolId: call.toolId, invocationId: call.invocationId })]);
+    return { ok: false, code: 'experiment_budget_exhausted', problem: `the wall-clock budget of experiment ${id} (${b.maxWallClockMs} ms) is spent; its actions are refused` };
+  }
+  if (b?.maxToolCalls !== undefined) {
+    const scope = experimentScope(id);
+    const charged = await deps.budget.charge([scope], { toolCalls: 1 }, `experiment:${call.invocationId}`, { idempotencyKey: `exp:${call.invocationId}` });
+    if (!charged.ok) {
+      await deps.events.append([event(ctx, EVENT_TYPES.budgetExhausted, 'budget', scope, { ...charged.exhausted, reason: 'experiment_tool_calls', experimentId: id, toolId: call.toolId, invocationId: call.invocationId })]);
+      return { ok: false, code: 'experiment_budget_exhausted', problem: `the tool-call budget of experiment ${id} is spent (${charged.exhausted.used}/${charged.exhausted.limit}); its actions are refused` };
+    }
+  }
+  const eventId = experimentActionEventId(call.invocationId);
+  if (!(await deps.events.get(eventId))) {
+    try {
+      await deps.events.append([{ ...event(ctx, EVENT_TYPES.experimentAction, 'experiment', id, { experimentId: id, toolId: call.toolId, invocationId: call.invocationId, workItemId: call.workItemId, ...facts }), eventId }]);
+    } catch (e) {
+      // (review) a concurrent replay of the same invocation recorded it first (same deterministic id)
+      if (!(await deps.events.get(eventId))) throw e;
+    }
+  }
+  return { ok: true };
 }
 
 // ---------------------------------------------------------------------------------------------------- external QPS

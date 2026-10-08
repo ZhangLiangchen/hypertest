@@ -8,7 +8,7 @@ import {
 } from '@hypertest/domain';
 import { categoryDecision, classifyTestChange, holdsProductFix, parseUnifiedDiff, type ApprovalRequest, type SelfHealDecision, type TestChangeClassification } from '@hypertest/policy';
 import { toolNameToId, type ToolExecutionRequest, type WorkspaceHandle } from '@hypertest/tools';
-import type { BudgetExhaustion } from '@hypertest/operation';
+import type { BudgetExhaustion, LedgerOperationRecord } from '@hypertest/operation';
 import type { DispatchResult, TerminalSignal, ToolDispatcher } from '@hypertest/runtime';
 import type { ControlDeps } from './deps.ts';
 import { roleClassification } from './clearance.ts';
@@ -21,9 +21,10 @@ import { workScope } from './work-factory.ts';
 import { clip, event, maxRisk } from './util.ts';
 import { POLICY_FLAGGED_EVENT, createPhaseGovernor, flagEventId, type ActionDescription } from './phases.ts';
 import {
-  EXPERIMENT_EXEMPT_TOOLS, EXPERIMENT_GUARDED_EFFECTS, JOB_MAY_RUN, QPS_REASON_PREFIX, callScopes, declaredExperimentIds, exhaustedScope, experimentClaimsProblem, experimentResourceProblem,
-  onToolBudgetExhausted, qpsJobMayRun, qpsKey, settleExternalQps,
+  EXPERIMENT_EXEMPT_TOOLS, EXPERIMENT_GUARDED_EFFECTS, JOB_MAY_RUN, QPS_REASON_PREFIX, callScopes, declaredExperimentIds, exhaustedScope, experimentActionCheck, experimentClaimsProblem,
+  experimentResourceProblem, onToolBudgetExhausted, qpsJobMayRun, qpsKey, settleExternalQps,
 } from './isolation.ts';
+import { experimentScope } from './domain-tools/specs.ts';
 
 /** (review B2) Re-reservations of one load.start invocation's rate before the call is refused (fail closed). */
 const MAX_QPS_REKEYS = 16;
@@ -472,6 +473,28 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
     }
   }
 
+  /**
+   * (addendum, D-0) A precise hint when a test file the run executed differs from the content its test artifact was
+   * registered with: that run's evidence will not count for the artifact (nor for the gate) until it is re-registered and
+   * validated again.
+   */
+  async function artifactDriftHint(structured: Record<string, unknown>): Promise<string | undefined> {
+    const files = (obj(structured['executedTests'])['files'] ?? []) as unknown[];
+    if (!Array.isArray(files) || files.length === 0) return undefined;
+    const artifacts = await specs.listTestArtifacts(input.runId);
+    const notes: string[] = [];
+    for (const f of files) {
+      const rec = obj(f);
+      const path = typeof rec['path'] === 'string' ? normalizeRel(rec['path']) : undefined;
+      if (path === undefined) continue;
+      const a = artifacts.find((x) => normalizeRel(x.path) === path);
+      if (a && typeof rec['sha256'] === 'string' && rec['sha256'] !== a.artifactDigest) {
+        notes.push(`${path} now has content ${String(rec['sha256']).slice(0, 12)}…, but test artifact ${a.artifactId} (revision ${a.revision}, ${a.approvalState}) was registered with ${a.artifactDigest.slice(0, 12)}…`);
+      }
+    }
+    return notes.length ? `[test artifact mismatch: ${notes.join('; ')}. This run's evidence does not count for those artifacts — re-register the file (test_artifact.register) and validate the new content again.]` : undefined;
+  }
+
   /** A dispatcher-level refusal: the call never reaches the ToolRuntime, but it is on L0 like any tool call (I10). */
   async function deny(call: ToolCall, toolId: string, invocationId: string, errorCode: string, text: string): Promise<DispatchResult> {
     await events.append([event(input.eventContext, 'tool.denied', 'tool', invocationId, { toolId, invocationId, status: 'denied', errorCode, reason: clip(text, 2000) })]);
@@ -484,10 +507,11 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
    * refused first dispatch, or when its job was found ended): a replayed call must never run a job on it, so a released
    * reservation is re-reserved under the next key (`qpsKey(invocationId, n)`). 'unavailable' when that keeps happening.
    */
-  async function reserveQps(invocationId: string, rate: number): Promise<{ ok: true; reservationId: string } | { ok: false; exhausted: BudgetExhaustion } | 'unavailable'> {
+  async function reserveQps(invocationId: string, rate: number, extraScopes: string[] = []): Promise<{ ok: true; reservationId: string } | { ok: false; exhausted: BudgetExhaustion } | 'unavailable'> {
     const scope = workScope(input.workItemId);
     for (let attempt = 1; attempt <= MAX_QPS_REKEYS; attempt++) {
-      const r = await budget.reserve([scope], { externalQps: rate }, `${QPS_REASON_PREFIX}${invocationId}`, { idempotencyKey: qpsKey(invocationId, attempt) });
+      // D-3: a load job of an experiment with maxExternalQps also reserves against the experiment's scope
+      const r = await budget.reserve([scope, ...extraScopes], { externalQps: rate }, `${QPS_REASON_PREFIX}${invocationId}`, { idempotencyKey: qpsKey(invocationId, attempt) });
       if (!r.ok || !budget.openReservations) return r;
       if ((await budget.openReservations(scope)).some((o) => o.reservationId === r.reservationId)) return r;
       logger.info('the QPS reservation of a replayed load.start was already given back: reserving its rate again', { invocationId, reservationId: r.reservationId, attempt });
@@ -505,7 +529,7 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
     invocationId: string,
     args: Record<string, unknown>,
     execution: Awaited<ReturnType<typeof toolRuntime.execute>>,
-    call: { qpsReservation: string | undefined; computeCapMs: number | undefined },
+    call: { qpsReservation: string | undefined; computeCapMs: number | undefined; experimentScopes?: string[] },
   ): Promise<string[]> {
     const notes: string[] = [];
     const scopes = callScopes(input.runId, input.workItemId);
@@ -514,7 +538,8 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
       const amounts: { computeMs?: number; artifactBytes?: number } = {};
       if (u.computeMs > 0) amounts.computeMs = u.computeMs;
       if (u.artifactBytes > 0) amounts.artifactBytes = u.artifactBytes;
-      const consumed = await budget.consume([workScope(input.workItemId)], amounts, `tool:${invocationId}`);
+      // D-3: an experiment action also settles against the experiment's budget scope (when it has one)
+      const consumed = await budget.consume([workScope(input.workItemId), ...(call.experimentScopes ?? [])], amounts, `tool:${invocationId}`);
       if (consumed.exhausted) {
         const x = consumed.exhausted;
         const compute = x.dimension === 'computeMs';
@@ -573,7 +598,16 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
       if (input.claimGuard?.lost && !TERMINAL_TOOL_IDS.includes(toolId)) {
         return deny(call, toolId, invocationId, 'resource_claim_lost', `[denied] resource_claim_lost: ${input.claimGuard.lost}; no further tool calls run on them in this turn`);
       }
-      const args = obj(call.arguments);
+      let args = obj(call.arguments);
+      // D-1: a known-good run on the base revision runs on the RUN's base commit (target.baseCommit), never on a commit the
+      // agent names — the control plane sets it (an agent-supplied value is overridden)
+      if (toolId === 'test.run' && args['revision'] === 'base') {
+        const base = (await deps.runs.get(input.runId))?.target.baseCommit;
+        if (base === undefined) {
+          return deny(call, toolId, invocationId, 'no_base_revision', `[denied] no_base_revision: the run names no base commit (target.baseCommit), so there is no base revision to run on. Record knownGoodUnavailableReason with test_artifact.validate (a generated test then never supports or violates a P0/P1 assertion). test.run was NOT executed.`);
+        }
+        args = { ...args, baseCommit: base };
+      }
       if (toolId === 'load.start') {
         // conformance-5: the run's maxExternalQps bounds every load job it starts (a user's cap on load against a
         // shared environment is never silently ignored)
@@ -589,12 +623,31 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
       const experiments = await itemExperiments();
       /** The item's experiments whose claims cover this write/fault call (attribution when it runs for several). */
       let covering: string[] = [];
+      /** (D-3/D-4) The one experiment a write/fault/load call is attributed to (its action, budget and evidence). */
+      let attributed: string | undefined;
+      let experimentBudgetScopes: string[] = [];
       if (effect !== undefined && EXPERIMENT_GUARDED_EFFECTS.has(effect) && !EXPERIMENT_EXEMPT_TOOLS.includes(toolId)) {
-        if (experiments.all.length > 0) {
-          const problem = await experimentClaimsProblem(deps, input.runId, experiments.all, toolId);
-          if (problem !== undefined) {
-            return deny(call, toolId, invocationId, 'experiment_claims_missing', `[denied] experiment_claims_missing: ${problem}. ${toolId} was NOT executed; do not work around it (another experiment may be using these resources).`);
+        // D-4: a write-to-environment / fault-injection / load call needs an ACTIVE ExperimentSpec of this work item —
+        // the experiment records build, environment, data, workload and faults without depending on the model's cooperation
+        if (experiments.all.length === 0) {
+          // a resource another experiment holds is named first (the more specific refusal: its holder is named)
+          const conflict = await experimentResourceProblem(deps, {
+            workItemId: input.workItemId,
+            experimentIds: [],
+            toolId,
+            resources: () => registry.get(toolId)?.resources(args as never, { workspace: ws, runId: input.runId, environments: deps.environments }) ?? [],
+          });
+          if (!conflict.ok) {
+            return deny(call, toolId, invocationId, conflict.code, `[denied] ${conflict.code}: ${conflict.problem}. ${toolId} was NOT executed; do not work around it (another experiment may be using these resources).`);
           }
+          return deny(
+            call, toolId, invocationId, 'experiment_required',
+            `[denied] experiment_required: ${toolId} acts on the environment (effect ${effect}) and work item ${input.workItemId} runs for no experiment. Define one first with experiment.define (hypothesis, environment, workload / fault plan, stop conditions, evidence requirements) — or work on an item that declares one (inputRefs kind experiment). ${toolId} was NOT executed.`,
+          );
+        }
+        const problem = await experimentClaimsProblem(deps, input.runId, experiments.all, toolId);
+        if (problem !== undefined) {
+          return deny(call, toolId, invocationId, 'experiment_claims_missing', `[denied] experiment_claims_missing: ${problem}. ${toolId} was NOT executed; do not work around it (another experiment may be using these resources).`);
         }
         // review B2: held claims license a write/fault only on the resources they claim, and no work item — running for an
         // experiment or not — writes to / faults a resource another experiment holds (its recorded contamination rule)
@@ -608,6 +661,19 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
           return deny(call, toolId, invocationId, verdict.code, `[denied] ${verdict.code}: ${verdict.problem}. ${toolId} was NOT executed; do not work around it (another experiment may be using these resources).`);
         }
         covering = verdict.covering.filter((id) => experiments.known.includes(id));
+        attributed = experiments.known.length === 1 ? experiments.known[0] : covering.length === 1 ? covering[0] : undefined;
+        if (attributed === undefined) {
+          return deny(
+            call, toolId, invocationId, 'experiment_ambiguous',
+            `[denied] experiment_ambiguous: work item ${input.workItemId} runs for experiments ${experiments.known.join(', ') || experiments.all.join(', ')} and ${covering.length === 0 ? 'none' : `${covering.join(', ')}`} of them cover${covering.length === 1 ? 's' : ''} ${toolId} unambiguously: the action could not be attributed to exactly one experiment. Act only on resources one experiment claims. ${toolId} was NOT executed.`,
+          );
+        }
+        const spec = await specs.getExperiment(attributed);
+        if (!spec) return deny(call, toolId, invocationId, 'experiment_claims_missing', `[denied] experiment_claims_missing: experiment ${attributed} does not exist. ${toolId} was NOT executed.`);
+        // D-3: the experiment must be ACTIVE (not stopped, stop conditions not met), the call within its plan and budget
+        const active = await experimentActionCheck(deps, input.eventContext, spec, { toolId, invocationId, args, workItemId: input.workItemId });
+        if (!active.ok) return deny(call, toolId, invocationId, active.code, `[denied] ${active.code}: ${active.problem}. ${toolId} was NOT executed.`);
+        if (spec.budget?.maxExternalQps !== undefined || spec.budget?.maxComputeMinutes !== undefined) experimentBudgetScopes = [experimentScope(spec.experimentId)];
       }
       const guarded = driftGuarded && effect === 'execute';
       if (quarantine && (QUARANTINE_BLOCKED_TOOL_IDS.includes(toolId) || (guarded && toolId !== QUARANTINE_RESTORE_TOOL))) {
@@ -658,8 +724,8 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
       if (toolId === 'load.start') {
         const cap = (await deps.runs.get(input.runId))?.budget.maxExternalQps;
         const rate = args['ratePerSecond'];
-        if (cap !== undefined && typeof rate === 'number' && Number.isFinite(rate) && rate >= 0) {
-          const reserved = await reserveQps(invocationId, rate);
+        if ((cap !== undefined || experimentBudgetScopes.length > 0) && typeof rate === 'number' && Number.isFinite(rate) && rate >= 0) {
+          const reserved = await reserveQps(invocationId, rate, experimentBudgetScopes);
           if (reserved === 'unavailable') {
             return deny(call, toolId, invocationId, 'budget_unavailable', `[denied] budget_unavailable: the request rate of ${toolId} could not be reserved (the call was replayed ${MAX_QPS_REKEYS} times after its rate was given back); the job was NOT started`);
           }
@@ -690,7 +756,7 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
       const snapshot = await snapshotFor(meta.turn);
       const request: ToolExecutionRequest = {
         toolId,
-        input: call.arguments,
+        input: toolId === 'test.run' && args['revision'] === 'base' ? args : call.arguments,
         invocationId,
         runId: input.runId,
         workItemId: input.workItemId,
@@ -705,8 +771,17 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
       // privacy: evidence of this call is recorded at the calling role's classification (read back only with clearance)
       request.dataClassification = roleClassification(deps.roles, input.role);
       // conformance-6: the call's evidence and operations name the experiment it runs for (one declared experiment)
-      if (experiments.known.length === 1) request.experimentId = experiments.known[0]!;
+      if (attributed !== undefined) request.experimentId = attributed;
+      else if (experiments.known.length === 1) request.experimentId = experiments.known[0]!;
       else if (covering.length === 1) request.experimentId = covering[0]!;
+      // (review, coverage-1/C12) ending an effect (load.stop) belongs to the experiment of the job it ends, whoever stops it
+      if (request.experimentId === undefined && EXPERIMENT_EXEMPT_TOOLS.includes(toolId) && typeof args['operationId'] === 'string') {
+        const job = (await deps.ledger.get(args['operationId']).catch(() => undefined)) as (LedgerOperationRecord | undefined);
+        if (job !== undefined && job.runId === input.runId && job.experimentId !== undefined) request.experimentId = job.experimentId;
+      }
+      // D-8: evidence names the SystemModel revision it was gathered under
+      const runNow = await deps.runs.get(input.runId);
+      if (runNow?.systemModelRevision !== undefined) request.systemModelRevision = runNow.systemModelRevision;
       if (computeCapMs !== undefined) request.timeoutMs = computeCapMs;
       if (maxArtifactBytes !== undefined) request.limits = { maxArtifactBytes };
       if (input.fencingToken !== undefined) {
@@ -726,7 +801,7 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
         if (qpsReservation !== undefined && !(await qpsJobMayRun(deps, input.runId, invocationId))) await budget.release(qpsReservation).catch(() => undefined);
         throw e;
       }
-      const budgetNotes = await settleCallBudget(toolId, invocationId, args, execution, { qpsReservation, computeCapMs });
+      const budgetNotes = await settleCallBudget(toolId, invocationId, args, execution, { qpsReservation, computeCapMs, experimentScopes: experimentBudgetScopes });
       if (toolId === 'experiment.define' && execution.status === 'success') experimentsCache = undefined;
       const drift = before !== undefined ? await checkDrift(toolId, invocationId, before) : undefined;
       if (before !== undefined) {
@@ -734,6 +809,10 @@ export function createToolDispatcher(deps: ControlDeps, input: DispatcherInput):
         await store.setGuard(input.agentId, null);
       }
       const flag = await afterAction(toolId, invocationId, call.arguments, execution, snapshot?.snapshotId);
+      if ((toolId === 'test.run' || toolId === 'mutation.run') && execution.status === 'success') {
+        const hint = await artifactDriftHint(obj(execution.structured));
+        if (hint) budgetNotes.push(hint);
+      }
       const noted = budgetNotes.length > 0 ? `${execution.modelText}\n${budgetNotes.join('\n')}` : execution.modelText;
       const body = flag !== undefined ? `${noted}\n${flag}` : noted;
       const result: DispatchResult = {

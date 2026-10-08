@@ -3,7 +3,7 @@ export { runtimeMigrations } from './migrations.ts';
 export { createSessionStore } from './sessions.ts';
 export { createAgentRepository } from './agents.ts';
 export { createEpochManager, safeEpochTurn, SWITCH_REASONS } from './epochs.ts';
-export { createModelInvoker, decisionFromEpoch, switchReasonFor } from './invoker.ts';
+export { CALIBRATION_BOUNDS, DEFAULT_COST_PRESSURE_RATIO, DEFAULT_PAUSE_BACKOFF, createModelInvoker, createTokenCalibration, decisionFromEpoch, qualityOnlyChange, switchReasonFor } from './invoker.ts';
 export {
   NativeEngine, NATIVE_ENGINE_KIND, TEXT_ONLY_NUDGE, TOO_MANY_TOOL_CALLS, MALFORMED_ARGUMENTS, REPETITIVE_LOOP, PARALLEL_TOOL_CONCURRENCY,
   normalizeResponse, toolCallSignature, turnCompletedEventId, validateLimits,
@@ -28,3 +28,7 @@ export {
   type FakeReply, type FakeScript, type FakeInvokeRequest, type FakeToolOutcome, type FakeToolHandler, type FakeToolSpec, type FakeDispatchRecord, type FakeContextOptions,
 } from './testing.ts';
 export { RUNTIME_PACKAGE_VERSION } from './version.ts';
+export { capabilityModes, childModes, type CapabilityMode, type ChildModes } from './capabilities.ts';
+export { inspectAgents, type AgentView } from './inspect.ts';
+export { resumePending } from './agents.ts';
+export { createPluginKernel, PLUGIN_KINDS, pluginDigest, validatePluginManifest, type HypertestPlugin, type PluginKernel, type PluginManifest, type PluginContext, type PluginHealth, type ContextHook, type ServiceRegistry, type CapabilityRegistry, type LoadedPlugin } from './plugins.ts';

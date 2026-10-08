@@ -387,6 +387,32 @@ export function engineContractSuite(name: string, makeEngine: (deps: EngineContr
       assert.match(r.toolResults[1]!.message.content, /too many tool calls in one turn/);
     });
 
+    test('resumeChild (A[4]): a continuable child\'s completed task is resumed by the engine with its queued input; failed or disposed sessions are refused', async () => {
+      const engine = makeEngine(deps);
+      const { ref, runId } = await newSession(engine);
+      const tools = new FakeDispatcher([completeWorkTool()]);
+      const model = new FakeModelInvoker([
+        { toolCalls: [{ name: 'complete_work', arguments: { summary: 'task 1' } }] },
+        { toolCalls: [{ name: 'complete_work', arguments: { summary: 'task 2' } }] },
+      ]);
+      assert.equal((await turn(engine, ref, host(model, tools, runId))).status, 'completed');
+      assert.equal((await engine.inspect(ref)).status, 'completed');
+      // the parent's follow-up arrives through the session inbox; the host resumes the child through the engine
+      await sessions.enqueueInput(ref.sessionId, [{ role: 'user', content: 'FOLLOW-UP from the parent' }]);
+      const r = await engine.resumeChild({ child: ref, host: host(model, tools, runId), limits: LIMITS, signal: new AbortController().signal });
+      assert.equal(r.status, 'completed');
+      assert.equal(r.completion?.summary, 'task 2');
+      assert.ok(JSON.stringify(model.requests[1]!.messages).includes('FOLLOW-UP from the parent'), 'the resumed turn saw the queued input');
+      assert.equal((await engine.inspect(ref)).turnCount, 2);
+      const failed = await newSession(engine);
+      await sessions.setStatus(failed.ref.sessionId, 'failed');
+      await assert.rejects(engine.resumeChild({ child: failed.ref, host: host(model, tools, failed.runId), limits: LIMITS, signal: new AbortController().signal }), isCode('precondition_failed'));
+      assert.equal((await engine.inspect(failed.ref)).status, 'failed', 'never reactivated');
+      const gone = await newSession(engine);
+      await engine.dispose(gone.ref);
+      await assert.rejects(engine.resumeChild({ child: gone.ref, host: host(model, tools, gone.runId), limits: LIMITS, signal: new AbortController().signal }), isCode('precondition_failed'));
+    });
+
     test('spawnChild: the child session holds only its own task context', async () => {
       const engine = makeEngine(deps);
       const { ref: parent, runId } = await newSession(engine, [{ role: 'user', content: 'PARENT-ONLY secret plan' }]);

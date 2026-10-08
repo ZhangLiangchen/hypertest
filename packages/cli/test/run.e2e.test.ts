@@ -249,6 +249,34 @@ describe('hypertest run → status / report / events / evidence verify on the fi
     assert.match(bad.stderr, /^hypertest oracle: invalid oracle file bad-oracle\.yaml:\n {2}- oracles\[0\]\.assertions must be a non-empty list\n/);
   });
 
+  test('D-10 (review): oracle invalidate declares the latest revision invalid (append-only), as a human only; stale revisions and bad input are refused', async () => {
+    // sum-negatives@1 was established by the previous test
+    const usage = await cli(['oracle', 'invalidate', 'sum-negatives', '--by', 'alice', '--reason', 'wrong expectation'], { cwd: dir.path, env });
+    assert.deepEqual([usage.code, usage.stderr], [2, usage.stderr]);
+    assert.match(usage.stderr, /--revision is required/);
+    const badRev = await cli(['oracle', 'invalidate', 'sum-negatives', '--revision', 'one', '--by', 'alice', '--reason', 'x'], { cwd: dir.path, env });
+    assert.equal(badRev.code, 2);
+    assert.match(badRev.stderr, /--revision must be a positive integer, got "one"/);
+    const sandboxed = await cli(['oracle', 'invalidate', 'sum-negatives', '--revision', '1', '--by', 'alice', '--reason', 'x'], { cwd: dir.path, env: { ...env, HYPERTEST_SANDBOX: '1' } });
+    assert.equal(sandboxed.code, 1);
+    assert.match(sandboxed.stderr, /oracle invalidate is a human decision and cannot be taken from inside a Hypertest sandbox/);
+    const r = await cli(['oracle', 'invalidate', 'sum-negatives', '--revision', '1', '--by', 'alice', '--reason', 'the requirement was misread'], { cwd: dir.path, env });
+    assert.deepEqual([r.code, r.stdout, r.stderr], [0, 'oracle sum-negatives revision 1 declared invalid by human:alice (revision 2); 0 decision(s) marked needs_reassessment\n', '']);
+    const config = await loadConfig(project.configPath, { env: { ...process.env, ...env } });
+    const ht = await createHypertest(config, { env: { ...process.env, ...env }, scriptedBrains: { sim: () => ({ text: 'unused' }) }, logger: new MemoryLogger() });
+    try {
+      const v1 = (await ht.services.specs.getOracle('sum-negatives', 1))!;
+      const v2 = (await ht.services.specs.getOracle('sum-negatives'))!;
+      assert.equal(v1.status, 'approved', 'history is never rewritten');
+      assert.deepEqual([v2.revision, v2.status, v2.invalidation?.revision, v2.invalidation?.reason], [2, 'invalid', 1, 'the requirement was misread']);
+    } finally {
+      await ht.close();
+    }
+    // only the latest revision can be declared invalid
+    const stale = await cli(['oracle', 'invalidate', 'sum-negatives', '--revision', '1', '--by', 'bob', '--reason', 'again'], { cwd: dir.path, env });
+    assert.deepEqual([stale.code, stale.stderr], [1, 'hypertest oracle: oracle sum-negatives is at revision 2; only the latest revision (not 1) can be declared invalid [conflict]\n']);
+  });
+
   test('conformance-11: waive records a human gate waiver on a live run; a finished run\'s decision is final', async () => {
     const final = await cli(['waive', run.runId, 'C6', '--by', 'alice', '--reason', 'late'], { cwd: dir.path, env });
     assert.deepEqual([final.code, final.stderr], [1, `hypertest waive: run ${run.runId} is completed: its decision is final (a waiver applies at a gate evaluation) [conflict]\n`]);

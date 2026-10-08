@@ -63,7 +63,9 @@ tool definitions (only `dispatch`/`isParallelSafe`).
 
 **Resume.** `resumeChild` validates everything `runTurn` would refuse — the session and the ref must be `pi`, the limits
 valid — *before* it reactivates an `interrupted`/`waiting` session: a misrouted or malformed resume never un-interrupts a
-session without running a turn.
+session without running a turn. (A[4]) It reactivates `interrupted`, `waiting` and `completed` sessions (a continuable child's next task) and
+refuses `failed` / `disposed` ones (`precondition_failed`); the control plane resumes continuable children through it
+(the runner calls `resumeChild` at the child's next step), and the shared contract suite covers it ("resumeChild (A[4])").
 
 **Pin.** The adapter relies on pi-agent-core internals of the pinned version (parallel batches prepared completely before
 any execution, `finishTurn` ending the loop, the live tool array). `SUPPORTED_PI_AGENT_CORE_VERSION` (`src/version.ts`,
@@ -111,6 +113,9 @@ form; tool-result images become `[image <mime>]`). Usage: IR → pi locally, pi 
 
 `PiEngineDeps` (= `NativeEngineDeps`). Additional exports: `PiEngine.adapterVersion`, `PI_AGENT_CORE_VERSION`,
 `RUNTIME_PI_PACKAGE_VERSION`.
+
+(unit model-runtime, wave 1; behaviour) `resumeChild` also reactivates a `completed` session and refuses `failed` /
+`disposed` sessions with `precondition_failed`; no type changes.
 
 ## Testing
 

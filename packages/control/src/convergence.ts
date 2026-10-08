@@ -1,10 +1,12 @@
-import { canonicalJson, isHypertestError, sha256Hex } from '@hypertest/core';
+import { canonicalJson, isHypertestError, sha256Hex, type JsonValue } from '@hypertest/core';
 import {
   EVENT_TYPES, isTerminalWorkState, workItemFingerprint,
-  type BlackboardRecord, type CoverageGap, type EventContext, type Finding, type Hypothesis, type PlanRevision, type QualityDecision, type Review, type Risk,
+  type BlackboardRecord, type CoverageGap, type EventContext, type EvidenceRecord, type Finding, type Hypothesis, type PlanRevision, type QualityDecision, type Review, type Risk,
   type TestRun, type WorkItem,
 } from '@hypertest/domain';
-import { DEFAULT_GATE_SPEC, acceptanceFacts, applyPhasePermit, withPolicyHold, type GateInput } from '@hypertest/policy';
+import {
+  DEFAULT_GATE_SPEC, acceptanceFacts, applyPhasePermit, withPolicyHold, type EnvironmentFacts, type ExperimentActionFacts, type ExperimentFacts, type GateInput, type GateOperation,
+} from '@hypertest/policy';
 import type { NewWorkItem } from '@hypertest/collab';
 import { EVIDENCE_PRODUCER_ROLES } from '@hypertest/agents';
 import type { ConvergenceState } from './contracts.ts';
@@ -13,10 +15,15 @@ import { acceptedPlanCount } from './domain-tools/plan.ts';
 import { createPhaseGovernor } from './phases.ts';
 import { ControlStore, type GateFeedback, type ReplanState } from './store.ts';
 import { WorkFactory, runScope } from './work-factory.ts';
+import { CRITICAL_FINDING_REPLAN_CONSUMER, criticalFindingTriggers } from './reactors.ts';
 import { authorizedGateWeakenings, clip, compact, event, gateReference, runCtx, workBudgetFor } from './util.ts';
 
-/** Criteria whose `unknown` status a replan can address by gathering more evidence (gate feedback loop). */
-export const FEEDBACK_CRITERIA: ReadonlySet<string> = new Set(['C3', 'C4', 'C6', 'C8']);
+/**
+ * Criteria whose `unknown` status a replan can address by gathering more evidence (gate feedback loop): critical oracles,
+ * required evidence, review, coverage, and (D-3 / D-11 / coverage-1) experiment validity, environment validity and the
+ * domain contracts (a missing SystemModel or experiment the lead can still record / define and re-run).
+ */
+export const FEEDBACK_CRITERIA: ReadonlySet<string> = new Set(['C3', 'C4', 'C6', 'C8', 'C10', 'C11', 'C12']);
 /** Gate evaluations per run: the first may send the lead back for more evidence, the second is final. */
 export const MAX_GATE_ATTEMPTS = 2;
 /**
@@ -27,7 +34,12 @@ export const MAX_GATE_ATTEMPTS = 2;
 export const PRODUCER_ROLES: readonly string[] = EVIDENCE_PRODUCER_ROLES;
 const PRODUCT_CATEGORIES: ReadonlySet<string> = new Set(['product_defect', 'security', 'performance']);
 
-export type ReplanReason = 'plan_drained' | 'gate_feedback';
+/**
+ * Why the lead replans (BLUEPRINT §4.1 step 3): the plan drained with objectives open, QualityGate feedback, (coverage-17)
+ * a new unresolved P0/P1 product finding, or (D-10) a pinned oracle changed revision during the run (the run is re-pinned
+ * and its evidence must be re-evaluated in new work/experiments under the new revision).
+ */
+export type ReplanReason = 'plan_drained' | 'gate_feedback' | 'critical_finding' | 'oracle_changed';
 
 export interface ReplanOutcome {
   scheduled: boolean;
@@ -67,7 +79,7 @@ export interface ConvergenceMonitor {
   /** running → converging → gating → QualityGate → decision (signed, sealed) → completed, or back to running with feedback. */
   gate(run: TestRun): Promise<GateOutcome>;
   /** Replan digest shown to the lead (exported for tests and reports). */
-  digest(run: TestRun, items: WorkItem[], reason: ReplanReason, ordinal: number, replans: ReplanState): Promise<string>;
+  digest(run: TestRun, items: WorkItem[], reason: ReplanReason, ordinal: number, replans: ReplanState, extra?: { findings?: string[]; oracles?: string[] }): Promise<string>;
   /**
    * (H7) Before the gate: when the run's gate requires an independent review and no review of the run (or of a decision)
    * exists, emits `review.requested` for the run — once per gate attempt (deterministic event id) — so the reviewer's
@@ -127,7 +139,7 @@ export function createConvergenceMonitor(deps: ControlDeps, config: ResolvedCont
     return undefined;
   }
 
-  async function digest(run: TestRun, items: WorkItem[], reason: ReplanReason, ordinal: number, replans: ReplanState): Promise<string> {
+  async function digest(run: TestRun, items: WorkItem[], reason: ReplanReason, ordinal: number, replans: ReplanState, extra?: { findings?: string[]; oracles?: string[] }): Promise<string> {
     const plan = await blackboard.latestAcceptedPlan(run.runId);
     const since = plan?.decidedAt ?? plan?.createdAt;
     const lines: string[] = [];
@@ -184,6 +196,18 @@ export function createConvergenceMonitor(deps: ControlDeps, config: ResolvedCont
     lines.push('### Failed / cancelled work');
     if (failed.length === 0) lines.push('- none');
     for (const w of failed) lines.push(`- ${w.workItemId} ${w.role} [${w.state}] ${clip(w.title, 120)}${w.failure ? ` — ${w.failure.reason}: ${clip(w.failure.message, 200)}` : ''}`);
+    if (reason === 'critical_finding' && extra?.findings?.length) {
+      lines.push('');
+      lines.push('### New unresolved P0/P1 findings (the reason for this replan)');
+      for (const f of extra.findings) lines.push(`- ${f}`);
+      lines.push('Plan the response: root-cause analysis, a regression test bound to the violated oracle assertion, independent verification, and whether the release objective can still be met.');
+    }
+    if (reason === 'oracle_changed' && extra?.oracles?.length) {
+      lines.push('');
+      lines.push('### Oracle revisions changed during the run (the reason for this replan)');
+      for (const o of extra.oracles) lines.push(`- ${o}`);
+      lines.push('The run is now pinned to the new revision(s). Evidence gathered under the old revision is re-judged by the gate against the new one; experiments defined under it are no longer valid evidence — define NEW experiments (experiment.define) and re-run the critical tests under the new revision. Never rewrite the history of the old one.');
+    }
     if (reason === 'gate_feedback' && replans.feedback) {
       const fb = replans.feedback;
       lines.push('');
@@ -205,25 +229,89 @@ export function createConvergenceMonitor(deps: ControlDeps, config: ResolvedCont
     return clip(lines.join('\n'), 12_000);
   }
 
-  async function maybeReplan(run: TestRun, items: WorkItem[]): Promise<ReplanOutcome> {
-    const replans = await store.replans(run.runId);
-    const plans = await blackboard.listPlans(run.runId);
-    const latest = await blackboard.latestAcceptedPlan(run.runId);
+  /** (D-10) The latest re-pins of the run (from L0), for a replan that could not be scheduled when they happened. */
+  async function lastRepins(run: TestRun): Promise<Array<{ oracleId: string; from: number; to: number }>> {
+    const evs = await events.read(run.runId, { types: [EVENT_TYPES.runOracleRepinned] });
+    return evs.map((e) => e.payload as { oracleId: string; from: number; to: number }).filter((p) => run.oracleRevisions[p.oracleId] === p.to);
+  }
+
+  /** (D-10) A re-pin that no replan has answered yet (the replan was blocked when the re-pin happened). */
+  async function pendingOracleChange(run: TestRun): Promise<boolean> {
+    const repins = await lastRepins(run);
+    if (repins.length === 0) return false;
+    const key = `oracle_changed:${repins.map((c) => `${c.oracleId}@${c.to}`).sort().join(',')}`;
+    const fp = workItemFingerprint({ runId: run.runId, role: 'lead', objective: `replan #${(await store.replans(run.runId)).revisionCount + 1}`, originKey: key });
+    const items = await blackboard.listWorkItems({ runId: run.runId });
+    const answered = (await events.read(run.runId, { types: [EVENT_TYPES.replanTriggered] })).some((e) => (e.payload as { reason?: string; oracles?: string[] }).reason === 'oracle_changed' && repins.every((c) => ((e.payload as { oracles?: string[] }).oracles ?? []).includes(`${c.oracleId}: revision ${c.from} → ${c.to}`)));
+    return !answered && !items.some((w) => w.fingerprint === fp);
+  }
+
+  /**
+   * (D-10) Re-pins the run to the newest APPROVED revision of every pinned oracle that changed during the run (append-only:
+   * the run's record moves forward, `run.oracle_repinned` is on L0, decisions of this run on the old revision are marked
+   * needs_reassessment). Returns the changes ("oracleId r1 → r2").
+   */
+  async function repinOracles(run: TestRun): Promise<{ run: TestRun; changes: Array<{ oracleId: string; from: number; to: number }> }> {
+    const changes: Array<{ oracleId: string; from: number; to: number }> = [];
+    const next: Record<string, number> = { ...run.oracleRevisions };
+    for (const [oracleId, pinned] of Object.entries(run.oracleRevisions ?? {})) {
+      const latest = await specs.getOracle(oracleId);
+      if (!latest || latest.revision <= pinned || latest.status !== 'approved') continue;
+      next[oracleId] = latest.revision;
+      changes.push({ oracleId, from: pinned, to: latest.revision });
+    }
+    if (changes.length === 0) return { run, changes };
+    const ctx = runCtx(run.runId, workerId);
+    const updated = await runs.update(run.runId, { oracleRevisions: next }, ctx);
+    for (const c of changes) {
+      await events.append([event(ctx, EVENT_TYPES.runOracleRepinned, 'run', run.runId, { oracleId: c.oracleId, from: c.from, to: c.to })]);
+      for (const d of await decisions.findByOracleRevision(c.oracleId, c.from)) {
+        if (d.runId !== run.runId) continue; // other runs: the oracle governance marks them per the change policy
+        await decisions.markNeedsReassessment(d.decisionId, `the run was re-pinned from oracle ${c.oracleId} revision ${c.from} to ${c.to}: re-evaluated under the new revision`, ctx);
+      }
+      logger.info('run re-pinned to a new oracle revision', { runId: run.runId, oracleId: c.oracleId, from: c.from, to: c.to });
+    }
+    return { run: updated, changes };
+  }
+
+  async function maybeReplan(start: TestRun, items: WorkItem[]): Promise<ReplanOutcome> {
+    const replans = await store.replans(start.runId);
+    const plans = await blackboard.listPlans(start.runId);
+    const latest = await blackboard.latestAcceptedPlan(start.runId);
+    const repinned = await repinOracles(start);
+    const run = repinned.run;
     let reason: ReplanReason | undefined;
+    let originKey: string | undefined;
+    const extra: { findings?: string[]; oracles?: string[] } = {};
+    let triggers: string[] = [];
     if (replans.feedbackPending) reason = 'gate_feedback';
-    else if (items.every((w) => isTerminalWorkState(w.state)) && !latest?.readyForGate) reason = 'plan_drained';
+    else if (repinned.changes.length > 0 || (await pendingOracleChange(run))) {
+      reason = 'oracle_changed';
+      const changes = repinned.changes.length > 0 ? repinned.changes : await lastRepins(run);
+      extra.oracles = changes.map((c) => `${c.oracleId}: revision ${c.from} → ${c.to}`);
+      originKey = `oracle_changed:${changes.map((c) => `${c.oracleId}@${c.to}`).sort().join(',')}`;
+    } else {
+      const critical = await criticalFindingTriggers(deps, run.runId);
+      if (critical.length > 0) {
+        reason = 'critical_finding';
+        triggers = critical.map((t) => t.eventId);
+        extra.findings = critical.map((t) => `${t.recordId} [${t.severity} ${t.category}] ${clip(t.title, 200)}`);
+        originKey = `critical_finding:${[...triggers].sort()[0]}`;
+      } else if (items.every((w) => isTerminalWorkState(w.state)) && !latest?.readyForGate) reason = 'plan_drained';
+    }
     if (!reason) return { scheduled: false };
     const blocked = await replanBlocker(run, items, plans, replans);
     if (blocked) return { scheduled: false, reason, blocked };
     const lead = roles.require('lead');
     const ctx = runCtx(run.runId, workerId);
     const ordinal = replans.revisionCount + 1;
-    const objective = await digest(run, items, reason, ordinal, replans);
+    const objective = await digest(run, items, reason, ordinal, replans, extra);
+    const titles: Record<ReplanReason, string> = { gate_feedback: 'address QualityGate feedback', plan_drained: 'plan drained', critical_finding: 'new P0/P1 finding', oracle_changed: 'oracle revision changed' };
     const item: NewWorkItem = {
       runId: run.runId,
       kind: 'replan',
       origin: { kind: 'system', reason: `replan:${reason}` },
-      title: `Replan #${ordinal}: ${reason === 'gate_feedback' ? 'address QualityGate feedback' : 'plan drained'}`,
+      title: `Replan #${ordinal}: ${titles[reason]}`,
       objective,
       role: 'lead',
       objectiveIds: [],
@@ -234,7 +322,7 @@ export function createConvergenceMonitor(deps: ControlDeps, config: ResolvedCont
       budget: workBudgetFor(lead),
       priority: 90,
       depth: 0,
-      fingerprint: workItemFingerprint({ runId: run.runId, role: 'lead', objective: `replan #${ordinal}`, originKey: `replan:${ordinal}` }),
+      fingerprint: workItemFingerprint({ runId: run.runId, role: 'lead', objective: `replan #${ordinal}`, originKey: originKey ?? `replan:${ordinal}` }),
       resourceClaims: [],
       state: 'ready',
     };
@@ -243,7 +331,15 @@ export function createConvergenceMonitor(deps: ControlDeps, config: ResolvedCont
       const r = await factory.create(item, ctx, tx);
       if (r.status === 'capped') return undefined;
       // a concurrent tick already scheduled this ordinal (fingerprint duplicate): count the replan once
-      if (r.status === 'created') await store.recordReplan(run.runId, reason, clock.isoNow(), tx);
+      if (r.status === 'created') {
+        await store.recordReplan(run.runId, reason, clock.isoNow(), tx);
+        // coverage-17: each triggering finding event is consumed once (inbox, I5) — a redelivered or re-read event never
+        // schedules a second replan
+        for (const id of triggers) await deps.inbox.tryConsume(CRITICAL_FINDING_REPLAN_CONSUMER, id, tx);
+        if (reason === 'critical_finding' || reason === 'oracle_changed') {
+          await events.append([event(ctx, EVENT_TYPES.replanTriggered, 'work_item', r.workItem.workItemId, { reason, workItemId: r.workItem.workItemId, triggers, findings: extra.findings, oracles: extra.oracles })], tx);
+        }
+      }
       return r.workItem.workItemId;
     });
     if (!created) return { scheduled: false, reason, blocked: 'work_item_cap' };
@@ -290,6 +386,104 @@ export function createConvergenceMonitor(deps: ControlDeps, config: ResolvedCont
     return out;
   }
 
+  /**
+   * (D-3 / D-4 / D-11) What the run did to the outside world, for the gate (C10, C11, C12): every operation of a tool whose
+   * effect is external or destructive, with its experiment and — from the `experiment.action` records — what the call did.
+   */
+  async function gateOperations(runId: string): Promise<GateOperation[]> {
+    const actions = new Map<string, ExperimentActionFacts>();
+    for (const e of await events.read(runId, { types: [EVENT_TYPES.experimentAction] })) {
+      const p = (e.payload ?? {}) as Record<string, unknown>;
+      if (typeof p['invocationId'] !== 'string') continue;
+      const f: ExperimentActionFacts = {};
+      if (typeof p['kind'] === 'string') f.kind = p['kind'];
+      if (typeof p['target'] === 'string') f.target = p['target'];
+      if (p['params'] && typeof p['params'] === 'object' && !Array.isArray(p['params'])) f.params = p['params'] as Record<string, JsonValue>;
+      for (const k of ['ratePerSecond', 'durationMs', 'concurrency'] as const) if (typeof p[k] === 'number') f[k] = p[k] as number;
+      actions.set(p['invocationId'], f);
+    }
+    const out: GateOperation[] = [];
+    for (const op of await deps.ledger.list({ runId })) {
+      const spec = deps.registry.get(op.operationType);
+      const effect = spec === undefined ? 'external' : typeof spec.effect === 'function' ? 'external' : spec.effect;
+      if (effect !== 'external' && effect !== 'destructive') continue;
+      const g: GateOperation = { operationId: op.operationId, toolId: op.operationType, effect, workItemId: op.workItemId, status: op.status, resourceKey: op.target.resourceKey, createdAt: op.createdAt };
+      const experimentId = (op as { experimentId?: string }).experimentId;
+      if (experimentId !== undefined) g.experimentId = experimentId;
+      if (op.toolInvocationId !== undefined) {
+        g.toolInvocationId = op.toolInvocationId;
+        const a = actions.get(op.toolInvocationId);
+        if (a) g.action = a;
+      }
+      out.push(g);
+    }
+    return out;
+  }
+
+  /** (D-3) Admission lapses and recorded stops of the run's experiments (C10). */
+  async function experimentFacts(runId: string, experimentIds: string[]): Promise<ExperimentFacts[]> {
+    const lapses = await events.read(runId, { types: [EVENT_TYPES.admissionLapsed, EVENT_TYPES.experimentStopped] });
+    return experimentIds.map((id) => {
+      const mine = lapses.filter((e) => e.aggregateId === id);
+      const f: ExperimentFacts = {
+        experimentId: id,
+        lapses: mine.filter((e) => e.eventType === EVENT_TYPES.admissionLapsed).map((e) => ({ at: e.occurredAt, conflicts: ((e.payload as { conflicts?: string[] } | undefined)?.conflicts ?? []).map(String) })),
+      };
+      const stop = mine.find((e) => e.eventType === EVENT_TYPES.experimentStopped);
+      if (stop) {
+        const p = (stop.payload ?? {}) as { at?: string; condition?: string; reason?: string };
+        f.stopped = { at: p.at ?? stop.occurredAt, condition: p.condition ?? 'manual', reason: p.reason ?? '' };
+      }
+      return f;
+    });
+  }
+
+  /** (D-11) The registry's view of every environment the run's evidence, experiments, target or actions name (C11). */
+  async function environmentFacts(run: TestRun, evidenceRecords: EvidenceRecord[], experimentEnvs: string[], operations: GateOperation[]): Promise<EnvironmentFacts[]> {
+    const ids = new Set<string>(experimentEnvs);
+    for (const e of evidenceRecords) if (e.environment?.environmentId) ids.add(e.environment.environmentId);
+    if (run.target.environmentId !== undefined) ids.add(run.target.environmentId);
+    for (const o of operations) if (o.resourceKey.startsWith('env/')) ids.add(o.resourceKey.slice(4).split('/')[0]!);
+    const out: EnvironmentFacts[] = [];
+    for (const id of [...ids].sort()) {
+      const env = (deps.environments.load ? await deps.environments.load(id).catch(() => undefined) : undefined) ?? deps.environments.get(id);
+      if (!env) {
+        out.push({ environmentId: id, registered: false });
+        continue;
+      }
+      const f: EnvironmentFacts = { environmentId: id, registered: true, generation: env.generation };
+      if (env.buildDigest !== undefined) f.buildDigest = env.buildDigest;
+      if (env.isolation !== undefined) f.dedicated = env.isolation.dedicated;
+      out.push(f);
+    }
+    return out;
+  }
+
+  /**
+   * (area-C-0) Parsed JSON artifacts of evidence referenced by claims whose field is not in the record's structured payload
+   * (the store checks the digest), so the gate evaluates such claims too.
+   */
+  async function claimData(claims: GateInput['claims'], evidenceRecords: EvidenceRecord[]): Promise<Record<string, JsonValue>> {
+    const byId = new Map(evidenceRecords.map((e) => [e.evidenceId, e]));
+    const out: Record<string, JsonValue> = {};
+    for (const c of claims) {
+      const field = c.evidenceQuery?.field;
+      if (c.value === undefined || typeof field !== 'string') continue;
+      for (const ref of c.evidenceRefs) {
+        const e = byId.get(ref);
+        if (!e || Object.hasOwn(out, ref) || !/^application\/(json|x-ndjson)/.test(e.artifact.mimeType)) continue;
+        const structured = e.structured;
+        if (structured && typeof structured === 'object' && !Array.isArray(structured) && field.split('.')[0]! in structured) continue;
+        try {
+          out[ref] = JSON.parse(new TextDecoder().decode(await deps.artifacts.get(e.artifact))) as JsonValue;
+        } catch {
+          // unreadable: the claim stays unevaluable (unknown) at the gate
+        }
+      }
+    }
+    return out;
+  }
+
   async function gateInput(run: TestRun, ctx: EventContext): Promise<GateInput> {
     const runId = run.runId;
     const gateSpec = (await store.getGate(runId)) ?? DEFAULT_GATE_SPEC;
@@ -301,6 +495,8 @@ export function createConvergenceMonitor(deps: ControlDeps, config: ResolvedCont
       const o = await specs.getOracle(oracleId, revision);
       if (o) oracles.push(o);
       const latest = await specs.getOracle(oracleId);
+      // D-10: a pinned revision declared invalid since (a newer `invalid` revision) is handed to the gate (C0 unknown)
+      if (latest && latest.revision > revision && latest.status === 'invalid') oracles.push(latest);
       for (let rev = latest?.revision ?? 0; rev > revision; rev--) {
         const cand = rev === latest?.revision ? latest : await specs.getOracle(oracleId, rev);
         if (cand?.status === 'approved') {
@@ -324,23 +520,33 @@ export function createConvergenceMonitor(deps: ControlDeps, config: ResolvedCont
     }
     const allEvidence = (await evidence.query({ runId })).filter((e) => e.seq <= root.lastSeq);
     const latestDecision = await decisions.latestForRun(runId);
+    const experiments = await specs.listExperiments(runId);
+    const operations = await gateOperations(runId);
+    const claims = await store.claims(runId);
+    const systemModel = await specs.latestSystemModel(runId);
     const input: GateInput = {
       run,
       gate: gateSpec,
       objectives: plan?.objectives ?? [],
       oracles,
       ...(Object.keys(currentOracleRevisions).length > 0 ? { currentOracleRevisions } : {}),
-      experiments: await specs.listExperiments(runId),
-      findings: await blackboard.query<Finding>({ runId, recordType: 'finding' }),
+      experiments,
+      // with history (D-11: a critical finding cleared by an agent is judged from its lineage)
+      findings: await blackboard.query<Finding>({ runId, recordType: 'finding', includeSuperseded: true }),
       risks: await blackboard.query<Risk>({ runId, recordType: 'risk' }),
-      reviews: await blackboard.query<Review>({ runId, recordType: 'review' }),
+      // with history: an artifact's oracle consistency review is found by its record id (D-1)
+      reviews: await blackboard.query<Review>({ runId, recordType: 'review', includeSuperseded: true }),
       coverageGaps: await blackboard.query<CoverageGap>({ runId, recordType: 'coverage_gap' }),
       testArtifacts: await specs.listTestArtifacts(runId),
       evidence: allEvidence,
       evidenceRoot: { rootHash: root.rootHash, count: root.count },
       workItems: await blackboard.listWorkItems({ runId }),
-      claims: await store.claims(runId),
+      claims,
       exceptions: await gateExceptions(runId),
+      operations,
+      experimentFacts: await experimentFacts(runId, experiments.map((x) => x.experimentId)),
+      environments: await environmentFacts(run, allEvidence, experiments.map((x) => x.environment.environmentId).filter((id) => id !== 'local'), operations),
+      claimData: await claimData(claims, allEvidence),
       runtimeManifestId: run.runtimeManifestId,
       policyRevision: run.policyRevision,
       decisionId: ids.next('qd'),
@@ -349,6 +555,7 @@ export function createConvergenceMonitor(deps: ControlDeps, config: ResolvedCont
       revision: (latestDecision?.revision ?? 0) + 1,
     };
     if (latestDecision) input.supersedes = latestDecision.decisionId;
+    if (systemModel) input.systemModel = systemModel;
     return input;
   }
 
@@ -378,7 +585,8 @@ export function createConvergenceMonitor(deps: ControlDeps, config: ResolvedCont
 
   async function gateRun(start: TestRun): Promise<GateOutcome> {
     const ctx = runCtx(start.runId, workerId);
-    let run = start;
+    // the run as stored now (a re-pin earlier in this tick moved its oracle revisions)
+    let run = (await runs.get(start.runId)) ?? start;
     // BUGate before_transition (run → gating), every gate attempt: the scheduler keeps convergence authority (the run is
     // gated regardless), but a refusal withholds the verdict (at best inconclusive, human review)
     const items = await blackboard.listWorkItems({ runId: run.runId });

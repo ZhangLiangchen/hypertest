@@ -49,7 +49,9 @@ function brains(results: Array<{ name: string; content: string; isError: boolean
   return {
     lead: (v) => {
       if (v.kind === 'initial_plan') {
-        if (v.step === 0) {
+        // coverage-1 (C12): the run records what it tests before it is judged
+        if (v.step === 0) return call('system_model.record', { components: [{ componentId: 'svc', name: 'probed service', kind: 'service', paths: [] }], sources: [{ kind: 'record', id: 'probe-target' }] });
+        if (v.step === 1) {
           return call('plan.propose_revision', {
             rationale: 'probe the service', objectives: [OBJECTIVE],
             workItems: [{ localId: 'p', title: 'probe', objective: 'Run the probe and report.', role: 'executor', dependsOn: [], objectiveIds: ['obj-probe'] }],
@@ -243,7 +245,8 @@ describe('BUGate phases in a run: after action → before transition → before 
     try {
       const run = await h.control.startRun({ goal: 'probe', target: {}, gate: PROBE_GATE, ...AUTHORITY });
       const t = await h.control.tick(run.runId);
-      await h.control.executeTurn(t.dispatched[0]!.workItemId, t.dispatched[0]!.fencingToken);
+      await h.control.executeTurn(t.dispatched[0]!.workItemId, t.dispatched[0]!.fencingToken); // the system model
+      await h.control.executeTurn(t.dispatched[0]!.workItemId, t.dispatched[0]!.fencingToken); // the plan
       const plans = await h.deps.blackboard.listPlans(run.runId);
       assert.deepEqual(plans.map((p) => p.status), ['rejected']);
       assert.match(plans[0]!.validationIssues[0]!, /^policy \(before_transition plan:accepted, approval_required, decision \S+\): rule:hold-plans: plans need a human$/);

@@ -56,6 +56,11 @@ import type { EvalArm, EvalSuite, EvalTask, LlmJudge, ReleaseGateOptions, Releas
  *     release registry of the store; decisions take `--by <name>` (`human:<name>`, or `ci:<pipeline>`) and are refused
  *     (`permission_denied`) under `$HYPERTEST_SANDBOX`. New exports `releaseActor`, `parseAllowances`, `parseCanary`,
  *     `suiteFromEval`.
+ *
+ * (additive, gate-governance D-10)
+ *   - `hypertest oracle invalidate <oracleId> --revision <n> --by <name> --reason "<text>"`: a human declares the latest
+ *     revision of an oracle invalid (OracleGovernance.invalidate: append-only invalid revision, decisions on it marked
+ *     needs_reassessment); refused (`permission_denied`) under `$HYPERTEST_SANDBOX`.
  */
 
 /** A text sink (process.stdout/stderr or a test collector). */

@@ -9,6 +9,7 @@
  */
 import { HypertestError, type JsonValue } from '@hypertest/core';
 import { isEligibleTestArtifact, type DomainEvent, type EvidenceRecord, type TestArtifact } from '@hypertest/domain';
+import { artifactCaseStatuses, sensitivityBinding } from '@hypertest/policy';
 import type { EvalTrial, Grader, GraderContext, GraderResult, TrialData } from './contracts.ts';
 import { RELEASE_VERDICTS, analyzePolicy, analyzeStaleness } from './analysis.ts';
 import { canonicalDifferences } from './trial-records.ts';
@@ -224,28 +225,38 @@ function structured(e: EvidenceRecord | undefined): Record<string, unknown> {
   return e?.structured !== null && typeof e?.structured === 'object' && !Array.isArray(e?.structured) ? (e.structured as Record<string, unknown>) : {};
 }
 
-/** Mutation runs of an artifact (a mutation-result whose selector names the artifact's test) that killed ≥ 1 mutant. */
+/**
+ * (v2, D-0) Kills of the mutation runs BOUND to the artifact: a mutation-result that executed exactly the artifact's file
+ * with its registered content (policy sensitivityBinding) — a mutation result of another test file proves nothing for it.
+ */
 function killedMutants(a: TestArtifact, evidence: readonly EvidenceRecord[]): number {
   let killed = 0;
   for (const e of evidence) {
-    if (e.evidenceType !== 'mutation-result') continue;
+    if (e.evidenceType !== 'mutation-result' || !sensitivityBinding(e, a, 'mutation').ok) continue;
     const s = structured(e);
-    const selector = str(s['selector']);
-    if (selector === undefined || !(selector === a.runner.selector || selector.includes(a.path))) continue;
     if (typeof s['killed'] === 'number') killed = Math.max(killed, s['killed']);
   }
   return killed;
 }
 
-/** The known-bad evidence of an artifact really failed on a case (the validation's own record, re-read from the evidence). */
+/** (v2, D-0) The artifact's known-bad run is bound to it and one of ITS cases failed (re-read from the evidence). */
 function failedKnownBad(a: TestArtifact, evidence: ReadonlyMap<string, EvidenceRecord>): boolean {
   const v = a.validations.knownBad;
   if (v?.status !== 'passed') return false;
   return v.evidenceRefs.some((id) => {
-    const s = structured(evidence.get(id));
-    const cases = Array.isArray(s['cases']) ? (s['cases'] as Array<{ status?: unknown }>) : [];
-    return evidence.get(id)?.evidenceType === 'test-result' && (s['passed'] === false || cases.some((c) => c.status === 'failed'));
+    const e = evidence.get(id);
+    return e !== undefined && sensitivityBinding(e, a, 'known_bad').ok && artifactCaseStatuses(e, a.path).includes('failed');
   });
+}
+
+/**
+ * (v2, D-1) The rest of the lifecycle, as recorded: static check passed, known-good passed (or recorded as unavailable),
+ * approved by an oracle consistency review of exactly this content.
+ */
+function lifecycleComplete(a: TestArtifact): boolean {
+  const v = a.validations;
+  return a.approvalState === 'approved' && a.oracleReview?.verdict === 'approve' && a.oracleReview.artifactDigest === a.artifactDigest
+    && v.static?.status === 'passed' && (v.knownGood?.status === 'passed' || v.knownGoodUnavailable !== undefined);
 }
 
 /** Evidence that an ineligible artifact produced: names it, or ran its content (workspace delta digest). */
@@ -261,11 +272,14 @@ function taintedBy(e: EvidenceRecord, a: TestArtifact): boolean {
 const EVIDENCE_CRITERIA: ReadonlySet<string> = new Set(['C3', 'C4', 'C8']);
 
 /**
- * TestGeneration (ground truth: known-good / seeded mutants): every generated test artifact is eligible exactly when it
- * demonstrated sensitivity — recomputed from the raw evidence: a mutation run of its test killed ≥ 1 seeded mutant, or
- * its known-bad run really failed — and the evidence of an insensitive (ineligible) generated test supported no
- * satisfied evidence criterion (C3 critical oracles, C4 required evidence, C8 coverage) of the decision: it never counts,
- * and a release needs an eligible generated test. A run that generated no test is a precondition failure.
+ * TestGeneration (ground truth: known-good / seeded mutants), revision 2: every generated test artifact is eligible
+ * exactly when it demonstrated sensitivity AND completed its lifecycle — sensitivity recomputed from the raw evidence
+ * BOUND to the artifact (a mutation run that executed exactly its file and content killed ≥ 1 seeded mutant, or its own
+ * known-bad run really failed on one of its cases); lifecycle: static check, known-good (or a recorded reason it cannot
+ * exist), an approving oracle consistency review of this content. The evidence of an ineligible generated test supported
+ * no satisfied evidence criterion (C3 critical oracles, C4 required evidence, C8 coverage) of the decision: it never
+ * counts, and a release needs an eligible generated test. A run that generated no test is a precondition failure.
+ * (Revision 1 accepted a selector match as sensitivity and sensitivity alone as eligibility — the audit's D-0/D-1.)
  */
 export const generatedTestsGovernedGrader: Grader = async (ctx) => {
   const missing = noRun('generatedTestsGoverned', ctx.data);
@@ -278,12 +292,13 @@ export const generatedTestsGovernedGrader: Grader = async (ctx) => {
   for (const a of artifacts) {
     const killed = killedMutants(a, ctx.data.evidence);
     const sensitive = killed > 0 || failedKnownBad(a, byId);
+    const complete = lifecycleComplete(a);
     const eligible = isEligibleTestArtifact(a);
     if (!eligible) ineligible.push(a);
     checks.push({
-      name: `${a.path} (${a.artifactId}) is eligible exactly when it proved sensitivity`,
-      ok: eligible === sensitive,
-      detail: `eligible ${eligible} (${a.approvalState}), killed ${killed} seeded mutant(s), known-bad ${a.validations.knownBad?.status ?? 'none'}`,
+      name: `${a.path} (${a.artifactId}) is eligible exactly when it proved sensitivity and completed its lifecycle`,
+      ok: eligible === (sensitive && complete),
+      detail: `eligible ${eligible} (${a.approvalState}), lifecycle ${complete ? 'complete' : 'incomplete'}, killed ${killed} bound seeded mutant(s), known-bad ${a.validations.knownBad?.status ?? 'none'}`,
     });
   }
   const d = ctx.data.decision;
@@ -291,7 +306,7 @@ export const generatedTestsGovernedGrader: Grader = async (ctx) => {
     // the criteria that establish correctness from evidence (a review citing what it inspected is not such support)
     const supporting = new Set(d.satisfiedCriteria.filter((c) => EVIDENCE_CRITERIA.has(c.criterionId)).flatMap((c) => c.evidenceRefs));
     const tainted = ineligible.flatMap((a) => ctx.data.evidence.filter((e) => supporting.has(e.evidenceId) && taintedBy(e, a)).map((e) => `${e.evidenceId} (${a.path})`));
-    checks.push({ name: 'no satisfied criterion rests on evidence of an insensitive generated test', ok: tainted.length === 0, detail: list(tainted) });
+    checks.push({ name: 'no satisfied criterion rests on evidence of an ineligible generated test', ok: tainted.length === 0, detail: list(tainted) });
     const released = RELEASE_VERDICTS.has(d.verdict);
     const eligibleCount = artifacts.length - ineligible.length;
     checks.push({ name: 'a release needs an eligible generated test', ok: !released || eligibleCount > 0, detail: `verdict ${d.verdict} with ${eligibleCount} eligible generated test(s)` });

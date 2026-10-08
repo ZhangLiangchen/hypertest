@@ -69,7 +69,7 @@ interface PriceNote {
   profile: ModelCapabilityProfile;
   violation?: PriceViolation;
   /** (A[1]) An observed-price change guard note (kind `change`) instead of a ceiling note. */
-  change?: { violated: boolean; observed: ObservedPrice; increasePct: number; maxIncreasePct: number };
+  change?: { violated: boolean; observed?: ObservedPrice; increasePct: number; maxIncreasePct: number };
 }
 
 /** The rejection stages after which a route may come back by itself (pause, never fail closed). */
@@ -170,6 +170,15 @@ class DefaultModelRouter implements ModelRouter {
     return this.#breakers ? this.#breakers.snapshots(this.#deps.clock.nowMs()) : [];
   }
 
+  probeNow(routeIds?: string[]): string[] {
+    if (!this.#breakers) return [];
+    const nowMs = this.#deps.clock.nowMs();
+    const ids = routeIds ?? this.#deps.catalog.list().map((p) => p.routeId);
+    const probed = ids.filter((id) => this.#breakers!.forceHalfOpen(id, nowMs));
+    if (probed.length > 0) this.#deps.logger.info('model circuits half-open on operator request: the next call on each is its probe', { routes: probed });
+    return probed.sort();
+  }
+
   /**
    * (A[1]) Refreshes the observed prices at a safe point (a turn boundary: the start of route / invoke / validate). A
    * failing price source keeps the last observed prices (logged): the guard never flaps open on a read error, and the
@@ -205,8 +214,10 @@ class DefaultModelRouter implements ModelRouter {
   /** (A[1]) The price-change guard: observed price vs catalog price, beyond maxIncreasePct ⇒ violated. */
   #priceChange(p: ModelCapabilityProfile): PriceNote['change'] | undefined {
     const max = this.#maxIncreasePct;
+    if (max === undefined) return undefined;
     const o = this.#observed.get(p.routeId);
-    if (max === undefined || !o || !costKnown(p)) return undefined;
+    // no observed price (or no catalog price to compare with): within the guard — a tripped route closes again
+    if (!o || !costKnown(p)) return { violated: false, increasePct: 0, maxIncreasePct: max };
     const pct = (observed: number, catalog: number) => (observed <= catalog ? 0 : catalog === 0 ? Number.POSITIVE_INFINITY : ((observed - catalog) / catalog) * 100);
     const increasePct = Math.max(pct(o.inputPerMillionUsd, p.costPerMillionInputUsd!), pct(o.outputPerMillionUsd, p.costPerMillionOutputUsd!));
     return { violated: increasePct > max, observed: o, increasePct, maxIncreasePct: max };
@@ -420,7 +431,7 @@ class DefaultModelRouter implements ModelRouter {
         if (change.violated) {
           return reject(
             'availability',
-            `circuit open (price_change): observed price $${change.observed.inputPerMillionUsd}/$${change.observed.outputPerMillionUsd} per M in/out is ${Number.isFinite(change.increasePct) ? `+${change.increasePct.toFixed(1)}%` : 'an unbounded increase'} over the catalog price $${p.costPerMillionInputUsd}/$${p.costPerMillionOutputUsd} (priceGuard.maxIncreasePct ${change.maxIncreasePct}%)`,
+            `circuit open (price_change): observed price $${change.observed?.inputPerMillionUsd}/$${change.observed?.outputPerMillionUsd} per M in/out is ${Number.isFinite(change.increasePct) ? `+${change.increasePct.toFixed(1)}%` : 'an unbounded increase'} over the catalog price $${p.costPerMillionInputUsd}/$${p.costPerMillionOutputUsd} (priceGuard.maxIncreasePct ${change.maxIncreasePct}%)`,
           );
         }
       }
@@ -567,6 +578,8 @@ class DefaultModelRouter implements ModelRouter {
       latencyMs: response.latencyMs,
       stopReason: response.stopReason,
       providerResponseId: response.providerResponseId ?? null,
+      // (additive) the caller's token estimate of this call's input: measured against usage.inputTokens (calibration)
+      estimatedInputTokens: Number.isFinite(routeRequest.contextTokensEstimate) ? routeRequest.contextTokensEstimate : null,
     };
     const outcome: InvokeOutcome = { ok: true, response, routeId: decision.routeId, attempts };
     // The provider answered: its tokens are spent. An audit append that fails now must not discard the response
@@ -712,7 +725,9 @@ class DefaultModelRouter implements ModelRouter {
         const base: Record<string, JsonValue> = {
           routeId, provider: n.profile.provider, model: n.profile.model, catalogRevision, snapshotId: request.contextSnapshotId,
           catalogPrice: { inputPerMillionUsd: n.profile.costPerMillionInputUsd ?? null, outputPerMillionUsd: n.profile.costPerMillionOutputUsd ?? null },
-          observedPrice: { inputPerMillionUsd: n.change.observed.inputPerMillionUsd, outputPerMillionUsd: n.change.observed.outputPerMillionUsd, observedAt: n.change.observed.observedAt ?? null, source: n.change.observed.source ?? null },
+          observedPrice: n.change.observed
+            ? { inputPerMillionUsd: n.change.observed.inputPerMillionUsd, outputPerMillionUsd: n.change.observed.outputPerMillionUsd, observedAt: n.change.observed.observedAt ?? null, source: n.change.observed.source ?? null }
+            : null,
           increasePct: Number.isFinite(n.change.increasePct) ? Number(n.change.increasePct.toFixed(3)) : null,
           maxIncreasePct: n.change.maxIncreasePct,
         };

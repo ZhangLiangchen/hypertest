@@ -238,6 +238,16 @@ describe('H4/H5: tool calls run under the work claim; replays are charged once a
     });
     try {
       const meta = (n: number) => ({ sessionId: agent.sessionId, turn: 20 + n, invocationId: `${agent.sessionId}:${20 + n}:l`, signal: new AbortController().signal });
+      // D-4: load runs only for an experiment of the item declaring it (defined by the lead's agent before its first call)
+      const defined = await h.deps.registry.get('experiment.define')!.execute({
+        hypothesis: 'the service holds 50 rps', workload: { kind: 'http_load', targetUrl: 'http://127.0.0.1:9/', ratePerSecond: 50, durationMs: 1000 },
+        isolation: { mode: 'exclusive_write', resourceClaims: [{ resourceKey: 'url/127.0.0.1:9', mode: 'write_exclusive' }] },
+      }, {
+        runId: run.runId, workItemId: item.workItemId, agentId: agent.agentId, role: 'lead', invocationId: `${agent.sessionId}:19:e`,
+        eventContext: { runId: run.runId, correlationId: item.workItemId, actorId: agent.agentId, workItemId: item.workItemId, agentId: agent.agentId },
+        signal: new AbortController().signal, logger: h.logger, environments: h.deps.environments, claim: { workItemId: item.workItemId, fencingToken: dd.fencingToken },
+      } as never);
+      assert.equal(defined.status, 'success', JSON.stringify(defined));
       const over = await d.dispatch({ id: 'l', name: 'load__start', arguments: { method: 'GET', targetUrl: 'http://127.0.0.1:9/', ratePerSecond: 500, durationMs: 1000 } }, meta(1));
       assert.match(String(over.message.content), /\[denied\] external_qps_exceeded: load\.start ratePerSecond 500 exceeds the run's maxExternalQps 50/);
       assert.deepEqual(executed, [], 'the job never started');
@@ -645,7 +655,10 @@ describe('conformance-4: an oracle superseded during the run', () => {
     return call('complete_work', { summary: 'ready', output: { summary: 'ready', planProposed: true, readyForGate: true, objectives: [] } });
   };
 
-  test('the gate names the superseded pin (C0 unknown): the verdict never rests on the replaced criterion', async () => {
+  // D-10 (changed with gate-governance: the run used to stay pinned to the superseded revision and the gate reported C0
+  // unknown): an approved revision mid-run re-pins the run append-only (run.oracle_repinned on L0), schedules a lead
+  // replan (oracle_changed) and the gate judges under the NEW revision — the replaced criterion never decides
+  test('an oracle approved mid-run re-pins the run, replans the lead (oracle_changed); the verdict never rests on the replaced criterion', async () => {
     const h = await createHarness({ brains: { lead: readyLead } });
     try {
       const ctx = { ...h.ctx('oracle-setup'), actorId: 'human:alice' };
@@ -665,9 +678,18 @@ describe('conformance-4: an oracle superseded during the run', () => {
       const out = await drive(h, run.runId, 30);
       const decision = out.final!.decision!;
       assert.notEqual(decision.verdict, 'pass');
-      const c0 = decision.unknownCriteria.find((c) => c.criterionId === 'C0');
-      assert.match(c0?.detail ?? '', /^oracle or_mid revision 1 is superseded by approved revision 2: /);
-      assert.deepEqual(decision.oracleRevisions, { or_mid: 1 }, 'the decision still names what the run pinned');
+      assert.deepEqual((await h.deps.runs.get(run.runId))!.oracleRevisions, { or_mid: 2 }, 'the run moved to the approved revision');
+      const repinned = await h.deps.events.read(run.runId, { types: ['run.oracle_repinned'] });
+      assert.deepEqual(repinned.map((e) => e.payload), [{ oracleId: 'or_mid', from: 1, to: 2 }]);
+      const replans = (await items(h, run.runId)).filter((w) => w.kind === 'replan' && /oracle revision changed/.test(w.title));
+      assert.equal(replans.length, 1, 'one replan answers the re-pin');
+      assert.match(replans[0]!.objective, /or_mid: revision 1 → 2/);
+      const triggered = await h.deps.events.read(run.runId, { types: ['replan.triggered'] });
+      assert.deepEqual(triggered.map((e) => (e.payload as { reason: string }).reason), ['oracle_changed']);
+      assert.deepEqual(decision.oracleRevisions, { or_mid: 2 }, 'the decision names the revision it was judged under');
+      assert.ok(!decision.unknownCriteria.some((c) => /superseded/.test(c.detail ?? '')), 'judged under the new revision: nothing rests on the old one');
+      // history is not rewritten: revision 1 still exists as it was
+      assert.equal((await h.deps.specs.getOracle('or_mid', 1))!.assertions[0]!.description, 'totals are exact');
       // conformance-9: the report names the gate that decided and the run's override of the default gate
       const report = await h.control.report(run.runId);
       assert.match(report.markdown, new RegExp(`- \\*\\*Gate:\\*\\* hypertest\\.default \\(spec ${decision.gateSpecDigest!.slice(0, 16)}; overrides: requireIndependentReview=false\\)`));

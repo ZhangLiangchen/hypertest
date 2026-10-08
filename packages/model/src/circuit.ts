@@ -216,6 +216,20 @@ export class CircuitBreakers {
     return undefined;
   }
 
+  /**
+   * (A[0] operator resume) An OPEN breaker becomes half-open now: the next call is its single probe (the breaker's
+   * protection stays — one call, its verdict decides). Returns whether the breaker was open.
+   */
+  forceHalfOpen(routeId: string, nowMs: number): boolean {
+    const c = this.#routes.get(routeId);
+    if (!c) return false;
+    this.#tick(c, nowMs);
+    if (c.state !== 'open') return false;
+    c.openedAtMs = nowMs - c.cooldownMs;
+    this.#tick(c, nowMs);
+    return true;
+  }
+
   /** Frees a probe slot without a verdict (the probe was never sent, or was cancelled by its caller). */
   releaseProbe(routeId: string): void {
     const c = this.#routes.get(routeId);

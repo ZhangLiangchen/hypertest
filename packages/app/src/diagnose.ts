@@ -1,5 +1,5 @@
 import { constants } from 'node:fs';
-import { access } from 'node:fs/promises';
+import { access, readFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { connect } from 'node:net';
 import { FixedClock, HypertestError, SequentialIdGenerator, noopLogger } from '@hypertest/core';
@@ -7,6 +7,7 @@ import { openDatabase } from '@hypertest/store';
 import { ModelCatalog, PiAiProvider, ProviderRegistry, createModelRouter, credentialAvailability, piCompatibilityClass, type ModelCapabilityProfile, type ModelProvider } from '@hypertest/model';
 import { resolveProtocolBinding } from '@hypertest/policy';
 import { createOciSandbox, networkIsolation } from '@hypertest/tools';
+import { pluginDigest } from '@hypertest/runtime';
 import { BUILTIN_ROLES, RoleCatalog, SPECIALIST_ROLES, type RoleDefinition } from '@hypertest/agents';
 import { isLoopbackHost } from './api.ts';
 import { completeRoute, defaultedRouteFields, providerCompatibilityClass, resolveConfigPaths, roleOverrides, validateConfig, withDerivedPaths } from './config.ts';
@@ -67,6 +68,17 @@ export async function diagnose(input: HypertestConfig, options: DiagnoseOptions 
 
   // ---- models: can the roles be routed? (a provider without its credential is unavailable: e2e[3])
   await checkRoutes(config, add, env);
+
+  // ---- A[6] kernel plugins: the entry exists and matches its pinned digest (doctor runs no plugin code)
+  for (const p of config.plugins ?? []) {
+    try {
+      const actual = pluginDigest(await readFile(p.entry));
+      if (actual !== p.digest) add('plugins', 'error', `plugin ${p.id}: digest mismatch — configured ${p.digest}, ${p.entry} is ${actual}: Hypertest refuses to start with it`);
+      else add('plugins', 'ok', `plugin ${p.id} ${p.version} (${p.kind}; ${p.capabilities.join(', ')}): ${p.entry} matches its digest`);
+    } catch (e) {
+      add('plugins', 'error', `plugin ${p.id}: entry ${p.entry} cannot be read: ${(e as Error).message}`);
+    }
+  }
 
   // ---- protocol + engines + sandbox
   try {

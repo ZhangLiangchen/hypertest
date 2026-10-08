@@ -15,8 +15,8 @@ export { DEFAULT_TEST_PATH_PATTERNS, categoryDecision, classifyTestChange } from
 export { parseUnifiedDiff, type DiffFile, type DiffHunk, type DiffLine } from './diff.ts';
 export { DEFAULT_GATE_SPEC, GATE_CRITERIA, ORACLE_AUTHORITY_KINDS, QualityGate, currentRecords, evaluateOracleCheck, gateOverrides, oracleAuthorityProblems, type OracleCheckOutcome } from './gate.ts';
 export {
-  artifactCaseStatuses, artifactEligibility, caseInFile, codeRevisionOf, executedTestsOf, isBaseRevisionRun, normalizeTestPath, oracleRefProblems, reviewProblems, sameTestFile,
-  sensitivityBinding, type ArtifactEligibility, type Binding, type BindingPurpose, type CodeRevision, type EligibilityContext, type ExecutedTestFile, type ExecutedTests,
+  TEST_FILE_PATH_PATTERNS, TEST_RUNNER_DISCOVERY_PATTERNS, artifactCaseStatuses, artifactEligibility, caseInFile, codeRevisionOf, executedTestsOf, isBaseRevisionRun, isTestPath,
+  mutatedFileOf, normalizeTestPath, oracleRefProblems, reviewProblems, sameTestFile, sensitivityBinding, type ArtifactEligibility, type Binding, type BindingPurpose, type CodeRevision, type EligibilityContext, type ExecutedTestFile, type ExecutedTests,
   type StageStatus, type StaticCheckResult,
 } from './sensitivity.ts';
 export {

@@ -98,11 +98,46 @@ Per route, in memory of the router instance (one per worker process; re-learned 
   catalog price above the ceiling opens the breaker **for cost-limited policies**; recorded once as
   `model.circuit_opened` (reason `price_ceiling`, price, ceiling, catalog revision) and as `model.circuit_closed`
   (`price_ceiling_cleared`) when a later catalog revision brings it back under.
+- **Price-change guard** (A[1]; `priceGuard.maxIncreasePct`, configured as `models.priceGuard` by the app): runtime
+  prices are observable through a `PriceSource` (`RouterDeps.prices`; the app's is the prices file,
+  `createFilePriceSource`, re-read at every routing/invoke boundary when its inode/mtime/size changes, the last good
+  prices kept when it becomes unreadable). An observed price more than `maxIncreasePct` above the catalog price opens the
+  route's circuit for **all** requests (`model.circuit_opened`, reason `price_change`, with `increasePct`,
+  `observedPrice`, `catalogPrice`); a later observation back within the guard closes it (`price_change_cleared`). The
+  observed price also becomes the route's price for cost estimation and the cost stage.
+- **Unknown cost** (A[2]): `costPerMillionInputUsd` / `costPerMillionOutputUsd` are optional. `estimateCostUsd` returns
+  `NaN` for an unknown price (`costKnown(profile)`); a cost-limited request (`policy.maxCostPerCallUsd`, or
+  `RouteRequest.costBudgeted` — the run or work item has a USD budget) never routes to a cost-unknown route (cost stage:
+  "route cost is unknown … and the request is cost-limited"); `RouteRequest.cheaperThanUsd` keeps only strictly cheaper
+  routes (the runtime's cost switch).
 - Events (aggregate `model`, aggregateId = routeId): `model.circuit_opened` `{ routeId, provider, model, reason
   (consecutive_failures | rate_limit_storm | probe_failed | price_ceiling), code, consecutiveFailures, rateLimitsInWindow,
   cooldownMs, halfOpenAt }` and `model.circuit_closed` — appended in ONE batch with the `model.invoked` of the call that
   caused them (a sink failure around a failed call is a fault, as for `model.invoked`).
 - `router.circuits()` lists the state of every route that has a breaker (`closed | open | half_open`, counts, times).
+
+### Availability, credentials and the PAUSE signal (A[0], e2e[3])
+
+- `ModelProvider.availability?()` reports whether a provider can be called at all. The HTTP providers take
+  `requireApiKey` / `apiKeySource`: a required credential that is missing or empty makes the provider unavailable
+  (`provider X has no credential: environment variable VAR is not set or empty (fail closed: no request is sent)`) — the
+  router rejects its routes at the capability stage and `complete()` throws `precondition_failed` before any fetch.
+- A failed `route()` / `invoke()` carries `unavailable: ModelUnavailability` `{ transient, reason, retryAt?, routes }`:
+  `transient` when only availability stopped every route (open circuits, rate limits / timeouts after retries; `retryAt`
+  from Retry-After or the earliest half-open time) — the runtime PAUSES the agent; otherwise no configured route may
+  ever serve the request (security, capability, a missing credential …) and the runtime fails closed with that exact
+  reason.
+- `router.validate(decision, request)` re-checks a decision without calling (the runtime's switch re-check before an
+  epoch), `router.catalogRevision`, and `router.probeNow(routeIds?)` makes open circuits half-open now (an operator
+  resume; the probe still decides).
+
+### Eval scores (coverage[7])
+
+`deriveRouteScores({ suiteId, revision, trials }, { minTrials = 3 })` turns graded eval trials (each with the
+`modelRoutes` its agents used) into a `RouteScoresFile` `{ version: 1, scores: { routeId: { role: score } }, source }`:
+score = (passes + 1) / (graded trials + 2) per (route, role) with at least `minTrials` graded trials (infra errors are
+not graded), with provenance (`suiteId`, `revision`, `inputDigest`, `trials`, `method`). `parseRouteScoresFile`
+validates one. The app merges it into the catalog (`ModelCatalog.withScores`) from `models.scoresFile`.
 
 ### Conventions
 
@@ -133,6 +168,7 @@ Per route, in memory of the router instance (one per worker process; re-learned 
 | I10 route/invoke/fallback events with full correlation; a sink failure is never masked as a model failure; after a paid call the append is retried and a persistent failure returns the response `auditPending` (never discarded, never re-called, no fallback) | `test/router.test.ts`, `test/router-invoke.test.ts`, `test/events.int.test.ts` (jsonb round-trip on PGlite and PostgreSQL 16) |
 | Provider error mapping, timeout vs cancel, SSE robustness (truncation), caller-callback faults, secret scrubbing | `test/openai.test.ts`, `test/anthropic.test.ts`, `test/pi-ai.test.ts`, `test/transport.test.ts`, `test/scripted.test.ts` |
 | Catalog immutability / validation | `test/catalog-registry.test.ts` |
+| Availability (A[0]/e2e[3]): transient vs permanent unavailability, retryAt, missing credential ⇒ unavailable with zero fetch calls; price-change guard opens/closes with L0 events; unknown cost refused for cost-limited requests | `test/availability.test.ts` |
 | Circuit breaker: open after N consecutive failures / rate-limit storm, no retry into an open circuit, single half-open probe (concurrent calls refused), backoff, stale successes never close it, fail-closed interaction with fallbacks (no provider call, no fallback under fail_closed, never an open or insecure fallback), property: availability only ever removes candidates, price guard for cost-limited policies, events batched with the call | `test/circuit-breaker.test.ts` |
 
 ## Contract changes (additive, 0.3)
@@ -150,6 +186,19 @@ and `onDelta` exceptions.
 `CircuitSnapshot`; exports `CircuitBreakers`, `DEFAULT_CIRCUIT_BREAKER`, `AVAILABILITY_FAILURES`, `MODEL_CIRCUIT_EVENTS`
 (`model.circuit_opened` / `model.circuit_closed` — not yet in the domain `EVENT_TYPES` catalog). Behaviour: an open
 route is rejected at routing and refused by `invoke()` before any provider call (`precondition_failed`).
+
+(unit model-runtime, wave 1)
+- `ModelCapabilityProfile.costPerMillionInputUsd` / `costPerMillionOutputUsd` are **optional** (unknown cost);
+  `estimateCostUsd` returns `NaN` for them; new `costKnown`. The catalog schema no longer requires them.
+- `ModelProvider.availability?(): ProviderAvailability`; provider options `requireApiKey?`, `apiKeySource?`; helpers
+  `credentialAvailability`, `missingCredentialError`.
+- `RouteRequest.costBudgeted?`, `cheaperThanUsd?`; `ModelUnavailability`; failure variants of `RouteDecision` /
+  `InvokeOutcome` gain `unavailable?`; `DecisionCheck`; `ModelRouter.validate?`, `catalogRevision?`, `probeNow?`.
+- `RouterDeps.prices?: PriceSource` (`ObservedPrice`); `CircuitBreakerOptions.priceGuard.maxIncreasePct?`; new
+  `src/prices.ts` (`parsePricesFile`, `createFilePriceSource`, `readPricesFile`, `updatePricesFile` — atomic write) and
+  `src/scores.ts` (`deriveRouteScores`, `parseRouteScoresFile`, `ROUTE_SCORES_METHOD`, `RouteScoresFile`, `ScoredTrial`).
+- `model.invoked` (ok) payload gains `estimatedInputTokens` (the caller's input estimate, measured against
+  `usage.inputTokens` for the runtime's token calibration).
 
 ## Testing
 

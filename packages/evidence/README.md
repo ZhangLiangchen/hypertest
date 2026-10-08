@@ -21,7 +21,7 @@ loaded lazily, so importing the package does not load the SDK unless an S3 store
 | `Ed25519Signer` (`generate`, `fromPem`, `fromSeed`, `privateKeyPem`) · `verifyEd25519` · `ed25519KeyId` | Signing via node:crypto. `keyId = 'ed25519:' + sha256(SPKI DER)[0..16]`. The `Signer` interface is the KMS/HSM port. |
 | `merkleRoot(hexLeaves)` | Parent node = `sha256(left + right)` over hex strings. An odd level duplicates its last node, a single leaf is its own root, and an empty list gives `sha256('')`. |
 | `recordEvidence(ledger, artifacts, input, tx?, options?)` | Puts the bytes, then appends the record. |
-| `resolveClaim(ledger, claim, { runId? })` | Returns supported only when all of these hold: at least one ref; every ref exists; each record's stored metadata and record hashes still recompute; all refs are in one run (or the given run); and each record matches `evidenceQuery.evidenceType`, `workItemId` and `field` (a dot path into `structured`). Otherwise it lists the problems. |
+| `resolveClaim(ledger, claim, { runId?, artifacts? })` | Returns supported only when all of these hold: at least one ref; every ref exists; each record's stored metadata and record hashes still recompute; all refs are in one run (or the given run); each record matches `evidenceQuery.evidenceType`, `workItemId` and `field` (a dot path into `structured`, or — with `artifacts` — into the record's JSON artifact when the structured payload lacks it); and (area-C[0]) when the claim states a `value`, the value EVALUATES true: domain `evaluateClaim` reduces the field over the cited records by `evidenceQuery.aggregation` (value — all equal —, count, sum, avg, min, max, first, last, p50, p90, p95, p99) and compares (strings/booleans exactly, numbers within `CLAIM_RELATIVE_TOLERANCE` = 0.5 %). A contradicted value (`claim value contradicts its evidence: …`) or an unevaluable one (`claim cannot be evaluated against its evidence: …`) is unsupported with the exact reason; `evaluation` carries the outcome. Otherwise it lists the problems. |
 | `verifyEvidenceRecords(runId, records, seals, { artifacts?, publicKeys? })` | Pure verifier that also works offline, e.g. on exported records. |
 | `evidenceMetadata`, `computeMetadataHash`, `computeRecordHash`, `sealMessage`, `parseArtifactLocator`, `casUri`, `EMPTY_ROOT` | Hash and locator helpers. |
 | `evidenceMigrations` | `evidence/001-ledger`: creates `ht_evidence` and `ht_evidence_seals`, plus append-only triggers. |
@@ -131,3 +131,6 @@ HYPERTEST_TEST_DB=postgres node scripts/run-tests.mjs --package evidence # every
   - `seal` returns only genuine seals and refuses to contradict earlier ones.
   - `latestSeal` is unverified.
   - `resolveClaim` also checks each record's hashes.
+- (gate-governance, additive) `ResolveClaimOptions.artifacts?` (read a field from the record's JSON artifact) and
+  `ClaimResolution.evaluation?` (the domain `ClaimEvaluation`); behaviour: a claim with a `value` is evaluated, and a
+  contradicted or unevaluable value is unsupported (it used to be accepted when the field merely existed).

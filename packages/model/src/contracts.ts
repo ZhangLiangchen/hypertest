@@ -379,6 +379,11 @@ export interface ModelRouter {
   validate?(decision: Extract<RouteDecision, { ok: true }>, routeRequest: RouteRequest): Promise<DecisionCheck>;
   /** (additive, optional) The catalog revision the router routes against now. */
   readonly catalogRevision?: string;
+  /**
+   * (additive, optional, A[0]) Operator resume: the open circuits of `routeIds` (all routes when omitted) become half-open
+   * now — the next call on each is its single probe. Returns the routes that were open.
+   */
+  probeNow?(routeIds?: string[]): string[];
 }
 
 // ----------------------------------------------------------------------------- provider options (additive)

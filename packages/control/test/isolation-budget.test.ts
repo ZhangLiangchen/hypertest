@@ -84,6 +84,17 @@ async function eventsOf(h: Harness, runId: string, type: string) {
   return (await h.deps.events.read(runId, { types: [type] })).map((e) => ({ ...e, payload: e.payload as Record<string, unknown> }));
 }
 
+/**
+ * (D-4) Load against an environment runs only for an experiment that declares the workload: the lead defines one (its
+ * later load.start calls are attributed to it). Defined through the lead's host: define it before another dispatcher's
+ * first call (a dispatcher reads its item's experiments at its first call, and again only after its own experiment.define).
+ */
+async function loadExperiment(l: { dispatch: (name: string, args: JsonValue) => Promise<{ message: { isError?: boolean; content: unknown }; execution?: ToolExecutionResult }> }, ratePerSecond: number, durationMs: number): Promise<string> {
+  const r = await l.dispatch('experiment.define', { hypothesis: `the service holds ${ratePerSecond} rps`, environmentId: 'svc', workload: { kind: 'http_load', ratePerSecond, durationMs } });
+  assert.equal(r.message.isError, undefined, String(r.message.content));
+  return String((r.execution!.structured as Record<string, unknown>)['experimentId']);
+}
+
 // ======================================================================================== experiments (conformance-6)
 
 describe('conformance-6: experiments are bound to admitted claims', () => {
@@ -160,7 +171,11 @@ describe('conformance-6: experiments are bound to admitted claims', () => {
     assert.equal(spec.randomSeeds.length, 1);
     assert.match(spec.randomSeeds[0]!, /^[0-9a-f]{16}$/);
     assert.deepEqual(spec.workload, input.workload);
-    assert.deepEqual(spec.isolation, { mode: 'exclusive_write', resourceClaims: [{ resourceKey: 'env/svc', mode: 'write_exclusive' }] });
+    // D-3/coverage-13: the isolation records its plan — the contamination checks the gate (C10) runs over the experiment
+    assert.deepEqual(spec.isolation, {
+      mode: 'exclusive_write', resourceClaims: [{ resourceKey: 'env/svc', mode: 'write_exclusive' }],
+      plan: { dedicatedEnvironment: false, contaminationChecks: [{ kind: 'foreign_operations', resources: ['env/svc'] }, { kind: 'environment_generation' }, { kind: 'exclusive_claims' }] },
+    });
     assert.deepEqual(spec.stopConditions, [{ kind: 'duration', value: 5_000 }]);
     assert.deepEqual(spec.contaminationRules.map((c) => c.exclusiveResources), [['env/svc']]);
     assert.match(spec.contaminationRules[0]!.description, /admission-enforced/);
@@ -173,7 +188,23 @@ describe('conformance-6: experiments are bound to admitted claims', () => {
     });
     const obsSpec = (await h.deps.specs.getExperiment(String((obs.execution!.structured as Record<string, unknown>)['experimentId'])))!;
     assert.deepEqual([obsSpec.randomSeeds, obsSpec.stopConditions, obsSpec.contaminationRules], [['42'], [{ kind: 'metric_threshold', metric: 'error_rate', value: 0.05 }], [{ description: 'no deploys', exclusiveResources: ['env/other'] }]]);
-    assert.deepEqual(obsSpec.isolation, { mode: 'shared_readonly', resourceClaims: [{ resourceKey: 'env/other', mode: 'read_shared' }] });
+    assert.deepEqual(obsSpec.isolation, { mode: 'shared_readonly', resourceClaims: [{ resourceKey: 'env/other', mode: 'read_shared' }], plan: { dedicatedEnvironment: false, contaminationChecks: [{ kind: 'foreign_operations', resources: ['env/other'] }, { kind: 'environment_generation' }] } });
+    // D-3: a contamination rule beyond the defaults is ENFORCED — its resources become claims admitted with the experiment
+    // (write_exclusive for a writing experiment; read_shared for a read-only one, which excludes every writer but never
+    // lets the read-only experiment write) — and another holder's write on them is refused at admission
+    const ruled = await l.dispatch('experiment.define', {
+      hypothesis: 'billing survives load', environmentId: 'svc', workload: { kind: 'http_load', ratePerSecond: 2 },
+      isolation: { mode: 'exclusive_write', resourceClaims: [{ resourceKey: 'service/billing', mode: 'write_exclusive' }] },
+      contaminationRules: [{ description: 'nobody touches the billing database', exclusiveResources: ['db/billing', 'service/billing/api'] }],
+    });
+    assert.equal(ruled.message.isError, undefined, String(ruled.message.content));
+    const ruledSpec = (await h.deps.specs.getExperiment(String((ruled.execution!.structured as Record<string, unknown>)['experimentId'])))!;
+    assert.deepEqual(ruledSpec.isolation.resourceClaims, [{ resourceKey: 'service/billing', mode: 'write_exclusive' }, { resourceKey: 'db/billing', mode: 'write_exclusive' }]);
+    assert.deepEqual((await h.deps.admission.held!(ruledSpec.experimentId)).map((c) => c.claim.resourceKey).sort(), ['db/billing', 'service/billing']);
+    assert.equal((await h.deps.admission.admit({ holderId: 'exp_writer', runId: 'run_other', claims: [{ resourceKey: 'db/billing', mode: 'write_exclusive' }], ttlMs: 60_000 })).admitted, false);
+    const roRuled = await l.dispatch('experiment.define', { hypothesis: 'reads are stable', environmentId: 'other', contaminationRules: [{ description: 'no cache writes', exclusiveResources: ['cache/other'] }] });
+    const roRuledSpec = (await h.deps.specs.getExperiment(String((roRuled.execution!.structured as Record<string, unknown>)['experimentId'])))!;
+    assert.deepEqual(roRuledSpec.isolation.resourceClaims, [{ resourceKey: 'env/other', mode: 'read_shared' }, { resourceKey: 'cache/other', mode: 'read_shared' }]);
   });
 
   test('a replayed definition returns the recorded experiment (same seed) and admits nothing twice', async () => {
@@ -560,6 +591,7 @@ describe('conformance-5: external QPS is reserved across concurrent load jobs an
     const reserved = async () => (await h.deps.budget.usage(runScope(l.run.runId)))?.reserved.externalQps ?? 0;
     const load = (rate: number) => ({ method: 'GET', environmentId: 'svc', path: '/', ratePerSecond: rate, durationMs: 60_000 });
     try {
+      await loadExperiment(l, 100, 60_000);
       const d = await dispatcherFor(h, l.run, l.item, l.agent.agentId, l.agent.sessionId, l.spec.capability, ['load.start', 'load.stop', 'load.observe']);
       const a = await d('load.start', load(60));
       assert.equal(a.message.isError, undefined, String(a.message.content));
@@ -632,6 +664,7 @@ describe('conformance-5 × durability-1: recovery keeps the QPS reservation of a
     const reserved = async () => (await h.deps.budget.usage(runScope(l.run.runId)))?.reserved ?? {};
     const load = (rate: number) => ({ method: 'GET', environmentId: 'svc', path: '/', ratePerSecond: rate, durationMs: 600_000 });
     try {
+      await loadExperiment(l, 100, 600_000);
       const d = await dispatcherFor(h, l.run, l.item, l.agent.agentId, l.agent.sessionId, l.spec.capability, ['load.start']);
       const started = await d('load.start', load(60));
       assert.equal(started.message.isError, undefined, String(started.message.content));
@@ -647,7 +680,11 @@ describe('conformance-5 × durability-1: recovery keeps the QPS reservation of a
       assert.equal((await reserved()).tokens ?? 0, 0, 'the stranded model reservation is released (durability-1)');
       assert.equal((await reserved()).externalQps, 60, 'the job still runs: its rate stays reserved');
       // the job still holds its rate: a second concurrent job above the cap is refused
-      const d2 = await dispatcherFor(h, l.run, l.item, 'agent-w2', 'sess-w2', l.spec.capability, ['load.start']);
+      // the recovered item keeps its agent (and the experiment that agent defined); worker-2's tick renews the experiment's
+      // claims (they lapsed with the dead worker's TTL) — the job itself never stopped
+      await worker2.tick(l.run.runId);
+      assert.equal((await reserved()).externalQps, 60);
+      const d2 = await dispatcherFor(h, l.run, l.item, l.agent.agentId, 'sess-w2', l.spec.capability, ['load.start']);
       const over = await d2('load.start', load(50));
       assert.equal(over.message.isError, true);
       assert.match(String(over.message.content), /\[denied\] external_qps_exhausted: running load jobs of this run already hold 60 of its maxExternalQps 100/);
@@ -721,6 +758,7 @@ describe('review B2 — external QPS is never run on a released reservation', ()
     });
     const reserved = async () => (await h.deps.budget.usage(runScope(l.run.runId)))?.reserved.externalQps ?? 0;
     try {
+      await loadExperiment(l, 100, 600_000);
       const call = await replayableDispatcherFor(h, l.run, l.item, l.agent.agentId, l.agent.sessionId, l.spec.capability, ['load.start']);
       await assert.rejects(call('load.start', load(60), `${l.agent.sessionId}:900:qa`), /event store unavailable/);
       assert.equal(await reserved(), 60, 'the job runs: its rate stays reserved');
@@ -734,6 +772,7 @@ describe('review B2 — external QPS is never run on a released reservation', ()
       assert.equal(await reserved(), 0);
     } finally {
       restore();
+      await h.control.cancelRun(l.run.runId, 'test done: release the experiment claims');
     }
   });
 
@@ -755,6 +794,7 @@ describe('review B2 — external QPS is never run on a released reservation', ()
     });
     const reserved = async () => (await h.deps.budget.usage(runScope(l.run.runId)))?.reserved.externalQps ?? 0;
     try {
+      await loadExperiment(l, 100, 600_000);
       const call = await replayableDispatcherFor(h, l.run, l.item, l.agent.agentId, l.agent.sessionId, l.spec.capability, ['load.start']);
       const inv = `${l.agent.sessionId}:900:ra`;
       await assert.rejects(call('load.start', load(60), inv), /policy store unavailable/);
@@ -861,7 +901,7 @@ describe('review B2 — no work item writes to or faults a resource another expe
     const b = await lead(h, 'intruding run');
     const seen: ToolExecutionRequest[] = [];
     const restore = intercept(h, async (req) => {
-      if (req.workItemId !== b.item.workItemId || req.toolId === 'blackboard.read') return undefined;
+      if (req.workItemId !== b.item.workItemId || req.toolId === 'blackboard.read' || req.toolId === 'experiment.define') return undefined;
       seen.push(req);
       return result(req);
     });
@@ -882,13 +922,28 @@ describe('review B2 — no work item writes to or faults a resource another expe
       assert.equal(seen.length, 0, 'nothing was executed');
       const events = (await h.deps.events.read(b.run.runId, { types: ['tool.denied'] })).filter((e) => (e.payload as Record<string, unknown>)['errorCode'] === 'experiment_resource_conflict');
       assert.equal(events.length, 4);
-      // reads of the held resource and writes elsewhere still run
+      // reads of the held resource still run; a write elsewhere needs an experiment of the item (D-4, changed with
+      // gate-governance: it used to run without one) — with one claiming that resource, it runs
       assert.equal((await d('http.request', { method: 'GET', environmentId: 'other', path: '/health' })).message.isError, undefined);
-      assert.equal((await d('http.request', { method: 'POST', environmentId: 'svc', path: '/x', body: '{}' })).message.isError, undefined);
-      assert.deepEqual(seen.map((r) => r.toolId), ['http.request', 'http.request']);
-      // once the holder's claims are released, the intruder may act
+      const unowned = await d('http.request', { method: 'POST', environmentId: 'svc', path: '/x', body: '{}' });
+      assert.match(String(unowned.message.content), /^\[denied\] experiment_required: http\.request acts on the environment \(effect external\) and work item wi_\w+ runs for no experiment/);
+      const own = expIdOf(await b.dispatch('experiment.define', { hypothesis: 'orders accept writes', environmentId: 'svc', isolation: { mode: 'exclusive_write', resourceClaims: [] } }));
+      const d2 = await dispatcherFor(h, b.run, b.item, b.agent.agentId, b.agent.sessionId, b.spec.capability, ['env.inject_fault', 'http.request']);
+      assert.equal((await d2('http.request', { method: 'POST', environmentId: 'svc', path: '/x', body: '{}' })).message.isError, undefined);
+      assert.deepEqual(seen.map((r) => [r.toolId, r.experimentId]), [['http.request', undefined], ['http.request', own]]);
+      // once the holder's claims are released, the intruder may define its own fault experiment there and act
       await h.deps.admission.release(fault);
-      assert.equal((await d('env.inject_fault', { environmentId: 'other', fault: 'latency' })).message.isError, undefined);
+      const faultB = expIdOf(await b.dispatch('experiment.define', { hypothesis: 'other tolerates latency too', environmentId: 'other', faultPlan: [{ kind: 'latency', target: 'other' }] }));
+      const wf = await executorFor(h, b.run.runId, [faultB], 'fp-intruder-fault');
+      const restoreWf = intercept(h, async (req) => (req.workItemId === wf.workItemId ? (seen.push(req), result(req)) : undefined));
+      try {
+        const d3 = await dispatcherFor(h, b.run, wf, 'agent-intruder-fault', 'sess-intruder-fault', b.spec.capability, ['env.inject_fault']);
+        const injected = await d3('env.inject_fault', { environmentId: 'other', kind: 'latency', params: { ms: 100 }, durationMs: 1000 });
+        assert.equal(injected.message.isError, undefined, String(injected.message.content));
+        assert.equal(seen.at(-1)!.experimentId, faultB, 'attributed to the declared fault experiment');
+      } finally {
+        restoreWf();
+      }
     } finally {
       restore();
     }
@@ -993,11 +1048,14 @@ describe('review B2 — no side effect runs once its evidence can no longer be s
     const l = await lead(h, 'artifact budget vs side effects', { maxArtifactBytes: 1000 });
     const seen: ToolExecutionRequest[] = [];
     const restore = intercept(h, async (req) => {
-      if (req.workItemId !== l.item.workItemId || req.toolId === 'blackboard.read') return undefined;
+      if (req.workItemId !== l.item.workItemId || req.toolId === 'blackboard.read' || req.toolId === 'experiment.define') return undefined;
       seen.push(req);
       return req.toolId === 'fs.search' ? result(req, { usage: { computeMs: 0, artifactBytes: 1500 } }) : result(req);
     });
     try {
+      // the item runs for a restart experiment on svc (D-4): what refuses the writes below is the spent budget
+      const defined = await l.dispatch('experiment.define', { hypothesis: 'svc survives a restart', environmentId: 'svc', faultPlan: [{ kind: 'restart', target: 'svc' }] });
+      assert.equal(defined.message.isError, undefined, String(defined.message.content));
       const d = await dispatcherFor(h, l.run, l.item, l.agent.agentId, l.agent.sessionId, l.spec.capability, ['fs.search', 'http.request', 'env.restart', 'load.stop']);
       await d('fs.search', { pattern: 'x' });
       assert.equal((await h.deps.budget.remaining!([workScope(l.item.workItemId)])).artifactBytes, 0);

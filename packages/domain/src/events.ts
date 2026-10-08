@@ -100,7 +100,9 @@ export const EVENT_TYPES = {
   /**
    * (additive, A[0]) A work item's agent was paused / resumed because no model route could serve it for now (fallback
    * pipeline end state PAUSE): `{ workItemId, agentId, pauseReason: 'model_unavailable', resumeAt, routes, reason,
-   * consecutive }` / `{ workItemId, agentId, pauseReason, by: 'timer' | 'operator', pausedSince }`.
+   * consecutive }` / `{ workItemId, agentId, pauseReason, by: 'timer' | 'operator', pausedSince }`. (additive) Also
+   * pauseReason `budget`: the run budget refused the agent's model call under `onBudgetExhausted: 'pause'` (`{ scope,
+   * dimension, limit, used, requested }`); the item resumes when the run is resumed with room for the call.
    */
   workPaused: 'work.paused',
   workResumed: 'work.resumed',
@@ -201,6 +203,13 @@ export const EVENT_TYPES = {
   contextCompacted: 'context.compacted',
   contextCondensationDeferred: 'context.condensation_deferred',
   contextStaleRejected: 'context.stale_rejected',
+  /** (additive, A[6]) Kernel-plugin context hooks added reference sections to a turn: `{ turn, snapshotId, hooks: [{ pluginId, name, sections, chars }] }`. */
+  contextHookApplied: 'context.hook_applied',
+  /**
+   * (additive) The turn's context did not fit the remaining run/work budget and was condensed to fit before the model call:
+   * `{ turn, sessionId, scope, dimension, allowanceTokens, estimateBefore, estimateAfter, viewBudgetCap }`.
+   */
+  contextBudgetCondensed: 'context.budget_condensed',
 
   budgetReserved: 'budget.reserved',
   budgetExhausted: 'budget.exhausted',

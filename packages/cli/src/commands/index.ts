@@ -3,6 +3,7 @@ import { approvalsCommand, approveCommand, experienceCommand, oracleCommand, wai
 import { doctorCommand } from './doctor.ts';
 import { evalCommand } from './eval.ts';
 import { initCommand } from './init.ts';
+import { modelCommand } from './model.ts';
 import { eventsCommand, evidenceCommand, reportCommand, statusCommand } from './inspect.ts';
 import { cancelCommand, resumeCommand, runCommand } from './run.ts';
 import { runtimeCommand } from './runtime.ts';
@@ -25,6 +26,7 @@ export const ALL_COMMANDS: readonly Command[] = Object.freeze([
   experienceCommand,
   cancelCommand,
   runtimeCommand,
+  modelCommand,
   evalCommand,
   serveCommand,
   workerCommand,

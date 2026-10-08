@@ -137,7 +137,10 @@ export function createReportBuilder(deps: ControlDeps): ReportBuilder {
       if (claims.length === 0) md.push('No claims.');
       for (const c of claims) {
         const t = traces.find((x) => x.claimId === c.claimId);
-        md.push(`- ${c.critical ? '**critical** ' : ''}${c.statement}${c.value !== undefined ? ` = ${JSON.stringify(c.value)}` : ''} — evidence ${c.evidenceRefs.join(', ')}${t ? ` — provenance ${t.complete ? 'complete' : `INCOMPLETE (${t.gaps.slice(0, 3).join('; ')})`}` : ''}`);
+        // area-C-0: a value claim was evaluated against its evidence when recorded (and critical ones again by the gate, C9);
+        // a statement without a value only references its evidence — say so, never present its prose as a verified fact
+        const verified = c.value !== undefined && typeof c.evidenceQuery?.field === 'string' ? ` (evaluated: ${c.evidenceQuery.aggregation ?? 'value'} of ${c.evidenceQuery.field})` : ' (reference only: the statement is not machine-verified)';
+        md.push(`- ${c.critical ? '**critical** ' : ''}${c.statement}${c.value !== undefined ? ` = ${JSON.stringify(c.value)}` : ''}${verified} — evidence ${c.evidenceRefs.join(', ')}${t ? ` — provenance ${t.complete ? 'complete' : `INCOMPLETE (${t.gaps.slice(0, 3).join('; ')})`}` : ''}`);
       }
       md.push('');
       md.push('## Plan evolution');

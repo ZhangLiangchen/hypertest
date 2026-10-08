@@ -271,6 +271,24 @@ added/modified test file is covered by a validated TestArtifact with exactly tha
 `@hypertest/policy`), so a run over an unregistered generated (or edited) test can never satisfy C1/C3/C4. The model
 text says which test files still need registration and validation.
 
+**What ran, on which code (gate-governance, D-0/D-1).** test.run and mutation.run also record `executedTests`
+(`{ attribution: complete|partial|none, files: [{ path, sha256, cases, staticCheck? }], unattributedCases }` — the test
+files the run executed with their content digest and attributed case count; a whole-suite node:test run names no file
+per case, so it is honestly `none`, while a run whose selector names one file attributes every case to it) and
+`codeRevision` (`{ kind: workspace|base, baseCommit, treeDigest }`). The changed test files that ran get a
+framework-appropriate static check of exactly that content (`staticCheckCommand`: `node --check`; TypeScript stripped
+by node and checked; `python3 -m py_compile` with the bytecode outside the workspace; `gofmt -e -l`; other languages:
+the run collected cleanly), reported as `STATIC CHECK FAILED` when it fails. `test.run` input `revision: "base"`
+(with the run's `baseCommit`, which the control plane injects) runs the workspace's tests on a PRIVATE copy whose
+non-test changes are restored to the base commit (`runOnBaseRevision`; the workspace is never modified): the
+known-good run of a regression test, marked `KNOWN-GOOD RUN ON THE BASE REVISION` and never evidence about the
+candidate. mutation.run records the files of its baseline (`MutationAnalysisResult.executedTests`) and says that it
+validates an artifact only when it executed exactly that artifact's file. (Review) It mutates PRODUCT code only: a
+test file as the mutation target (`isTestFilePath`, the policy's `TEST_FILE_PATH_PATTERNS`) is refused
+(`invalid_argument`) before anything runs, and the result records `mutatedFile: { path, isTestFile, changedSinceBase }`
+— mutants of a file written in the workspace are flagged in the text and never bind. The policy's `sensitivityBinding` decides from
+these records whether a run can validate an artifact.
+
 **Fake-green guards** (`TestRunResult.passed`): true only with exit 0, no harness error, ≥ 1 passed case and
 no failed/error/xpass case; skipped and xfail never make a run green on their own. node:test reports a file
 that registered no test as a *passing* pseudo-case named after the file — it is dropped (a failing one is a
@@ -385,6 +403,14 @@ restores. score = killed / (killed + survived), 0 when nothing was decidable. Th
   `renderWorktreeDiff`) against the base commit's tree, so skip-worktree / assume-unchanged bits, `git replace`
   refs, clean/diff filters, textconv, `info/exclude` and sparse-checkout cannot hide a change from the drift guard;
   diffs are rendered by `git diff --no-index` over copies outside the repository (no filters, no external diff).
+
+- (gate-governance) `MutationAnalysisResult.executedTests?`, `ToolExecutionRequest.systemModelRevision?`,
+  `ExperimentProvenance.systemModelRevision?` (evidence provenance names the run's SystemModel revision),
+  `EnvironmentDescriptor.isolation?` (`{ dedicated, namespace?, database?, account? }` — an operator registration);
+  test.run input `revision` / `baseCommit`; test-result / coverage / mutation-result payloads gain `executedTests` and
+  `codeRevision`; new exports `attributeExecutedTests`, `staticCheckCommand`, `staticChecks`, `collectedCleanly`,
+  `workspaceCodeRevision`, `changedSubset`, `runOnBaseRevision`, types `ExecutedTestsRecord`, `ExecutedTestFileRecord`,
+  `StaticCheck`, `BaseRunInput`. Tests: `test/execution-binding.test.ts`, `test/whitebox-tools.test.ts`.
 
 ### How to test
 

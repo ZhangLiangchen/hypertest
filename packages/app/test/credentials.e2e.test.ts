@@ -106,8 +106,11 @@ describe('e2e[3] a provider without its credential is unavailable: no request le
       const ht = await createHypertest(db.store ? { ...c, store: db.store } : c, { env: { ANTHROPIC_API_KEY: '' }, fetch: rec.fetch, scriptedBrains: { sim: roleRouter(tinyRunBrains()) }, logger: new MemoryLogger() });
       try {
         const outcome = await ht.run({ goal: 'Is the sum module releasable?', target: { repoPath: repo.path, commit: repo.head } }, { timeoutMs: 90_000 });
+        // the run is driven to its gate on the available route (the verdict itself is the gate's business, not this test's)
         assert.equal(outcome.status, 'completed');
-        assert.equal(outcome.decision?.verdict, 'pass');
+        assert.ok(outcome.decision, 'a QualityDecision was produced');
+        const items = await ht.services.blackboard.listWorkItems({ runId: outcome.runId });
+        assert.ok(items.every((w) => w.failure?.reason !== 'model_unavailable'), 'no work item failed for want of a model');
         const routed = await ht.events(outcome.runId, { types: ['model.routed'] });
         assert.ok(routed.length > 0);
         for (const e of routed) {

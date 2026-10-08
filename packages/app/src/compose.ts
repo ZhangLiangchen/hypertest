@@ -23,8 +23,8 @@ import {
   createPolicyDecisionLog, policyMigrations, resolveProtocolBinding, type PolicyEngine,
 } from '@hypertest/policy';
 import {
-  AnthropicProvider, ModelCatalog, OpenAICompatibleProvider, PiAiProvider, ProviderRegistry, ScriptedProvider, createModelRouter, piCompatibilityClass,
-  type ModelCapabilityProfile, type ModelProvider, type ModelRouter, type RouteRequest,
+  AnthropicProvider, ModelCatalog, OpenAICompatibleProvider, PiAiProvider, ProviderRegistry, ScriptedProvider, createFilePriceSource, createModelRouter, parseRouteScoresFile,
+  piCompatibilityClass, type CircuitBreakerOptions, type ModelCapabilityProfile, type ModelProvider, type ModelRouter, type RouteRequest,
 } from '@hypertest/model';
 import {
   ExactSearch, HashEmbedder, HybridRetriever, PowerContextClient, SymbolIndex, VectorCorpusCache, WorkspaceVectorRetriever, contextMigrations, createExperienceStore, createFreshnessGuard,
@@ -38,8 +38,8 @@ import {
   type ToolRuntimeDeps,
 } from '@hypertest/tools';
 import {
-  EngineRegistry, NativeEngine, RUNTIME_PACKAGE_VERSION, buildRuntimeManifest, createAgentRepository, createAgentRunner, createEpochManager, createRuntimeReleaseRegistry,
-  createSessionStore, createSubagentRuntime, runtimeMigrations, toolCatalogRevision, type AgentEngine,
+  EngineRegistry, NativeEngine, RUNTIME_PACKAGE_VERSION, buildRuntimeManifest, createAgentRepository, createAgentRunner, createEpochManager, createPluginKernel, createRuntimeReleaseRegistry,
+  createSessionStore, createSubagentRuntime, inspectAgents, runtimeMigrations, toolCatalogRevision, type AgentEngine,
 } from '@hypertest/runtime';
 import { PI_AGENT_CORE_VERSION, PiEngine, RUNTIME_PI_PACKAGE_VERSION } from '@hypertest/runtime-pi';
 import { DSH_PINS, DshEngine, RUNTIME_DSH_PACKAGE_VERSION } from '@hypertest/runtime-dsh';
@@ -154,7 +154,7 @@ export function manifestTaskQueue(taskQueue: string, manifestId: string): string
 
 // ------------------------------------------------------------------------------------------------ models
 
-function buildProviders(config: HypertestConfig, overrides: HypertestOverrides, env: Record<string, string | undefined>, logger: Logger): ProviderRegistry {
+function buildProviders(config: HypertestConfig, overrides: HypertestOverrides, env: Record<string, string | undefined>, logger: Logger, pluginProviders: readonly ModelProvider[] = []): ProviderRegistry {
   const registry = new ProviderRegistry();
   const brains = overrides.scriptedBrains ?? {};
   for (const p of config.models.providers) {
@@ -187,6 +187,13 @@ function buildProviders(config: HypertestConfig, overrides: HypertestOverrides, 
       case 'pi-ai':
         provider = new PiAiProvider({ providerId: p.id, piProvider: p.piProvider!, ...(p.baseUrl ? { baseUrl: p.baseUrl } : {}), ...common });
         break;
+      case 'plugin': {
+        // A[6]: contributed by a configured provider plugin (declared `provider:<id>`, digest-pinned)
+        const contributed = pluginProviders.find((x) => x.providerId === p.id);
+        if (!contributed) throw invalid(`models.providers (${p.id}): no loaded plugin provides provider ${p.id}`, { provider: p.id });
+        provider = contributed;
+        break;
+      }
       case 'scripted': {
         const brain = Object.hasOwn(brains, p.id) ? brains[p.id] : undefined;
         if (!brain) throw invalid(`models.providers (${p.id}): scripted provider has no brain; pass overrides.scriptedBrains['${p.id}']`, { provider: p.id });
@@ -230,6 +237,41 @@ export async function buildCatalog(config: HypertestConfig, providers: ProviderR
     profiles.push(completeRoute(route, tag!));
   }
   return new ModelCatalog(profiles);
+}
+
+/** (A[1]) The observed-prices file: models.pricesFile, else `<dataDir>/state/model-prices.json`. */
+export function modelPricesFile(config: HypertestConfig): string {
+  return config.models.pricesFile ?? join(config.project.dataDir, 'state', 'model-prices.json');
+}
+
+/**
+ * (coverage[7]) Merges models.scoresFile (eval-derived route quality scores) into the catalog: a new catalog revision and
+ * the manifest's `modelScores` record (file digest, scored routes, provenance). A scores file naming an unknown route, or
+ * an unreadable / invalid one, fails the composition (invalid_argument) — never silently ignored.
+ */
+export async function applyScoresFile(catalog: ModelCatalog, path: string): Promise<{ catalog: ModelCatalog; record: NonNullable<RuntimeManifest['modelScores']> }> {
+  let bytes: Buffer;
+  try {
+    bytes = readFileSync(path);
+  } catch (e) {
+    throw invalid(`models.scoresFile: ${path} cannot be read: ${(e as Error).message}`, { path });
+  }
+  let doc;
+  try {
+    doc = parseRouteScoresFile(JSON.parse(bytes.toString('utf8')), `models.scoresFile ${path}`);
+  } catch (e) {
+    throw invalid((e as Error).message, { path });
+  }
+  const unknown = Object.keys(doc.scores).filter((r) => !catalog.get(r));
+  if (unknown.length > 0) throw invalid(`models.scoresFile ${path}: scores for routes that are not configured: ${unknown.join(', ')}`, { path, unknown });
+  const record: NonNullable<RuntimeManifest['modelScores']> = { digest: sha256Hex(bytes), routes: Object.keys(doc.scores).sort() };
+  if (doc.source) {
+    const src: NonNullable<NonNullable<RuntimeManifest['modelScores']>['source']> = {};
+    for (const k of ['suiteId', 'revision', 'inputDigest', 'method'] as const) if (typeof doc.source[k] === 'string') src[k] = doc.source[k] as string;
+    if (typeof doc.source.trials === 'number') src.trials = doc.source.trials;
+    record.source = src;
+  }
+  return { catalog: catalog.withScores(doc.scores), record };
 }
 
 // ------------------------------------------------------------------------------------------------ infrastructure
@@ -570,11 +612,20 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
   // Pure construction first: a missing scripted brain, a bad provider or route, a malformed image digest fails before
   // anything is created.
   const imageDigest = imageDigestFrom(env);
-  const providers = buildProviders(config, overrides, env, logger);
+  // A[6] kernel plugins (digest-pinned local modules): loaded, started and health-checked before anything uses them
+  const plugins = await createPluginKernel((config.plugins ?? []).map((p) => ({ ...p, ...(p.config ? { config: p.config } : {}) })), { logger, clock });
+  let providers: ProviderRegistry;
+  try {
+    providers = buildProviders(config, overrides, env, logger, plugins.providers());
+  } catch (e) {
+    await plugins.stop();
+    throw e;
+  }
   for (const p of config.models.providers) {
     if (p.maxRetries !== undefined) logger.warn('models.providers[].maxRetries is not supported: retries and fail-closed fallback are the model router\'s; the value is ignored', { provider: p.id });
   }
   const pending: Array<{ name: string; close: () => Promise<void> }> = [];
+  pending.push({ name: 'plugins', close: () => plugins.stop() });
   const closeAll = async (): Promise<void> => {
     for (const c of pending.splice(0).reverse()) {
       try {
@@ -586,7 +637,15 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
   };
 
   try {
-    const catalog = await buildCatalog(config, providers);
+    let catalog = await buildCatalog(config, providers);
+    // coverage[7]: eval-derived quality scores (an explicit, auditable file) feed the router's quality stage
+    let modelScores: RuntimeManifest['modelScores'];
+    if (config.models.scoresFile) {
+      const applied = await applyScoresFile(catalog, config.models.scoresFile);
+      catalog = applied.catalog;
+      modelScores = applied.record;
+      logger.info('eval-derived route scores applied to the model catalog', { scoresFile: config.models.scoresFile, routes: applied.record.routes, catalogRevision: catalog.revision });
+    }
     await mkdir(dataDir, { recursive: true, mode: 0o700 });
     const keys = await loadSigningKeys(config, dataDir, logger);
     const capabilitySecret = await loadCapabilitySecret(config, dataDir, env, logger);
@@ -675,8 +734,10 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
     }
     const protocol = await resolveProtocolBinding(config.bugate?.path ? { bugatePath: config.bugate.path } : {});
 
-    // ---- models
-    const router: ModelRouter = createModelRouter({ ...base, catalog, providers, events });
+    // ---- models (A[1]: observed prices re-read at every turn boundary; the configured price guard)
+    const prices = createFilePriceSource(modelPricesFile(config), { logger: logger.child({ component: 'model-prices' }) });
+    const circuitBreaker: CircuitBreakerOptions | undefined = config.models.priceGuard ? { priceGuard: { ...config.models.priceGuard } } : undefined;
+    const router: ModelRouter = createModelRouter({ ...base, catalog, providers, events, prices, ...(circuitBreaker ? { circuitBreaker } : {}) });
     const preflightRouter: ModelRouter = createModelRouter({ ...base, catalog, providers });
 
     // ---- context engine
@@ -737,6 +798,8 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
       pending.push({ name: 'browser', close: () => closeBlackboxResources() });
     }
     const registry = new ToolRegistry(builtinTools(toolOptions));
+    // A[6]: plugin tools join the same registry AFTER the built-in and domain tools (below), so a plugin tool can never
+    // take a governed tool's id (the registry refuses a duplicate id: conflict)
     const toolDeps: ToolRuntimeDeps = {
       ...base,
       registry,
@@ -767,7 +830,7 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
     const sessions = createSessionStore({ ...base, db, events });
     const agents = createAgentRepository({ ...base, db, events });
     const epochs = createEpochManager({ ...base, db, events, sessions });
-    const engineList: AgentEngine[] = [new NativeEngine({ ...base, sessions, events })];
+    const engineList: AgentEngine[] = [new NativeEngine({ ...base, sessions, events }), ...plugins.engines({ ...base, sessions, events })];
     try {
       engineList.push(new PiEngine({ ...base, sessions, events }));
     } catch (e) {
@@ -809,9 +872,20 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
       toolRuntime, registry, workspaces, environments,
       sessions, agents, epochs, engines, subagents, runner, roles,
       config: controlConfig,
+      // A[6]: context-assembly hooks of kernel plugins
+      ...(plugins.contextHooks().length > 0 ? { contextHooks: plugins.contextHooks() } : {}),
     };
     // the manifest pins the complete tool catalog: built-in + domain tools
     for (const spec of createDomainTools(deps)) if (!registry.get(spec.id)) registry.register(spec);
+    // A[6]: plugin tools join the one registry (the same capability check, permit, freshness, ledger and evidence
+    // pipeline) only now: a plugin tool reusing a built-in or domain tool id (e.g. complete_work) is refused, never a shadow
+    for (const t of plugins.tools()) {
+      if (registry.get(t.id)) {
+        const owner = plugins.capabilities.owner(`tool:${t.id}`) ?? 'a plugin';
+        throw new HypertestError('conflict', `plugin ${owner}: tool ${t.id} is already a built-in or domain tool; a plugin may not replace a governed tool`, { details: { toolId: t.id, pluginId: owner } });
+      }
+      registry.register(t);
+    }
     const engineAdapters = [{ provider: 'engine:native', package: '@hypertest/runtime', version: RUNTIME_PACKAGE_VERSION }];
     if (engines.has('pi')) {
       engineAdapters.push({ provider: 'engine:pi', package: '@hypertest/runtime-pi', version: RUNTIME_PI_PACKAGE_VERSION });
@@ -852,6 +926,8 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
         // every tool's schemas, effect, risk, timeout and side-effect binding + the adapters' capabilities
         toolCatalogRevision: toolCatalogRevision(registry.list(), adapters.list()),
         protocol: { id: protocol.binding.protocolId, version: protocol.binding.version, digest: protocol.binding.digest },
+        ...(modelScores ? { modelScores } : {}),
+        ...(plugins.plugins.length > 0 ? { plugins: plugins.manifestEntries() } : {}),
       },
       clock.isoNow(),
     );
@@ -898,7 +974,7 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
     const services: HypertestServices = {
       db, bus, relay, events, runs, blackboard, specs, decisions, operations: ledger, artifacts, evidence, signer, publicKeys: keys.publicKeys,
       policy, decisionLog, approvals, oracles, protocol, providers, catalog, router, memory, provenance, tools: registry, environments, roles, workerId, logger, clock, ids,
-      adapters,
+      adapters, toolRuntime, workspaces, plugins,
     };
     const releases = createReleaseService({
       db, registry: releaseRegistry, manifest, runs, events, blackboard, leases, ledger, reconciler, agents, control: plane, durable,
@@ -996,6 +1072,8 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
             quarantined.push(run.runId);
             continue;
           }
+          // A[0]: an operator resume lets agents paused for model unavailability try their routes again now
+          await control.releaseModelPauses?.(run.runId, 'operator:resume');
           await durable.startRun(run.runId);
           resumed.push(run.runId);
         }
@@ -1043,6 +1121,32 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
         // and the durable signal stops the loop that does
         await control.cancelRun(runId, reason);
         await durable.signal(runId, { type: 'cancel', reason });
+      },
+      async requestModelSwitch(runId, target, routeId, actor, reason) {
+        if (!control.requestModelSwitch) throw new HypertestError('unsupported', 'this control plane cannot record model switches');
+        if (actor?.kind !== 'human' || typeof actor.id !== 'string' || actor.id.trim() === '') throw new HypertestError('invalid_argument', 'a model switch is requested by a named human ({ kind: human, id })');
+        const out = await control.requestModelSwitch(runId, target, routeId, `human:${actor.id}`, reason);
+        await wake(runId);
+        return out;
+      },
+      agents: (runId) => inspectAgents({ agents, engines, epochs }, runId),
+      async resume(runId) {
+        if (closing) throw new HypertestError('unavailable', 'this Hypertest instance is closed');
+        const run = await runs.get(runId);
+        if (!run) throw new HypertestError('not_found', `run ${runId} not found`);
+        if (isTerminalRun(run.status)) throw new HypertestError('conflict', `run ${runId} is already ${run.status}`, { details: { runId, status: run.status } });
+        if (run.runtimeManifestId !== manifest.manifestId) throw pinViolation(run, manifest.manifestId);
+        // a paused run is resumed FIRST, through the release-governed control plane: a quarantined or migrating run is
+        // refused before anything changes (its model pauses stay as they are). That resume releases the run's model
+        // pauses itself, so the pauses still waiting are listed before it to report what was released.
+        const nowMs = clock.nowMs();
+        const waitingBefore = run.status === 'paused' && epochs.listModelPauses ? (await epochs.listModelPauses(runId)).filter((p) => Date.parse(p.resumeAt) > nowMs).map((p) => p.sessionId) : [];
+        if (run.status === 'paused') await control.resumeRun(runId);
+        const releasedNow = (await control.releaseModelPauses?.(runId, 'operator:resume')) ?? [];
+        const releasedPauses = [...new Set([...waitingBefore, ...releasedNow])].sort();
+        await durable.startRun(runId);
+        await wake(runId);
+        return { releasedPauses };
       },
       close() {
         closing ??= closeAll();

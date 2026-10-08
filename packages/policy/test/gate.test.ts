@@ -2,9 +2,9 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { canonicalJson, sha256Hex, type JsonValue } from '@hypertest/core';
 import type {
-  BlackboardRecord, EvidenceRecord, Finding, GateSpec, Objective, OracleAssertion, OracleSpec, ReportClaim, Review, Risk, TestArtifact, TestRun, WorkItem,
+  BlackboardRecord, EvidenceRecord, ExperimentSpec, Finding, GateSpec, Objective, OracleAssertion, OracleSpec, ReportClaim, Review, Risk, SystemModel, TestArtifact, TestRun, WorkItem,
 } from '@hypertest/domain';
-import { DEFAULT_GATE_SPEC, QualityGate, evaluateOracleCheck, gateOverrides, type GateInput } from '../src/index.ts';
+import { DEFAULT_GATE_SPEC, QualityGate, evaluateOracleCheck, gateOverrides, type GateInput, type GateOperation } from '../src/index.ts';
 
 const RUN = 'run_gate';
 const gate = new QualityGate();
@@ -78,7 +78,7 @@ const objectives: Objective[] = [
 ];
 
 const run: TestRun = {
-  runId: RUN, goal: 'assess releasability of the cart change', target: {}, status: 'gating', budget: { maxWallClockMs: 1, maxAgentConcurrency: 1, maxModelTokens: 1, maxToolCalls: 1, maxWorkItems: 1, maxAgentDepth: 1, maxPlanRevisions: 1 },
+  runId: RUN, goal: 'assess releasability of the cart change', target: { baseCommit: 'c0ffee' }, status: 'gating', budget: { maxWallClockMs: 1, maxAgentConcurrency: 1, maxModelTokens: 1, maxToolCalls: 1, maxWorkItems: 1, maxAgentDepth: 1, maxPlanRevisions: 1 },
   runtimeManifestId: 'rm_1', policyRevision: 'builtin@1', currentPlanRevision: 1, systemModelRevision: 3, oracleRevisions: { or_cart: 2 }, experimentIds: [], labels: {}, createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
 };
 
@@ -104,14 +104,76 @@ function baseline(): GateInput {
     evidence,
     evidenceRoot: { rootHash: 'root_abc', count: evidence.length },
     workItems: [workItem('wi_exec', { evidenceRequirements: [{ evidenceType: 'test-result', minCount: 1, critical: true }] })],
-    claims: [{ claimId: 'cl_1', statement: 'p95 is 180ms', evidenceQuery: { evidenceType: 'metric' }, evidenceRefs: ['ev_metric'], critical: true }],
+    claims: [{ claimId: 'cl_1', statement: 'p95 is 180ms', value: 180, evidenceQuery: { evidenceType: 'metric', field: 'p95' }, evidenceRefs: ['ev_metric'], critical: true }],
     exceptions: [],
     runtimeManifestId: 'rm_1',
     policyRevision: 'builtin@1',
     decisionId: 'dec_2',
     now: '2026-02-01T00:00:00.000Z',
     producerProviders: ['openai'],
+    // coverage-1: the run's SystemModel and its (here: no) write/fault/load actions; D-11: the environments in use (none)
+    systemModel: systemModel(),
+    operations: [],
+    environments: [],
   };
+}
+
+function systemModel(extra: Partial<SystemModel> = {}): SystemModel {
+  return {
+    systemModelId: `sm_${RUN}`, runId: RUN, revision: 3, subject: { repoRefs: ['/repo'], commitDigests: ['c1'], buildDigests: ['b1'] },
+    components: [{ componentId: 'cart', name: 'cart', kind: 'module', paths: ['src/cart.js'], riskTags: [] }], interfaces: [], dependencies: [], stateMachines: [], invariants: [],
+    dataAssets: [], securityBoundaries: [], changedComponents: ['cart'], riskTags: [], sources: [], createdBy: 'agent_arch', createdAt: '2026-01-01T00:00:00.000Z', ...extra,
+  };
+}
+
+/**
+ * D-0/D-1: a generated artifact that completed its WHOLE lifecycle, with the records the gate re-derives it from: a
+ * known-good run on the base revision that executed exactly its file/content (carrying the static check), a mutation run
+ * that executed nothing but its file and killed mutants, and an independent approving oracle consistency review.
+ */
+function lifecycle(a: TestArtifact, seq0 = 100): { artifact: TestArtifact; evidence: EvidenceRecord[]; review: BlackboardRecord<Review> } {
+  const files = (staticCheck: boolean) => [{ path: a.path, sha256: a.artifactDigest, cases: 1, ...(staticCheck ? { staticCheck: { checker: 'node --check', ok: true } } : {}) }];
+  const good = ev(`ev_good_${a.artifactId}`, seq0, 'test-result', {
+    framework: 'node_test', passed: true, cases: [{ id: `${a.path}::case`, name: 'case', file: a.path, status: 'passed' }],
+    executedTests: { attribution: 'complete', files: files(true), unattributedCases: 0 }, codeRevision: { kind: 'base', baseCommit: 'c0ffee', treeDigest: 'tree_base' },
+  } as unknown as JsonValue);
+  const mut = ev(`ev_mut_${a.artifactId}`, seq0 + 1, 'mutation-result', {
+    file: 'src/cart.js', mutatedFile: { path: 'src/cart.js', isTestFile: false, changedSinceBase: false }, killed: 3, survived: 1, score: 0.75, baseline: { passed: true, total: 1 },
+    executedTests: { attribution: 'complete', files: files(false), unattributedCases: 0 }, codeRevision: { kind: 'workspace', baseCommit: 'c0ffee', treeDigest: 'tree_cand' },
+  } as unknown as JsonValue);
+  const review = rec<Review>('review', `rec_rev_${a.artifactId}`, { subjectRef: { kind: 'test_artifact', id: a.artifactId }, verdict: 'approve', rationale: 'encodes a_total exactly', checkedEvidenceRefs: [good.evidenceId, mut.evidenceId], reviewerRole: 'reviewer', modelProvider: 'anthropic' }, { createdBy: 'agent_reviewer' });
+  const artifact: TestArtifact = {
+    ...a,
+    generatedBy: { agentId: 'agent_designer', role: 'test_designer' },
+    oracleRefs: [{ oracleId: 'or_cart', revision: 2, assertionIds: ['a_total'] }],
+    validations: {
+      static: { status: 'passed', evidenceRefs: [good.evidenceId] },
+      knownGood: { status: 'passed', evidenceRefs: [good.evidenceId], codeDigest: 'tree_base' },
+      mutation: { status: 'passed', evidenceRefs: [mut.evidenceId], killed: 3 },
+    },
+    approvalState: 'approved',
+    oracleReview: { reviewRecordId: review.recordId, reviewerAgentId: 'agent_reviewer', reviewerRole: 'reviewer', verdict: 'approve', artifactDigest: a.artifactDigest, oracleRevisions: { or_cart: 2 }, at: '2026-01-01T00:00:00.000Z' },
+  };
+  return { artifact, evidence: [good, mut], review };
+}
+
+/** The input with a lifecycle's artifact, evidence and review added (root count kept consistent). */
+function withLifecycle(input: GateInput, ...lcs: Array<ReturnType<typeof lifecycle>>): GateInput {
+  const evidence = [...input.evidence, ...lcs.flatMap((l) => l.evidence)];
+  return { ...input, testArtifacts: [...input.testArtifacts, ...lcs.map((l) => l.artifact)], reviews: [...input.reviews, ...lcs.map((l) => l.review)], evidence, evidenceRoot: { ...input.evidenceRoot, count: evidence.length } };
+}
+
+function experimentSpec(id: string, extra: Partial<ExperimentSpec> = {}): ExperimentSpec {
+  return {
+    experimentId: id, runId: RUN, revision: 1, oracleRefs: [{ oracleId: 'or_cart', revision: 2 }], hypothesis: 'h', subjects: [{ role: 'candidate', buildDigest: 'b-2' }],
+    environment: { environmentId: 'kv', environmentClass: 'local', generation: 1 }, fixtures: [], faultPlan: [], randomSeeds: ['s'],
+    isolation: { mode: 'exclusive_write', resourceClaims: [{ resourceKey: `env/${extra.environment?.environmentId ?? 'kv'}`, mode: 'write_exclusive' }] },
+    evidenceRequirements: [], stopConditions: [], contaminationRules: [], createdBy: 'agent_lead', createdAt: '2026-01-01T00:00:00.000Z', ...extra,
+  };
+}
+
+function operation(operationId: string, toolId: string, resourceKey: string, extra: Partial<GateOperation> = {}): GateOperation {
+  return { operationId, toolId, effect: 'external', workItemId: 'wi_exec', status: 'verified', resourceKey, toolInvocationId: `inv_${operationId}`, createdAt: '2026-01-01T00:00:01.000Z', ...extra };
 }
 
 const ids = (cs: Array<{ criterionId: string }>) => cs.map((c) => c.criterionId);
@@ -122,7 +184,7 @@ const criterion = (d: ReturnType<QualityGate['evaluate']>, id: string) => [...d.
 test('baseline: every criterion satisfied ⇒ pass, with every decision field filled', () => {
   const d = gate.evaluate(baseline());
   assert.equal(d.verdict, 'pass', d.reasons.join('\n'));
-  assert.deepEqual(ids(d.satisfiedCriteria), ['C0', 'C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8', 'C9']);
+  assert.deepEqual(ids(d.satisfiedCriteria), ['C0', 'C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8', 'C9', 'C10', 'C11', 'C12']);
   assert.deepEqual(d.violatedCriteria, []);
   assert.deepEqual(d.unknownCriteria, []);
   assert.equal(d.requiresHumanReview, false);
@@ -214,10 +276,52 @@ test('C2: fixed-but-unverified still blocks; verified_fixed / below-threshold / 
   assert.equal(gate.evaluate(blocked).verdict, 'fail');
   const ok = baseline();
   ok.findings.push(finding('rec_f_v', { status: 'verified_fixed' }), finding('rec_f_p2', { severity: 'P2' }), finding('rec_f_dup', { status: 'duplicate' }));
-  ok.findings.push(finding('rec_f_old', { status: 'open' }, { lineageId: 'lin_1', version: 1 }), finding('rec_f_new', { status: 'verified_fixed' }, { lineageId: 'lin_1', version: 2, supersedes: 'rec_f_old' }));
+  // D-11: an agent clears a P1 finding only with deterministic support — its oracle assertion (a_total) is satisfied here
+  const support = { oracleRef: { oracleId: 'or_cart', revision: 2, assertionId: 'a_total' } };
+  ok.findings.push(finding('rec_f_old', { status: 'open', ...support }, { lineageId: 'lin_1', version: 1 }), finding('rec_f_new', { status: 'verified_fixed', ...support }, { lineageId: 'lin_1', version: 2, supersedes: 'rec_f_old' }));
   const d = gate.evaluate(ok);
   assert.equal(d.verdict, 'pass', d.reasons.join('\n'));
   assert.deepEqual(d.unresolvedFindings, []);
+});
+
+test('D-11: a blocking P0/P1 product finding cleared by an agent without deterministic support stays in doubt (C2 unknown); a human clearing or a satisfied oracle assertion settles it', () => {
+  const history = (status: Finding['status'], last: Partial<Finding>, by = 'agent_rca') => [
+    finding('rec_c1', { status: 'open' }, { lineageId: 'lin_c', version: 1 }),
+    finding('rec_c2', { status, ...last }, { lineageId: 'lin_c', version: 2, supersedes: 'rec_c1', createdBy: by }),
+  ];
+  for (const [what, status, last] of [
+    ['rejected', 'rejected', {}],
+    ['downgraded to P2', 'open', { severity: 'P2' }],
+    ['re-categorised as a test defect', 'open', { category: 'test_defect', severity: 'P2' }],
+    ['accepted as a risk', 'accepted_risk', {}],
+    ['verified fixed without an oracle assertion', 'verified_fixed', {}],
+  ] as const) {
+    const input = baseline();
+    input.findings.push(...history(status, last));
+    const d = gate.evaluate(input);
+    assert.equal(criterion(d, 'C2').status, 'unknown', what);
+    assert.equal(d.verdict, 'inconclusive', what);
+    assert.ok(d.reasons.some((r) => r.includes('rec_c2 was a blocking product finding and was cleared by agent agent_rca')), d.reasons.join('\n'));
+  }
+  // a human (or system) decision clears it
+  const human = baseline();
+  human.findings.push(...history('rejected', {}, 'human:qa-lead'));
+  assert.equal(gate.evaluate(human).verdict, 'pass');
+  // the clearing is supported when the finding's oracle assertion is satisfied by eligible deterministic evidence …
+  const supported = baseline();
+  supported.findings.push(...history('verified_fixed', { oracleRef: { oracleId: 'or_cart', revision: 2, assertionId: 'a_total' } }));
+  assert.equal(gate.evaluate(supported).verdict, 'pass');
+  // … never when that assertion is itself unproven
+  const unproven = baseline();
+  unproven.findings.push(...history('verified_fixed', { oracleRef: { oracleId: 'or_cart', revision: 2, assertionId: 'a_total' } }));
+  unproven.evidence = unproven.evidence.filter((e) => e.evidenceId !== 'ev_tests');
+  unproven.evidenceRoot.count = unproven.evidence.length;
+  assert.equal(criterion(gate.evaluate(unproven), 'C2').status, 'unknown');
+  // an exception approved by an agent never waives it (agents cannot bypass a deterministic criterion)
+  const waived = baseline();
+  waived.findings.push(...history('rejected', {}));
+  waived.exceptions = [{ criterionId: 'C2', approvedBy: { kind: 'agent', id: 'agent_reviewer' }, rationale: 'looks fine' }];
+  assert.equal(gate.evaluate(waived).verdict, 'inconclusive');
 });
 
 test('C2: an unresolved P1 test-infrastructure finding casts doubt ⇒ unknown ⇒ inconclusive', () => {
@@ -254,7 +358,8 @@ test('C3: metric threshold and evidence predicate violations ⇒ fail', () => {
 
 test('C3: no supporting evidence for a critical assertion ⇒ unknown ⇒ inconclusive', () => {
   const input = baseline();
-  input.evidence[1] = ev('ev_metric', 2, 'metric', { metric: 'cpu_percent', p95: 10 });
+  // (the record keeps p95 180: the baseline's critical claim about it stays true)
+  input.evidence[1] = ev('ev_metric', 2, 'metric', { metric: 'cpu_percent', p95: 180 });
   const d = gate.evaluate(input);
   assert.equal(d.verdict, 'inconclusive');
   assert.deepEqual(ids(d.unknownCriteria), ['C3']);
@@ -289,10 +394,13 @@ test('C3: evidence from a non-eligible generated test does not count', () => {
   const d = gate.evaluate(input);
   assert.equal(d.verdict, 'inconclusive');
   assert.deepEqual(ids(d.unknownCriteria), ['C3', 'C4']);
-  assert.ok(d.reasons.some((r) => r.startsWith('ignored evidence from ineligible generated tests: ev_tests (test artifact ta_gen not eligible)')));
-  // once the generated test demonstrated sensitivity (fails on known-bad code) its evidence counts
+  assert.ok(d.reasons.some((r) => r.startsWith('ignored evidence from ineligible generated tests: ev_tests (test artifact ta_gen not eligible')), d.reasons.join('\n'));
+  // a stored "validated" state with a recorded (but unbound) known-bad is NOT trusted (D-0): the gate re-derives the lifecycle
   input.testArtifacts = [generated, { ...generated, revision: 2, validations: { ...generated.validations, knownBad: { status: 'passed', evidenceRefs: ['ev_kb'] } } }];
-  assert.equal(gate.evaluate(input).verdict, 'pass');
+  assert.equal(gate.evaluate(input).verdict, 'inconclusive');
+  // once the generated test completed its lifecycle (bound static/known-good/mutation evidence + independent review) it counts
+  const done = withLifecycle({ ...input, testArtifacts: [] }, lifecycle({ ...generated, revision: 3 }));
+  assert.equal(gate.evaluate(done).verdict, 'pass', gate.evaluate(done).reasons.join('\n'));
   // evidence pointing at an unknown artifact is ignored as well
   input.testArtifacts = [];
   assert.equal(gate.evaluate(input).verdict, 'inconclusive');
@@ -318,6 +426,7 @@ test('C3: evidence without a build identity belongs to the build current when it
   const B1: OracleAssertion = { assertionId: 'a_neg', description: 'negative transfers are rejected', kind: 'requirement', severity: 'P1', check: { type: 'http_expectation', method: 'POST', path: '/transfers', expectStatus: 400 } };
   const deployed = { environmentId: 'bank', environmentClass: 'sandbox', generation: 2, buildDigest: 'b-2' };
   const escape = baseline();
+  escape.environments = [{ environmentId: 'bank', registered: true, generation: 2 }];
   escape.oracles = [oracle([P1_TEST, B1])];
   escape.evidence.push(
     ev('ev_on_build', 10, 'api-response', { method: 'POST', path: '/transfers', status: 201 }, { environment: deployed }),
@@ -331,6 +440,10 @@ test('C3: evidence without a build identity belongs to the build current when it
   // b-2); after it, it passes — the fix is judged on b-3 and on what was recorded while b-3 was current
   const fixed = baseline();
   fixed.oracles = [oracle([P1_TEST, B1])];
+  // the run itself deployed b-3 (a verified env.deploy of its experiment): the generation change is explained (C11)
+  fixed.environments = [{ environmentId: 'bank', registered: true, generation: 3 }];
+  fixed.experiments = [experimentSpec('exp_deploy', { environment: { environmentId: 'bank', environmentClass: 'sandbox', generation: 2 } })];
+  fixed.operations = [operation('op_deploy', 'env.deploy', 'env/bank', { experimentId: 'exp_deploy', effect: 'destructive' })];
   fixed.evidence.push(
     ev('ev_before', 10, 'api-response', { method: 'POST', path: '/transfers', status: 201 }),
     ev('ev_old_build', 11, 'api-response', { method: 'POST', path: '/transfers', status: 201 }, { environment: deployed }),
@@ -454,8 +567,15 @@ test('C6: a review of the run subject counts; not required ⇒ satisfied', () =>
   const notRequired = baseline();
   notRequired.reviews = [];
   notRequired.gate = { ...notRequired.gate, requireIndependentReview: false };
+  // D-7: an oracle in force whose judgePolicy requires an independent reviewer still requires one …
+  const forced = gate.evaluate(notRequired);
+  assert.equal(criterion(forced, 'C6').status, 'violated');
+  assert.equal(forced.verdict, 'conditional');
+  assert.ok(forced.reasons.some((r) => r.includes('independent review required by the judgePolicy of oracle or_cart@2')), forced.reasons.join('\n'));
+  // … only when neither the gate nor any oracle in force requires review is C6 satisfied without one
+  notRequired.oracles = [oracle([P1_TEST, P0_LATENCY, P1_ERRORS, P2_LLM], { judgePolicy: { deterministicRequiredForCritical: true, allowLlmOnlyDecision: false, independentReviewerRequired: false } })];
   const d = gate.evaluate(notRequired);
-  assert.equal(d.verdict, 'pass');
+  assert.equal(d.verdict, 'pass', d.reasons.join('\n'));
   assert.equal(d.requiresHumanReview, false);
 });
 
@@ -514,6 +634,21 @@ test('C9: critical claims without resolvable evidence ⇒ inconclusive', () => {
   const nonCritical = baseline();
   nonCritical.claims.push({ claimId: 'cl_4', statement: 'nice', evidenceQuery: {}, evidenceRefs: [], critical: false } as ReportClaim);
   assert.equal(gate.evaluate(nonCritical).verdict, 'pass');
+  // area-C-0 (review): a critical claim whose number lives only in the prose of its statement (no value to evaluate) is not
+  // verified by citing a real evidence id — unknown, never satisfied
+  const prose = baseline();
+  prose.claims = [{ claimId: 'cl_5', statement: 'p95 is 120ms', evidenceQuery: { evidenceType: 'metric' }, evidenceRefs: ['ev_metric'], critical: true }];
+  const pd = gate.evaluate(prose);
+  assert.equal(pd.verdict, 'inconclusive');
+  assert.deepEqual(ids(pd.unknownCriteria), ['C9']);
+  assert.ok(pd.reasons.includes('C9 critical claim cl_5 ("p95 is 120ms") states no value to evaluate against its evidence: a statement alone is not verifiable'), pd.reasons.join('\n'));
+  // the same claim with its value evaluated: satisfied when it matches, violated (fail) when the evidence contradicts it
+  prose.claims = [{ ...prose.claims[0]!, value: 180, evidenceQuery: { evidenceType: 'metric', field: 'p95' } }];
+  assert.equal(gate.evaluate(prose).verdict, 'pass');
+  prose.claims = [{ ...prose.claims[0]!, value: 120 }];
+  const contradicted = gate.evaluate(prose);
+  assert.equal(contradicted.verdict, 'fail');
+  assert.deepEqual(ids(contradicted.violatedCriteria), ['C9']);
 });
 
 // ----------------------------------------------------------------------------- precedence + exceptions
@@ -591,7 +726,7 @@ test('I7: pass is impossible when every evidence record comes from an ineligible
   const d = gate.evaluate({ ...baseline(), gate: permissive, oracles: [], claims: [], workItems: [], testArtifacts: [draft], evidence, evidenceRoot: { rootHash: 'r', count: 1 } });
   assert.equal(d.verdict, 'inconclusive');
   assert.deepEqual(ids(d.unknownCriteria), ['C1']);
-  assert.ok(d.reasons.includes('C1 no eligible evidence: all 1 run evidence records come from ineligible or unknown generated tests'), d.reasons.join('\n'));
+  assert.ok(d.reasons.includes('C1 no eligible evidence: none of the 1 run evidence records is evidence about the candidate from an eligible source (ineligible generated tests, base-revision validation runs, experiments under a superseded oracle revision)'), d.reasons.join('\n'));
   // C1 stays non-waivable
   const waived = gate.evaluate({ ...baseline(), gate: permissive, oracles: [], claims: [], workItems: [], testArtifacts: [draft], evidence, evidenceRoot: { rootHash: 'r', count: 1 }, exceptions: [{ criterionId: 'C1', approvedBy: { kind: 'human', id: 'u' }, rationale: 'x' }] });
   assert.equal(waived.verdict, 'inconclusive');
@@ -627,6 +762,11 @@ function artifact(extra: Partial<TestArtifact> = {}): TestArtifact {
     validations: { knownBad: { status: 'passed', evidenceRefs: ['ev_bad'] } }, approvalState: 'validated', createdAt: '2026-01-01T00:00:00.000Z', ...extra,
   };
 }
+/** The run with a fully eligible artifact (whole lifecycle, see lifecycle()); `tweak` perturbs the artifact. */
+function coveredRun(d: unknown, base: Partial<TestArtifact> = {}, tweak: (a: TestArtifact) => TestArtifact = (a) => a): GateInput {
+  const lc = lifecycle(artifact(base));
+  return withLifecycle(generatedRun(d), { ...lc, artifact: tweak(lc.artifact) });
+}
 const delta = (testFiles: Array<{ path: string; change: string; sha256: string | null }>, extra: Record<string, unknown> = {}) =>
   ({ status: 'computed', baseCommit: 'c0ffee', readOnly: false, treeDigest: 't', changedFiles: testFiles.length, testFiles, ...extra });
 /** The audit PoC: an UNLINKED generated test (no testArtifactId) whose single trivial case matches the oracle selector. */
@@ -643,33 +783,41 @@ test('conformance-2: a run over a new test file that no validated artifact cover
   assert.notEqual(d.verdict, 'pass');
   assert.equal(d.verdict, 'inconclusive');
   for (const c of ['C1', 'C3', 'C4']) assert.equal(criterion(d, c).status, 'unknown', c);
-  assert.ok(d.reasons.some((r) => r.includes('ev_gen (test file test/new_generated.test.js is added since the base commit and no validated test artifact has its content')), d.reasons.join('\n'));
+  assert.ok(d.reasons.some((r) => r.includes('ev_gen (test file test/new_generated.test.js is added since the base commit and no test artifact has its content')), d.reasons.join('\n'));
 });
 
-test('conformance-2: the same run counts once a validated artifact has exactly that content digest (derived from digests, not a claim)', () => {
-  const covered = gate.evaluate({ ...generatedRun(delta([{ path: 'test/new_generated.test.js', change: 'added', sha256: GEN_SHA }])), testArtifacts: [artifact()] });
+test('conformance-2: the same run counts once an eligible artifact has exactly that content digest (derived from digests, not a claim)', () => {
+  const added = delta([{ path: 'test/new_generated.test.js', change: 'added', sha256: GEN_SHA }]);
+  const covered = gate.evaluate(coveredRun(added));
   assert.equal(covered.verdict, 'pass', covered.reasons.join('\n'));
   // the artifact covers only the content it validated: a later edit of the file is uncovered again
-  const edited = gate.evaluate({ ...generatedRun(delta([{ path: 'test/new_generated.test.js', change: 'added', sha256: 'b'.repeat(64) }])), testArtifacts: [artifact()] });
+  const edited = gate.evaluate(coveredRun(delta([{ path: 'test/new_generated.test.js', change: 'added', sha256: 'b'.repeat(64) }])));
   assert.equal(edited.verdict, 'inconclusive');
-  // a draft / quarantined / insensitive artifact, or a superseded validated revision, does not cover it
-  for (const a of [
-    artifact({ approvalState: 'draft' }),
-    artifact({ approvalState: 'quarantined' }),
-    artifact({ validations: { knownGood: { status: 'passed', evidenceRefs: ['ev_good'] } } }),
-    artifact({ sourceType: 'existing', validations: {} }),
-  ]) {
-    const r = gate.evaluate({ ...generatedRun(delta([{ path: 'test/new_generated.test.js', change: 'added', sha256: GEN_SHA }])), testArtifacts: [a] });
-    assert.equal(r.verdict, 'inconclusive', JSON.stringify(a));
+  // a draft / validated-but-unreviewed / quarantined / insensitive artifact, or a superseded eligible revision, does not cover it
+  for (const [what, tweak] of [
+    ['draft', (a: TestArtifact) => ({ ...a, approvalState: 'draft' as const })],
+    ['validated, no oracle review', (a: TestArtifact) => ({ ...a, approvalState: 'validated' as const })],
+    ['quarantined', (a: TestArtifact) => ({ ...a, approvalState: 'quarantined' as const })],
+    ['insensitive', (a: TestArtifact) => ({ ...a, validations: { static: a.validations.static!, knownGood: a.validations.knownGood! } })],
+    ['no known-good', (a: TestArtifact) => ({ ...a, validations: { static: a.validations.static!, mutation: a.validations.mutation! } })],
+    ['no static check', (a: TestArtifact) => ({ ...a, validations: { knownGood: a.validations.knownGood!, mutation: a.validations.mutation! } })],
+    ['changed existing file without lifecycle', (a: TestArtifact) => ({ ...a, sourceType: 'existing' as const, validations: {} })],
+    ['review by its creator', (a: TestArtifact) => ({ ...a, generatedBy: { agentId: 'agent_reviewer', role: 'test_designer' } })],
+    ['review by the creator role', (a: TestArtifact) => ({ ...a, generatedBy: { agentId: 'agent_designer', role: 'reviewer' } })],
+    ['oracleRefs not in force', (a: TestArtifact) => ({ ...a, oracleRefs: [{ oracleId: 'or_cart', revision: 1, assertionIds: ['a_total'] }] })],
+  ] as const) {
+    const r = gate.evaluate(coveredRun(added, {}, tweak));
+    assert.equal(r.verdict, 'inconclusive', what);
   }
-  const retired = gate.evaluate({ ...generatedRun(delta([{ path: 'test/new_generated.test.js', change: 'added', sha256: GEN_SHA }])), testArtifacts: [artifact(), artifact({ revision: 2, approvalState: 'retired' })] });
-  assert.equal(retired.verdict, 'inconclusive', 'only the latest revision counts');
+  const retired = coveredRun(added);
+  retired.testArtifacts.push({ ...retired.testArtifacts[0]!, revision: 2, approvalState: 'retired' });
+  assert.equal(gate.evaluate(retired).verdict, 'inconclusive', 'only the latest revision counts');
 });
 
 test('conformance-2: modified test files need coverage too; deletions, unchanged trees and read-only unavailable deltas are not judged here; a writable unavailable delta is', () => {
   const modified = gate.evaluate({ ...generatedRun(delta([{ path: 'test/cart.test.js', change: 'modified', sha256: GEN_SHA }, { path: 'test/old.test.js', change: 'deleted', sha256: null }])), testArtifacts: [] });
   assert.equal(modified.verdict, 'inconclusive');
-  const repaired = gate.evaluate({ ...generatedRun(delta([{ path: 'test/cart.test.js', change: 'modified', sha256: GEN_SHA }, { path: 'test/old.test.js', change: 'deleted', sha256: null }])), testArtifacts: [artifact({ sourceType: 'repaired', path: 'test/cart.test.js' })] });
+  const repaired = gate.evaluate(coveredRun(delta([{ path: 'test/cart.test.js', change: 'modified', sha256: GEN_SHA }, { path: 'test/old.test.js', change: 'deleted', sha256: null }]), { sourceType: 'repaired', path: 'test/cart.test.js' }));
   assert.equal(repaired.verdict, 'pass', repaired.reasons.join('\n'));
   assert.equal(gate.evaluate(generatedRun(delta([]))).verdict, 'pass', 'nothing changed: the existing suite ran');
   assert.equal(gate.evaluate(generatedRun({ status: 'unavailable', readOnly: true, reason: 'not a git repository' })).verdict, 'pass');
@@ -682,7 +830,7 @@ test('conformance-2: modified test files need coverage too; deletions, unchanged
 test('conformance-2: one uncovered file in the run taints its evidence even when the declared artifact is eligible (no riding along)', () => {
   const i = generatedRun(delta([{ path: 'test/new_generated.test.js', change: 'added', sha256: GEN_SHA }, { path: 'test/unregistered.test.js', change: 'added', sha256: 'c'.repeat(64) }]));
   (i.evidence[0]!.structured as Record<string, unknown>)['testArtifactId'] = 'ta_gen';
-  const d = gate.evaluate({ ...i, testArtifacts: [artifact()] });
+  const d = gate.evaluate(withLifecycle(i, lifecycle(artifact())));
   assert.equal(d.verdict, 'inconclusive');
   assert.ok(d.reasons.some((r) => r.includes('test/unregistered.test.js')), d.reasons.join('\n'));
 });
@@ -748,7 +896,7 @@ test('conformance-4: an oracle approved in a newer revision during the run makes
   const d = gate.evaluate({ ...pinned, currentOracleRevisions: { [id]: rev + 1 } });
   assert.equal(d.verdict, 'inconclusive');
   assert.equal(criterion(d, 'C0').status, 'unknown');
-  assert.equal(criterion(d, 'C0').detail, `oracle ${id} revision ${rev} is superseded by approved revision ${rev + 1}: the verdict would rest on a replaced criterion — judge the candidate against the new revision in a new run`);
+  assert.equal(criterion(d, 'C0').detail, `oracle ${id} revision ${rev} is superseded by approved revision ${rev + 1}: the verdict would rest on a replaced criterion — re-evaluate under the new revision (the control plane re-pins the run and replans)`);
   // even a gate that waives the oracle requirement does not judge on a superseded pin
   assert.equal(gate.evaluate({ ...pinned, gate: { ...pinned.gate, requireOracle: false }, currentOracleRevisions: { [id]: rev + 1 } }).verdict, 'inconclusive');
 });

@@ -60,18 +60,40 @@ gate: { requireIndependentReview: true }
 - **Interpolation** `${VAR}`, `${VAR:-default}`, `$${` (literal) applies to string values only; never to keys, never to
   `*Env` fields, and never with a variable named by a `*Env` field or whose name looks like a credential (KEY, SECRET,
   TOKEN, PASSWORD, …). All problems are reported together; secret values never appear in messages.
-- **Routes** name at least `routeId`, `provider` (declared in `models.providers`) and `model`; `ROUTE_DEFAULTS` fill
-  the rest: capabilities `[tool_use, structured_output]`, structuredOutput `native`, reasoning `none`, contextWindow
-  128000, maxOutputTokens 4096, maxDataClassification `confidential`, quality `{default: 0.7}`, toolReliability 0.8,
-  costs 0, typicalLatencyMs 2000, maxActionRisk `high`, enabled. `continuationCompatibilityClass` is the provider's
-  tag: `anthropic:<model>`, `pi-ai:<api>:<piProvider>:<model>` (resolved pi model), `<providerId>:<model>` for
-  openai-compatible/scripted; a pinned different tag for anthropic/pi-ai is refused. The defaults do **not** satisfy
-  the built-in lead (reasoning + long_context, quality ≥ 0.75): declare capabilities and quality per route —
-  `diagnose` lists the roles no route can serve.
+- **Routes** (A[2]: every route has an EXPLICIT CapabilityProfile) name at least `routeId`, `provider` (declared in
+  `models.providers`), `model` and **`capabilities`** (required: "nothing is assumed"); undeclared fields take
+  CONSERVATIVE defaults (`ROUTE_DEFAULTS`): maxDataClassification `internal`, maxActionRisk `low`, structuredOutput
+  `prompted` when the `structured_output` capability is declared (else `none`), reasoning `none`, contextWindow 128000,
+  maxOutputTokens 4096, quality `{default: 0.7}`, toolReliability 0.8, typicalLatencyMs 2000, enabled. Cost is
+  **unknown** unless both `costPerMillionInputUsd` and `costPerMillionOutputUsd` are declared (one without the other is
+  an error): a run or work item with a USD budget (`maxModelCostUsd` / `maxCostUsd`) never routes to a cost-unknown
+  route, and the condenser (a per-call cost cap) never does. `defaultedRouteFields(route)` lists what a route left to
+  the defaults; `diagnose` warns about defaulted fields and unknown prices. `continuationCompatibilityClass` is the
+  provider's tag: `anthropic:<model>`, `pi-ai:<api>:<piProvider>:<model>` (resolved pi model), `<providerId>:<model>`
+  for openai-compatible/scripted; a pinned different tag for anthropic/pi-ai is refused. Declare capabilities, quality,
+  classification and risk per route — `diagnose` lists the roles no route can serve.
+- **Model governance keys** (`models.*`): `priceGuard` (A[1]: `{ maxIncreasePct?, default?, routes?, appliesTo? }`,
+  validated; an observed price beyond `maxIncreasePct` over the catalog price opens the route's circuit with an L0
+  event), `pricesFile` (default `<dataDir>/state/model-prices.json`: the observed prices, maintained by `hypertest
+  model prices set|clear` and re-read by a running Hypertest at every turn boundary), `scoresFile` (coverage[7]: eval
+  scores from `hypertest eval apply-scores`, merged into the catalog with `ModelCatalog.withScores` at start and
+  recorded in the RuntimeManifest as `modelScores` `{ digest, routes, source }`; scores for unconfigured routes are
+  refused).
+- **Plugins** (A[6]): `plugins: [{ id, version, kind: tool | engine | provider | context-hook, entry, digest:
+  sha256:<hex>, capabilities: [...], config? }]` — local ES modules, digest-pinned (a mismatch refuses the start:
+  nothing of the plugin is loaded), loaded by the runtime's plugin kernel (init → start → health; stopped on close),
+  recorded in the RuntimeManifest (`plugins`). Plugin tools join the tool registry (and its catalog revision) after the
+  built-in and domain tools — a plugin tool reusing a governed tool id is refused (`conflict`) — and pass the same
+  capability check, policy permit, operation ledger and evidence as built-in tools. The digest pins the entry file only
+  (modules it imports are not pinned: ship a plugin as one bundled file); plugin providers are
+  declared as `models.providers[].kind: plugin`; plugin engines may be `engines.default`; context hooks add labelled
+  reference sections to every turn (data, never instructions).
 - **Roles**: built-in catalog ⊕ `models.defaultPolicy` (applied to every role's model policy) ⊕ the condenser as a
   plain summarizer (`requiredCapabilities: []`, it is invoked without tools) ⊕ `roles.<role>` (wins).
-- Missing `apiKeyEnv` variables are not load errors: `createHypertest` logs a warning (name only) and `diagnose`
-  reports an error.
+- **Missing credentials fail closed** (e2e[3]): a provider whose `apiKeyEnv` variable is unset or empty (and a hosted
+  `anthropic` provider without `apiKeyEnv` or `baseUrl`) is UNAVAILABLE — the router never routes to its routes and its
+  `complete()` refuses before any request is sent (zero fetch calls); `createHypertest` logs a warning (name only),
+  a run whose roles have no other route is refused at start with the exact reason, and `diagnose` reports it.
 
 ### Composition (`createHypertest`)
 
@@ -207,6 +229,9 @@ database → store lock).
 | GET | `/runs/:id/report[?format=markdown]` | `RunReport` (or its markdown) |
 | GET | `/runs/:id/evidence/verify` | `{ ok, problems }` |
 | POST | `/runs/:id/cancel` | `{ reason }` → `{ ok }` |
+| POST | `/runs/:id/resume` | → `{ ok, releasedPauses }` (A[0]: releases model pauses — the paused agents retry now — and resumes a paused run). An operator decision: requires the API token (403 `token_required` without one), so an agent reaching the loopback API cannot un-pause a run. A quarantined or migrating run is refused (release governance) before any pause is released |
+| GET | `/runs/:id/agents` | `{ agents }` (A[4]: each agent's `engine.inspect` state, capability modes, epoch, model pause) |
+| POST | `/runs/:id/model-switch` | `{ target: role \| agentId, routeId, by, reason? }` → `{ switch }` (A[3]: a manual model switch applied at the target agents' next safe turn boundary after the re-check); **requires the API token** |
 | GET | `/approvals?runId=&status=` | `{ approvals }` |
 | POST | `/approvals/:id`, `/oracle-proposals/:id` | `{ approve, by, rationale }` → `{ ok }` (decided by the human `by`); **requires the API token** (403 `token_required` on a server without one) |
 
@@ -237,6 +262,14 @@ use.
 | I7 a gate spec (config or a run's override) cannot silently disable a gate rule (unknown severity, malformed required evidence) | `test/config.test.ts`, `test/app.e2e.test.ts` (facade robustness) |
 | Keys persist with 0600 (dir 0700), are reloaded, tightened when loose; configured-but-missing keys are faults; rotated keys stay trusted; capability secret stable / from env (≥ 16) | `test/keys.test.ts` |
 | Fail fast: invalid config, missing brain, unresolvable route before anything is created; no routes / unroutable lead ⇒ `start()` refuses, no run | `test/app.e2e.test.ts`, `test/compose.test.ts` |
+| A[0] a timing-out single route PAUSES the work (`work.paused` model_unavailable), the durable runtime resumes it after the backoff and the run completes — local and Temporal; `ht.resume(runId)` releases the pause before its backoff (`model.pauses_released`) and refuses a quarantined run before releasing anything | `test/model-pause.e2e.test.ts` |
+| A[6] a plugin tool reusing a built-in or domain tool id (`complete_work`, `fs.read`) refuses the composition | `test/plugins.e2e.test.ts` |
+| A[3] a manual switch of the executor role (requested while the lead plans) is applied: every executor call runs on the requested route, `switchReason: manual` | `test/model-governance.e2e.test.ts` |
+| e2e[3] a missing credential fails closed: zero fetch calls, the exact reason, doctor reports it | `test/credentials.e2e.test.ts` |
+| A[1] price guard configured and validated; an observed price change beyond it opens the circuit (L0) and the other route serves; coverage[7] eval scores change routing and the manifest (`modelScores`) | `test/model-governance.e2e.test.ts` |
+| A[5] nested delegation (depth 2) end to end with depth and work-item caps; parents get only their child's result | `test/nested-delegation.e2e.test.ts` |
+| A[6] kernel plugins: manifest record, digest mismatch refuses the composition, plugin tool through capability check / policy permit / operation ledger / evidence, context hooks, stop on close | `test/plugins.e2e.test.ts` |
+| A[0]/A[3]/A[4] operator endpoints (resume, model switch with the token, agent inspection) | `test/api.test.ts` |
 | Crash safety: a run interrupted mid-turn by `close()` is resumed by the next instance over the same data dir and completes | `test/app.e2e.test.ts` (restart) |
 | `close()` releases every handle (a child process that composed, ran and closed exits on its own) | `test/app.e2e.test.ts` + `test/fixtures/exit-probe.ts` |
 | API: validation, media type, body limit, Host guard, bearer token, JSON errors without internals, malformed paths, SSE ordering/resume/end (never before the final events) | `test/api.test.ts`, `test/app.e2e.test.ts` (REST API over a real instance) |
@@ -363,3 +396,20 @@ HYPERTEST_TEST_DB=postgres node scripts/run-tests.mjs --package app  # e2e runs 
   adapter and every pinned `@deepseek-ai` package — only when it is the configured default engine; `close()` disposes its
   DSH kernel. A drifted DSH install fails the composition (`precondition_failed`), never a run. Installations that do not
   select it are unchanged (same manifest).
+- (unit model-runtime, wave 1) Config: `ProviderConfig.kind` `plugin`; `models.priceGuard` / `pricesFile` /
+  `scoresFile`; `plugins?: PluginConfig[]`; route `capabilities` REQUIRED and conservative `ROUTE_DEFAULTS`
+  (`internal`, `low`, unknown cost; both prices or none). `HypertestOverrides.fetch?` (the HTTP providers' fetch, for
+  tests); `HypertestInstance.requestModelSwitch`, `agents(runId)`, `resume(runId)`; `HypertestServices.toolRuntime?`,
+  `workspaces?`, `plugins?`. New exports `defaultedRouteFields`, `applyScoresFile`, `modelPricesFile` and re-exports
+  `deriveRouteScores`, `parseRouteScoresFile`, `readPricesFile`, `updatePricesFile`. API: `POST /runs/:id/resume`,
+  `GET /runs/:id/agents`, `POST /runs/:id/model-switch` (token). **Behaviour:** a provider whose credential is missing
+  is unavailable (never called); `resumeIncomplete()` and `resume()` release model pauses; the RuntimeManifest records
+  `modelScores` and `plugins` (manifest ids change when they are configured).
+- (unit gate-governance, wave 1) Config: `gate.requireContracts` (boolean; default `true` through the gate's
+  `DEFAULT_GATE_SPEC` — turning it off in a run override is a gate weakening that needs `gateOverrideBy`) and
+  `environments[].isolation: { dedicated, namespace?, database?, account? }` (validated: `dedicated` boolean, the names
+  strings, unknown keys refused) — the operator's registration that lets an experiment use isolation mode
+  `dedicated_environment`. Behaviour reachable through the composition: every write/fault/load call needs an active
+  experiment of its work item, test artifacts follow the full lifecycle (bound evidence, base-revision known-good,
+  independent review), and a run needs a SystemModel to pass (gate C12). Tests: `test/config.test.ts`; the e2e fixtures
+  (`test/helpers.ts`) record a SystemModel and declare the configured oracle's judge policy.

@@ -78,6 +78,13 @@ export interface RuntimeManifest {
   /** Revision of the tool catalog; built by the runtime from every tool's schemas, effect, risk, timeout and side-effect binding. */
   toolCatalogRevision: string;
   protocol?: { id: string; version: string; digest: string };
+  /**
+   * (additive, coverage[7]) The eval-derived route quality scores merged into the model catalog (models.scoresFile): the
+   * file's sha256, the scored routes and the scores' provenance (suite, revision, eval result digest, method).
+   */
+  modelScores?: { digest: string; routes: string[]; source?: { suiteId?: string; revision?: string; inputDigest?: string; trials?: number; method?: string } };
+  /** (additive, A[6]) Kernel plugins loaded from the configuration (digest-pinned ES modules) and what they may provide. */
+  plugins?: Array<{ id: string; version: string; kind: string; digest: string; capabilities: string[] }>;
   createdAt: string;
 }
 

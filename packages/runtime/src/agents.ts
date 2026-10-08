@@ -44,6 +44,34 @@ export function rowToAgent(r: AgentRow): AgentInstance {
   return a;
 }
 
+/**
+ * (A[4]) Whether a resume is pending for the agent: its next step runs through the engine's resumeChild (the engine
+ * reactivates its child session) rather than runTurn. Set by SubagentRuntime.resume, cleared by the runner.
+ */
+export async function resumePending(x: SqlExecutor, agentId: string): Promise<boolean> {
+  const r = await x.query<{ resume_pending: boolean | null }>(`SELECT resume_pending FROM ht_agents WHERE agent_id = $1`, [agentId]);
+  return r.rows[0]?.resume_pending === true;
+}
+
+/** Turn statuses that are settled (the turn's outcome is committed): every other status is a turn still in progress. */
+export const SETTLED_TURN_STATUSES: ReadonlySet<string> = new Set(['completed', 'boundary', 'failed']);
+
+/**
+ * The pending resume with the session's last settled turn at the time of the resume (`afterTurn`): a settled turn after it means
+ * the engine already took the resume over (reactivated the session and started the resumed turn) — e.g. a crash between
+ * resumeChild committing the turn and the runner clearing the flag — so the resume is consumed (never a second turn).
+ */
+export async function resumeState(x: SqlExecutor, agentId: string): Promise<{ pending: boolean; afterTurn?: number }> {
+  const r = await x.query<{ resume_pending: boolean | null; resume_after_turn: unknown }>(`SELECT resume_pending, resume_after_turn FROM ht_agents WHERE agent_id = $1`, [agentId]);
+  const row = r.rows[0];
+  if (row?.resume_pending !== true) return { pending: false };
+  return row.resume_after_turn === null || row.resume_after_turn === undefined ? { pending: true } : { pending: true, afterTurn: Number(row.resume_after_turn) };
+}
+
+export async function setResumePending(x: SqlExecutor, agentId: string, pending: boolean, afterTurn?: number): Promise<void> {
+  await x.query(`UPDATE ht_agents SET resume_pending = $2, resume_after_turn = $3 WHERE agent_id = $1`, [agentId, pending, pending && afterTurn !== undefined ? afterTurn : null]);
+}
+
 export async function selectAgent(x: SqlExecutor, agentId: string, lock = false): Promise<AgentInstance | undefined> {
   const r = await x.query<AgentRow>(`SELECT ${COLUMNS} FROM ht_agents WHERE agent_id = $1${lock ? ' FOR UPDATE' : ''}`, [agentId]);
   return r.rows[0] ? rowToAgent(r.rows[0]) : undefined;

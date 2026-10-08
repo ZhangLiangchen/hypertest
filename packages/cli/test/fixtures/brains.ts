@@ -2,6 +2,7 @@
  * `--scripted-brains` module for the CLI tests: deterministic brains for the scripted provider `sim`, selected by the
  * `HT_CLI_SCENARIO` variable of the CLI's environment (the factory export receives it):
  *
+ *   (every scenario: the lead first records the SystemModel — gate C12)
  *   pass          lead Plan v1 = one executor item → the executor runs the repository's real node:test suite →
  *                 lead Plan v2 readyForGate citing the test-result evidence (verdict pass, or conditional when the
  *                 gate requires an independent review nobody gave)
@@ -86,11 +87,13 @@ type RoleBrain = (v: View) => Reply;
 function lead(scenario: string): RoleBrain {
   return (v) => {
     if (v.kind === 'initial_plan') {
+      // coverage-1 (gate C12): the run records the system it tests before it is judged
+      if (v.step === 0) return call('system_model.record', { components: [{ componentId: 'sum', name: 'sum module', kind: 'module', paths: ['src/sum.js'] }], sources: [{ kind: 'file', id: 'src/sum.js' }] });
       if (scenario === 'inconclusive') {
-        if (v.step === 0) return call('plan.propose_revision', { rationale: 'Nothing to execute: hand over to the gate.', objectives: [OBJECTIVE], workItems: [], readyForGate: true });
+        if (v.step === 1) return call('plan.propose_revision', { rationale: 'Nothing to execute: hand over to the gate.', objectives: [OBJECTIVE], workItems: [], readyForGate: true });
         return call('complete_work', { summary: 'ready for gate', output: { summary: 'ready for gate', planProposed: true, readyForGate: true, objectives: [{ objectiveId: 'obj-sum', status: 'open', evidenceRefs: [] }] } });
       }
-      if (v.step === 0) {
+      if (v.step === 1) {
         return call('plan.propose_revision', {
           rationale: 'Execute the existing suite on the candidate commit.',
           objectives: [OBJECTIVE],

@@ -43,6 +43,12 @@ const DEPLOY_TOOL: ToolSpec<{ version: string }> = {
   },
 };
 
+/**
+ * (D-4) A deployment writes to the environment: it runs only for an experiment of the item, whose claims cover what it
+ * deploys to (the deployer defines one first).
+ */
+const DEPLOY_EXPERIMENT = { hypothesis: 'the new version deploys cleanly', isolation: { mode: 'exclusive_write', resourceClaims: [{ resourceKey: 'env/local/app', mode: 'write_exclusive' }] } };
+
 const DEPLOYER: RoleDefinition = {
   role: 'deployer',
   description: 'deploys',
@@ -50,7 +56,7 @@ const DEPLOYER: RoleDefinition = {
   phase: 'execution',
   taskType: 'deploy',
   defaultModelPolicy: { requiredCapabilities: ['tool_use'] },
-  toolPolicy: { allow: ['ops.deploy', 'complete_work', 'fail_work'] },
+  toolPolicy: { allow: ['ops.deploy', 'experiment.define', 'complete_work', 'fail_work'] },
   permissionProfile: 'test_executor',
   workspace: 'scratch',
   dataClassification: 'internal',
@@ -66,7 +72,8 @@ describe('long-running external operations: waiting items are observed, not re-d
     const deployerViews: string[] = [];
     const deployer: RoleBrain = (v) => {
       deployerViews.push(v.userText);
-      if (v.step === 0) return call('ops.deploy', { version: '1.2.3' });
+      if (v.step === 0) return call('experiment.define', DEPLOY_EXPERIMENT);
+      if (v.step === 1) return call('ops.deploy', { version: '1.2.3' });
       return call('complete_work', { summary: 'deployed 1.2.3' });
     };
     const lead: RoleBrain = (v) => {
@@ -83,6 +90,7 @@ describe('long-running external operations: waiting items are observed, not re-d
       assert.equal(await runItem(h.control, t1.dispatched[0]!.workItemId, t1.dispatched[0]!.fencingToken), 'completed');
       const t2 = await h.control.tick(run.runId);
       const d = t2.dispatched[0]!;
+      assert.equal((await h.control.executeTurn(d.workItemId, d.fencingToken)).status, 'continue', 'the experiment is defined');
       const out = await h.control.executeTurn(d.workItemId, d.fencingToken);
       assert.equal(out.status, 'waiting');
       const [op] = await h.deps.ledger.list({ runId: run.runId });
@@ -104,7 +112,7 @@ describe('long-running external operations: waiting items are observed, not re-d
       const item = (await h.deps.blackboard.getWorkItem(d.workItemId)) as WorkItem;
       assert.equal(item.state, 'running');
       assert.equal(await runItem(h.control, d.workItemId, item.claim!.fencingToken), 'completed');
-      assert.match(deployerViews[1]!, new RegExp(`Results of pending operations/delegations:\\n- operation ${op.operationId} \\(deploy\\) verified: \\{"deployed":true\\}`));
+      assert.match(deployerViews[2]!, new RegExp(`Results of pending operations/delegations:\\n- operation ${op.operationId} \\(deploy\\) verified: \\{"deployed":true\\}`));
       assert.equal(target.dispatched, 1, 'exactly one external effect');
     } finally {
       await h.dispose();
@@ -115,7 +123,7 @@ describe('long-running external operations: waiting items are observed, not re-d
 describe('a waiting item keeps its resources while its external operation runs', () => {
   test('observeWaiting renews the item\'s resource claims with its lease: a conflicting item is not admitted meanwhile', async () => {
     const target = new FakeDeployTarget();
-    const deployer: RoleBrain = (v) => (v.step === 0 ? call('ops.deploy', { version: '2.0.0' }) : call('complete_work', { summary: 'deployed' }));
+    const deployer: RoleBrain = (v) => (v.step === 0 ? call('experiment.define', DEPLOY_EXPERIMENT) : v.step === 1 ? call('ops.deploy', { version: '2.0.0' }) : call('complete_work', { summary: 'deployed' }));
     const claims = [{ resourceKey: 'env/local/app', mode: 'write_exclusive' }];
     const lead: RoleBrain = (v) => {
       if (v.step === 0) {
@@ -136,21 +144,26 @@ describe('a waiting item keeps its resources while its external operation runs',
       const t1 = await h.control.tick(run.runId);
       assert.equal(await runItem(h.control, t1.dispatched[0]!.workItemId, t1.dispatched[0]!.fencingToken), 'completed');
       const d = (await h.control.tick(run.runId)).dispatched[0]!;
+      assert.equal((await h.control.executeTurn(d.workItemId, d.fencingToken)).status, 'continue');
       assert.equal((await h.control.executeTurn(d.workItemId, d.fencingToken)).status, 'waiting');
+      const [experiment] = await h.deps.specs.listExperiments(run.runId);
       // the operation takes longer than one lease TTL: the durable runtime keeps observing
       for (let i = 0; i < 3; i++) {
         h.clock.advance(40_000);
         assert.equal((await h.control.observeWaiting(d.workItemId)).status, 'waiting');
+        await h.control.tick(run.runId); // the tick renews the experiment's claims (its defining item is live)
       }
       const held = await h.deps.admission.active(run.runId);
-      assert.deepEqual(held.map((c) => [c.holderId, c.claim.resourceKey]), [[d.workItemId, 'env/local/app']], 'claim alive after 120 s (TTL 60 s)');
+      assert.deepEqual(held.map((c) => [c.holderId, c.claim.resourceKey]).sort(), [[d.workItemId, 'env/local/app'], [experiment!.experimentId, 'env/local/app']].sort(), 'claims alive after 120 s (TTL 60 s): the item\'s and its experiment\'s');
       const rival = await h.deps.admission.admit({ holderId: 'rival', runId: run.runId, claims: claims as never, ttlMs: 60_000 });
       assert.equal(rival.admitted, false, 'nobody else can take the resource while the deployment runs');
       target.done = true;
       assert.equal((await h.control.observeWaiting(d.workItemId)).status, 'continue');
       const item = (await h.deps.blackboard.getWorkItem(d.workItemId)) as WorkItem;
       assert.equal(await runItem(h.control, d.workItemId, item.claim!.fencingToken), 'completed');
-      assert.deepEqual(await h.deps.admission.active(run.runId), [], 'released with the completion');
+      assert.deepEqual((await h.deps.admission.active(run.runId)).filter((c) => c.holderId === d.workItemId), [], 'the item\'s claim is released with the completion');
+      await h.control.tick(run.runId); // its experiment's claims follow their (ended) owner and its settled operation
+      assert.deepEqual(await h.deps.admission.active(run.runId), [], 'released once the owner ended and the deployment settled');
     } finally {
       await h.dispose();
     }
@@ -282,7 +295,7 @@ describe('recover(): reconcile, then take over orphaned work with new fencing to
 describe('durability-7: a wait has a deadline', () => {
   test('an operation that never settles fails its waiting item at the item\'s maxWallClockMs (resources released); the run can converge', async () => {
     const target = new FakeDeployTarget();
-    const deployer: RoleBrain = (v) => (v.step === 0 ? call('ops.deploy', { version: '3.0.0' }) : call('complete_work', { summary: 'deployed' }));
+    const deployer: RoleBrain = (v) => (v.step === 0 ? call('experiment.define', DEPLOY_EXPERIMENT) : v.step === 1 ? call('ops.deploy', { version: '3.0.0' }) : call('complete_work', { summary: 'deployed' }));
     const claims = [{ resourceKey: 'env/local/app', mode: 'write_exclusive' }];
     const lead: RoleBrain = (v) => {
       if (v.step === 0) {
@@ -303,7 +316,9 @@ describe('durability-7: a wait has a deadline', () => {
       const t1 = await h.control.tick(run.runId);
       assert.equal(await runItem(h.control, t1.dispatched[0]!.workItemId, t1.dispatched[0]!.fencingToken), 'completed');
       const d = (await h.control.tick(run.runId)).dispatched[0]!;
+      assert.equal((await h.control.executeTurn(d.workItemId, d.fencingToken)).status, 'continue');
       assert.equal((await h.control.executeTurn(d.workItemId, d.fencingToken)).status, 'waiting');
+      const [experiment] = await h.deps.specs.listExperiments(run.runId);
       // the deployment never finishes; before the deadline the item keeps waiting
       h.clock.advance(200_000);
       assert.equal((await h.control.observeWaiting(d.workItemId)).status, 'waiting');
@@ -313,7 +328,10 @@ describe('durability-7: a wait has a deadline', () => {
       assert.equal(item.state, 'failed');
       assert.equal(item.failure?.reason, 'budget_exhausted');
       assert.match(item.failure!.message, /waited past the work item's maxWallClockMs \(300000 ms\) for op_\S+: still unsettled/);
-      assert.deepEqual(await h.deps.admission.active(run.runId), [], 'its resources are free again');
+      assert.deepEqual((await h.deps.admission.active(run.runId)).filter((c) => c.holderId === d.workItemId), [], 'its resources are free again');
+      // the experiment keeps its environment isolated while its unsettled deployment may still act (review B2)
+      await h.control.tick(run.runId);
+      assert.deepEqual((await h.deps.admission.active(run.runId)).map((c) => c.holderId), [experiment!.experimentId]);
       const unsettled = await h.deps.ledger.listUnsettled(run.runId);
       assert.equal(unsettled.length, 1, 'the operation itself is left to reconciliation, never retried blindly');
       // the run is no longer held by a waiting item

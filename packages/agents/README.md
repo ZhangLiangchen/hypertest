@@ -87,6 +87,15 @@ self-review).
 `delegate.release` (the control plane's handles on background / continuable delegated children); the lead — the only
 delegating role — holds them and its prompt explains `background` / `continuable` delegation.
 
+(gate-governance) `DOMAIN_TOOL_IDS` gains `experiment.stop` (60 known tool ids). The lead, executor, environment and
+vision_gui roles hold `experiment.define` / `experiment.stop` and their prompts say that writes, load and faults run
+only for an active experiment (refused `experiment_required` otherwise); the test designer's prompt describes the whole
+artifact lifecycle (static check, known-good on the base revision via `test.run` revision "base" or a recorded
+`knownGoodUnavailableReason` — only a base-revision known-good lets the artifact decide a P0/P1 assertion —, a mutation
+run of the candidate's PRODUCT source naming only its own file, the independent oracle consistency review); the
+reviewer's prompt describes that review (`blackboard.post_review` on subjectRef `test_artifact`). Catalog revision
+changes (prompts and tool lists). Tests: `test/roles.test.ts`, `test/tools.test.ts`.
+
 (runtime-roles unit) Two built-in roles (catalog revision changes): `vision_gui` and `local_private` (above), their
 output contracts `GUI_OUTPUT_SCHEMA` (`{summary, checks: [{check, method: dom|api|visual, outcome: passed|failed|error|
 not_run, expected, actual, evidenceIds ≥ 1}], findings, screenshots}`) and `PRIVATE_OUTPUT_SCHEMA` (`{summary,

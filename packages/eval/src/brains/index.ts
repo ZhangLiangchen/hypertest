@@ -6,7 +6,7 @@
 import { HypertestError } from '@hypertest/core';
 import type { ScriptedBrain } from '@hypertest/model';
 import type { ChildBrainContext } from '../contracts.ts';
-import { armBrains, assertBrainArgs, type BrainView, type PocBrainArgs, type RoleBrain } from './kit.ts';
+import { armBrains, assertBrainArgs, recordingSystemModel, scriptedSystemModel, type BrainView, type PocBrainArgs, type RoleBrain } from './kit.ts';
 import { POC_A_ROLES } from './poc-a.ts';
 import { POC_B_ROLES } from './poc-b.ts';
 import { pocCOutage, pocCRoles, pocCTag } from './poc-c.ts';
@@ -40,7 +40,9 @@ function policiesFor(args: PocBrainArgs): { roles: Record<string, RoleBrain>; ou
 export function pocBrains(args: PocBrainArgs): Record<string, ScriptedBrain> {
   assertBrainArgs(args);
   const p = policiesFor(args);
-  return armBrains(args, p.roles, p.outages ?? {}, p.tag);
+  // coverage-1 (gate C12): every scripted lead records the SystemModel of its task before it plans
+  const roles = p.roles['lead'] ? { ...p.roles, lead: recordingSystemModel(p.roles['lead'], scriptedSystemModel(args.taskId)) } : p.roles;
+  return armBrains(args, roles, p.outages ?? {}, p.tag);
 }
 
 /** Child-process brains export: `ctx.args` are the PocBrainArgs computed by the arm in the parent. */

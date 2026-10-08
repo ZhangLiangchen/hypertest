@@ -76,14 +76,21 @@ test('PoC A: the seeded pagination regression is found by a dynamic multi-LLM te
   assert.deepEqual([a.leaks, a.inheritedFirstCalls], [0, 0]);
   // Evidence + Review — the reviewer (another provider) fetched every cited evidence itself and approved on the recorded
   // test-result (pocAWorkflow: the approval rests on test-result evidence the reviewer fetched with evidence.get)
-  assert.deepEqual(a.reviews, [
+  assert.deepEqual(a.reviews.filter((r) => r.subject !== 'test_artifact'), [
     { verdict: 'approve', provider: 'judge-c', subject: 'record', checked: ['stdout', 'test-result'] },
     // H7: the run-level review the gate requires, requested by the control plane before the gate, judged on test-result
     { verdict: 'approve', provider: 'judge-c', subject: 'run', checked: ['test-result'] },
   ]);
+  // D-1: each validated test artifact got its oracle consistency review from the independent reviewer (another provider
+  // and role than its designer), judged on the validation runs that executed it
+  assert.deepEqual(a.reviews.filter((r) => r.subject === 'test_artifact').map((r) => `${r.verdict}/${r.provider}/${r.checked.join('+')}`).sort(), [
+    'approve/judge-c/mutation-result+test-result',
+    'approve/judge-c/test-result',
+  ]);
   // …and it is independent of every producer's provider: C6 is satisfied in the multi-LLM arm
   assert.ok(a.satisfied?.includes('C6'), `satisfied ${a.satisfied?.join(', ')}`);
-  assert.deepEqual(a.artifacts, ['tests/paginate-pages.test.js:validated', 'tests/transfer-conservation.test.js:validated']);
+  // D-1: static check + known-good (the regression test on the BASE revision) + sensitivity + approving review ⇒ approved
+  assert.deepEqual(a.artifacts, ['tests/paginate-pages.test.js:approved', 'tests/transfer-conservation.test.js:approved']);
   // BUGate — the unresolved defect violates the critical oracle assertion: no release
   assert.equal(a.verdict, 'fail');
   assert.ok(a.violated?.includes('C3'), `violated ${a.violated?.join(', ')}`);

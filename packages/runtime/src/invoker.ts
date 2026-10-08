@@ -4,13 +4,50 @@ import {
   type ModelSwitchReason, type RiskClass,
 } from '@hypertest/domain';
 import type { DecisionCheck, InvokeRequest, ModelCapabilityProfile, ModelUnavailability, RouteRejection, RouteRequest } from '@hypertest/model';
-import type { InvokerDeps, ModelInvocation, ModelInvoker, ModelPause, ModelSwitchRequest, OkRouteDecision, PendingFallback } from './contracts.ts';
+import type { InvokerDeps, ModelBudgetRefusal, ModelInvocation, ModelInvoker, ModelPause, ModelSwitchRequest, OkRouteDecision, PendingFallback, TokenCalibration } from './contracts.ts';
 import { assertTurnNumber } from './util.ts';
 
 /** (A[0]) Default backoff of a pause whose resume time is not known (doubling per consecutive pause). */
 export const DEFAULT_PAUSE_BACKOFF = Object.freeze({ baseMs: 5_000, maxMs: 300_000 });
 /** (A[3]) Budget pressure: remaining cost budget below this fraction of the limit ⇒ switch to a cheaper eligible route. */
 export const DEFAULT_COST_PRESSURE_RATIO = 0.25;
+
+/**
+ * Token-estimate calibration bounds: the measured ratio actual/estimate is clamped to [min, max] and smoothed
+ * (exponentially weighted, `weight` for the newest sample) per route.
+ */
+export const CALIBRATION_BOUNDS = Object.freeze({ min: 0.5, max: 3, weight: 0.5 });
+
+/**
+ * A per-route calibration of `estimateTokens` (a chars/4 heuristic) against the input tokens providers report. Hosts keep
+ * one per process (shared by the agents of a worker); an invoker without one keeps its own.
+ */
+export function createTokenCalibration(): TokenCalibration {
+  const ratios = new Map<string, number>();
+  return {
+    ratio: (routeId) => ratios.get(routeId) ?? 1,
+    observe(routeId, estimated, actual) {
+      if (!(Number.isFinite(estimated) && estimated > 0 && Number.isFinite(actual) && actual > 0)) return;
+      const sample = Math.min(CALIBRATION_BOUNDS.max, Math.max(CALIBRATION_BOUNDS.min, actual / estimated));
+      const prev = ratios.get(routeId);
+      ratios.set(routeId, prev === undefined ? sample : prev + CALIBRATION_BOUNDS.weight * (sample - prev));
+    },
+  };
+}
+
+/** The ledger's typed refusal (`{scope, dimension, limit, used, reserved, requested}`), when the port reports one. */
+function typedExhaustion(x: unknown): { scope: string; dimension: string; limit: number; used: number; reserved: number; requested: number } | undefined {
+  if (!x || typeof x !== 'object') return undefined;
+  const e = x as Record<string, unknown>;
+  const num = (k: string): number | undefined => (typeof e[k] === 'number' && Number.isFinite(e[k]) ? (e[k] as number) : undefined);
+  const limit = num('limit');
+  if (typeof e['scope'] !== 'string' || typeof e['dimension'] !== 'string' || limit === undefined) return undefined;
+  return { scope: e['scope'], dimension: e['dimension'], limit, used: num('used') ?? 0, reserved: num('reserved') ?? 0, requested: num('requested') ?? 0 };
+}
+
+function amount(dimension: string, v: number): string {
+  return dimension === 'costUsd' ? `$${Number(v.toFixed(6))}` : String(Math.round(v));
+}
 
 /** Maps the router's failure code to the ModelEpoch switch reason of the fallback epoch. */
 export function switchReasonFor(code: string): ModelSwitchReason {
@@ -114,6 +151,11 @@ export function createModelInvoker(deps: InvokerDeps): ModelInvoker {
   if (!(pressureRatio >= 0 && pressureRatio <= 1)) throw new HypertestError('invalid_argument', `costPressureRatio must be in [0, 1] (got ${String(pressureRatio)})`);
   const canSwitchProvider = deps.providerSwitch !== false;
   const sessionId = agent.sessionId;
+  const calibration = deps.calibration ?? createTokenCalibration();
+  const minOutputTokens = deps.minOutputTokens ?? Math.min(deps.maxOutputTokens, 1024);
+  if (!(Number.isInteger(minOutputTokens) && minOutputTokens >= 1 && minOutputTokens <= deps.maxOutputTokens)) {
+    throw new HypertestError('invalid_argument', `minOutputTokens must be an integer in [1, maxOutputTokens ${deps.maxOutputTokens}] (got ${String(minOutputTokens)})`);
+  }
 
   function warnMemory(what: string): void {
     if (warnedMemory) return;
@@ -286,9 +328,17 @@ export function createModelInvoker(deps: InvokerDeps): ModelInvoker {
           currentValid = true;
           if (deps.costPressure) {
             const pressure = await deps.costPressure();
-            const estimate = pressure ? router.estimateCostUsd(decision.routeId, contextTokensEstimate, deps.maxOutputTokens) : Number.NaN;
-            if (pressure && Number.isFinite(estimate) && (pressure.remainingUsd < pressureRatio * pressure.limitUsd || estimate > pressure.remainingUsd)) {
-              const routed = await router.route(restrict({ ...withExcluded(routeRequest, excluded), cheaperThanUsd: estimate }), ctx);
+            // the call's own cost (calibrated input + the output the route can return: the router caps a call's output
+            // at the route's maxOutputTokens) decides whether the budget is under pressure ...
+            const routeMaxOut = deps.catalog?.get(decision.routeId)?.maxOutputTokens;
+            const callOut = routeMaxOut !== undefined ? Math.min(deps.maxOutputTokens, routeMaxOut) : deps.maxOutputTokens;
+            const estimate = pressure ? router.estimateCostUsd(decision.routeId, Math.ceil(contextTokensEstimate * calibration.ratio(decision.routeId)), callOut) : Number.NaN;
+            // ... and "cheaper" compares like with like: the router prices each candidate at the request's input estimate +
+            // the candidate's maxOutputTokens, so the current route is priced on exactly that basis (else a dearer
+            // per-token route with a smaller output cap could pass as cheaper)
+            const basis = pressure && routeMaxOut !== undefined ? router.estimateCostUsd(decision.routeId, contextTokensEstimate, routeMaxOut) : estimate;
+            if (pressure && Number.isFinite(estimate) && Number.isFinite(basis) && (pressure.remainingUsd < pressureRatio * pressure.limitUsd || estimate > pressure.remainingUsd)) {
+              const routed = await router.route(restrict({ ...withExcluded(routeRequest, excluded), cheaperThanUsd: basis }), ctx);
               if (routed.ok && routed.routeId !== decision.routeId) {
                 logger.info('budget pressure: switching to a cheaper eligible route', { agentId: agent.agentId, from: decision.routeId, to: routed.routeId, remainingUsd: pressure.remainingUsd });
                 candidate = { decision: routed, reason: 'cost', excluded, source: 'reroute' };
@@ -374,21 +424,52 @@ export function createModelInvoker(deps: InvokerDeps): ModelInvoker {
       if (!epoch || !decision) throw new HypertestError('internal', `no route decision for agent ${agent.agentId} at turn ${request.turn}`);
 
       // ---------------------------------------------------------------- 3. budget reserve
+      // The reservation is what the call can cost at most: the CALIBRATED input estimate (measured per route against the
+      // provider-reported input tokens) + the output reserve. When the remaining budget cannot hold the full output
+      // reserve, the call's maxOutputTokens shrinks to what remains (never below minOutputTokens) instead of refusing a
+      // call that fits; the reservation settles to the actual usage after the call.
       let reservationId: string | undefined;
+      let maxOutputTokens = deps.maxOutputTokens;
       if (deps.budget) {
-        const amounts: { tokens: number; costUsd?: number } = { tokens: contextTokensEstimate + deps.maxOutputTokens };
-        try {
-          const cost = router.estimateCostUsd(decision.routeId, contextTokensEstimate, deps.maxOutputTokens);
-          if (Number.isFinite(cost)) amounts.costUsd = cost;
-          else logger.warn('model cost is unknown for this route; reserving tokens only', { routeId: decision.routeId });
-        } catch (e) {
-          // The route vanished from the catalog: the router refuses the call below (and computes a fallback).
-          if (!isHypertestError(e, 'not_found')) throw e;
-          logger.warn('model route unknown to the router cost estimator; reserving tokens only', { routeId: decision.routeId });
+        const routeId = decision.routeId;
+        const inputTokens = Math.ceil(contextTokensEstimate * calibration.ratio(routeId));
+        const price = (outputTokens: number): number | undefined => {
+          try {
+            const c = router.estimateCostUsd(routeId, inputTokens, outputTokens);
+            return Number.isFinite(c) ? c : undefined;
+          } catch (e) {
+            // The route vanished from the catalog: the router refuses the call below (and computes a fallback).
+            if (!isHypertestError(e, 'not_found')) throw e;
+            return undefined;
+          }
+        };
+        if (deps.budget.remaining) {
+          const left = await deps.budget.remaining(deps.budgetScopes);
+          let fit = maxOutputTokens;
+          if (left.tokens !== undefined) fit = Math.min(fit, Math.floor(left.tokens - inputTokens));
+          const inputCost = price(0);
+          const perOutput = inputCost !== undefined ? ((price(1_000_000) ?? inputCost) - inputCost) / 1_000_000 : undefined;
+          if (left.costUsd !== undefined && inputCost !== undefined && perOutput !== undefined && perOutput > 0) fit = Math.min(fit, Math.floor((left.costUsd - inputCost) / perOutput));
+          if (fit < maxOutputTokens && fit >= minOutputTokens) {
+            logger.info('budget nearly spent: the call\'s output reserve shrinks to what remains', { agentId: agent.agentId, routeId, maxOutputTokens: fit, configured: maxOutputTokens, remaining: left });
+            maxOutputTokens = fit;
+          }
         }
+        const amounts: { tokens: number; costUsd?: number } = { tokens: inputTokens + maxOutputTokens };
+        const cost = price(maxOutputTokens);
+        if (cost !== undefined) amounts.costUsd = cost;
+        else logger.warn('model cost is unknown for this route; reserving tokens only', { routeId });
         const reserved = await deps.budget.reserve(deps.budgetScopes, amounts, `model:${agent.agentId}:turn:${request.turn}`);
         if (!reserved.ok) {
-          return { ok: false, boundary: 'budget_exhausted', message: `model budget exhausted for scopes ${deps.budgetScopes.join(', ')} (needed ${amounts.tokens} tokens${amounts.costUsd !== undefined ? `, $${amounts.costUsd.toFixed(6)}` : ''})` };
+          const needed = `route ${routeId} needed ${amounts.tokens} tokens (input ${inputTokens} + output reserve ${maxOutputTokens})${amounts.costUsd !== undefined ? `, $${Number(amounts.costUsd.toFixed(6))}` : ''}`;
+          const x = typedExhaustion(reserved.exhausted);
+          if (!x) return { ok: false, boundary: 'budget_exhausted', message: `model budget exhausted for scopes ${deps.budgetScopes.join(', ')}: ${needed}` };
+          const refusal: ModelBudgetRefusal = { ...x, routeId, neededTokens: amounts.tokens };
+          if (amounts.costUsd !== undefined) refusal.neededCostUsd = amounts.costUsd;
+          const d = x.dimension;
+          const message =
+            `model budget exhausted at ${x.scope} on ${d}: ${amount(d, x.used)} used + ${amount(d, x.reserved)} reserved by calls in flight + ${amount(d, x.requested)} for this call > limit ${amount(d, x.limit)}; ${needed}`;
+          return { ok: false, boundary: 'budget_exhausted', message, budget: refusal };
         }
         reservationId = reserved.reservationId;
       }
@@ -405,7 +486,7 @@ export function createModelInvoker(deps: InvokerDeps): ModelInvoker {
       const call: InvokeRequest['call'] = {
         // Cross-model continuation rule: opaque reasoning only reaches routes of the same compatibility class.
         messages: projectForRoute(request.messages, decision.continuationCompatibilityClass),
-        maxOutputTokens: deps.maxOutputTokens,
+        maxOutputTokens,
         signal: request.signal,
       };
       if (tools.length > 0) call.tools = tools;
@@ -441,6 +522,8 @@ export function createModelInvoker(deps: InvokerDeps): ModelInvoker {
             logger.error('budget settle failed after a successful model call (reservation kept)', { reservationId, error: String(e) });
           }
         }
+        // the estimator, measured: the next reservations of this route use the calibrated estimate
+        calibration.observe(outcome.routeId, contextTokensEstimate, usage.inputTokens);
         // a successful call ends a pause sequence (the next pause backs off from the start again)
         if (paused) await clearPause();
         return { ok: true, message: outcome.response.message, usage, routeId: outcome.routeId, epochId: epoch.epochId, stopReason: outcome.response.stopReason };

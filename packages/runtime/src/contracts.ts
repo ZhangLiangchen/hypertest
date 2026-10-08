@@ -71,7 +71,36 @@ export type ModelInvocation =
       message: string;
       unavailable?: ModelUnavailability;
       pause?: ModelPause;
+      /** (additive) For `budget_exhausted`: the ledger's typed refusal — which scope and which dimension refused, and why. */
+      budget?: ModelBudgetRefusal;
     };
+
+/**
+ * (additive) A model call the budget ledger refused at the turn boundary: the FIRST scope/dimension of the reservation
+ * chain without room (`used + reserved + requested > limit`, as the ledger reports it) and what the call needed
+ * (calibrated input estimate + the output reserve, priced on the route). The host applies its exhaustion policy to the
+ * scope that refused — a run-scope refusal is a run exhaustion, never a failure of the item that happened to ask.
+ */
+export interface ModelBudgetRefusal {
+  scope: string;
+  dimension: string;
+  limit: number;
+  used: number;
+  reserved: number;
+  requested: number;
+  routeId: string;
+  neededTokens: number;
+  neededCostUsd?: number;
+}
+
+/**
+ * (additive) Measured calibration of the token estimator per route: `estimateTokens` (chars/4) against the input tokens
+ * the provider reported. The invoker reserves `ceil(estimate × ratio)` input tokens and feeds every successful call back.
+ */
+export interface TokenCalibration {
+  ratio(routeId: string): number;
+  observe(routeId: string, estimatedInputTokens: number, actualInputTokens: number): void;
+}
 
 /**
  * (additive, A[0]) Fallback pipeline end state PAUSE: a transient model unavailability that paused an agent (no route can
@@ -473,6 +502,8 @@ export interface BudgetPort {
   reserve(scopes: string[], amounts: { tokens?: number; costUsd?: number }, reason: string): Promise<{ ok: true; reservationId: string } | { ok: false; exhausted: unknown }>;
   settle(reservationId: string, actual: { tokens?: number; costUsd?: number }): Promise<void>;
   release(reservationId: string): Promise<void>;
+  /** (additive, optional) Headroom per limited dimension over the scopes and their ancestors (BudgetLedger.remaining). */
+  remaining?(scopes: string[]): Promise<{ tokens?: number; costUsd?: number }>;
 }
 
 export interface InvokerDeps extends BaseDeps {
@@ -520,6 +551,16 @@ export interface InvokerDeps extends BaseDeps {
   providerSwitch?: boolean;
   /** (additive, A[0]) Backoff of a pause whose resume time is not known (default base 5000 ms, doubling, max 300000 ms). */
   pauseBackoff?: { baseMs?: number; maxMs?: number };
+  /**
+   * (additive) Token-estimate calibration shared across the agent's turns (the host keeps one per process); default: one
+   * per invoker. Reservations use the calibrated input estimate; each successful call is fed back.
+   */
+  calibration?: TokenCalibration;
+  /**
+   * (additive) The smallest output reserve the invoker may shrink a call to when the remaining budget (BudgetPort.remaining)
+   * cannot hold `maxOutputTokens` (default min(maxOutputTokens, 1024)); below it the boundary is `budget_exhausted`.
+   */
+  minOutputTokens?: number;
 }
 
 // ----------------------------------------------------------------------------- subagents

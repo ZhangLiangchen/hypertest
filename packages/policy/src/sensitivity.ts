@@ -1,5 +1,7 @@
 import type { JsonValue } from '@hypertest/core';
 import type { BlackboardRecord, EvidenceRecord, OracleSpec, Review, TestArtifact } from '@hypertest/domain';
+import { DEFAULT_TEST_PATH_PATTERNS } from './classifier.ts';
+import { matchesGlob } from './patterns.ts';
 
 /**
  * (D-0 / D-1, BLOCKER of the audit) Sensitivity evidence BOUND to the TestArtifact it validates, and the full artifact
@@ -48,6 +50,35 @@ function obj(v: JsonValue | undefined): Record<string, JsonValue> | undefined {
 
 export function normalizeTestPath(p: string): string {
   return p.replace(/\\/g, '/').replace(/^\.\/+/, '');
+}
+
+/** The default discovery patterns of the supported test runners (node:test `*-test.*`, `test-*.*`, `test.*`; spec dirs …). */
+export const TEST_RUNNER_DISCOVERY_PATTERNS: readonly string[] = Object.freeze(['**/*-test.*', '**/*_test.*', '**/test-*.*', '**/test.*', '**/*_spec.*', '**/spec/**', '**/__tests__/**']);
+
+/**
+ * Paths whose change can alter which test cases run or what they assert: the policy's test path patterns plus the runners'
+ * discovery patterns. One source of truth for the tools (workspace deltas, base-revision runs, mutation targets) and the
+ * sensitivity binding.
+ */
+export const TEST_FILE_PATH_PATTERNS: readonly string[] = Object.freeze([...DEFAULT_TEST_PATH_PATTERNS, ...TEST_RUNNER_DISCOVERY_PATTERNS]);
+
+/** True when `path` is test code (TEST_FILE_PATH_PATTERNS). */
+export function isTestPath(path: string): boolean {
+  const p = normalizeTestPath(path);
+  return TEST_FILE_PATH_PATTERNS.some((g) => matchesGlob(g, p));
+}
+
+/**
+ * The file a mutation run mutated, as `mutation.run` recorded it (`mutatedFile: { path, isTestFile, changedSinceBase }`,
+ * derived by the tool from the workspace — never claimed by the caller); undefined when absent or malformed.
+ */
+export function mutatedFileOf(e: Pick<EvidenceRecord, 'structured'>): { path: string; isTestFile?: boolean; changedSinceBase?: boolean } | undefined {
+  const m = obj(obj(e.structured)?.['mutatedFile']);
+  if (!m || typeof m['path'] !== 'string' || m['path'] === '') return undefined;
+  const out: { path: string; isTestFile?: boolean; changedSinceBase?: boolean } = { path: m['path'] };
+  if (typeof m['isTestFile'] === 'boolean') out.isTestFile = m['isTestFile'];
+  if (typeof m['changedSinceBase'] === 'boolean') out.changedSinceBase = m['changedSinceBase'];
+  return out;
 }
 
 /** Same file, allowing one side to be absolute or rooted elsewhere (`/ws/test/a.test.js` ≡ `test/a.test.js`). */
@@ -150,6 +181,16 @@ export function sensitivityBinding(e: EvidenceRecord, a: Pick<TestArtifact, 'art
   }
   if ((mine.cases ?? 0) < 1) return { ok: false, problem: `${label} evidence ${e.evidenceId} attributes no test case to ${a.path}` };
   if (purpose === 'mutation') {
+    // the mutants must be in the candidate's PRODUCT code: mutating the artifact itself, another test file or a file written
+    // in the workspace (a helper the test imports) proves nothing about whether the test notices a product defect
+    const mutated = mutatedFileOf(e);
+    if (!mutated) return { ok: false, problem: `mutation evidence ${e.evidenceId} records no mutated-file facts (which file was mutated, whether it is test code or was written in the workspace): run mutation.run again` };
+    if (sameTestFile(mutated.path, a.path) || executed.files.some((f) => sameTestFile(f.path, mutated.path)) || mutated.isTestFile !== false || isTestPath(mutated.path)) {
+      return { ok: false, problem: `mutation evidence ${e.evidenceId} mutated ${mutated.path}, which is test code (the artifact itself or another test file): killing mutants of a test proves nothing about the product — run mutation.run on the product source the artifact tests` };
+    }
+    if (mutated.changedSinceBase !== false) {
+      return { ok: false, problem: `mutation evidence ${e.evidenceId} mutated ${mutated.path}, which ${mutated.changedSinceBase === true ? 'was added or modified in the workspace' : 'is not known to be unchanged since the base commit'}: only mutants of the candidate's own product code show sensitivity` };
+    }
     const others = executed.files.filter((f) => !sameTestFile(f.path, a.path));
     if (others.length > 0 || executed.attribution !== 'complete' || executed.unattributedCases > 0) {
       return {
@@ -175,8 +216,14 @@ export interface ArtifactEligibility {
   revision: number;
   /** May count as gate evidence (every lifecycle stage completed, re-derived). */
   eligible: boolean;
-  /** May support or violate a P0/P1 assertion: eligible AND a known-good run passed (not merely "unavailable"). */
+  /**
+   * May support or violate a P0/P1 assertion: eligible AND its known-good run passed on the run's BASE revision (not merely
+   * "unavailable", and not on the candidate workspace: a test that passes on the code under test proves nothing about what
+   * correct behaviour is — it may encode the defect itself as the expectation).
+   */
   criticalSupport: boolean;
+  /** (additive) Where the known-good run that passed ran: the run's base revision, or the (candidate) workspace. */
+  knownGoodRevision?: 'base' | 'workspace';
   stages: { static: StageStatus; knownGood: StageStatus; sensitivity: StageStatus; oracleReview: StageStatus };
   reasons: string[];
 }
@@ -188,6 +235,8 @@ export interface EligibilityContext {
   reviews: ReadonlyArray<BlackboardRecord<Review>>;
   /** The oracle revisions in force for the run (approved, pinned, current). */
   oraclesInForce: ReadonlyArray<OracleSpec>;
+  /** The run's known-good base commit (target.baseCommit): a known-good run on the base revision must have run on it. */
+  baseCommit?: string;
 }
 
 /** Oracle consistency: every oracleRef names an assertion of an oracle revision in force. Returns the problems. */
@@ -284,14 +333,22 @@ export function artifactEligibility(a: TestArtifact, ctx: EligibilityContext): A
   let goodCode: string | undefined;
   if (stagePassed(v.knownGood)) {
     const b = bound('known_good', v.knownGood!.evidenceRefs[0]);
+    const rev = b.ok ? codeRevisionOf(b.e) : undefined;
     if (!b.ok) {
       out.stages.knownGood = 'failed';
       out.reasons.push(`known-good: ${b.problem}`);
+    } else if (rev?.kind === 'base' && rev.baseCommit !== ctx.baseCommit) {
+      out.stages.knownGood = 'failed';
+      out.reasons.push(`known-good: ${b.e.evidenceId} ran on base revision ${String(rev.baseCommit)}, not the run's base commit ${ctx.baseCommit ?? '(none)'}`);
     } else {
       const statuses = artifactCaseStatuses(b.e, a.path);
       if (statuses.length > 0 && statuses.every((s) => s === 'passed')) {
         out.stages.knownGood = 'passed';
         goodCode = b.codeDigest;
+        out.knownGoodRevision = rev?.kind === 'base' ? 'base' : 'workspace';
+        if (out.knownGoodRevision !== 'base') {
+          out.reasons.push(`known-good: ${b.e.evidenceId} passed on the workspace (candidate) code, not on the run's base revision: the artifact never supports or violates a P0/P1 assertion (run test.run revision "base" for that)`);
+        }
       } else {
         out.stages.knownGood = 'failed';
         out.reasons.push(`known-good: the artifact's cases in ${b.e.evidenceId} did not all pass (${statuses.join(', ') || 'none'})`);
@@ -341,6 +398,6 @@ export function artifactEligibility(a: TestArtifact, ctx: EligibilityContext): A
 
   const s = out.stages;
   out.eligible = s.static === 'passed' && (s.knownGood === 'passed' || s.knownGood === 'waived') && s.sensitivity === 'passed' && s.oracleReview === 'passed';
-  out.criticalSupport = out.eligible && s.knownGood === 'passed';
+  out.criticalSupport = out.eligible && s.knownGood === 'passed' && out.knownGoodRevision === 'base' && ctx.baseCommit !== undefined;
   return out;
 }

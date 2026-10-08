@@ -355,8 +355,10 @@ export interface OracleGovernance {
    * (additive, D-10) Declares revision `revision` (the latest) of an oracle invalid — the design's rollback "Oracle v2
    * declared invalid → v3 approved → decisions on v2 needs_reassessment → re-execute/re-judge". Append-only: a new revision
    * with status `invalid` and `invalidation` is written (history is never updated), every decision based on the revision
-   * is marked needs_reassessment regardless of the change policy, and `oracle.invalidated` is emitted (live runs pinned
-   * to it replan). Only a human or system authority may invalidate (permission_denied for agents); a reason is required.
+   * is marked needs_reassessment regardless of the change policy, and `oracle.invalidated` is emitted. A live run pinned
+   * to it is at best inconclusive (C0 unknown) until a newer revision is approved through a proposal — the control plane
+   * then re-pins the run and replans. Only a human or system authority may invalidate (permission_denied for agents); a
+   * reason is required. CLI: `hypertest oracle invalidate`.
    */
   invalidate?(oracleId: string, revision: number, by: ActorRef, reason: string, ctx: EventContext): Promise<{ invalid: OracleSpec; invalidatedDecisions: string[] }>;
 }

@@ -1,8 +1,8 @@
-import type { Clock, EventBus, IdGenerator, Logger, SqlDatabase } from '@hypertest/core';
+import type { Clock, EventBus, IdGenerator, JsonValue, Logger, SqlDatabase } from '@hypertest/core';
 import type { BudgetEnvelope, DomainEvent, GateSpec, ModelPolicy, OracleAssertion, OracleSpec, RuntimeEpoch, RuntimeManifest, TestRun } from '@hypertest/domain';
-import type { ModelCapabilityProfile, ModelCatalog, ModelRouter, ProviderRegistry, ScriptedBrain } from '@hypertest/model';
+import type { ModelCapabilityProfile, ModelCatalog, ModelRouter, PriceCeiling, ProviderRegistry, ScriptedBrain } from '@hypertest/model';
 import type { ApprovalRequest, ApprovalService, OracleGovernance, PolicyDecisionLog, PolicyEngine, PolicyRule, ResolvedProtocol } from '@hypertest/policy';
-import type { EnvironmentDescriptor, EnvironmentRegistry, SandboxProfile, ToolRegistryLike } from '@hypertest/tools';
+import type { EnvironmentDescriptor, EnvironmentRegistry, SandboxProfile, ToolRegistryLike, ToolRuntime, WorkspaceManager } from '@hypertest/tools';
 import type { RoleCatalogLike, RoleOverrides } from '@hypertest/agents';
 import type { ControlPlane, RunReport, StartRunInput } from '@hypertest/control';
 import type { DurableRuntime, RunOutcome } from '@hypertest/durable';
@@ -11,7 +11,7 @@ import type { ArtifactStore, EvidenceLedger, Signer } from '@hypertest/evidence'
 import type { DurableMemory, ProvenanceService } from '@hypertest/context';
 import type { AdapterRegistry, OperationLedger } from '@hypertest/operation';
 import type {
-  CanarySelection, CompatibilitySuiteResult, PromotionResult, RecordSuiteInput, RollbackResult, RuntimeRelease, RuntimeReleaseRegistry, SchemaMigrationAllowance,
+  AgentView, CanarySelection, CompatibilitySuiteResult, ModelSwitchRequest, PluginKernel, PromotionResult, RecordSuiteInput, RollbackResult, RuntimeRelease, RuntimeReleaseRegistry, SchemaMigrationAllowance,
 } from '@hypertest/runtime';
 
 /**
@@ -35,7 +35,8 @@ import type {
  */
 export interface ProviderConfig {
   id: string;
-  kind: 'openai-compatible' | 'anthropic' | 'pi-ai' | 'scripted';
+  /** (additive) `plugin`: the provider is contributed by a configured plugin declaring `provider:<id>`. */
+  kind: 'openai-compatible' | 'anthropic' | 'pi-ai' | 'scripted' | 'plugin';
   baseUrl?: string;
   /** Name of the environment variable holding the API key (keys are never stored in config). */
   apiKeyEnv?: string;
@@ -58,6 +59,23 @@ export interface HypertestConfig {
     providers: ProviderConfig[];
     routes: Array<Partial<ModelCapabilityProfile> & Pick<ModelCapabilityProfile, 'routeId' | 'provider' | 'model'>>;
     defaultPolicy?: ModelPolicy;
+    /**
+     * (additive, A[1]) The price guard: `maxIncreasePct` — an observed price (pricesFile) more than this percentage above
+     * the route's catalog price opens the route's circuit for every request (`model.circuit_opened` reason
+     * `price_change`); `default` / `routes` — per-million-token ceilings (USD) for cost-limited requests (`appliesTo`:
+     * `cost_limited` (default) or `all`).
+     */
+    priceGuard?: { maxIncreasePct?: number; default?: PriceCeiling; routes?: Record<string, PriceCeiling>; appliesTo?: 'cost_limited' | 'all' };
+    /**
+     * (additive, A[1]) Observed route prices (JSON, `hypertest models prices set`), re-read at every turn boundary when it
+     * changed. Default `<dataDir>/state/model-prices.json`.
+     */
+    pricesFile?: string;
+    /**
+     * (additive, coverage[7]) Route quality scores derived from eval results (`hypertest eval apply-scores`), merged into
+     * the catalog at startup (a new catalog revision; recorded in the RuntimeManifest as modelScores).
+     */
+    scoresFile?: string;
   };
   roles?: RoleOverrides['roles'];
   budget?: Partial<BudgetEnvelope>;
@@ -85,6 +103,28 @@ export interface HypertestConfig {
    * one creates runs; once a release is active, new runs are created only under it or a canary that selects them).
    */
   runtime?: { requireActiveRelease?: boolean };
+  /**
+   * (additive, A[6]) Kernel plugins: local ES modules pinned by the sha256 of their entry file, loaded at composition in
+   * this order (init → start → health; stopped in reverse on close), recorded in the RuntimeManifest. A plugin may
+   * contribute only what its `capabilities` declare (`tool:<id>`, `engine:<kind>`, `provider:<id>`,
+   * `context-hook:<name>`, `service:<name>`); its tools pass the same capability check, policy permit, ledger and evidence
+   * as built-in tools (and are offered only to roles whose tool policy allows them).
+   */
+  plugins?: PluginConfig[];
+}
+
+/** (additive, A[6]) One configured kernel plugin. */
+export interface PluginConfig {
+  id: string;
+  version: string;
+  kind: 'tool' | 'engine' | 'provider' | 'context-hook';
+  /** The ES module (relative paths resolve against the configuration file). */
+  entry: string;
+  /** `sha256:<64 hex>` of the entry file (e.g. `sha256sum plugin.mjs`). */
+  digest: string;
+  capabilities: string[];
+  /** Plugin configuration (no secrets: plugins read their secrets from `*Env` names they document). */
+  config?: Record<string, JsonValue>;
 }
 
 /** (additive, conformance-1) A configured oracle: the OracleSpec content plus the human who establishes it. */
@@ -219,6 +259,13 @@ export interface HypertestServices {
   ids: IdGenerator;
   /** (additive, optional) The side-effect adapters whose capabilities the manifest's toolCatalogRevision pins. */
   adapters?: AdapterRegistry;
+  /**
+   * (additive, optional, A[6]) The governed ToolRuntime every tool call goes through (validate → capability → permit →
+   * freshness → operation ledger → evidence), the workspace manager, and the loaded kernel plugins.
+   */
+  toolRuntime?: ToolRuntime;
+  workspaces?: WorkspaceManager;
+  plugins?: PluginKernel;
 }
 
 /** (additive) What createHypertest returns: the Hypertest facade with every optional member present. */
@@ -230,6 +277,18 @@ export interface HypertestInstance extends Hypertest {
   listApprovals(filter?: { runId?: string; status?: ApprovalRequest['status'][] }): Promise<ApprovalRequest[]>;
   cancel(runId: string, reason: string): Promise<void>;
   readonly releases: RuntimeReleaseService;
+  /**
+   * (additive, A[3]) Manual model switch (`hypertest model switch`, POST /runs/:id/model-switch): `target` is an agent id
+   * of the run or a role; applied at the target agents' next safe turn boundary after the permission/profile re-check.
+   */
+  requestModelSwitch(runId: string, target: string, routeId: string, actor: { kind: 'human'; id: string }, reason?: string): Promise<ModelSwitchRequest>;
+  /** (additive, A[4]) The run's agents through engine.inspect (session state), with their epoch and any model pause. */
+  agents(runId: string): Promise<AgentView[]>;
+  /**
+   * (additive, A[0]) Operator resume of one run (`hypertest resume <runId>`, POST /runs/:id/resume): releases its model
+   * pauses (their open circuits probe now), resumes it when paused, and drives it in this process.
+   */
+  resume(runId: string): Promise<{ releasedPauses: string[] }>;
 }
 
 /** (additive) A runtime release as `hypertest runtime list` shows it. */

@@ -4,8 +4,8 @@ import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { HypertestError, canonicalJson, sha256Hex, type JsonValue } from '@hypertest/core';
-import type { SandboxRunner, TestRunResult, TestRunnerAdapter, WorkspaceChange, WorkspaceHandle, WorkspaceManager } from '../contracts.ts';
-import { SAFE_GIT_CONFIG, trustedGitEnv } from './git-exec.ts';
+import type { SandboxRunner, TestRunResult, TestRunnerAdapter, WorkspaceHandle, WorkspaceManager } from '../contracts.ts';
+import { SAFE_GIT_CONFIG, gitRun, trustedGitEnv } from './git-exec.ts';
 import { copyWorkspace } from './mutation.ts';
 import { confineExisting, normalizeRel } from './paths.ts';
 import { fileExists, looksLikePath, splitSelector } from './runners/common.ts';
@@ -273,21 +273,38 @@ export interface BaseRunInput {
   request: Parameters<TestRunnerAdapter['run']>[1];
   /** Paths that count as test code (kept from the workspace); everything else that changed is restored to the base. */
   isTestFile: (path: string) => boolean;
+  /** The known-good base commit (the run's target.baseCommit; set by the control plane, never by the agent). */
+  baseCommit: string;
+}
+
+/** Every path that differs between the workspace (committed, staged, unstaged, untracked) and `commit`. */
+async function changesAgainst(ws: WorkspaceHandle, workspaces: WorkspaceManager, commit: string): Promise<Array<{ path: string; change: 'added' | 'modified' | 'deleted' }>> {
+  const out = new Map<string, 'added' | 'modified' | 'deleted'>();
+  const r = await gitRun(ws.root, ['diff', '--no-renames', '--name-status', '-z', commit, '--'], { check: true });
+  const parts = r.stdout.split('\0').filter((x) => x !== '');
+  for (let i = 0; i + 1 < parts.length; i += 2) {
+    const status = parts[i]!;
+    const path = parts[i + 1]!;
+    out.set(path, status.startsWith('A') ? 'added' : status.startsWith('D') ? 'deleted' : 'modified');
+  }
+  // untracked files are not in `git diff`; the workspace manager lists them (added since the workspace's own base)
+  for (const c of (await workspaces.changedFiles?.(ws)) ?? []) if (!out.has(c.path) && c.change === 'added') out.set(c.path, 'added');
+  return [...out.entries()].map(([path, change]) => ({ path, change })).sort((a, b) => (a.path < b.path ? -1 : 1));
 }
 
 /**
- * (D-1) A known-good run on the BASE revision: a private copy of the workspace whose product code is restored to the base
- * commit (every changed non-test file reverted, added non-test files removed) while the workspace's test files (the
- * artifact under validation, its helpers and fixtures) are kept — so a generated test can show it passes on the code
- * before the change. The workspace is never modified. Returns the run, its attributed executed tests (relative to the
- * copy, i.e. the same paths) and the code revision `{ kind: 'base', baseCommit, treeDigest }`.
+ * (D-1) A known-good run on the BASE revision (the run's target.baseCommit): a private copy of the workspace whose product
+ * code is restored to that commit (every non-test file that differs from it reverted, files it does not have removed)
+ * while the workspace's test files (the artifact under validation, its helpers and fixtures) are kept — so a generated
+ * regression test can show that it passes on the code before the change. The workspace is never modified. Returns the
+ * run, the copy's root (same relative paths) and the code revision `{ kind: 'base', baseCommit, treeDigest }`.
  */
 export async function runOnBaseRevision(input: BaseRunInput): Promise<{ run: Awaited<ReturnType<TestRunnerAdapter['run']>>; root: string; codeRevision: Record<string, JsonValue>; cleanup(): Promise<void> }> {
   const { ws } = input;
-  if (ws.baseCommit === undefined || typeof input.workspaces.changedFiles !== 'function') {
-    throw new HypertestError('precondition_failed', 'revision "base" needs a git workspace with a base commit (an isolated worktree or snapshot of the target)');
+  if (ws.baseCommit === undefined || typeof input.workspaces.changedFiles !== 'function' || typeof input.baseCommit !== 'string' || input.baseCommit === '') {
+    throw new HypertestError('precondition_failed', 'revision "base" needs a git workspace with a base commit (an isolated worktree or snapshot of the target) and the run\'s base commit');
   }
-  const changes: WorkspaceChange[] = await input.workspaces.changedFiles(ws);
+  const changes = await changesAgainst(ws, input.workspaces, input.baseCommit);
   const realRoot = await realpath(ws.root);
   const tempInsideRoot = ws.tempDir !== undefined && (ws.tempDir === realRoot || ws.tempDir.startsWith(realRoot + sep));
   const ownBase = ws.tempDir === undefined || tempInsideRoot;
@@ -301,15 +318,15 @@ export async function runOnBaseRevision(input: BaseRunInput): Promise<{ run: Awa
   try {
     await copyWorkspace(ws, copyRoot);
     const kept: Array<{ path: string; change: string; sha256: string | null }> = [];
-    for (const c of [...changes].sort((a, b) => (a.path < b.path ? -1 : 1))) {
+    for (const c of changes) {
       if (input.isTestFile(c.path)) {
-        kept.push({ path: c.path, change: c.change, sha256: c.sha256 ?? null });
+        kept.push({ path: c.path, change: c.change, sha256: c.change === 'deleted' ? null : ((await sha256File(join(copyRoot, c.path))) ?? null) });
         continue;
       }
       const target = join(copyRoot, c.path);
       if (c.change === 'added') await rm(target, { force: true });
       else {
-        const blob = await gitBlob(ws.root, ws.baseCommit, c.path);
+        const blob = await gitBlob(ws.root, input.baseCommit, c.path);
         if (blob === undefined) await rm(target, { force: true });
         else {
           await mkdir(dirname(target), { recursive: true });
@@ -319,7 +336,7 @@ export async function runOnBaseRevision(input: BaseRunInput): Promise<{ run: Awa
     }
     const copyWs: WorkspaceHandle = { ...ws, root: copyRoot, readOnly: false, kind: 'scratch' };
     const run = await input.runner.run(copyWs, input.request, input.sandbox);
-    const codeRevision: Record<string, JsonValue> = { kind: 'base', baseCommit: ws.baseCommit, treeDigest: sha256Hex(canonicalJson({ baseCommit: ws.baseCommit, revision: 'base', tests: kept })) };
+    const codeRevision: Record<string, JsonValue> = { kind: 'base', baseCommit: input.baseCommit, treeDigest: sha256Hex(canonicalJson({ baseCommit: input.baseCommit, revision: 'base', tests: kept })) };
     return { run, root: copyRoot, codeRevision, cleanup };
   } catch (e) {
     await cleanup();

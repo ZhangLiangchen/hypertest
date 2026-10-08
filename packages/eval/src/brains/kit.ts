@@ -279,6 +279,42 @@ export async function awaitObservation(file: string | undefined, predicate: (o: 
   }
 }
 
+/**
+ * (coverage-1, gate C12) The view of a request without its FIRST tool call (the assistant message and its results): what
+ * a role policy written for the transcript after a prelude call sees.
+ */
+export function withoutFirstCall(v: BrainView): BrainView {
+  const msgs = v.request.messages;
+  const first = msgs.findIndex((m) => m.role === 'assistant');
+  if (first < 0) return v;
+  const assistant = msgs[first] as { toolCalls?: Array<{ id: string }> };
+  const ids = new Set((assistant.toolCalls ?? []).map((c) => c.id));
+  const messages = msgs.filter((m, i) => i !== first && !(m.role === 'tool' && ids.has(m.toolCallId)));
+  return viewOf({ ...v.request, messages });
+}
+
+/**
+ * (coverage-1, gate C12) A lead that records the run's SystemModel (`system_model.record`) as the first call of its
+ * initial plan, then follows `lead` exactly as before (it sees the transcript without that call). The model is
+ * deterministic (a function of the task), so a replayed or resumed child records the same model.
+ */
+export function recordingSystemModel(lead: RoleBrain, model: JsonValue): RoleBrain {
+  return (v) => {
+    if (v.kind !== 'initial_plan') return lead(v);
+    const calls = pairedCalls(v);
+    if (calls.length === 0) return toolCall('system_model.record', model);
+    return calls[0]!.tool === 'system_model.record' ? lead(withoutFirstCall(v)) : lead(v);
+  };
+}
+
+/** The SystemModel the scripted leads record for a task: the system under test of its fixture (one component). */
+export function scriptedSystemModel(taskId: string): JsonValue {
+  return {
+    components: [{ componentId: 'sut', name: `system under test of ${taskId}`, kind: 'service', paths: [] }],
+    sources: [{ kind: 'record', id: `eval-task:${taskId}` }],
+  };
+}
+
 /** Refuses malformed brain arguments (they come from JSON). */
 export function assertBrainArgs(args: unknown): asserts args is PocBrainArgs {
   const a = args as Partial<PocBrainArgs> | undefined;

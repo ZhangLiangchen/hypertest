@@ -7,7 +7,7 @@ import {
 } from '@hypertest/domain';
 import type { EnvironmentFacts, GateInput } from './contracts.ts';
 import { experimentValidity, type GateOperation } from './experiments.ts';
-import { artifactEligibility, caseInFile, isBaseRevisionRun, type ArtifactEligibility, type EligibilityContext } from './sensitivity.ts';
+import { artifactEligibility, caseInFile, executedTestsOf, isBaseRevisionRun, sameTestFile, type ArtifactEligibility, type EligibilityContext } from './sensitivity.ts';
 
 /**
  * The deterministic QualityGate (I7). Pure: the decision depends only on the input (no clock, no
@@ -57,14 +57,17 @@ import { artifactEligibility, caseInFile, isBaseRevisionRun, type ArtifactEligib
  *   C8 coverage             – latest coverage evidence below gate.minCoverage ⇒ violated (fail); none ⇒ unknown.
  *   C9 critical_claims      – (area-C-0) every critical report claim is EVALUATED (domain `evaluateClaim`: the
  *                             evidenceQuery aggregation over the cited evidence compared with the claimed value): no or
- *                             dangling evidence, or an unevaluable claim ⇒ unknown; a value the evidence contradicts ⇒
+ *                             dangling evidence, an unevaluable claim, or a critical claim stating no value (its fact
+ *                             only in the prose of the statement) ⇒ unknown; a value the evidence contradicts ⇒
  *                             violated (fail).
  *   C10 experiment_validity – (D-3/D-4/D-5) every experiment whose actions or evidence support the decision is valid
  *                             (experiments.ts `experimentValidity`): claims never lapsed and no foreign action on its
  *                             exclusive resources, environment generation unchanged, executed faults/load == declared plan,
  *                             no action after a met stop condition ⇒ otherwise violated (fail); evidence requirements
- *                             unmet, declared faults never executed, unverifiable actions, a superseded oracle revision ⇒
- *                             unknown.
+ *                             unmet, declared faults never executed, unverifiable actions ⇒ unknown. (D-10) An experiment
+ *                             that ran under an oracle revision no longer in force is superseded: its evidence never
+ *                             counts (any criterion it would have supported stays unproven until a NEW experiment re-runs
+ *                             it) and it is not judged.
  *   C11 environment_validity– (D-11) the environments the run used are valid: registered, no unresolved P0–P2
  *                             environment finding, no generation drift not explained by the run's own verified
  *                             restarts/deploys, no environment operation in an uncertain state (failed, outcome_unknown,
@@ -397,18 +400,29 @@ function deltaEligibility(e: EvidenceRecord, byDigest: ReadonlyMap<string, TestA
     return d['readOnly'] === true ? { critical: true } : { problem: `workspace delta unavailable (${String(d['reason'] ?? 'unknown')}): the tests that ran cannot be tied to the base commit or to validated artifacts`, critical: false };
   }
   if (d['testFilesTruncated'] === true) return { problem: 'too many changed test files to verify', critical: false };
-  const files = d['testFiles'];
-  if (!Array.isArray(files)) return { problem: 'malformed workspace delta (no testFiles)', critical: false };
+  const listed = d['testFiles'];
+  if (!Array.isArray(listed)) return { problem: 'malformed workspace delta (no testFiles)', critical: false };
+  // every changed test file is judged (a run may load more than it reports); the files the run EXECUTED are judged first,
+  // so the problem names the test that actually ran
+  const executed = (executedTestsOf(e)?.files ?? []).map((f) => f.path);
+  const ran = (f: JsonValue): boolean => {
+    const path = f !== null && typeof f === 'object' && !Array.isArray(f) ? (f as Record<string, JsonValue>)['path'] : undefined;
+    return typeof path === 'string' && executed.some((x) => sameTestFile(x, path));
+  };
+  const files = [...listed.filter(ran), ...listed.filter((f) => !ran(f))];
   let critical = true;
   for (const f of files) {
     if (f === null || typeof f !== 'object' || Array.isArray(f)) return { problem: 'malformed workspace delta entry', critical: false };
     const { path, change, sha256 } = f as Record<string, JsonValue>;
     if (change === 'deleted') continue;
     if (typeof sha256 !== 'string' || sha256 === '') return { problem: `test file ${String(path)} (${String(change)}) has no content digest`, critical: false };
-    const judged = (byDigest.get(sha256) ?? []).map((a) => judge(a, true));
+    const candidates = byDigest.get(sha256) ?? [];
+    const judged = candidates.map((a) => judge(a, true));
     const covering = judged.filter((j) => j.eligible);
     if (covering.length === 0) {
-      const why = judged.length === 0 ? 'no test artifact has its content' : `its artifact is not eligible: ${judged.flatMap((j) => j.reasons).slice(0, 3).join('; ')}`;
+      const why = judged.length === 0
+        ? 'no test artifact has its content'
+        : `its artifact ${candidates.map((a) => `${a.artifactId}@${a.revision}`).join(', ')} is not eligible: ${judged.flatMap((j) => j.reasons).slice(0, 3).join('; ')}`;
       return { problem: `test file ${String(path)} is ${String(change)} since the base commit and ${why} (sha256 ${sha256.slice(0, 12)})`, critical: false };
     }
     if (!covering.some((j) => j.criticalSupport)) critical = false;
@@ -450,8 +464,23 @@ export class QualityGate {
     // Evidence from generated tests that did not complete their lifecycle does not count (nor does evidence pointing at an
     // unknown artifact, nor evidence of a run over new/changed test files no eligible artifact covers, nor a known-good
     // validation run on the base revision). Every stage is re-derived from the cited evidence and review records.
+    // (D-10, review) experiments that ran under an oracle revision no longer in force: their evidence was gathered for a
+    // replaced criterion — it never decides the verdict (re-run as a NEW experiment), and the experiment is not judged (C10)
+    const experiments = latestExperiments(input.experiments.filter((x) => x.runId === undefined || x.runId === run.runId));
+    const supersededExperiments = new Map<string, string>();
+    for (const x of experiments) {
+      for (const ref of x.oracleRefs ?? []) {
+        const cur = oraclesInForce.find((o) => o.oracleId === ref.oracleId);
+        if (cur && cur.revision !== ref.revision) {
+          supersededExperiments.set(x.experimentId, `it ran under oracle ${ref.oracleId} revision ${ref.revision}; revision ${cur.revision} is in force`);
+          break;
+        }
+      }
+    }
+    const supersededEvidence: string[] = [];
+
     const artifacts = latestArtifacts(input.testArtifacts);
-    const eligibilityCtx: EligibilityContext = { evidence: evidenceById, reviews: allReviews, oraclesInForce };
+    const eligibilityCtx: EligibilityContext = { evidence: evidenceById, reviews: allReviews, oraclesInForce, ...(run.target?.baseCommit !== undefined ? { baseCommit: run.target.baseCommit } : {}) };
     const memo = new Map<string, ArtifactEligibility>();
     const judge = (a: TestArtifact, changed: boolean): ArtifactEligibility => {
       const key = `${a.artifactId}@${a.revision}:${changed}`;
@@ -469,6 +498,11 @@ export class QualityGate {
     const validationOnly: string[] = [];
     const criticalOk = new Set<string>();
     const eligible = runEvidence.filter((e) => {
+      const xid = experimentOf(e);
+      if (xid !== undefined && supersededExperiments.has(xid)) {
+        supersededEvidence.push(`${e.evidenceId} (experiment ${xid}: ${supersededExperiments.get(xid)!})`);
+        return false;
+      }
       if (isBaseRevisionRun(e)) {
         validationOnly.push(e.evidenceId);
         return false;
@@ -500,7 +534,6 @@ export class QualityGate {
     const findings = currentRecords(findingHistory);
     const risks = currentRecords(input.risks).filter((r) => r.runId === run.runId);
     const reviews = currentRecords(allReviews);
-    const experiments = latestExperiments(input.experiments.filter((x) => x.runId === undefined || x.runId === run.runId));
     const operations = input.operations;
 
     const outcomes = new Map<CriterionId, Outcome>();
@@ -571,7 +604,7 @@ export class QualityGate {
         reasons.push('no evidence recorded');
       } else if (eligible.length === 0) {
         status = 'unknown';
-        reasons.push(`no eligible evidence: none of the ${runEvidence.length} run evidence records is evidence about the candidate from an eligible source (ineligible generated tests, base-revision validation runs)`);
+        reasons.push(`no eligible evidence: none of the ${runEvidence.length} run evidence records is evidence about the candidate from an eligible source (ineligible generated tests, base-revision validation runs, experiments under a superseded oracle revision)`);
       }
       outcomes.set('C1', { status, evidenceRefs: [], detail: status === 'satisfied' ? `${allEvidence.length} evidence records match root ${input.evidenceRoot.rootHash}` : reasons.join('; '), reasons });
     }
@@ -659,7 +692,11 @@ export class QualityGate {
         const history = findingHistory.filter((r) => r.lineageId === cur.lineageId);
         if (!history.some((r) => blocks(r.payload) && PRODUCT_CATEGORIES.has(r.payload.category))) continue;
         if (/^(human|system):/.test(cur.createdBy)) continue;
-        if (cur.payload.status === 'duplicate' && cur.payload.duplicateOf !== undefined && (blockingLineages.has(cur.payload.duplicateOf) || product.some((p) => p.recordId === cur.payload.duplicateOf))) continue;
+        if (cur.payload.status === 'duplicate' && cur.payload.duplicateOf !== undefined) {
+          // a duplicate of a finding that still blocks keeps the defect represented
+          const target = findingHistory.find((r) => r.recordId === cur.payload.duplicateOf);
+          if (target && blockingLineages.has(target.lineageId)) continue;
+        }
         const ref = cur.payload.oracleRef;
         if (ref?.assertionId !== undefined && assertionStatus.get(`${ref.oracleId}/${ref.assertionId}`) === 'satisfied') continue;
         cleared.push(cur);
@@ -685,7 +722,8 @@ export class QualityGate {
       const x = experimentOf(e);
       if (x !== undefined) experimentEvidence.set(x, [...(experimentEvidence.get(x) ?? []), e]);
     }
-    const started = experiments.filter((x) => (experimentEvidence.get(x.experimentId)?.length ?? 0) > 0 || (operations ?? []).some((o) => o.experimentId === x.experimentId));
+    const startedAll = experiments.filter((x) => (experimentEvidence.get(x.experimentId)?.length ?? 0) > 0 || (operations ?? []).some((o) => o.experimentId === x.experimentId));
+    const started = startedAll.filter((x) => !supersededExperiments.has(x.experimentId));
 
     // C4 required_evidence
     {
@@ -858,6 +896,10 @@ export class QualityGate {
         } else if (evaluation?.status === 'unevaluable') {
           unknownClaims++;
           reasons.push(`critical claim ${c.claimId} cannot be evaluated: ${evaluation.detail}`);
+        } else if (evaluation?.status === 'reference') {
+          // a critical claim whose fact lives only in the prose of its statement is not machine-verifiable
+          unknownClaims++;
+          reasons.push(`critical claim ${c.claimId} ("${c.statement}") states no value to evaluate against its evidence: a statement alone is not verifiable`);
         }
       }
       const status: Outcome['status'] = contradicted ? 'violated' : unknownClaims ? 'unknown' : 'satisfied';
@@ -882,7 +924,7 @@ export class QualityGate {
           continue;
         }
         const facts = input.experimentFacts?.find((f) => f.experimentId === x.experimentId);
-        const env = input.environments?.find((e) => e.environmentId === x.environment.environmentId);
+        const env = input.environments?.find((e) => e.environmentId === x.environment?.environmentId);
         const v = experimentValidity({
           spec: x, evidence: experimentEvidence.get(x.experimentId) ?? [], operations, ...(facts ? { facts } : {}), oraclesInForce,
           ...(env?.dedicated !== undefined ? { environmentDedicated: env.dedicated } : {}), now: input.now,
@@ -893,11 +935,13 @@ export class QualityGate {
         for (const m of v.violations) reasons.push(`experiment ${x.experimentId} invalid: ${m}`);
         for (const m of v.unknowns) reasons.push(`experiment ${x.experimentId} unproven: ${m}`);
       }
+      const superseded = startedAll.filter((x) => supersededExperiments.has(x.experimentId));
+      for (const x of superseded) reasons.push(`experiment ${x.experimentId} is superseded (${supersededExperiments.get(x.experimentId)!}): not judged, its evidence does not count — re-run it as a new experiment under the revision in force`);
       const status: Outcome['status'] = violated ? 'violated' : unknown ? 'unknown' : 'satisfied';
       outcomes.set('C10', {
         status,
         evidenceRefs: uniqSorted(refs),
-        detail: started.length === 0 ? 'no experiment ran' : `${started.length} experiment(s): ${violated} invalid, ${unknown} unproven`,
+        detail: started.length === 0 ? `no experiment ran${superseded.length ? ` under the oracle revisions in force (${superseded.length} superseded)` : ''}` : `${started.length} experiment(s): ${violated} invalid, ${unknown} unproven${superseded.length ? `; ${superseded.length} superseded` : ''}`,
         reasons,
       });
     }
@@ -907,7 +951,10 @@ export class QualityGate {
       const reasons: string[] = [];
       const used = new Set<string>();
       for (const e of runEvidence) if (e.environment?.environmentId) used.add(e.environment.environmentId);
-      for (const x of experiments) if (x.environment.environmentId !== 'local' || input.environments?.some((f) => f.environmentId === 'local')) used.add(x.environment.environmentId);
+      for (const x of experiments) {
+        const id = x.environment?.environmentId;
+        if (id !== undefined && (id !== 'local' || input.environments?.some((f) => f.environmentId === 'local'))) used.add(id);
+      }
       if (run.target.environmentId !== undefined) used.add(run.target.environmentId);
       for (const o of operations ?? []) {
         const id = envIdOfResource(o.resourceKey);
@@ -927,7 +974,7 @@ export class QualityGate {
           continue;
         }
         const gens = runEvidence.filter((e) => e.environment?.environmentId === id).map((e) => e.environment!.generation);
-        for (const x of experiments) if (x.environment.environmentId === id) gens.push(x.environment.generation);
+        for (const x of experiments) if (x.environment?.environmentId === id && typeof x.environment.generation === 'number') gens.push(x.environment.generation);
         if (gens.length > 0 && facts.generation !== undefined) {
           const gMin = Math.min(...gens);
           const gMax = Math.max(...gens, facts.generation);
@@ -1045,6 +1092,7 @@ export class QualityGate {
     }
     reasons.push(...exceptionReasons);
     if (ignored.length) reasons.push(`ignored evidence from ineligible generated tests: ${ignored.join(', ')}`);
+    if (supersededEvidence.length) reasons.push(`ignored evidence of experiments under a superseded oracle revision: ${supersededEvidence.join(', ')}`);
     if (validationOnly.length) reasons.push(`validation-only evidence (known-good runs on the base revision, never evidence about the candidate): ${validationOnly.join(', ')}`);
 
     const verdict: QualityVerdict = failType ? 'fail' : unknownAny ? 'inconclusive' : conditionalType ? 'conditional' : 'pass';
@@ -1060,7 +1108,7 @@ export class QualityGate {
     for (const a of [...artifacts.values()].sort((x, y) => byString(x.artifactId, y.artifactId))) testArtifactRevisions[a.artifactId] = a.revision;
     const builds = new Set<string>();
     for (const b of input.systemModel?.subject.buildDigests ?? []) builds.add(b);
-    for (const x of experiments) for (const s of x.subjects) if (s.buildDigest && s.buildDigest !== 'unknown') builds.add(s.buildDigest);
+    for (const x of experiments) for (const s of x.subjects ?? []) if (s.buildDigest && s.buildDigest !== 'unknown') builds.add(s.buildDigest);
 
     const decision: QualityDecision = {
       decisionId: input.decisionId,

@@ -6,6 +6,7 @@ export {
 export {
   ALL_MIGRATIONS, HYPERTEST_VERSION, hypertestSourceDigest, MAX_AGENTS_PER_RUN, RELAY_POLL_MS, RUN_ID_RE, TOOL_SCHEMA_VERSION, buildCatalog, createHypertest, decisionProblems, defaultWorkerId,
   manifestTaskQueue, pinnedControlPlane, sandboxProfile, sandboxHiddenPaths, sandboxEgressOrigins, opaPolicyRevision, type PinLookup,
+  applyScoresFile, modelPricesFile,
 } from './compose.ts';
 export { ENVIRONMENT_STATE_FILE, persistentEnvironmentRegistry, resolveEnvironments } from './environments.ts';
 export { acquireDirectoryLock, lockFileFor, lockHolder, processAlive, type DirectoryLock } from './lock.ts';
@@ -17,3 +18,5 @@ export {
   DEFAULT_CHECKPOINT_TIMEOUT_MS, IMAGE_DIGEST_ENV, agentClassification, condenserPrivacyFloor, createReleaseService, hypertestGitSha, imageDigestFrom, releaseGovernedControlPlane,
   runtimeReleaseNotes, withRuntimeReleaseNotes, type ReleaseServiceDeps,
 } from './releases.ts';
+/** (additive) Model governance helpers for the CLI: eval-derived route scores (coverage[7]) and observed prices (A[1]). */
+export { deriveRouteScores, parseRouteScoresFile, readPricesFile, updatePricesFile, type RouteScoresFile, type ScoredTrial, type PricesFile } from '@hypertest/model';

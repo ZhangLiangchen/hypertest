@@ -2,7 +2,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { HypertestError, isHypertestError } from '@hypertest/core';
-import { loadConfig, mergeConfig, type HypertestConfig, type HypertestConfigInput } from '@hypertest/app';
+import { deriveRouteScores, loadConfig, mergeConfig, type HypertestConfig, type HypertestConfigInput, type ScoredTrial } from '@hypertest/app';
 import type { EvalArm, EvalSuite, ReleaseGateOptions, ReleaseGateReport, SuiteOptions, SuiteResult } from '@hypertest/eval';
 import { UsageError, flag, int, list, positionals, required, str } from '../args.ts';
 import type { Command } from '../command.ts';
@@ -169,12 +169,46 @@ export function withJudge(suite: EvalSuite): EvalSuite {
   return { ...suite, tasks: suite.tasks.map((t) => (t.graders.some((g) => g.split('?')[0] === 'llmRubric') ? t : { ...t, graders: [...t.graders, 'llmRubric'] })) };
 }
 
+/**
+ * (coverage[7]) `eval apply-scores`: the auditable path from eval results to routing — a SuiteResult (eval run --out)
+ * becomes a RouteScoresFile (scores + provenance) that models.scoresFile merges into the catalog.
+ */
+async function applyScores(ctx: CommandContext, values: Parameters<Command['run']>[1], args: string[]): Promise<number> {
+  const [, input] = positionals('eval', args, ['apply-scores', 'suite-result.json']);
+  const out = required('eval', values, 'out');
+  const minTrials = int('eval', values, 'min-trials', { min: 1, max: 1_000_000 });
+  const file = resolve(ctx.io.cwd, input!);
+  let raw: unknown;
+  try {
+    raw = JSON.parse(await readFile(file, 'utf8'));
+  } catch (e) {
+    throw new HypertestError('invalid_argument', `eval apply-scores: ${file} is not a readable SuiteResult JSON: ${(e as Error).message}`);
+  }
+  const doc = raw as { suiteId?: unknown; revision?: unknown; trials?: unknown };
+  const scores = deriveRouteScores(
+    { ...(typeof doc.suiteId === 'string' ? { suiteId: doc.suiteId } : {}), ...(typeof doc.revision === 'string' ? { revision: doc.revision } : {}), trials: doc.trials as ScoredTrial[] },
+    { ...(minTrials !== undefined ? { minTrials } : {}), derivedAt: new Date().toISOString() },
+  );
+  const target = resolve(ctx.io.cwd, out);
+  await mkdir(dirname(target), { recursive: true });
+  await writeFile(target, `${JSON.stringify(scores, null, 2)}\n`);
+  if (ctx.global.json) ctx.json({ out: target, scores: scores.scores, source: scores.source });
+  else {
+    const rows = Object.entries(scores.scores).flatMap(([routeId, byRole]) => Object.entries(byRole).map(([role, v]) => [routeId, role, v.toFixed(3)]));
+    if (rows.length === 0) ctx.out(`no (route, role) pair has ${minTrials ?? 3} graded trials: nothing scored`);
+    else for (const l of table(['ROUTE', 'ROLE', 'SCORE'], rows)) ctx.out(l);
+    ctx.err(`wrote ${target} (${scores.source?.trials ?? 0} graded trials); set models.scoresFile to it — the next start routes with these scores`);
+  }
+  return EXIT_CODES.ok;
+}
+
 export const evalCommand: Command = {
   name: 'eval',
   summary: 'run an evaluation suite (fresh environment per trial) and compare arms; gate a candidate against a baseline',
   usage: [
     'eval run <suite> [--trials n] [--arms a,b] [--work-dir <dir>] [--keep-work-dir] [--timeout-ms n] [--mode in-process|child-process] [--judge scripted] [--out <suite-result.json>] [--report <file>] [--json]',
     'eval gate --baseline <suite-result.json> --candidate <suite-result.json> [--baseline-arm a] [--candidate-arm b] [--alpha 0.05] [--report <file>] [--json]',
+    'eval apply-scores <suite-result.json> --out <scores.json> [--min-trials n] [--json]',
   ],
   optionHelp: [
     ['--trials <n>', 'trials per task and arm (default 1)'],
@@ -191,21 +225,25 @@ export const evalCommand: Command = {
     ['--baseline-arm <id>', 'gate: arm of the baseline (default: its only arm, or the arm both share)'],
     ['--candidate-arm <id>', 'gate: arm of the candidate (default: its only arm, or the baseline arm)'],
     ['--alpha <p>', 'gate: significance level of "defect recall not significantly lower" (exact McNemar; default 0.05)'],
+    ['--min-trials <n>', 'apply-scores: graded trials a (route, role) pair needs before it is scored (default 3)'],
   ],
   notes: [
     'Suites: poc-a-whitebox, poc-b-event-driven, poc-c-durable-load, oracle-robustness, recovery-chaos, context-freshness, model-switch, security-injection, test-generation, core (as provided by @hypertest/eval).',
     'The `config` arm evaluates the models and role policies of your configuration file (live providers need their key variables; scripted providers need --scripted-brains).',
     'eval run: exit code 0 when every trial passed, 1 otherwise.',
+    'eval apply-scores: derives per-route, per-role quality scores from a SuiteResult (graded trials whose agents of the role ran on the route; (passes + 1) / (trials + 2)) and writes them with their provenance to --out. Point models.scoresFile at it: the next start routes with the scores, and its RuntimeManifest records them (modelScores).',
     'eval gate: exit code 0 when the candidate passes every check (critical false release not worse, defect recall not significantly lower, security violations = 0, duplicate side effects = 0, evidence completeness 100% for critical decisions, comparable results, full coverage), 1 otherwise.',
   ],
   options: {
     trials: { type: 'string' }, arms: { type: 'string' }, 'work-dir': { type: 'string' }, 'keep-work-dir': { type: 'boolean' }, 'timeout-ms': { type: 'string' }, mode: { type: 'string' },
     out: { type: 'string' }, report: { type: 'string' }, judge: { type: 'string' },
     baseline: { type: 'string' }, candidate: { type: 'string' }, 'baseline-arm': { type: 'string' }, 'candidate-arm': { type: 'string' }, alpha: { type: 'string' },
+    'min-trials': { type: 'string' },
   },
   longRunning: true,
   async run(ctx, values, args) {
     if (args[0] === 'gate') return gate(ctx, values, args);
+    if (args[0] === 'apply-scores') return applyScores(ctx, values, args);
     if (args[0] !== 'run') throw new UsageError(args[0] === undefined ? 'missing sub-command (eval run <suite>)' : `unknown sub-command eval ${args[0]}`, 'eval');
     const [, suiteId] = positionals('eval', args, ['run', 'suite']);
     const judgeKind = str(values, 'judge');

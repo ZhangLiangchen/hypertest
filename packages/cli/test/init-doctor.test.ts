@@ -197,15 +197,24 @@ describe('hypertest doctor', () => {
     assert.equal(report.ok, false);
     assert.equal(report.configPath, join(project, 'hypertest.config.yaml'));
     const errors = report.checks.filter((c) => c.status === 'error');
-    assert.deepEqual(errors, [
+    assert.deepEqual(errors.slice(0, 2), [
       { name: 'secrets', status: 'error', detail: 'provider deepseek (apiKeyEnv): environment variable DEEPSEEK_API_KEY is not set' },
       { name: 'secrets', status: 'error', detail: 'provider anthropic (apiKeyEnv): environment variable ANTHROPIC_API_KEY is not set' },
     ]);
-    assert.deepEqual(report.checks.map((c) => c.name), ['node', 'config', 'secrets', 'secrets', 'models', 'models', 'models', 'protocol', 'engines', 'sandbox', 'store', 'artifacts', 'git', 'docker']);
+    // e2e[3]: a provider without its credential is unavailable (fail closed), so no route can serve the lead either
+    assert.equal(errors.length, 3);
+    assert.equal(errors[2]!.name, 'models');
+    assert.match(errors[2]!.detail, /^no route can serve the lead role \(deepseek-chat: provider deepseek is unavailable: provider deepseek has no credential: environment variable DEEPSEEK_API_KEY is not set or empty \(fail closed: no request is sent\); claude-opus: provider anthropic is unavailable: provider anthropic has no credential: environment variable ANTHROPIC_API_KEY is not set or empty/);
+    const names = report.checks.map((c) => c.name);
+    assert.deepEqual(names.slice(0, 4), ['node', 'config', 'secrets', 'secrets']);
+    assert.deepEqual(names.slice(-7), ['protocol', 'engines', 'sandbox', 'store', 'artifacts', 'git', 'docker']);
+    assert.ok(names.slice(4, -7).every((n) => n === 'models'), names.join(','));
+    // the doctor names each provider whose missing credential makes its routes unavailable (never routed to)
+    assert.ok(report.checks.some((c) => c.name === 'models' && c.status === 'warn' && /^provider deepseek has no credential: .*: routes deepseek-chat are unavailable — never routed to, no request is sent/.test(c.detail)));
     const human = await cli(['doctor', '--no-connect'], { cwd: project, env: NO_KEYS });
     assert.equal(human.code, 1);
     assert.match(human.stdout, /\[ERROR\] secrets {4}provider deepseek \(apiKeyEnv\): environment variable DEEPSEEK_API_KEY is not set\n/);
-    assert.match(human.stdout, /\n\n2 errors, \d+ warnings?\n$/);
+    assert.match(human.stdout, /\n\n3 errors, \d+ warnings?\n$/);
   });
 
   test('an invalid configuration lists every problem (exit 1) without echoing inline secrets', async () => {

@@ -99,7 +99,7 @@ export function evidenceTools(deps: ControlDeps): ToolSpec[] {
       id: 'evidence.claim',
       title: 'Record a claim',
       description:
-        'Record a report claim (statement, optional value) backed by evidence ids of this run. The claim is stored only when every cited evidence exists, is intact and matches the evidenceQuery (type / work item / structured field). Critical claims gate the QualityDecision.',
+        'Record a report claim (statement, optional value) backed by evidence ids of this run. The claim is stored only when every cited evidence exists, is intact, matches the evidenceQuery (type / work item / structured field) and — when a value is stated — the value EVALUATES true: evidenceQuery.field read from each cited record, reduced by evidenceQuery.aggregation (value (default: all equal), count, sum, avg, min, max, first, last, p50, p90, p95, p99) and compared with value (numbers within 0.5 %, strings/booleans exactly). Critical claims gate the QualityDecision (C9 re-evaluates them) and must state a value with evidenceQuery.field: a statement alone is not machine-verifiable (e.g. {statement: "avg TPS 103215", value: 103215, critical: true, evidenceQuery: {evidenceType: "metric", field: "avg_tps", aggregation: "avg"}}).',
       inputSchema: {
         type: 'object',
         additionalProperties: false,
@@ -118,6 +118,11 @@ export function evidenceTools(deps: ControlDeps): ToolSpec[] {
       } as JsonSchema,
       area: 'claims',
       async execute(input, ctx) {
+        // area-C-0: a critical claim gates the verdict, so it must be machine-verifiable — a number or fact only in the prose
+        // of the statement is what the report must never assert as evidence-backed (technology-selection §Evidence Store)
+        if (input.critical === true && (input.value === undefined || typeof input.evidenceQuery?.field !== 'string' || input.evidenceQuery.field === '')) {
+          return refuse('unsupported_claim', `a critical claim must state its value with evidenceQuery.field (and an aggregation when several records or values are reduced), so that it is evaluated against the evidence: ${input.value === undefined ? 'no value is stated' : 'evidenceQuery.field is missing'} — a statement alone is not machine-verifiable`);
+        }
         const claim: ReportClaim = {
           // retry-stable: a replayed call stores nothing twice (ht_claims ignores a known claim id)
           claimId: `clm_${sha256Hex(`${ctx.runId}\u0000${ctx.invocationId}`).slice(0, 26)}`,
@@ -127,10 +132,11 @@ export function evidenceTools(deps: ControlDeps): ToolSpec[] {
           critical: input.critical ?? false,
         };
         if (input.value !== undefined) claim.value = input.value;
-        const resolution = await resolveClaim(evidence, claim, { runId: ctx.runId });
+        // area-C-0: the claim is EVALUATED (evidenceQuery aggregation over its evidence vs its value), not only referenced
+        const resolution = await resolveClaim(evidence, claim, { runId: ctx.runId, artifacts });
         if (!resolution.supported) return refuse('unsupported_claim', `claim not supported by its evidence: ${resolution.problems.join('; ')}`, { problems: resolution.problems });
         await store.putClaim(ctx.runId, claim, clock.isoNow());
-        return success({ claimId: claim.claimId, supported: true, evidenceRefs: claim.evidenceRefs, critical: claim.critical });
+        return success({ claimId: claim.claimId, supported: true, evidenceRefs: claim.evidenceRefs, critical: claim.critical, evaluation: resolution.evaluation?.detail });
       },
     }),
   ];

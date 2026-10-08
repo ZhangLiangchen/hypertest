@@ -18,7 +18,10 @@ the real policy engine).
 | `createSessionStore(deps)` | SQL `SessionStore`: portable transcript, turn records, tool-call settlement, native state, compactions, input inbox. |
 | `createAgentRepository(deps)` | SQL `AgentRepository` over `ht_agents` (a disposed agent is terminal). |
 | `createEpochManager(deps)` | `ModelEpoch`s at safe boundaries (I3), `model.epoch_started`, `providersUsedByRoles`, pending fallbacks. |
-| `createModelInvoker(deps)` | Per-agent `ModelInvoker`: routes at boundaries, epochs, budget reserve/settle/release, fallback at the next turn. |
+| `createModelInvoker(deps)` | Per-agent `ModelInvoker`: routes at boundaries (manual / fallback / policy / quality / cost switches re-checked before the epoch), PAUSE or fail closed, calibrated budget reserve/settle/release, fallback at the next turn. |
+| `createTokenCalibration()` | Per-route calibration of the token estimator against provider-reported input tokens (shared per worker). |
+| `createPluginKernel(configs, opts)` | Kernel plugins (below). |
+| `inspectAgents`, `childModes`, `capabilityModes` | Engine inspection and EngineCapabilities decisions (below). |
 | `NativeEngine` | `kind: 'native'`, `version` = this package's version. The Hypertest agent loop (below). |
 | `createSubagentRuntime(deps)` | spawn/resume/message/interrupt/collect/children/dispose/settle/`capabilityOf` with caps, capability binding and non-amplification (I2). `capabilityAmplification(child, parent)` is the check. |
 | `createAgentRunner(deps)` | `step()` = one turn (the durable activity unit); `run()` = loop with the work budget; both recover an outcome the engine committed but a crash left unapplied (`recoveredResult`, `recoveredWaiting`). `validateBudget`. |
@@ -133,23 +136,76 @@ begun, nothing produced). A `model_responded` turn (response with unsettled call
 `previousEpochId` must be the current epoch (`conflict`), identity must match the session. Emits
 `model.epoch_started` in the insert transaction.
 
-`createModelInvoker(deps).invoke()` at every turn boundary:
-1. A **pending fallback** (recorded by the previous failed call) starts a new epoch *here* (reason `unavailable` /
-   `rate_limit` / `policy`) and is consumed in the same transaction; else the current epoch's stored decision is
-   reused; else the router routes (security → capability → …; `no_eligible_route` ⇒ `model_unavailable`, no epoch)
-   and the `initial` epoch starts. The RouteRequest: role/taskType/policy/actionRisk/dataClassification from deps
-   (`routeRequestExtras()` may only *tighten*: `providersToAvoid`/`excludeRoutes`/capabilities are added,
-   `actionRisk`/`dataClassification` take the stricter value; policy/role/identity are never overridden), `requiredCapabilities` = policy ∪ `tool_use`
-   (tools present) ∪ `structured_output` (responseFormat) ∪ extras, `contextTokensEstimate = estimateTokens(messages,
-   tools)`, `contextSnapshotId` = the turn's snapshot.
-2. Budget (`BudgetPort`, optional): reserve `{tokens: estimate + maxOutputTokens, costUsd: router.estimateCostUsd}`
-   ⇒ exhausted ⇒ `budget_exhausted` (no call).
-3. `router.invoke` with messages projected by `projectForRoute` for the epoch's continuation class and
-   `excludeRoutes` = routes that already failed in this epoch sequence. ok ⇒ settle actual tokens/cost. Failure ⇒
-   release; caller abort ⇒ `cancelled`; router fallback ⇒ stored for the next boundary ⇒ `retry_next_turn`; none ⇒
-   `model_unavailable`. A settle/release failure is logged and the reservation kept (over-counted, never under).
-   A response the router returns `auditPending` (its `model.invoked` append failed after the provider answered) is
-   kept and its usage SETTLED — never released: the call is paid (durability-10); the audit gap is logged as an error.
+`createModelInvoker(deps).invoke()` at every turn boundary (I3: the permission/profile re-check happens BEFORE a new
+epoch; a refused switch records no epoch):
+1. **Switch triggers**, in order — **manual** (an operator's `ModelSwitchRequest` for this agent or its role,
+   `EpochManager.pendingSwitch`; applied or refused once per agent, `recordSwitchOutcome`), a **pending fallback**
+   (recorded by the previous failed call: reason `unavailable` / `rate_limit` / `policy`), the **current epoch re-checked**
+   (`router.validate`: a route that no longer holds switches HERE — reason `quality` when only its scores changed in a
+   new catalog revision, `policy` otherwise, `unavailable` for an availability stop), **cost pressure** (`costPressure()`:
+   remaining USD below `costPressureRatio` × limit, or the next call costing more than remains ⇒ a strictly cheaper
+   eligible route, reason `cost`; "cheaper" is priced on the router's basis for every route — the request's input
+   estimate + the route's own maxOutputTokens — so a dearer per-token route with a smaller output cap never passes as
+   cheaper), else the **initial** route. The RouteRequest: role/taskType/policy/actionRisk/
+   dataClassification from deps (`routeRequestExtras()` may only *tighten*), `requiredCapabilities` = policy ∪ `tool_use`
+   (tools) ∪ `structured_output` (responseFormat) ∪ extras, `contextTokensEstimate = estimateTokens(messages, tools)`,
+   `costBudgeted` (A[2]: cost-unknown routes refused).
+2. **Re-check before the epoch**: the candidate is validated against the current request (and, for an engine without
+   `providerSwitch`, must stay on the session's provider — A[4] emulation); refused ⇒ `model.switch_refused`, NO epoch:
+   a refused manual/cost switch keeps the current epoch, a refused fallback re-routes without the refused route.
+   Accepted ⇒ `EpochManager.start` records the epoch (with the route's profile) in one transaction.
+3. **PAUSE vs fail closed** (A[0]): no route for now (`ModelUnavailability.transient`: open circuits, rate limits /
+   timeouts after retries, a single-route or `fail_closed` role whose route is unavailable) ⇒ a durable `ModelPause`
+   (`ht_model_pauses`: resumeAt = Retry-After / the earliest half-open time, else backoff 5 s doubling to 5 min) and the
+   boundary `model_unavailable` with `pause`; no configured route may EVER serve (security, capability, a missing
+   credential) ⇒ `model_unavailable` with the exact reason, no pause. A successful call clears the pause.
+4. **Budget** (`BudgetPort`, optional): the reservation is the CALIBRATED input estimate (`TokenCalibration`: the
+   measured ratio of provider-reported input tokens to `estimateTokens` per route, smoothed, clamped [0.5, 3]; fed by
+   every successful call) + the output reserve. When `BudgetPort.remaining` shows the full `maxOutputTokens` reserve
+   does not fit, the call's `maxOutputTokens` shrinks to what remains (never below `minOutputTokens`, default
+   min(maxOutputTokens, 1024)). A refusal ⇒ `budget_exhausted` with the ledger's typed refusal (`budget`: scope,
+   dimension, limit, used, reserved, requested, route, needed tokens/USD) and an exact message (`model budget exhausted
+   at run:… on costUsd: $0.999 used + $0 reserved by calls in flight + $0.0123 for this call > limit $1; …`).
+5. `router.invoke` with messages projected by `projectForRoute` for the epoch's continuation class and `excludeRoutes`
+   = routes that already failed in this epoch sequence. ok ⇒ settle the actual tokens/cost. Failure ⇒ release; caller
+   abort ⇒ `cancelled`; router fallback ⇒ stored for the next boundary ⇒ `retry_next_turn`; none ⇒ PAUSE / fail closed
+   (3). A settle/release failure is logged and the reservation kept (over-counted, never under). A response the router
+   returns `auditPending` is kept and its usage SETTLED — never released: the call is paid (durability-10).
+
+`EpochManager` (additive, `runtime/006-model-pauses-switches`): `modelPause` / `setModelPause` / `clearModelPause` /
+`listModelPauses` / `releaseModelPauses(runId, at)` (an operator resume makes paused agents retry now),
+`requestSwitch` (`model.switch_requested`; a newer request for the same target supersedes older ones) / `pendingSwitch`
+/ `recordSwitchOutcome` / `listSwitches`, `clearPendingFallback`; epochs record the route profile (`route_profile`).
+
+## Engine capabilities, inspection and kernel plugins
+
+- **EngineCapabilities are consulted** (A[4], `src/capabilities.ts`): `childModes(engine, { continuable, background })`
+  decides per child whether the engine provides a mode natively or the host emulates it, and refuses what cannot be
+  emulated (`continuable` needs `peerMessaging`); the modes are recorded in `agent.spawned`. A continuable child is
+  resumed through **`engine.resumeChild`** when the engine has `continuableChild` (the runner calls it at the child's
+  next step: `ht_agents.resume_pending`), else the host reactivates the session (`agent.resumed` payload `via`:
+  `engine.resumeChild` | `host_emulated`). The resume records the session's last SETTLED turn
+  (`ht_agents.resume_after_turn`, migration `runtime/007-resume-after-turn`; an interrupted turn left mid-dispatch is not
+  settled — the resume replays it): when the session is `active` again or a turn after it has settled, resumeChild ran
+  before a crash left the flag set, so the runner consumes the resume and recovers that turn (settle / replay /
+  continue) instead of running another. `providerSwitch: false` keeps model switches on the session's provider.
+- `inspectAgents({ agents, engines, epochs? }, runId)` (`src/inspect.ts`) returns each agent with `engine.inspect` state
+  (or the error), its capability modes, current epoch and model pause — used by `hypertest status` and
+  `GET /runs/:id/agents`.
+- **Kernel plugins** (A[6], `src/plugins.ts`): `PluginManifest { id, version, kind: tool | engine | provider |
+  context-hook, entry, capabilities: string[], digest: sha256:<hex> }`; `createPluginKernel(configs, { logger, clock })`
+  verifies the entry's digest BEFORE importing it (mismatch ⇒ `precondition_failed`, nothing of it loaded) and again
+  after, then runs `init` (in order) → contributions checked against the declared capabilities (`tool:<id>`,
+  `engine:<kind>`, `provider:<id>`, `context-hook:<name>`, `service:<name>`) → `start` → `health` (unhealthy ⇒ refused);
+  any failure stops the started plugins in reverse order. The **Service Registry** (`ctx.services.provide/get`, shared
+  by the plugins) and the **Capability Registry** (`kernel.capabilities`: which plugin owns each declared contribution;
+  a contribution two plugins declare is a conflict); `tools()`, `providers()`, `engines(deps)`, `contextHooks()`,
+  `health()`, `manifestEntries()` (for `RuntimeManifest.plugins`), `stop()` (reverse, idempotent). Plugin tools are
+  ordinary `ToolSpec`s: the ToolRuntime applies the capability check, policy permit, freshness, operation ledger and
+  evidence to them like to any built-in tool; the composition registers them after the built-in and domain tools, so a
+  plugin tool reusing a governed tool id (e.g. `complete_work`, `fs.read`) is refused (`conflict`), never a replacement.
+  Limits: the digest pins the ENTRY file only — modules it imports are not pinned, so ship a plugin as one bundled file;
+  plugins run inside the Hypertest process (no isolation beyond the digest pin).
 
 ## Subagents and the runner
 
@@ -217,6 +273,9 @@ additive: `src` may not depend on `@hypertest/store`.)
 | I11 content-hashed manifest, no engine hot swap, unversioned pins fail closed; the runtime-BOM fields change the id and are validated; tool catalog revision pins timeouts, bindings and adapter capabilities | `test/manifest.test.ts` |
 | I11 runtime releases: promotion only one step at a time and only over the latest passing engine-contract AND replay results; one active / one canary; admission (unmanaged, active, selected canary, refused); rollback moves the pointer back and retires for good; append-only history and immutable manifests (triggers); epoch chain; compatibility verdict; `lock(tx)` holds off a rollback until the holder's transaction ends | `test/releases.test.ts` (PGlite + PostgreSQL) |
 | I12 depth/agent-count caps (incl. concurrent spawns, inherited depth cap), work budgets | `test/subagents.test.ts`, `test/runner.test.ts` |
+| I3 switch triggers (manual, policy, quality, cost, fallback) re-checked BEFORE the epoch; refused switches record no epoch; PAUSE vs fail closed | `test/model-switch.test.ts` |
+| A[4] EngineCapabilities: emulate or refuse; resumeChild through the engine (native, pi, DSH); inspect | `test/engine-abi.test.ts`, contract suite ("resumeChild (A[4])") |
+| A[6] plugin lifecycle order, health failure, digest mismatch (nothing loaded), undeclared contributions refused | `test/plugins.test.ts` |
 
 ## Contract changes (additive, 0.3)
 
@@ -243,6 +302,18 @@ parent's, a child capability must be covered by the parent's, `routeRequestExtra
   `runtime/005-releases` appended to `runtimeMigrations`. Domain (additive): `RuntimeEpoch`, `RuntimeCompatibilityCheck`,
   `PauseReason` `quarantined` | `migrating`, `EVENT_TYPES.runMigrated` (`run.migrated`) / `runQuarantined`
   (`run.quarantined`), `BuiltinRole` `vision_gui` | `local_private`.
+- (unit model-runtime, wave 1; additive) `ModelInvocation` failure `unavailable?`, `pause?`, `budget?`
+  (`ModelBudgetRefusal`); `ModelPause`, `ModelSwitchRequest`, `ModelSwitchOutcome`, `TokenCalibration`;
+  `BudgetPort.remaining?`; `InvokerDeps` `events?`, `catalog?`, `costBudgeted?`, `costPressure?`, `costPressureRatio?`,
+  `providerSwitch?`, `pauseBackoff?`, `calibration?`, `minOutputTokens?`; `EpochManager` optional pause / switch methods
+  (above), `StartEpochOptions.profile?`, `EpochRouting.profile?`; migration `runtime/006-model-pauses-switches`
+  (`ht_epochs.route_profile`, `ht_agents.resume_pending`, `ht_model_pauses`, `ht_model_switches`,
+  `ht_model_switch_outcomes`); exports `createTokenCalibration`, `CALIBRATION_BOUNDS`, `DEFAULT_PAUSE_BACKOFF`,
+  `DEFAULT_COST_PRESSURE_RATIO`, `qualityOnlyChange`, `childModes`, `capabilityModes`, `inspectAgents`, the plugin kernel
+  (`createPluginKernel`, `pluginDigest`, `validatePluginManifest`, `PLUGIN_KINDS` and types). Behaviour: the switch
+  re-check precedes the epoch; continuable children resume through `engine.resumeChild` when the engine supports it
+  (`SubagentRuntime.resume` then only marks the agent; the runner resumes it at its next step); the engines'
+  `resumeChild` refuses failed/disposed sessions (`precondition_failed`).
 - (review fix, additive) `RuntimeReleaseRegistry.lock(tx)`: takes the registry's mutation lock inside the caller's
   transaction (held until it ends; `invalid_argument` without one), so a caller that acts on a release's state (the
   app's run migration) re-reads it after every register/promotion/rollback/retirement that could change it. Lock order:

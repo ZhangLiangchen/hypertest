@@ -36,13 +36,22 @@ function leadComplete(summary: string, ready: boolean, evidenceRefs: string[]) {
 /** The lead plans ONE executor item; everything after the finding happens through reactors, not through the lead. */
 export const pocBLead: RoleBrain = (v) => {
   if (v.kind === 'initial_plan') {
+    // D-4: the probe writes to the bank (accounts, transfers): it runs for an experiment that records what it does
     if (v.step === 0) {
+      return toolCall('experiment.define', {
+        hypothesis: 'POST /transfers rejects non-positive amounts with 400 (bank-api B1) and transfers conserve the total balance (B2)',
+        environmentId: BANK_ENV_ID, isolation: { mode: 'exclusive_write', resourceClaims: [] }, evidenceRequirements: [{ evidenceType: 'api-response', minCount: 1 }],
+      });
+    }
+    if (v.step === 1) {
+      const experimentId = str(jsonOf(resultText(v, 0)), 'experimentId');
       return leadReply('black-box target: probe the transfer contract directly, the reactors take the defect loop', 'plan.propose_revision', {
         rationale: 'Plan v1: probe POST /transfers of environment bank against oracle bank-api (B1 non-positive amounts ⇒ 400, B2 balance conservation) and record every exchange.',
         objectives: [OBJECTIVE],
         workItems: [
           {
             localId: 'probe-transfers', title: 'Probe the transfer contract', role: 'executor', dependsOn: [], objectiveIds: [OBJECTIVE.objectiveId],
+            ...(experimentId ? { inputRefs: [{ kind: 'experiment', id: experimentId }] } : {}),
             objective: `Against environment ${BANK_ENV_ID}: open two accounts, POST /transfers with amount 0 and with a negative amount (oracle bank-api B1 expects 400 for both), read the accounts back and GET /health (B2: balanceConserved). Post an evidence-backed finding for every violation.`,
             evidenceRequirements: [{ evidenceType: 'api-response', minCount: 1, critical: true }],
           },
@@ -226,12 +235,16 @@ export const pocBTestDesigner: RoleBrain = (v) => {
     case 3: {
       const run = resultText(v, 2);
       const artifactId = str(jsonOf(resultText(v, 1)), 'artifactId')!;
-      return toolCall('test_artifact.validate', /NOT PASSED/.test(run) ? { artifactId, knownBadEvidenceId: evIds(run).at(-1)! } : { artifactId, knownGoodEvidenceId: evIds(run).at(-1)! });
+      // D-1: a black-box service has no base revision to run against: the known-good run cannot exist yet — recorded, so
+      // the artifact can never support a P0/P1 assertion on its own
+      return toolCall('test_artifact.validate', /NOT PASSED/.test(run)
+        ? { artifactId, knownBadEvidenceId: evIds(run).at(-1)!, knownGoodUnavailableReason: 'the defective bank service is the only deployment: no fixed build exists to run this regression test against' }
+        : { artifactId, knownGoodEvidenceId: evIds(run).at(-1)! });
     }
     default: {
       const artifactId = str(jsonOf(resultText(v, 1)), 'artifactId')!;
       const ev = evIds(resultText(v, 2)).at(-1)!;
-      const summary = `Regression test ${REGRESSION_TEST_PATH} (artifact ${artifactId}) for finding ${finding.recordId}: it fails on the defective service (known-bad ${ev}); the known-good run awaits a fix.`;
+      const summary = `Regression test ${REGRESSION_TEST_PATH} (artifact ${artifactId}) for finding ${finding.recordId}: it fails on the defective service (known-bad ${ev}); no known-good deployment exists (recorded).`;
       return toolCall('complete_work', { summary, evidenceRefs: [ev], recordRefs: [finding.recordId], output: { summary, testArtifacts: [{ artifactId, path: REGRESSION_TEST_PATH, covers: [finding.recordId], evidenceRefs: [ev] }] } });
     }
   }

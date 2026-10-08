@@ -52,8 +52,22 @@ export const statusCommand: Command = {
         const run = await requireRun(ht, runId);
         const { decision, interim } = await runDecisions(ht, run);
         const reassessment = decision ? await ht.services.decisions.reassessment(decision.decisionId) : undefined;
-        if (ctx.global.json) ctx.json({ run, decision: decision ?? null, interimDecision: interim ?? null, needsReassessment: reassessment?.needsReassessment ?? false });
-        else for (const l of runLines(run, decision, reassessment, interim)) ctx.out(l);
+        // A[4]: each agent's session state comes from its engine (engine.inspect), with its route and any model pause
+        const agents = await ht.agents(runId);
+        if (ctx.global.json) ctx.json({ run, decision: decision ?? null, interimDecision: interim ?? null, needsReassessment: reassessment?.needsReassessment ?? false, agents });
+        else {
+          for (const l of runLines(run, decision, reassessment, interim)) ctx.out(l);
+          if (agents.length > 0) {
+            ctx.out('agents:');
+            const rows = agents.map((a) => {
+              const engine = 'error' in a.engine ? `inspect failed: ${a.engine.error}` : `${a.engine.status}, ${a.engine.turnCount} turn(s)${a.engine.lastTurnStatus ? `, last ${a.engine.lastTurnStatus}` : ''}`;
+              const route = a.epoch ? `${a.epoch.routeId} (${a.epoch.switchReason})` : '-';
+              const pause = a.modelPause ? `paused (model_unavailable) until ${a.modelPause.resumeAt}` : '';
+              return [a.agentId, a.role, a.status, `${a.engineKind}: ${engine}`, route, pause];
+            });
+            for (const l of table(['AGENT', 'ROLE', 'STATUS', 'ENGINE (inspect)', 'ROUTE (epoch)', 'MODEL PAUSE'], rows)) ctx.out(`  ${l}`);
+          }
+        }
         return EXIT_CODES.ok;
       }
       const runs = await ht.listRuns({ ...(statuses.length > 0 ? { status: statuses as RunStatus[] } : {}), limit });

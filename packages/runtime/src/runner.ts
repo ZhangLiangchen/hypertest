@@ -2,6 +2,7 @@ import { HypertestError } from '@hypertest/core';
 import type { AgentInstance, EventContext, WorkBudget } from '@hypertest/domain';
 import type { AgentRunner, DispatchResult, EngineHost, RunnerDeps, RunTurnRequest, RunTurnResult, StepOutcome, TerminalSignal, TurnLimits, TurnRecord } from './contracts.ts';
 import { zeroUsage } from './util.ts';
+import { SETTLED_TURN_STATUSES, resumeState, setResumePending } from './agents.ts';
 
 /** Consecutive `retry_next_turn` boundaries run() follows before handing control back (fallback chains are finite anyway). */
 export const MAX_CONSECUTIVE_RETRY_BOUNDARIES = 4;
@@ -85,14 +86,47 @@ export function createAgentRunner(deps: RunnerDeps): AgentRunner {
     return undefined;
   }
 
+  /**
+   * (A[4]) Whether the agent's next step resumes it through engine.resumeChild. A resume the engine already took over
+   * before a crash left the flag set is consumed here, and the ordinary recovery then settles / replays / continues that
+   * turn instead of running another one: the engine reactivated the session (it is `active` — a resume is only pending
+   * for a session that is not), or a turn settled after the one settled at the resume (the resumed or replayed turn
+   * committed, and the session closed again: completed / waiting / failed).
+   */
+  async function pendingResume(agent: AgentInstance): Promise<boolean> {
+    const state = await resumeState(deps.db, agent.agentId);
+    if (!state.pending) return false;
+    const session = await sessions.get(agent.sessionId);
+    const last = await sessions.lastTurn(agent.sessionId);
+    const reactivated = session?.status === 'active';
+    const settledAfter = state.afterTurn !== undefined && last !== undefined && SETTLED_TURN_STATUSES.has(last.status) && last.turn > state.afterTurn;
+    if (reactivated || settledAfter) {
+      await setResumePending(deps.db, agent.agentId, false);
+      logger.warn('the engine already took over the resume of this agent before a crash: recovering that turn', {
+        agentId: agent.agentId, afterTurn: state.afterTurn ?? null, lastTurn: last?.turn ?? null, lastTurnStatus: last?.status ?? null, sessionStatus: session?.status ?? null,
+      });
+      return false;
+    }
+    return true;
+  }
+
   async function step(agentId: string, host: EngineHost, options: { limits: TurnLimits; signal: AbortSignal }): Promise<StepOutcome> {
     const agent = await mustGet(agentId);
     assertRunnable(agent);
-    const recovered = await recoverCommitted(agent, host.eventContext);
-    if (recovered) return recovered;
+    // A[4]: a resumed child (continuable / interrupted) continues through its engine's resumeChild, which reactivates the
+    // child session (its previous `completed` session is not an unsettled outcome to recover)
+    const resuming = await pendingResume(agent);
+    if (!resuming) {
+      const recovered = await recoverCommitted(agent, host.eventContext);
+      if (recovered) return recovered;
+    }
     const engine = engines.get(agent.engineKind);
     const request: RunTurnRequest = { session: { sessionId: agent.sessionId, engineKind: agent.engineKind }, host, limits: options.limits, signal: options.signal };
-    const result = await engine.runTurn(request);
+    let result: RunTurnResult;
+    if (resuming) {
+      result = await engine.resumeChild({ child: request.session, host, limits: options.limits, signal: options.signal });
+      await setResumePending(deps.db, agentId, false);
+    } else result = await engine.runTurn(request);
 
     const fresh = await mustGet(agentId);
     if (fresh.status === 'disposed') return { result, agent: fresh };
@@ -147,7 +181,7 @@ export function createAgentRunner(deps: RunnerDeps): AgentRunner {
         assertRunnable(agent);
         const session = await sessions.get(agent.sessionId);
         if (!session) throw new HypertestError('not_found', `session ${agent.sessionId} of agent ${agentId} not found`);
-        if (session.status === 'completed' || session.status === 'failed' || (session.status === 'waiting' && agent.status === 'active')) {
+        if ((session.status === 'completed' || session.status === 'failed' || (session.status === 'waiting' && agent.status === 'active')) && !(await pendingResume(agent))) {
           // The engine already decided (an earlier attempt crashed before the agent was updated): settle / sync the
           // recorded outcome first. Budgets must not override a recorded completion.
           host = await hostFactory();

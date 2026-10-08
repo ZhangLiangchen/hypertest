@@ -378,3 +378,86 @@ describe('REST API security and lifecycle', () => {
     await api.close();
   });
 });
+
+describe('REST API: model operations (A[0] resume, A[3] model switch, A[4] agent inspection)', () => {
+  const TOKEN = 'operator-token-0123456789';
+  function opsFacade() {
+    const ht = fakeHypertest();
+    return Object.assign(ht, {
+      async resume(runId: string) {
+        ht.calls.push(['resume', [runId]]);
+        return { releasedPauses: 2 };
+      },
+      async agents(runId: string) {
+        ht.calls.push(['agents', [runId]]);
+        return [{ agentId: 'ag_1', role: 'lead', engine: { state: 'running' }, modelPause: null }];
+      },
+      async requestModelSwitch(...args: unknown[]) {
+        ht.calls.push(['requestModelSwitch', args]);
+        if (args[2] === 'ghost') throw new HypertestError('invalid_argument', 'route ghost is not in the model catalog (main, backup)');
+        return { switchId: 'msw_1', runId: args[0], target: { kind: 'role', role: args[1] }, routeId: args[2], requestedBy: 'human:alice' };
+      },
+    });
+  }
+
+  test('POST /runs/:id/resume (an operator decision: token) releases the model pauses; GET /runs/:id/agents lists the inspected agents; unknown runs are 404', async () => {
+    const ht = opsFacade();
+    // without a token an agent reaching the loopback API could un-pause a run an operator or the budget paused (I1)
+    const open = await startApiServer(ht as unknown as Hypertest, { port: 0 });
+    try {
+      const r = await request(open.url, 'POST', '/runs/run_1/resume', json({}));
+      assert.deepEqual([r.status, r.json().error.code], [403, 'token_required']);
+      assert.equal(ht.calls.filter((c) => c[0] === 'resume').length, 0, 'never reached the facade');
+      const agents = await request(open.url, 'GET', '/runs/run_1/agents');
+      assert.deepEqual([agents.status, agents.json().agents.map((a: { agentId: string }) => a.agentId)], [200, ['ag_1']], 'reading the agents needs no decision token');
+    } finally {
+      await open.close();
+    }
+    const api = await startApiServer(ht as unknown as Hypertest, { port: 0, token: TOKEN });
+    const auth = (body: unknown) => ({ body: JSON.stringify(body), headers: { 'content-type': 'application/json', authorization: `Bearer ${TOKEN}` } });
+    try {
+      let r = await request(api.url, 'POST', '/runs/run_1/resume', auth({}));
+      assert.deepEqual([r.status, r.json()], [200, { ok: true, releasedPauses: 2 }]);
+      assert.deepEqual(ht.calls.findLast((c) => c[0] === 'resume')![1], ['run_1']);
+      r = await request(api.url, 'POST', '/runs/run_nope/resume', auth({}));
+      assert.deepEqual([r.status, r.json().error.code], [404, 'not_found']);
+      r = await request(api.url, 'POST', '/runs/run_1/resume', json({}));
+      assert.deepEqual([r.status, r.json().error.code], [401, 'unauthenticated']);
+      r = await request(api.url, 'GET', '/runs/run_1/resume', { headers: { authorization: `Bearer ${TOKEN}` } });
+      assert.deepEqual([r.status, r.headers['allow']], [405, 'POST']);
+    } finally {
+      await api.close();
+    }
+  });
+
+  test('POST /runs/:id/model-switch is an operator decision: refused without the token (never reaches the facade), validated with it', async () => {
+    const ht = opsFacade();
+    const open = await startApiServer(ht as unknown as Hypertest, { port: 0 });
+    try {
+      const r = await request(open.url, 'POST', '/runs/run_1/model-switch', json({ target: 'executor', routeId: 'backup', by: 'agent' }));
+      assert.deepEqual([r.status, r.json().error.code], [403, 'token_required']);
+      assert.equal(ht.calls.filter((c) => c[0] === 'requestModelSwitch').length, 0);
+    } finally {
+      await open.close();
+    }
+    const api = await startApiServer(ht as unknown as Hypertest, { port: 0, token: TOKEN });
+    const auth = (body: unknown) => ({ body: JSON.stringify(body), headers: { 'content-type': 'application/json', authorization: `Bearer ${TOKEN}` } });
+    try {
+      let r = await request(api.url, 'POST', '/runs/run_1/model-switch', auth({ target: 'executor', routeId: 'backup', by: 'alice', reason: 'degraded' }));
+      assert.deepEqual([r.status, r.json().switch.switchId], [200, 'msw_1']);
+      assert.deepEqual(ht.calls.findLast((c) => c[0] === 'requestModelSwitch')![1], ['run_1', 'executor', 'backup', { kind: 'human', id: 'alice' }, 'degraded']);
+      r = await request(api.url, 'POST', '/runs/run_1/model-switch', auth({ target: 'executor', routeId: 'backup', by: 'alice', force: true }));
+      assert.deepEqual([r.status, r.json().error.message], [400, "unknown field 'force'"]);
+      r = await request(api.url, 'POST', '/runs/run_1/model-switch', auth({ target: 'executor', routeId: 'backup' }));
+      assert.deepEqual([r.status, r.json().error.message], [400, 'by must be a non-empty string']);
+      r = await request(api.url, 'POST', '/runs/run_1/model-switch', auth({ target: 'executor', routeId: 'ghost', by: 'alice' }));
+      assert.deepEqual([r.status, r.json().error], [400, { code: 'invalid_argument', message: 'route ghost is not in the model catalog (main, backup)' }]);
+      r = await request(api.url, 'POST', '/runs/run_nope/model-switch', auth({ target: 'executor', routeId: 'backup', by: 'alice' }));
+      assert.deepEqual([r.status, r.json().error.code], [404, 'not_found']);
+      r = await request(api.url, 'POST', '/runs/run_1/model-switch', json({ target: 'executor', routeId: 'backup', by: 'mallory' }));
+      assert.deepEqual([r.status, r.json().error.code], [401, 'unauthenticated']);
+    } finally {
+      await api.close();
+    }
+  });
+});

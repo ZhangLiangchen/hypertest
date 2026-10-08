@@ -264,17 +264,20 @@ export const runCommand: Command = {
 export const resumeCommand: Command = {
   name: 'resume',
   summary: 'resume the incomplete runs pinned to this runtime (after a crash or an interruption)',
-  usage: ['resume [--detach] [--follow] [--timeout-ms <n>]'],
+  usage: ['resume [<runId>] [--detach] [--follow] [--timeout-ms <n>]'],
   optionHelp: [
     ['--detach', 'only (re)start the durable workflows (durable.kind temporal only; this process hosts no worker)'],
     ['--follow', 'print the runs\' events to stderr while waiting'],
     ['--timeout-ms <n>', 'stop waiting after n ms'],
   ],
-  notes: ['Exit code: 0 when every resumed run completed with a verdict, 1 otherwise; 130 when interrupted.'],
+  notes: [
+    'With <runId>: that run only — its agents paused for model unavailability resume now (their routes\' open circuits probe), and a paused run is resumed. Without: every incomplete run pinned to this runtime (model pauses are released too).',
+    'Exit code: 0 when every resumed run completed with a verdict, 1 otherwise; 130 when interrupted.',
+  ],
   options: { detach: { type: 'boolean' }, follow: { type: 'boolean' }, 'timeout-ms': { type: 'string' } },
   longRunning: (values) => values['detach'] !== true,
   async run(ctx, values, args) {
-    positionals('resume', args, []);
+    const [only] = positionals('resume', args, [], ['runId']);
     const detach = flag(values, 'detach');
     const timeoutMs = int('resume', values, 'timeout-ms', { min: 1 });
     return withInstance(ctx, { drivesAgents: !detach, ...(detach ? { adjust: detachable('resume') } : {}) }, async ({ ht }) => {
@@ -283,7 +286,12 @@ export const resumeCommand: Command = {
         if (ctx.global.json) ctx.json({ resumed: [], outcomes: [], interrupted: true });
         return EXIT_CODES.interrupted;
       }
-      const ids = await ht.resumeIncomplete();
+      let ids: string[];
+      if (only !== undefined) {
+        const r = await ht.resume(only);
+        if (!ctx.global.json && r.releasedPauses.length > 0) ctx.err(`released ${r.releasedPauses.length} model pause(s) of run ${only}`);
+        ids = [only];
+      } else ids = await ht.resumeIncomplete();
       if (ids.length === 0) {
         if (ctx.global.json) ctx.json({ resumed: [], outcomes: [] });
         else ctx.out('no incomplete runs pinned to this runtime');

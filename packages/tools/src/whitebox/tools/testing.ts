@@ -1,7 +1,7 @@
 import { readFile, stat } from 'node:fs/promises';
 import { HypertestError, canonicalJson, sha256Hex, type JsonValue } from '@hypertest/core';
 import type { ArtifactRef } from '@hypertest/domain';
-import { DEFAULT_TEST_PATH_PATTERNS, matchesGlob } from '@hypertest/policy';
+import { TEST_FILE_PATH_PATTERNS, isTestPath } from '@hypertest/policy';
 import type { BuiltinToolOptions, CoverageMap, TestRunnerAdapter, TestRunResult, ToolContext, ToolSpec, WorkspaceHandle, WorkspaceManager } from '../../contracts.ts';
 import { detectCoverageFormat, parseCoverage, type CoverageFormat } from '../coverage.ts';
 import { MUTATION_OPERATORS, runMutationAnalysis } from '../mutation.ts';
@@ -30,16 +30,14 @@ export async function selectRunner(runners: readonly TestRunnerAdapter[], ws: Wo
 
 /**
  * Paths whose change can alter which test cases run or what they assert: the policy's test path patterns plus the
- * default discovery patterns of the supported runners (node:test `*-test.*`, `*_test.*`, `test-*.*`, `test.*`; spec dirs).
+ * default discovery patterns of the supported runners (node:test `*-test.*`, `*_test.*`, `test-*.*`, `test.*`; spec dirs) —
+ * policy `TEST_FILE_PATH_PATTERNS`, the same list the sensitivity binding judges mutation targets with.
  */
-export const TEST_FILE_PATTERNS: readonly string[] = Object.freeze([
-  ...DEFAULT_TEST_PATH_PATTERNS,
-  '**/*-test.*', '**/*_test.*', '**/test-*.*', '**/test.*', '**/*_spec.*', '**/spec/**', '**/__tests__/**',
-]);
+export const TEST_FILE_PATTERNS: readonly string[] = TEST_FILE_PATH_PATTERNS;
 const MAX_DELTA_TEST_FILES = 500;
 
 export function isTestFilePath(path: string): boolean {
-  return TEST_FILE_PATTERNS.some((g) => matchesGlob(g, path));
+  return isTestPath(path);
 }
 
 /**
@@ -175,6 +173,11 @@ interface TestRunInput {
   testArtifactIds?: string[];
   /** (additive, D-1) `base`: run on the base revision (product code restored, test files kept) — a known-good run. */
   revision?: 'workspace' | 'base';
+  /**
+   * (additive, D-1) The base commit of a `revision: "base"` run. The control plane sets it from the run's target.baseCommit
+   * (an agent-supplied value is overridden); the evidence records it in `codeRevision.baseCommit`.
+   */
+  baseCommit?: string;
 }
 
 const BASE_RUN_NOTE = '\nKNOWN-GOOD RUN ON THE BASE REVISION: product code restored to the base commit, your test files kept. This is validation evidence for test_artifact.validate (knownGoodEvidenceId) only — it is never evidence about the candidate.';
@@ -199,6 +202,7 @@ export function testRunTool(options: BuiltinToolOptions): ToolSpec<TestRunInput>
         testArtifactId: { type: 'string', minLength: 1, maxLength: 128 },
         testArtifactIds: { type: 'array', items: { type: 'string', minLength: 1, maxLength: 128 }, maxItems: 50 },
         revision: { enum: ['workspace', 'base'], default: 'workspace' },
+        baseCommit: { type: 'string', pattern: '^[0-9a-f]{7,64}$' },
       },
     },
     effect: 'execute',
@@ -234,7 +238,8 @@ export function testRunTool(options: BuiltinToolOptions): ToolSpec<TestRunInput>
       let codeRevision: Record<string, JsonValue>;
       let cleanup: (() => Promise<void>) | undefined;
       if (base) {
-        const r = await runOnBaseRevision({ ws: ctx.workspace, workspaces: options.workspaces, runner, sandbox: options.sandbox, request, isTestFile: (p) => isTestFilePath(p) || p === selected });
+        if (input.baseCommit === undefined) throw new HypertestError('precondition_failed', 'revision "base" needs the run\'s base commit (the target names none): a known-good run on the base revision is impossible here');
+        const r = await runOnBaseRevision({ ws: ctx.workspace, workspaces: options.workspaces, runner, sandbox: options.sandbox, request, isTestFile: (p) => isTestFilePath(p) || p === selected, baseCommit: input.baseCommit });
         run = r.run;
         root = r.root;
         codeRevision = r.codeRevision;
@@ -346,7 +351,7 @@ export function mutationRunTool(options: BuiltinToolOptions): ToolSpec<MutationI
   return {
     id: 'mutation.run',
     title: 'Mutation analysis',
-    description: `Validate test sensitivity: mutate a source file (operators: ${MUTATION_OPERATORS.join(', ')}) in a private copy of the workspace and run the selected tests against each mutant. killed = tests fail, survived = tests still pass. The baseline must pass first. Records mutation-result evidence with the score (killed / decidable mutants). The workspace itself is never modified.`,
+    description: `Validate test sensitivity: mutate a PRODUCT source file of the candidate (operators: ${MUTATION_OPERATORS.join(', ')}) in a private copy of the workspace and run the selected tests against each mutant. killed = tests fail, survived = tests still pass. The baseline must pass first. Test files (and files written in your workspace) are refused as mutation targets: mutants of a test prove nothing about the product. Records mutation-result evidence with the score (killed / decidable mutants), the test files that ran and the mutated file. The workspace itself is never modified.`,
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -367,9 +372,24 @@ export function mutationRunTool(options: BuiltinToolOptions): ToolSpec<MutationI
     // copies and executes the whole workspace's test suite: the root is touched, not only the mutated file
     resources: (input, ctx) => [rootResource(ctx), pathResource(ctx, input.file)],
     async execute(input, ctx) {
+      const mutatedPath = normalizeRel(input.file);
+      // D-0: mutants of test code (the artifact itself, another test, a fixture) never show that a test notices a product
+      // defect — refused before anything runs (the sensitivity binding refuses such a result too)
+      if (isTestFilePath(mutatedPath)) {
+        throw new HypertestError('invalid_argument', `${mutatedPath} is test code: mutation.run mutates the candidate's PRODUCT source (the code the tests check) — mutating a test file proves nothing about its sensitivity`);
+      }
       const runner = await selectRunner(runners, ctx.workspace, input.framework);
       // D-0: the code the analysis runs on (derived before it runs) — recorded with the executed test files
       const delta = await workspaceDelta(ctx.workspace, options.workspaces, input.testSelector);
+      // D-0: whether the mutated file is the candidate's own code or was written in this workspace (derived, never claimed)
+      let changedSinceBase: boolean | undefined;
+      if (typeof options.workspaces.changedFiles === 'function') {
+        try {
+          changedSinceBase = (await options.workspaces.changedFiles(ctx.workspace)).some((c) => normalizeRel(c.path) === mutatedPath && c.change !== 'deleted');
+        } catch {
+          changedSinceBase = undefined;
+        }
+      }
       const analysis = await runMutationAnalysis({
         ws: ctx.workspace,
         file: normalizeRel(input.file),
@@ -389,6 +409,7 @@ export function mutationRunTool(options: BuiltinToolOptions): ToolSpec<MutationI
       const structured = JSON.parse(JSON.stringify(analysis)) as Record<string, JsonValue>;
       structured['codeRevision'] = workspaceCodeRevision(delta);
       structured['workspaceDelta'] = delta;
+      structured['mutatedFile'] = { path: mutatedPath, isTestFile: false, ...(changedSinceBase !== undefined ? { changedSinceBase } : {}) };
       if (input.testArtifactId) structured['testArtifactId'] = input.testArtifactId;
       const ev = await ctx.recordEvidence({
         evidenceType: 'mutation-result',
@@ -401,6 +422,7 @@ export function mutationRunTool(options: BuiltinToolOptions): ToolSpec<MutationI
       const ranFiles = analysis.executedTests?.files.map((f) => f.path) ?? [];
       const text =
         `mutation score ${(analysis.score * 100).toFixed(1)}%: ${analysis.killed} killed, ${analysis.survived} survived, ${analysis.errors} errors (${analysis.total} run of ${analysis.generated} generated)` +
+        `\nmutated: ${mutatedPath}${changedSinceBase === true ? ' (added or modified in your workspace: mutants of a file you wrote show no sensitivity — mutate the candidate\'s own product code)' : ''}` +
         `\nexecuted test files: ${ranFiles.join(', ') || 'none attributable'}${(analysis.executedTests?.unattributedCases ?? 0) > 0 ? ` (+${analysis.executedTests!.unattributedCases} unattributed case(s))` : ''} — this result validates a test artifact only when it executed exactly that artifact's file` +
         (survivors.length ? '\nsurvivors (tests did not notice):\n' + survivors.map((m) => `  L${m.line} ${m.operator}: ${JSON.stringify(m.original)} -> ${JSON.stringify(m.replacement)}`).join('\n') : '');
       return { status: 'success', structured, text, evidenceRefs: [ev.evidenceId] };

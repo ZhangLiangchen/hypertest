@@ -54,6 +54,7 @@ export const DOMAIN_TOOL_IDS = Object.freeze([
   'oracle.list',
   'oracle.propose_change',
   'experiment.define',
+  'experiment.stop',
   'test_artifact.register',
   'test_artifact.validate',
   'evidence.get',

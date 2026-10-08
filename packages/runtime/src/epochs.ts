@@ -296,7 +296,8 @@ export function createEpochManager(deps: EpochDeps): EpochManager {
     async releaseModelPauses(runId, at) {
       assertNonEmpty(runId, 'runId');
       if (!Number.isFinite(Date.parse(at))) throw new HypertestError('invalid_argument', `at must be an ISO-8601 time (got ${at})`);
-      const r = await db.query<{ session_id: string }>(`UPDATE ht_model_pauses SET resume_at = LEAST(resume_at, $2::timestamptz) WHERE run_id = $1 RETURNING session_id`, [runId, at]);
+      // only pauses that would still wait are released (a repeated release changes nothing and reports nothing)
+      const r = await db.query<{ session_id: string }>(`UPDATE ht_model_pauses SET resume_at = $2::timestamptz WHERE run_id = $1 AND resume_at > $2::timestamptz RETURNING session_id`, [runId, at]);
       return r.rows.map((row) => row.session_id).sort();
     },
 

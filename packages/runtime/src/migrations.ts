@@ -18,9 +18,13 @@ import { RELEASE_MIGRATION } from './releases.ts';
  * - 005 (runtime release registry, `releases.ts`): `ht_runtime_releases` (registered manifests and their release state;
  *   the manifest is immutable), `ht_runtime_release_pointer` (the active pointer), `ht_runtime_release_lock`,
  *   `ht_runtime_suite_results` / `ht_runtime_release_transitions` / `ht_runtime_epochs` (append-only).
- * - 006: `ht_epochs.route_profile` (A[3]: the route's capability profile when the epoch started, to tell a quality switch
+ * - 006: `ht_agents.resume_pending` (A[4]: a resumed child continues through its engine's resumeChild at the next step),
+ *   `ht_epochs.route_profile` (A[3]: the route's capability profile when the epoch started, to tell a quality switch
  *   from a policy switch after a catalog change), `ht_model_pauses` (A[0]: a session paused for model unavailability, durable resume time), `ht_model_switches` +
  *   `ht_model_switch_outcomes` (A[3]: manual model switch requests and each target agent's applied/refused outcome).
+ * - 007: `ht_agents.resume_after_turn` (A[4]: the session's last settled turn when a resume through resumeChild was
+ *   requested — a later settled turn, or the session active again, means the engine already took the resume over, so a
+ *   crash before the flag was cleared never runs a second turn).
  */
 export const runtimeMigrations: Migration[] = [
   {
@@ -186,6 +190,7 @@ ALTER TABLE ht_agents ADD COLUMN IF NOT EXISTS max_depth integer CHECK (max_dept
     id: 'runtime/006-model-pauses-switches',
     sql: `
 ALTER TABLE ht_epochs ADD COLUMN IF NOT EXISTS route_profile jsonb;
+ALTER TABLE ht_agents ADD COLUMN IF NOT EXISTS resume_pending boolean NOT NULL DEFAULT false;
 
 CREATE TABLE IF NOT EXISTS ht_model_pauses (
   session_id   text PRIMARY KEY REFERENCES ht_sessions (session_id),
@@ -223,5 +228,10 @@ CREATE TABLE IF NOT EXISTS ht_model_switch_outcomes (
   PRIMARY KEY (switch_id, agent_id)
 );
 `,
+  },
+  {
+    // A[4] crash window of an engine-driven resume: the turn the resume was requested after (see resumeState)
+    id: 'runtime/007-resume-after-turn',
+    sql: `ALTER TABLE ht_agents ADD COLUMN IF NOT EXISTS resume_after_turn integer CHECK (resume_after_turn IS NULL OR resume_after_turn >= 0);`,
   },
 ];

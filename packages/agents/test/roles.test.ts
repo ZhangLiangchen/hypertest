@@ -40,7 +40,7 @@ const TOOL_MAX_EFFECT: Record<KnownToolId, ToolEffect> = {
   'blackboard.read': 'read', 'blackboard.post_finding': 'record', 'blackboard.post_hypothesis': 'record', 'blackboard.report_coverage_gap': 'record',
   'blackboard.post_risk': 'record', 'blackboard.post_review': 'record', 'blackboard.post_note': 'record',
   'plan.propose_revision': 'record', 'plan.read': 'read', 'work.propose': 'record', 'system_model.record': 'record',
-  'oracle.get': 'read', 'oracle.list': 'read', 'oracle.propose_change': 'record', 'experiment.define': 'record',
+  'oracle.get': 'read', 'oracle.list': 'read', 'oracle.propose_change': 'record', 'experiment.define': 'record', 'experiment.stop': 'record',
   'test_artifact.register': 'record', 'test_artifact.validate': 'execute',
   'evidence.get': 'read', 'evidence.query': 'read', 'evidence.claim': 'record',
   delegate: 'record', 'delegate.status': 'read', 'delegate.collect': 'read', 'delegate.message': 'record', 'delegate.release': 'record',
@@ -257,7 +257,9 @@ test('lead prompt explains typed Plan IR, dynamic analysis-first planning, repla
 
 test('role prompts state their key operational rules', () => {
   const expectations: Record<string, string[]> = {
-    test_designer: ['Known-good', 'Known-bad', 'mutation.run', 'test_artifact.validate', 'never product code', 'the known-good run waits for a fix', 'leave it unvalidated'],
+    // D-1 (changed with gate-governance: a regression test's known-good run no longer waits for a fix — it runs on the base
+    // revision, or the designer records why none can exist; validation is followed by an independent review)
+    test_designer: ['Known-good', 'Known-bad', 'mutation.run', 'test_artifact.validate', 'never product code', 'revision "base"', 'knownGoodUnavailableReason', 'testSelector naming ONLY your test file', 'oracle consistency review'],
     executor: ['exactly as specified', 'No execution evidence, no finding', 'never as a product defect', 'load.stop', 'xpass', 'is not_run, never passed', 'restating every required field'],
     rca: ['Reproduce before theorising', '`confirmed`', '`hypothesis`', '`unknown`', 'blackboard.post_hypothesis', 'restating title, description, severity'],
     fixer: ['request_approval', 'Regression is mandatory', 'Never edit test files'],

@@ -137,6 +137,7 @@ describe('test artifacts: register → validate (sensitivity) → materialized i
   let h: Harness;
   let repo: Awaited<ReturnType<typeof pricingRepo>>;
   const designer: Array<{ name: string; content: string; isError: boolean }> = [];
+  const reviewer: Array<{ name: string; content: string; isError: boolean }> = [];
   let artifactId = '';
   before(async () => {
     repo = await pricingRepo();
@@ -159,15 +160,29 @@ describe('test artifacts: register → validate (sensitivity) → materialized i
             case 2:
               artifactId = parsed(v.lastResult!.content)['artifactId'] as string;
               return call('test.run', { framework: 'node_test', selector: 'test/regression.test.js', testArtifactIds: [artifactId] });
-            case 3: {
-              const tr = (await h.deps.evidence.query({ runId: v.runId, workItemId: v.workItemId, evidenceType: 'test-result' }))[0]!;
-              return call('test_artifact.validate', { artifactId, knownBadEvidenceId: tr.evidenceId });
+            case 3:
+              // the known-good run: the same test on the BASE revision (product code restored; the dispatcher binds the run's baseCommit)
+              return call('test.run', { framework: 'node_test', selector: 'test/regression.test.js', revision: 'base' });
+            case 4: {
+              const [bad, good] = await h.deps.evidence.query({ runId: v.runId, workItemId: v.workItemId, evidenceType: 'test-result' });
+              return call('test_artifact.validate', { artifactId, knownGoodEvidenceId: good!.evidenceId, knownBadEvidenceId: bad!.evidenceId });
             }
-            case 4:
+            case 5:
               return call('fs.write', { path: 'test/regression.test.js', content: REGRESSION_EXTENDED });
             default:
               return call('complete_work', { summary: 'regression test registered', output: { summary: 'registered', testArtifacts: [{ artifactId, path: 'test/regression.test.js', covers: ['discount-10'] }] } });
           }
+        },
+        // the oracle consistency review the validation requested (D-1): by the time it runs, the designer changed the test
+        // again (revision 3 is a draft), so an approval is refused — a review never approves content it did not see validated
+        reviewer: async (v) => {
+          if (v.lastResult) reviewer.push(v.lastResult);
+          const checked = (await h.deps.evidence.query({ runId: v.runId, evidenceType: 'test-result' })).slice(0, 2).map((e) => e.evidenceId);
+          const subjectRef = { kind: 'test_artifact', id: artifactId };
+          if (v.step === 0) return call('blackboard.post_review', { subjectRef, verdict: 'approve', rationale: 'the test checks 25% off 2000 is 1500', checkedEvidenceRefs: checked });
+          if (v.step === 1) return call('blackboard.post_review', { subjectRef, verdict: 'needs_more_evidence', rationale: 'the test changed after its validation', checkedEvidenceRefs: checked });
+          const recordId = parsed(reviewer[1]!.content)['recordId'] as string;
+          return call('complete_work', { summary: 'stale', output: { summary: 'the artifact changed after validation', verdict: 'needs_more_evidence', reviews: [recordId], checkedEvidenceIds: checked } });
         },
         executor: async (v) => {
           if (v.step === 0) {
@@ -192,15 +207,19 @@ describe('test artifacts: register → validate (sensitivity) → materialized i
     const t = await h.control.tick(run.runId);
     const design = t.dispatched[0]!;
     assert.equal(await runItem(h.control, design.workItemId, design.fencingToken), 'completed');
-    const [, registered, ran, validated, changed] = designer;
+    const [, registered, ran, baseRan, validated, changed] = designer;
     assert.equal(registered!.isError, false, registered!.content);
     const reg = parsed(registered!.content);
     assert.equal(reg['sourceType'], 'generated', 'a designer never registers its own test as existing');
     assert.equal(reg['approvalState'], 'draft');
     assert.equal(reg['artifactDigest'], sha256Hex(REGRESSION));
     assert.match(ran!.content, /NOT PASSED/);
+    assert.equal(baseRan!.isError, false, baseRan!.content);
+    assert.match(baseRan!.content, /KNOWN-GOOD RUN ON THE BASE REVISION/);
     assert.equal(validated!.isError, false, validated!.content);
-    assert.equal(parsed(validated!.content)['approvalState'], 'validated');
+    // D-1 lifecycle: static check + known-good on the base revision + bound known-bad ⇒ validated (review pending)
+    assert.equal(parsed(validated!.content)['approvalState'], 'validated', validated!.content);
+    assert.deepEqual(parsed(validated!.content)['stages'], { static: 'passed', knownGood: 'passed', knownBad: 'passed', mutation: 'missing', oracleReview: 'pending' });
     assert.equal(changed!.isError, false);
     const artifact = (await h.deps.specs.getTestArtifact(artifactId)) as TestArtifact;
     assert.equal(artifact.revision, 3);
@@ -209,9 +228,18 @@ describe('test artifacts: register → validate (sensitivity) → materialized i
     const history = await Promise.all([1, 2].map((r) => h.deps.specs.getTestArtifact(artifactId, r)));
     assert.deepEqual(history.map((a) => a!.approvalState), ['draft', 'validated']);
     assert.equal(history[1]!.validations.knownBad!.status, 'passed');
+    assert.equal(history[1]!.validations.knownGood!.revision, 'base');
+    assert.equal(history[1]!.validations.knownGood!.artifactDigest, sha256Hex(REGRESSION));
 
     const t2 = await h.control.tick(run.runId);
-    const exec = t2.dispatched[0]!;
+    const byId = new Map((await items(h, run.runId)).map((w) => [w.workItemId, w]));
+    const review = t2.dispatched.find((d) => byId.get(d.workItemId)!.role === 'reviewer')!;
+    assert.deepEqual(byId.get(review.workItemId)!.inputRefs, [{ kind: 'test_artifact', id: artifactId }]);
+    assert.equal(await runItem(h.control, review.workItemId, review.fencingToken), 'completed');
+    assert.equal(reviewer[0]!.isError, true);
+    assert.match(reviewer[0]!.content, /review_refused: review refused: test artifact ta_\w+ is draft: only a validated artifact \(static check, known-good, known-bad or mutation done\) can pass the oracle consistency review/);
+    assert.equal((await h.deps.specs.getTestArtifact(artifactId))!.approvalState, 'draft');
+    const exec = t2.dispatched.find((d) => byId.get(d.workItemId)!.role === 'executor') ?? (await h.control.tick(run.runId)).dispatched[0]!;
     assert.equal(await runItem(h.control, exec.workItemId, exec.fencingToken), 'completed');
     const execRoot = await workspaceRoot(h, exec.workItemId);
     assert.equal(await readFile(join(execRoot, 'test/regression.test.js'), 'utf8'), REGRESSION, 'the registered content was materialized');

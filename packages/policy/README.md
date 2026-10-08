@@ -17,9 +17,11 @@ Depends only on `@hypertest/core`, `@hypertest/domain` and `yaml`. The binding A
 | Permits (I1) | `BuiltinPolicyEngine(rules, revision, options?)`, `DEFAULT_POLICY_RULES`, `POLICY_RULE_SCHEMA`, `OpaPolicyEngine({ url, path, timeoutMs, revision })`, `CompositePolicyEngine(engines)`, `intersectConstraints` |
 | Audit | `createPolicyDecisionLog(deps)` (`ht_policy_decisions`), `createApprovalService(deps)` (`ht_approvals`), `policyMigrations` |
 | BUGate phases | `POLICY_PHASES`, `requestPhase`, `flaggedActionsOf`, `IMPLICIT_EVIDENCE_TYPES`, `actionOutcomeFacts`, `acceptanceFacts`, `applyPhasePermit`, `withPolicyHold`, types `PolicyPhase`, `ActionOutcomeFacts`, `TransitionFacts`, `AcceptanceFacts`, `PolicyHold` |
-| Oracles (I8) | `createOracleGovernance(deps)`, `assertMayDecide`, `agentIndependenceViolation` |
+| Oracles (I8) | `createOracleGovernance(deps)` (+ `invalidate`), `assertMayDecide`, `agentIndependenceViolation`, `authorityProblems` |
+| Test artifacts (D-0/D-1) | `sensitivityBinding(evidence, artifact, purpose)`, `artifactEligibility(artifact, ctx)`, `artifactCaseStatuses`, `executedTestsOf`, `codeRevisionOf`, `isBaseRevisionRun`, `sameTestFile`, `caseInFile`, `normalizeTestPath`, `oracleRefProblems`, `reviewProblems` |
+| Experiments (D-3/D-4/D-5) | `planViolation`, `faultMatches`, `evaluateStopConditions`, `observedErrorRate`, `exclusiveResourcesOf`, `experimentValidity`, `ACTION_MAY_HAVE_HAPPENED`, `FAULT_TOOL_IDS`, `LOAD_TOOL_IDS` |
 | Self-heal (I8) | `classifyTestChange(diff, options?)`, `categoryDecision`, `DEFAULT_TEST_PATH_PATTERNS`, `parseUnifiedDiff` |
-| Gate (I7) | `QualityGate#evaluate(input)`, `DEFAULT_GATE_SPEC`, `GATE_CRITERIA`, `currentRecords`, `evaluateOracleCheck` (the C3 check evaluator), `OracleCheckOutcome` |
+| Gate (I7) | `QualityGate#evaluate(input)`, `DEFAULT_GATE_SPEC`, `GATE_CRITERIA`, `currentRecords`, `evaluateOracleCheck` (the C3 check evaluator), `OracleCheckOutcome`, `ORACLE_AUTHORITY_KINDS`, `oracleAuthorityProblems` |
 | BUGate | `resolveProtocolBinding({ bugatePath? })`, `prepareProtocolContext(protocol, request)`, `EMBEDDED_PRINCIPLES`, `PREPARED_PROTOCOL_CONTEXT_SCHEMA` |
 
 ### Semantics worth knowing
@@ -96,8 +98,34 @@ Depends only on `@hypertest/core`, `@hypertest/domain` and `yaml`. The binding A
   selection changes in runner config and pytest collection hooks are `unknown` (approval). Malformed
   hunks (truncated, or `+`/`-` lines outside any hunk; `DiffFile.issues`) are `unknown`, never auto-allowed.
   Default test paths add `**/test/**`, `**/fixtures/**`, `**/testdata/**` to the spec'd JS/Python/Go set.
-- **QualityGate.** Pure and deterministic. Criteria C1–C9 (see `GATE_CRITERIA` and the header of
-  `src/gate.ts`); verdict precedence fail > inconclusive > conditional > pass. Beyond the letter of the
+- **Test artifacts (gate-governance, D-0/D-1).** `sensitivityBinding` decides whether a test-result / mutation-result
+  provably executed an artifact: its recorded `executedTests` name the artifact's file with exactly the registered
+  content digest and ≥ 1 case, its `codeRevision` records the code (tree digest); a mutation run must have executed
+  ONLY that file (complete attribution), and its recorded `mutatedFile` must be the candidate's PRODUCT code — not the
+  artifact, not another test (`isTestPath`: `TEST_FILE_PATH_PATTERNS`, shared with the tools), not a file written in the
+  workspace (review: an insensitive test used to "prove" sensitivity by killing mutants of its own tautological
+  assertion). The problem text is exact (`test_artifact.validate` refuses with it).
+  `artifactEligibility` re-derives the whole lifecycle from the cited evidence and review records — static check of
+  this content, known-good (passing, bound, on the run's base commit when run on the base revision — a pass on the
+  candidate workspace or a recorded "unavailable" reason keeps the artifact eligible but never lets it support or
+  violate a P0/P1 assertion: `criticalSupport` needs a base-revision known-good, `knownGoodRevision` says where it ran),
+  sensitivity (a bound failing known-bad on other code, or a bound mutation run with a killed mutant), oracle refs naming
+  assertions of oracles in force, an approving oracle consistency review of this digest by another agent of another
+  role — and never trusts a stored state or score.
+- **Superseded experiments and prose claims (review).** An experiment whose oracleRefs name a revision no longer in force
+  is superseded: its evidence never counts (reasons list it) and C10 does not judge it, so a NEW experiment re-run under
+  the revision in force decides. A critical claim without a value (its fact only in the prose of the statement) is
+  unknown in C9.
+- **Experiments (D-3/D-4/D-5).** `planViolation` (a fault outside the fault plan, load above the workload),
+  `evaluateStopConditions` (duration since the first action, error rate, metric threshold, manual; the earliest met
+  condition), `experimentValidity` (C10: isolation held, no foreign action on its exclusive resources during it,
+  environment generation unchanged except by its own verified restarts/deploys, executed == declared, no action after a
+  met stop condition, evidence requirements met, dedicated environment registered, oracle refs still in force;
+  contradictions ⇒ violations, missing facts ⇒ unknowns). Pure functions over the gate input.
+- **QualityGate.** Pure and deterministic. Criteria C0–C12 (see `GATE_CRITERIA` and the header of
+  `src/gate.ts`; gate-governance added C10 experiment_validity, C11 environment_validity, C12 domain_contracts and made
+  C3 bind artifacts, C4 count experiment requirements, C6 follow oracle judge policies and C9 evaluate claims);
+  verdict precedence fail > inconclusive > conditional > pass. Beyond the letter of the
   spec: C1 is also `unknown` with zero evidence, zero *eligible* evidence (only ineligible generated
   tests) or foreign-run evidence (a pass without evidence is impossible and C1 is never waivable); C2 treats unresolved P0/P1 test/infra/environment findings as
   `unknown`; C3 evaluates the latest *build* (by `environment.buildDigest`/`provenance.commit`) so a fix
@@ -132,6 +160,7 @@ Depends only on `@hypertest/core`, `@hypertest/domain` and `yaml`. The binding A
 | I1 permit before tool: capability checked first, signature/run/subject/work-item binding, malformed input denied, fail-closed defaults, OPA fail-closed, immutable rules | `test/engine.test.ts`, `test/opa.test.ts`, `test/opa.int.test.ts` |
 | I2 no amplification: attenuation per field, greedy child, tampered parent refused, non-canonical keys, seeded randomized property (400 capabilities × 50 actions) | `test/capabilities.test.ts`, `test/patterns.test.ts` |
 | I7 gate: one test per criterion (satisfied/violated/unknown), precedence, exceptions, determinism, zero (eligible) evidence, LLM-only critical, ineligible generated tests, latest build (unidentified evidence never hides the current build's failure) | `test/gate.test.ts` |
+| Gate-governance: the D-0 audit scenario (an insensitive test + another file's mutation result never passes), binding problems, lifecycle stages and unavailable known-good, symmetric C3 eligibility, critical test failed, claim evaluation (C9), C10 contradictions/unknowns and stop conditions (seeded property test), C11, C12, the five contract revisions on the decision, agent waivers ignored, D-7 authorities / judge policy / invalidation | `test/governance-lifecycle.test.ts` |
 | I8/conformance-2: evidence carrying a `workspaceDelta` counts only when every test file added/modified since the base commit is covered by the LATEST revision of a TestArtifact with exactly that content digest that proved its sensitivity (draft/quarantined/retired/insensitive/`existing`-claimed artifacts do not cover; one uncovered file taints the record even with an eligible declared artifact); an unavailable delta counts only for a read-only workspace | `test/gate.test.ts` › conformance-2 |
 | H8: `evaluateOracleCheck` is the gate's own C3 evaluator (same outcome and refs as C3) | `test/gate.test.ts` › H8 |
 | I8 oracles: self-approval, same/unknown provider or role, approver kinds, flip needs human (re-checked at decision time), stale proposal, create-only establish, concurrent approvals (in-process and across instances), resumable approval, new revision + reassessment | `test/oracle-governance.test.ts` |
@@ -178,6 +207,14 @@ expired) apply to.
 phase rules (the action rules are unchanged, so `builtin:<digest>` revisions change); `policy.decided` gains `phase`;
 the OPA input always has `phase`. Behaviour: a request with an unknown phase or malformed phase facts is denied
 (`malformed_request`).
+
+(gate-governance, additive) `GateInput.systemModel?` / `operations?` (`GateOperation`) / `experimentFacts?` /
+`environments?` (`EnvironmentFacts`) / `claimData?`; `OracleGovernance.invalidate?()`; new modules `src/sensitivity.ts`
+and `src/experiments.ts` (table above). Behaviour: criteria C10–C12 (all fail-type when violated; C11/C12 report
+`unknown`); `DEFAULT_GATE_SPEC.requireContracts: true`; the decision records `systemModelId`, `buildDigests` and
+`testArtifactRevisions`; a pinned oracle declared `invalid` makes C0 unknown; ungoverned or invalidated oracles are not
+in force. (The control plane re-pins a run to a newly approved oracle revision before gating — D-10 — so the
+conformance-4 "superseded" C0 detail remains only as a guard for a gate input assembled without re-pinning.)
 
 ## Testing
 

@@ -19,6 +19,7 @@ export {
   parseJunitCases, parseJestJson, parseGoTestJson, applyPytestSummary, goSelectorArgs, buildResult, totalsOf, type CommandRunnerOptions,
 } from './runners/index.ts';
 export { generateMutants, applyMutant, selectMutants, classifyMutantRun, maskSource, languageOf, runMutationAnalysis, MUTATION_OPERATORS, type MutationAnalysisInput } from './mutation.ts';
+export { attributeExecutedTests, changedSubset, collectedCleanly, runOnBaseRevision, staticCheckCommand, staticChecks, workspaceCodeRevision, type BaseRunInput, type ExecutedTestFileRecord, type ExecutedTestsRecord, type StaticCheck } from './executed.ts';
 export { DEFAULT_SHELL_ALLOWLIST, shellDenial } from './tools/shell.ts';
 export { patchPaths, parseNumstatPaths } from './tools/fs.ts';
 export { assertNotGitMetadata } from './tools/common.ts';

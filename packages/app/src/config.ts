@@ -13,7 +13,7 @@ import type { HypertestConfig, HypertestConfigInput, LoadConfigOptions, OracleCo
  * validation. Secrets never live in the configuration: `*Env` fields NAME environment variables (read at runtime).
  */
 
-export const PROVIDER_KINDS = ['openai-compatible', 'anthropic', 'pi-ai', 'scripted'] as const;
+export const PROVIDER_KINDS = ['openai-compatible', 'anthropic', 'pi-ai', 'scripted', 'plugin'] as const;
 export const ENGINE_KINDS = ['native', 'pi', 'dsh'] as const;
 /** Variables passed through to sandboxed processes by default (the sandbox sets PATH/HOME/LANG/TMPDIR itself). */
 export const DEFAULT_ENV_ALLOWLIST: readonly string[] = Object.freeze(['PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR']);
@@ -55,7 +55,7 @@ export function defaultedRouteFields(route: Partial<ModelCapabilityProfile>): { 
 
 const TOP_LEVEL_KEYS = new Set([
   'version', 'project', 'store', 'bus', 'durable', 'artifacts', 'models', 'roles', 'budget', 'gate', 'policy', 'bugate', 'engines', 'sandbox',
-  'environments', 'tools', 'signing', 'memory', 'observability', 'oracles', 'runtime',
+  'environments', 'tools', 'signing', 'memory', 'observability', 'oracles', 'runtime', 'plugins',
 ]);
 /** Discriminated sections: a patch with another `kind` replaces the section instead of merging into it. */
 const KIND_SECTIONS = new Set(['store', 'bus', 'durable', 'artifacts', 'memory']);
@@ -233,6 +233,9 @@ export function resolveConfigPaths(config: HypertestConfig, baseDir: string): Hy
   if (out.artifacts?.kind === 'fs' && out.artifacts.root !== undefined) out.artifacts.root = abs(out.artifacts.root)!;
   if (out.bugate?.path !== undefined) out.bugate.path = abs(out.bugate.path)!;
   if (out.signing?.keyFile !== undefined) out.signing.keyFile = abs(out.signing.keyFile)!;
+  if (out.models?.pricesFile !== undefined) out.models.pricesFile = abs(out.models.pricesFile)!;
+  if (out.models?.scoresFile !== undefined) out.models.scoresFile = abs(out.models.scoresFile)!;
+  if (Array.isArray(out.plugins)) for (const p of out.plugins) if (p && typeof p.entry === 'string') p.entry = abs(p.entry)!;
   return out;
 }
 
@@ -284,6 +287,7 @@ export function providerCompatibilityClass(provider: ProviderConfig, model: stri
       return anthropicCompatibilityClass(model);
     case 'openai-compatible':
     case 'scripted':
+    case 'plugin':
       return `${provider.id}:${model}`;
     default:
       return undefined; // pi-ai: `pi-ai:<api>:<piProvider>:<model>` needs the resolved pi model (createHypertest)
@@ -417,6 +421,7 @@ function validateProviders(errors: Errors, providers: unknown): Map<string, Prov
     if (kind === 'pi-ai') str(errors, `${label}.piProvider`, p['piProvider'], true);
     else if (p['piProvider'] !== undefined) errors.push(`${label}.piProvider is only valid for kind pi-ai`);
     if (kind === 'scripted' && (p['apiKeyEnv'] !== undefined || p['baseUrl'] !== undefined)) errors.push(`${label}: scripted providers take neither baseUrl nor apiKeyEnv`);
+    if (kind === 'plugin' && (p['apiKeyEnv'] !== undefined || p['baseUrl'] !== undefined || p['headers'] !== undefined)) errors.push(`${label}: plugin providers are configured by their plugin (no baseUrl, apiKeyEnv or headers here)`);
     posInt(errors, `${label}.timeoutMs`, p['timeoutMs']);
     posInt(errors, `${label}.maxRetries`, p['maxRetries'], 0);
     const headers = p['headers'];
@@ -472,6 +477,33 @@ function validateRoutes(errors: Errors, routes: unknown, providers: Map<string, 
     const v = validateJson(MODEL_CAPABILITY_PROFILE_SCHEMA, profile);
     if (!v.valid) for (const issue of v.issues.filter((x) => !/additional properties/.test(x.message))) errors.push(`${label}${issue.path && issue.path !== '/' ? issue.path.replaceAll('/', '.') : ''}: ${issue.message}`);
   });
+}
+
+/** (A[1]) models.priceGuard: percentages and per-million ceilings must be finite numbers ≥ 0; routes must exist. */
+function validatePriceGuard(errors: Errors, pg: unknown, routes: unknown): void {
+  if (pg === undefined) return;
+  if (!objectAt(errors, 'models.priceGuard', pg, false)) return;
+  unknownKeys(errors, 'models.priceGuard', pg, ['maxIncreasePct', 'default', 'routes', 'appliesTo']);
+  const nonNeg = (path: string, v: unknown) => {
+    if (v !== undefined && !(typeof v === 'number' && Number.isFinite(v) && v >= 0)) errors.push(`${path} must be a finite number ≥ 0, got ${JSON.stringify(v)}`);
+  };
+  nonNeg('models.priceGuard.maxIncreasePct', pg['maxIncreasePct']);
+  oneOf(errors, 'models.priceGuard.appliesTo', pg['appliesTo'], ['cost_limited', 'all'], false);
+  const ceiling = (path: string, c: unknown) => {
+    if (!objectAt(errors, path, c, true)) return;
+    unknownKeys(errors, path, c, ['inputPerMillionUsd', 'outputPerMillionUsd']);
+    nonNeg(`${path}.inputPerMillionUsd`, c['inputPerMillionUsd']);
+    nonNeg(`${path}.outputPerMillionUsd`, c['outputPerMillionUsd']);
+  };
+  if (pg['default'] !== undefined) ceiling('models.priceGuard.default', pg['default']);
+  const byRoute = pg['routes'];
+  if (byRoute !== undefined && objectAt(errors, 'models.priceGuard.routes', byRoute, false)) {
+    const known = new Set(Array.isArray(routes) ? routes.map((r) => (isPlainObject(r) ? r['routeId'] : undefined)) : []);
+    for (const [routeId, c] of Object.entries(byRoute)) {
+      if (!known.has(routeId)) errors.push(`models.priceGuard.routes.${routeId}: no such route in models.routes`);
+      ceiling(`models.priceGuard.routes.${routeId}`, c);
+    }
+  }
 }
 
 function validateStore(errors: Errors, store: unknown): void {
@@ -796,7 +828,10 @@ function validateRest(errors: Errors, c: Record<string, unknown>): void {
   const engines = c['engines'];
   if (engines !== undefined && objectAt(errors, 'engines', engines, false)) {
     unknownKeys(errors, 'engines', engines, ['default']);
-    if (typeof engines['default'] !== 'string' || !(ENGINE_KINDS as readonly string[]).includes(engines['default'])) {
+    // (A[6]) an engine plugin's kind (declared `engine:<kind>`) is a registered engine too
+    const pluginEngines = (Array.isArray(c['plugins']) ? c['plugins'] : []).flatMap((p) => (isPlainObject(p) && Array.isArray(p['capabilities']) ? p['capabilities'] : []))
+      .filter((cap): cap is string => typeof cap === 'string' && cap.startsWith('engine:')).map((cap) => cap.slice('engine:'.length));
+    if (typeof engines['default'] !== 'string' || !([...ENGINE_KINDS, ...pluginEngines] as readonly string[]).includes(engines['default'])) {
       errors.push(`engines.default: ${JSON.stringify(engines['default'])} is not a registered engine (${ENGINE_KINDS.join(', ')})`);
     }
   }
@@ -908,12 +943,54 @@ export function validateConfig(config: HypertestConfig): string[] {
   validateSections(errors, c);
   const models = c['models'];
   if (objectAt(errors, 'models', models, true)) {
-    unknownKeys(errors, 'models', models, ['providers', 'routes', 'defaultPolicy']);
+    unknownKeys(errors, 'models', models, ['providers', 'routes', 'defaultPolicy', 'priceGuard', 'pricesFile', 'scoresFile']);
     const providers = validateProviders(errors, models['providers']);
     validateRoutes(errors, models['routes'], providers);
     if (models['defaultPolicy'] !== undefined && !isPlainObject(models['defaultPolicy'])) errors.push('models.defaultPolicy must be a mapping');
+    validatePriceGuard(errors, models['priceGuard'], models['routes']);
+    if (models['pricesFile'] !== undefined) str(errors, 'models.pricesFile', models['pricesFile'], false);
+    if (models['scoresFile'] !== undefined) str(errors, 'models.scoresFile', models['scoresFile'], false);
   }
   validatePolicy(errors, c['policy']);
   validateRest(errors, c);
+  validatePlugins(errors, c['plugins'], isPlainObject(models) ? models['providers'] : undefined);
   return errors;
+}
+
+/** (A[6]) plugins: the manifest shape; plugin providers must be contributed by a configured provider plugin. */
+function validatePlugins(errors: Errors, plugins: unknown, providers: unknown): void {
+  const declaredProviders = new Set<string>();
+  if (plugins !== undefined) {
+    if (!Array.isArray(plugins)) errors.push('plugins must be a list');
+    else {
+      const ids = new Set<string>();
+      plugins.forEach((p, i) => {
+        const at = `plugins[${i}]`;
+        if (!objectAt(errors, at, p, true)) return;
+        const label = typeof p['id'] === 'string' ? `${at} (${p['id']})` : at;
+        unknownKeys(errors, label, p, ['id', 'version', 'kind', 'entry', 'digest', 'capabilities', 'config']);
+        if (str(errors, `${label}.id`, p['id'], true)) {
+          if (!/^[a-z0-9][a-z0-9._-]{0,99}$/.test(p['id'])) errors.push(`${label}.id must match [a-z0-9][a-z0-9._-]{0,99}`);
+          if (ids.has(p['id'])) errors.push(`${label}.id: duplicate plugin id`);
+          ids.add(p['id']);
+        }
+        str(errors, `${label}.version`, p['version'], true);
+        oneOf(errors, `${label}.kind`, p['kind'], ['tool', 'engine', 'provider', 'context-hook']);
+        str(errors, `${label}.entry`, p['entry'], true);
+        if (typeof p['digest'] !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(p['digest'])) errors.push(`${label}.digest must be sha256:<64 lowercase hex> of the entry file`);
+        const caps = p['capabilities'];
+        if (!Array.isArray(caps) || caps.length === 0 || caps.some((x) => typeof x !== 'string' || !/^(tool|engine|provider|context-hook|service):.+$/.test(x))) {
+          errors.push(`${label}.capabilities must list <tool|engine|provider|context-hook|service>:<name> entries`);
+        } else for (const x of caps as string[]) if (x.startsWith('provider:')) declaredProviders.add(x.slice('provider:'.length));
+        if (p['config'] !== undefined && !isPlainObject(p['config'])) errors.push(`${label}.config must be a mapping`);
+      });
+    }
+  }
+  if (Array.isArray(providers)) {
+    providers.forEach((p, i) => {
+      if (isPlainObject(p) && p['kind'] === 'plugin' && typeof p['id'] === 'string' && !declaredProviders.has(p['id'])) {
+        errors.push(`models.providers[${i}] (${p['id']}): no configured plugin declares provider:${p['id']}`);
+      }
+    });
+  }
 }

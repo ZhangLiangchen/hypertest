@@ -9,7 +9,7 @@ import type {
   DurableMemory, FreshnessGuard, ProvenanceService, ResolverRegistry, Retriever, SnapshotBuilder, SnapshotStore, WorkingContextManager,
 } from '@hypertest/context';
 import type { EnvironmentRegistry, ToolRegistryLike, ToolRuntime, WorkspaceManager } from '@hypertest/tools';
-import type { AgentRepository, AgentRunner, EngineRegistryLike, EpochManager, SessionStore, SubagentRuntime, TurnLimits } from '@hypertest/runtime';
+import type { AgentRepository, AgentRunner, ContextHook, EngineRegistryLike, EpochManager, SessionStore, SubagentRuntime, TurnLimits } from '@hypertest/runtime';
 import type { RoleCatalogLike } from '@hypertest/agents';
 
 /** Deterministic quality gate port (structurally satisfied by @hypertest/policy QualityGate). */
@@ -116,6 +116,11 @@ export interface ControlDeps extends BaseDeps {
   runner: AgentRunner;
   roles: RoleCatalogLike;
   config: ControlConfig;
+  /**
+   * (additive, optional, A[6]) Context-assembly hooks of kernel plugins: each turn's assembled context gets their bounded
+   * reference sections (labelled as data, never instructions; L0 `context.hook_applied`).
+   */
+  contextHooks?: Array<{ pluginId: string; name: string; hook: ContextHook }>;
 }
 
 /** Resolved configuration with every default applied. */

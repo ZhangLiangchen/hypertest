@@ -14,6 +14,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { HypertestError, canonicalJson, sha256Hex, type JsonValue } from '@hypertest/core';
 import { isEligibleTestArtifact } from '@hypertest/domain';
+import { artifactCaseStatuses, sensitivityBinding } from '@hypertest/policy';
 import type { BridgeReport, EvalSuite, EvalTrial, SuiteOptions, SuiteResult, VersionedGrader } from './contracts.ts';
 import { GRADERS, createPlanDynamicsGrader, normalizedSource } from './graders.ts';
 import { GRADER_REVISIONS } from './grader-revisions.ts';
@@ -60,7 +61,7 @@ export const GRADER_DEPENDENCIES: Readonly<Record<string, readonly Fn[]>> = Obje
   freshnessGuarded: [analyzeStaleness, analyzePolicy],
   modelSwitchContinuity: [],
   injectionContained: [analyzePolicy],
-  generatedTestsGoverned: [isEligibleTestArtifact, analyzeSensitivity],
+  generatedTestsGoverned: [isEligibleTestArtifact, analyzeSensitivity, sensitivityBinding, artifactCaseStatuses],
   llmRubric: [buildEvidencePacket, groundJudgeAnswer, judgeMessages],
   baselineEquivalence: [canonicalProjection, canonicalDifferences],
 });

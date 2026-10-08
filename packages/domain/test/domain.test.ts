@@ -49,7 +49,18 @@ test('generated tests need demonstrated sensitivity to be eligible', () => {
     oracleRefs: [], runner: { framework: 'node_test', selector: 't.test.js' }, validations: {}, approvalState: 'validated', createdAt: '',
   };
   assert.equal(isEligibleTestArtifact(base), false);
-  assert.equal(isEligibleTestArtifact({ ...base, validations: { knownBad: { status: 'passed', evidenceRefs: ['e'] } } }), true);
+  // D-1: sensitivity alone is not enough — every lifecycle stage and an approving oracle consistency review are required
+  assert.equal(isEligibleTestArtifact({ ...base, validations: { knownBad: { status: 'passed', evidenceRefs: ['e'] } } }), false);
+  const passed = { status: 'passed' as const, evidenceRefs: ['e'] };
+  const review = { reviewRecordId: 'rec_r', reviewerAgentId: 'agent_r', reviewerRole: 'reviewer', verdict: 'approve' as const, artifactDigest: 'x', oracleRevisions: {}, at: '' };
+  const complete: TestArtifact = { ...base, approvalState: 'approved', oracleReview: review, validations: { static: passed, knownGood: passed, knownBad: passed } };
+  assert.equal(isEligibleTestArtifact(complete), true);
+  assert.equal(isEligibleTestArtifact({ ...complete, validations: { static: passed, knownGood: passed, mutation: passed } }), true, 'mutation is sensitivity too');
+  assert.equal(isEligibleTestArtifact({ ...complete, approvalState: 'validated' }), false, 'no oracle review');
+  assert.equal(isEligibleTestArtifact({ ...complete, oracleReview: { ...review, artifactDigest: 'other' } }), false, 'review of other content');
+  assert.equal(isEligibleTestArtifact({ ...complete, validations: { knownGood: passed, knownBad: passed } }), false, 'no static check');
+  assert.equal(isEligibleTestArtifact({ ...complete, validations: { static: passed, knownBad: passed } }), false, 'no known-good');
+  assert.equal(isEligibleTestArtifact({ ...complete, validations: { static: passed, knownBad: passed, knownGoodUnavailable: { reason: 'no base behaviour', recordedBy: 'a', at: '' } } }), true, 'an explicit unavailability reason');
   assert.equal(isEligibleTestArtifact({ ...base, sourceType: 'existing' }), true);
   assert.equal(isEligibleTestArtifact({ ...base, sourceType: 'existing', approvalState: 'quarantined' }), false);
 });

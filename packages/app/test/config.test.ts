@@ -157,7 +157,7 @@ describe('loadConfig', () => {
     await assert.rejects(loadConfig(invalid, { env: {} }), (e: unknown) => {
       assert.ok(e instanceof HypertestError && e.code === 'invalid_argument');
       assert.match(e.message, /unknown configuration key 'modelz'/);
-      assert.match(e.message, /models\.providers\[0\] \(o\)\.kind: unknown provider kind "openai" \(expected one of openai-compatible, anthropic, pi-ai, scripted\)/);
+      assert.match(e.message, /models\.providers\[0\] \(o\)\.kind: unknown provider kind "openai" \(expected one of openai-compatible, anthropic, pi-ai, scripted, plugin\)/);
       assert.match(e.message, /models\.routes\[0\] \(r\)\.provider: provider 'ghost' is not declared in models\.providers/);
       assert.deepEqual((e.details as { errors: string[] }).errors.length, 3);
       return true;
@@ -299,7 +299,7 @@ describe('validateConfig', () => {
       }),
       [
         'budget.maxToolCalls must be an integer ≥ 1',
-        "gate: unknown key 'sneaky' (expected one of gateId, description, failOnUnresolvedSeverity, conditionalOnRiskLevel, requiredEvidence, requireDeterministicForCritical, requireIndependentReview, minCoverage, requireOracle)",
+        "gate: unknown key 'sneaky' (expected one of gateId, description, failOnUnresolvedSeverity, conditionalOnRiskLevel, requiredEvidence, requireDeterministicForCritical, requireIndependentReview, minCoverage, requireOracle, requireContracts)",
         'gate.failOnUnresolvedSeverity must be one of P0, P1, P2, P3, got "p1"',
         'gate.requiredEvidence[0].minCount must be an integer ≥ 1, got 0',
         'gate.requiredEvidence[1].evidenceType is required',
@@ -313,6 +313,20 @@ describe('validateConfig', () => {
     assert.deepEqual(validateConfig({ ...defaultConfig(), gate: { failOnUnresolvedSeverity: 'P9' } } as unknown as HypertestConfig), ['gate.failOnUnresolvedSeverity must be one of P0, P1, P2, P3, got "P9"']);
     // H3: 'P4' is not a domain Severity — the QualityGate would compare it as "nothing blocks" (C2 silently disabled)
     assert.deepEqual(validateRunOverrides({ gate: { failOnUnresolvedSeverity: 'P4' } }), ['gate.failOnUnresolvedSeverity must be one of P0, P1, P2, P3, got "P4"']);
+  });
+
+  test('coverage-1 / coverage-13: gate.requireContracts must be a boolean; environments[].isolation is an operator registration (dedicated boolean, string names)', () => {
+    assert.deepEqual(validateRunOverrides({ gate: { requireContracts: 'no' } }), ['gate.requireContracts must be a boolean']);
+    assert.deepEqual(validateRunOverrides({ gate: { requireContracts: false } }), []);
+    const env = (isolation: unknown) => ({ ...defaultConfig(), environments: [{ environmentId: 'svc', environmentClass: 'local', generation: 0, isolation }] }) as unknown as HypertestConfig;
+    assert.deepEqual(validateConfig(env({ dedicated: true, namespace: 'ns-test', database: 'db_test', account: 'acct' })), []);
+    assert.deepEqual(validateConfig(env({ dedicated: false })), []);
+    assert.deepEqual(validateConfig(env({ namespace: 'ns' })), ['environments[0].isolation.dedicated must be a boolean']);
+    const bad = validateConfig(env({ dedicated: 'yes', namespace: 7, owner: 'me' }));
+    assert.ok(bad.includes('environments[0].isolation.dedicated must be a boolean'), bad.join('\n'));
+    assert.ok(bad.some((e) => /environments\[0\]\.isolation: unknown key 'owner'/.test(e)), bad.join('\n'));
+    assert.ok(bad.some((e) => /environments\[0\]\.isolation\.namespace/.test(e)), bad.join('\n'));
+    assert.ok(validateConfig(env('dedicated')).some((e) => /environments\[0\]\.isolation/.test(e)));
   });
 
   test('A[2] audit probe: a route that declares only routeId/provider/model is refused (capabilities required); half a price is refused', () => {

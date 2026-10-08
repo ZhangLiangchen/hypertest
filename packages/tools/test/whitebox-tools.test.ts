@@ -2,7 +2,7 @@ import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { chmod, mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createGitRepo, testDeps } from '@hypertest/testkit';
 import { BuiltinPolicyEngine, DEFAULT_GATE_SPEC, DEFAULT_POLICY_RULES, QualityGate } from '@hypertest/policy';
@@ -440,7 +440,32 @@ test('conformance-2: test.run records what was tested relative to the base commi
     artifactId: 'ta_gen', runId: RUN, revision: 1, path: 'test/new_generated.test.mjs', artifactDigest: sha256Hex(GEN), sourceType: 'generated', oracleRefs: [],
     runner: { framework: 'node_test', selector: 'test/new_generated.test.mjs' }, validations: { knownBad: { status: 'passed', evidenceRefs: ['ev_x'] } }, approvalState: 'validated', createdAt: '',
   };
-  assert.equal(new QualityGate().evaluate(gateInput([validated])).verdict, 'pass');
+  // D-0/D-1: a stored "validated" state (with an unbound known-bad reference) is never trusted: the gate re-derives the
+  // artifact's whole lifecycle from bound evidence and review records, so this artifact does not cover the file
+  const judged = new QualityGate().evaluate(gateInput([validated]));
+  assert.equal(judged.verdict, 'inconclusive');
+  assert.ok(judged.reasons.some((x) => x.includes('test/new_generated.test.mjs is added since the base commit and its artifact ta_gen@1 is not eligible')), judged.reasons.join('\n'));
+  // the evidence records WHAT it executed and on which code (D-0): a whole-suite node:test run cannot attribute its cases to
+  // files (node's junit report names none) — honest `none`, never a guess …
+  type Bound = { executedTests: { attribution: string; unattributedCases: number; files: Array<{ path: string; sha256: string; cases: number; staticCheck?: { checker: string; ok: boolean; detail?: string } }> }; codeRevision: Record<string, unknown> };
+  const whole = testResult.structured as Bound;
+  assert.equal(whole.executedTests.attribution, 'none');
+  assert.ok(whole.executedTests.unattributedCases >= 2);
+  assert.deepEqual(whole.codeRevision, { kind: 'workspace', baseCommit: repo.commits[0], treeDigest: delta.treeDigest });
+  // … while a run of the artifact's file attributes every case to it, with its digest and the static check of the changed file
+  const sel = ok(await run({ selector: 'test/new_generated.test.mjs' }));
+  const bound = (await env.evidence.getMany(sel.evidenceRefs)).find((e) => e?.evidenceType === 'test-result')!.structured as Bound;
+  assert.equal(bound.executedTests.attribution, 'complete');
+  assert.deepEqual(bound.executedTests.files, [{ path: 'test/new_generated.test.mjs', sha256: sha256Hex(GEN), cases: 1, staticCheck: { checker: 'node --check', ok: true } }]);
+  // a syntax error in the changed test file is recorded as a failed static check (and reported to the agent)
+  await writeFile(join(dwt.root, 'test', 'broken.test.mjs'), "import { test } from 'node:test';\ntest('x', () => { if ( });\n");
+  const broken = await run({ selector: 'test/broken.test.mjs' });
+  const brokenBound = (await env.evidence.getMany(broken.evidenceRefs)).find((e) => e?.evidenceType === 'test-result')?.structured as Bound | undefined;
+  const brokenFile = brokenBound?.executedTests.files.find((f) => f.path === 'test/broken.test.mjs');
+  assert.equal(brokenFile?.staticCheck?.ok, false, JSON.stringify(brokenBound?.executedTests));
+  assert.match(brokenFile!.staticCheck!.detail!, /SyntaxError/);
+  assert.match(broken.modelText, /STATIC CHECK FAILED: test\/broken\.test\.mjs \(node --check\)/);
+  await rm(join(dwt.root, 'test', 'broken.test.mjs'));
   // modifying an existing test is a change too; a selector naming a non-pattern file includes it
   await writeFile(join(dwt.root, 'test', 'calc.test.mjs'), GOOD_TEST + '// weakened\n');
   await writeFile(join(dwt.root, 'checks.mjs'), GEN);

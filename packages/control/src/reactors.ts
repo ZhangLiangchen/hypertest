@@ -1,5 +1,5 @@
 import type { DeliveredEvent, SqlExecutor } from '@hypertest/core';
-import { workItemFingerprint, type BlackboardRecord, type DomainEvent, type Ref, type WorkItem } from '@hypertest/domain';
+import { EVENT_TYPES, SEVERITY_ORDER, isUnresolvedFinding, workItemFingerprint, type BlackboardRecord, type DomainEvent, type Finding, type Ref, type Severity, type WorkItem } from '@hypertest/domain';
 import type { NewWorkItem } from '@hypertest/collab';
 import { matchesSubscription, renderSubscriptionWork, type RoleSubscription, type SubscriptionSubject } from '@hypertest/agents';
 import type { AgentRole } from '@hypertest/domain';
@@ -13,6 +13,52 @@ export const REACTOR_CONSUMER = 'reactors';
 /** Durable bus consumer and subject filter used when an event bus is configured. */
 export const REACTOR_SUBJECTS = ['ht.*.>'];
 const BATCH = 200;
+
+/** (coverage-17) Inbox consumer of the finding events that scheduled a lead replan (each event triggers at most once, I5). */
+export const CRITICAL_FINDING_REPLAN_CONSUMER = 'lead-replan:critical-finding';
+const CRITICAL_CATEGORIES: ReadonlySet<string> = new Set(['product_defect', 'security', 'performance', 'unknown']);
+
+export interface CriticalFindingTrigger {
+  /** The finding event that makes the finding a new critical one (created, or updated to P0/P1). */
+  eventId: string;
+  recordId: string;
+  lineageId: string;
+  severity: Severity;
+  category: string;
+  title: string;
+}
+
+/**
+ * (coverage-17, BLUEPRINT §4.1 step 3) New unresolved P0/P1 product findings the lead has not replanned for yet: finding
+ * events (created, or updated to P0/P1) of the run whose finding is STILL unresolved at P0/P1 in a product category, of a
+ * lineage none of whose events was consumed by CRITICAL_FINDING_REPLAN_CONSUMER (the convergence monitor consumes the
+ * trigger events in the transaction that creates the replan work item — deduplicated by event id). One trigger per lineage.
+ */
+export async function criticalFindingTriggers(deps: Pick<ControlDeps, 'events' | 'inbox' | 'blackboard'>, runId: string): Promise<CriticalFindingTrigger[]> {
+  const evs = await deps.events.read(runId, { types: [EVENT_TYPES.findingCreated, EVENT_TYPES.findingUpdated] });
+  const byLineage = new Map<string, DomainEvent<unknown>[]>();
+  for (const e of evs) {
+    const p = (e.payload ?? {}) as Record<string, unknown>;
+    if (p['recordType'] !== undefined && p['recordType'] !== 'finding') continue;
+    const severity = str(p['severity']);
+    if (severity === undefined || !Object.hasOwn(SEVERITY_ORDER, severity) || SEVERITY_ORDER[severity as Severity] > SEVERITY_ORDER.P1) continue;
+    if (!CRITICAL_CATEGORIES.has(str(p['category']) ?? '')) continue;
+    const lineage = str(p['lineageId']) ?? e.aggregateId;
+    byLineage.set(lineage, [...(byLineage.get(lineage) ?? []), e]);
+  }
+  const out: CriticalFindingTrigger[] = [];
+  for (const [lineageId, events] of byLineage) {
+    let handled = false;
+    for (const e of events) if (await deps.inbox.consumed(CRITICAL_FINDING_REPLAN_CONSUMER, e.eventId)) handled = true;
+    if (handled) continue;
+    // still a critical, unresolved product finding now (a finding resolved before the lead could react needs no replan)
+    const head = await deps.blackboard.head<Finding>(lineageId);
+    if (!head || head.runId !== runId || head.recordType !== 'finding' || !isUnresolvedFinding(head.payload) || SEVERITY_ORDER[head.payload.severity] > SEVERITY_ORDER.P1 || !CRITICAL_CATEGORIES.has(head.payload.category)) continue;
+    const first = events[0]!;
+    out.push({ eventId: first.eventId, recordId: head.recordId, lineageId, severity: head.payload.severity, category: head.payload.category, title: head.payload.title });
+  }
+  return out;
+}
 
 export interface CatchUpResult {
   /** Events of subscribed types examined (consumed or recognised as duplicates). */
@@ -166,7 +212,9 @@ export function createReactorService(deps: ControlDeps): ReactorService {
       const rendered = renderSubscriptionWork(sub, vars);
       // a run-level review request (H7) names the run, not a record
       const runSubject = e.eventType === 'review.requested' && subjectRef?.['kind'] === 'run' && str(subjectRef['id']) === e.runId;
-      const inputRefs: Ref[] = runSubject ? [{ kind: 'run', id: e.runId }] : recordId !== undefined ? [{ kind: 'record', id: recordId }] : [];
+      // D-1: an oracle consistency review request names a test artifact
+      const artifactSubject = e.eventType === 'review.requested' && subjectRef?.['kind'] === 'test_artifact' ? str(subjectRef['id']) : undefined;
+      const inputRefs: Ref[] = runSubject ? [{ kind: 'run', id: e.runId }] : artifactSubject !== undefined ? [{ kind: 'test_artifact', id: artifactSubject }] : recordId !== undefined ? [{ kind: 'record', id: recordId }] : [];
       const item: NewWorkItem = {
         runId: e.runId,
         kind: 'reaction',

@@ -9,6 +9,7 @@ import type { ToolSpec } from '@hypertest/tools';
 import type { ControlDeps } from '../deps.ts';
 import { Caller, checkEvidence, domainTool, refuse, success } from './common.ts';
 import { cleared, recordClassification, roleClassification, withheldNote } from '../clearance.ts';
+import { applyArtifactReview, artifactReviewRefusal, reviewedArtifactDigest } from './specs.ts';
 
 const RECORD_TYPES = ['finding', 'hypothesis', 'coverage_gap', 'risk', 'review', 'test_strategy', 'decision', 'note'] as const;
 /** Roles allowed to mark a finding confirmed (evidence-backed reproduction / independent review / planning). */
@@ -381,7 +382,7 @@ export function blackboardTools(deps: ControlDeps): ToolSpec[] {
       id: 'blackboard.post_review',
       title: 'Post a review',
       description:
-        'Record an independent review verdict (approve|reject|needs_more_evidence|unknown) of a subject ({kind, id}) with the rationale and every evidence id you inspected. A review of kind run (this run) or decision counts for the QualityGate.',
+        'Record an independent review verdict (approve|reject|needs_more_evidence|unknown) of a subject ({kind, id}) with the rationale and every evidence id you inspected. A review of kind run (this run) or decision counts for the QualityGate. A review of kind test_artifact is its oracle consistency review: approve (only a validated artifact, never by its creator\'s agent or role, and only when its oracleRefs name assertions of the oracle revisions in force) makes it gate evidence; reject sends it back to draft.',
       inputSchema: REVIEW_INPUT_SCHEMA,
       area: 'blackboard',
       async execute(input, ctx) {
@@ -394,12 +395,28 @@ export function blackboardTools(deps: ControlDeps): ToolSpec[] {
           const r = await blackboard.getRecord(input.subjectRef.id);
           if (!r || r.runId !== ctx.runId) return refuse('not_found', `record ${input.subjectRef.id} does not exist in this run`);
         }
+        // D-1: a review of a test artifact is its oracle consistency review (checked before anything is recorded)
+        const artifactReview = input.subjectRef.kind === 'test_artifact';
+        /** The content the review is checked against (it applies only while the artifact still has this content). */
+        let reviewedDigest: string | undefined;
+        if (artifactReview) {
+          reviewedDigest = await reviewedArtifactDigest(deps, ctx, input.subjectRef.id);
+          const refusal = await artifactReviewRefusal(deps, ctx, input.subjectRef.id, input.verdict);
+          if (refusal) return refuse('review_refused', `review refused: ${refusal}`);
+        }
         const epoch = await caller.epoch();
         const review: Review = { subjectRef: input.subjectRef, verdict: input.verdict, rationale: input.rationale, checkedEvidenceRefs: checked, reviewerRole: ctx.role };
         if (epoch.routeId !== undefined) review.modelRouteId = epoch.routeId;
         if (epoch.provider !== undefined) review.modelProvider = epoch.provider;
         const { rec } = await post(caller, 'review', review, checked);
-        return success({ recordId: rec.recordId, lineageId: rec.lineageId, countsForGate: input.subjectRef.kind === 'run' || input.subjectRef.kind === 'decision', modelProvider: review.modelProvider });
+        const applied = artifactReview ? await applyArtifactReview(deps, ctx, input.subjectRef.id, { recordId: rec.recordId, verdict: input.verdict, ...(review.modelProvider !== undefined ? { modelProvider: review.modelProvider } : {}) }, reviewedDigest) : undefined;
+        return success(
+          {
+            recordId: rec.recordId, lineageId: rec.lineageId, countsForGate: input.subjectRef.kind === 'run' || input.subjectRef.kind === 'decision', modelProvider: review.modelProvider,
+            ...(applied ? { testArtifact: { artifactId: input.subjectRef.id, approvalState: applied.approvalState, ...(applied.stale ? { applied: false } : {}) } } : {}),
+          },
+          applied?.stale,
+        );
       },
     }),
 

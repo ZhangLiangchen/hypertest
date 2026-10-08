@@ -3,6 +3,7 @@ import type {
   ActorRef, BudgetEnvelope, ContextSnapshot, EventContext, GateSpec, PlanRevision, QualityDecision, ReportClaim, TargetRef, TestRun, WorkItem,
 } from '@hypertest/domain';
 import type { RoleCatalogLike } from '@hypertest/agents';
+import type { ModelSwitchRequest } from '@hypertest/runtime';
 
 /**
  * @hypertest/control — the Hypertest-owned control plane: Lead/Scheduler (control), Blackboard-driven
@@ -144,6 +145,12 @@ export interface ControlPlane {
    * model unavailability may resume at its next observation (its next turn routes again). Returns the released sessions.
    */
   releaseModelPauses?(runId: string, by?: string): Promise<string[]>;
+  /**
+   * (additive, optional, A[3]) An operator's manual model switch: `target` is an agent id of the run or a role; the
+   * target agents switch to `routeId` at their next safe turn boundary (after the permission/profile re-check; refused
+   * switches are on L0). Validates the run (not finished), the route (in the catalog) and the target.
+   */
+  requestModelSwitch?(runId: string, target: string, routeId: string, requestedBy: string, reason?: string): Promise<ModelSwitchRequest>;
   snapshot(runId: string): Promise<ContextSnapshot>;
   report(runId: string): Promise<RunReport>;
   readonly deps: BaseDeps;

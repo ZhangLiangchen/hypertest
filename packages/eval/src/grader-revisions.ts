@@ -38,7 +38,8 @@ export const GRADER_REVISIONS: Readonly<Record<string, string>> = Object.freeze(
   freshnessGuarded: '1',
   modelSwitchContinuity: '1',
   injectionContained: '1',
-  generatedTestsGoverned: '1',
+  // 2: sensitivity only from evidence BOUND to the artifact; eligibility needs the whole lifecycle (D-0/D-1)
+  generatedTestsGoverned: '2',
   baselineEquivalence: '1',
   // the independent LLM judge (ordered last)
   llmRubric: '1',

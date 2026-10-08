@@ -44,19 +44,35 @@ function leadComplete(summary: string, ready: boolean, status: 'open' | 'satisfi
   });
 }
 
+/**
+ * (D-3/D-4) The load experiment: the restart (its fault plan) and the 30 rps job (its workload) act on kv only for it; it
+ * stops when the job's error rate exceeds 50 % and needs the job's metric evidence (gate C4/C10).
+ */
+export const KV_EXPERIMENT = Object.freeze({
+  hypothesis: `kv-service meets ${'kv-slo'} (p99 < 250 ms, error rate < 1%) at ${KV_LOAD.ratePerSecond} rps on a fresh generation`,
+  environmentId: KV_ENV_ID,
+  faultPlan: [{ kind: 'restart', target: KV_ENV_ID }],
+  workload: { kind: 'http_load', ratePerSecond: KV_LOAD.ratePerSecond, durationMs: KV_LOAD.durationMs, concurrency: KV_LOAD.concurrency },
+  stopConditions: [{ kind: 'error_rate_above', value: 0.5 }],
+  evidenceRequirements: [{ evidenceType: 'metric', minCount: 1 }],
+});
+
 export const pocCLead: RoleBrain = (v) => {
   if (v.kind === 'initial_plan') {
-    if (v.step === 0) {
+    if (v.step === 0) return toolCall('experiment.define', KV_EXPERIMENT as unknown as JsonValue);
+    if (v.step === 1) {
+      const experimentId = str(jsonOf(resultText(v, 0)), 'experimentId');
+      const refs = experimentId ? { inputRefs: [{ kind: 'experiment', id: experimentId }] } : {};
       return leadReply('performance goal: fresh generation, load, metrics, independent review; the dump runs in parallel', 'plan.propose_revision', {
         rationale: 'Plan v1: restart kv-service to a known generation, run the 30 rps load job, quantify its latency and error rate from metric evidence, collect the diagnostics dump in parallel, and have the run reviewed independently.',
         objectives: [OBJECTIVE],
         workItems: [
           {
-            localId: 'prepare', title: 'Restart kv-service', role: 'environment', dependsOn: [], objectiveIds: [OBJECTIVE.objectiveId],
+            localId: 'prepare', title: 'Restart kv-service', role: 'environment', dependsOn: [], objectiveIds: [OBJECTIVE.objectiveId], ...refs,
             objective: `Restart environment ${KV_ENV_ID} with env.restart to a fresh generation, then verify with http.request GET /health that it serves.`,
           },
           {
-            localId: 'load', title: 'Run the 30 rps load job', role: 'environment', dependsOn: ['prepare'], objectiveIds: [OBJECTIVE.objectiveId],
+            localId: 'load', title: 'Run the 30 rps load job', role: 'environment', dependsOn: ['prepare'], objectiveIds: [OBJECTIVE.objectiveId], ...refs,
             objective: `Run load.start against environment ${KV_ENV_ID}: ${KV_LOAD.method} ${KV_LOAD.path} at ${KV_LOAD.ratePerSecond} rps for ${KV_LOAD.durationMs} ms (concurrency ${KV_LOAD.concurrency}). Wait for the job, verify the achieved rate with metrics.scrape and report the load job's operation id.`,
             evidenceRequirements: [{ evidenceType: 'metric', minCount: 1, critical: true }],
           },
@@ -65,7 +81,7 @@ export const pocCLead: RoleBrain = (v) => {
             objective: 'Collect the kv-service diagnostics dump with shell.exec (it is large) and confirm what it contains.',
           },
           {
-            localId: 'analyse', title: 'Quantify latency and error rate', role: 'metrics_analyst', dependsOn: ['load'], objectiveIds: [OBJECTIVE.objectiveId],
+            localId: 'analyse', title: 'Quantify latency and error rate', role: 'metrics_analyst', dependsOn: ['load'], objectiveIds: [OBJECTIVE.objectiveId], ...refs,
             objective: `Quantify the latency (p99) and error rate of the load job reported by the load item against oracle ${KV_ORACLE_ID} (C1 p99 < 250 ms at 30 rps, C2 error rate < 1%): load.observe the job, metrics.scrape environment ${KV_ENV_ID}, judge data sufficiency and record critical claims citing the metric evidence.`,
             evidenceRequirements: [{ evidenceType: 'metric', minCount: 1, critical: true }],
           },

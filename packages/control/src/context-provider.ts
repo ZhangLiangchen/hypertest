@@ -45,6 +45,15 @@ export async function environmentReadSet(deps: Pick<ControlDeps, 'environments'>
 export interface TurnState {
   turn?: number;
   snapshot?: ContextSnapshot;
+  /**
+   * (additive) A cap on this assembly's working-view budget (tokens), set by the worker when the remaining run/work
+   * budget cannot hold the turn: the view's HARD/SOFT pressure is then measured against the budget, not only the window.
+   */
+  viewBudgetCap?: number;
+  /** (additive) Tokens of the working view the last assembly produced (read by the worker's budget fit). */
+  viewTokens?: number;
+  /** (additive) The level of the compaction the last assembly made, if it made one. */
+  compactedLevel?: 'soft' | 'hard';
 }
 
 /**
@@ -124,7 +133,11 @@ export function condenserSummarizer(deps: ControlDeps, input: { run: TestRun; it
         const text = out.response.message.content.map((p) => (p.type === 'text' ? p.text : '')).join('').trim();
         if (!text) throw new Error('condenser returned no text');
         const used = out.response.usage.inputTokens + out.response.usage.outputTokens;
-        await budget.charge([runScope(input.run.runId)], { tokens: used }, `condense:${input.item.workItemId}`).catch(() => undefined);
+        // the condensation is a model call of the run: its tokens AND its USD cost count against the run budget (a USD
+        // budget that missed condenser calls could be overrun unseen)
+        const charged: { tokens: number; costUsd?: number } = { tokens: used };
+        if (typeof out.response.usage.costUsd === 'number' && Number.isFinite(out.response.usage.costUsd)) charged.costUsd = out.response.usage.costUsd;
+        await budget.charge([runScope(input.run.runId)], charged, `condense:${input.item.workItemId}`).catch((e: unknown) => logger.error('the condenser call could not be charged to the run budget', { runId: input.run.runId, error: (e as Error).message }));
         return text;
       } catch (e) {
         if (!fallback) throw e;
@@ -281,6 +294,7 @@ export function createContextProvider(deps: ControlDeps, config: ResolvedControl
   /** Persists a compaction and its L0 event (context.compacted, with its level). */
   async function recordCompaction(sessionId: string, turn: number, compaction: Compaction): Promise<void> {
     await sessions.addCompaction(sessionId, compaction);
+    turnState.compactedLevel = compaction.level === 'soft' ? 'soft' : 'hard';
     await events.append([
       event(eventContext, 'context.compacted', 'context', sessionId, {
         sessionId, compactionId: compaction.compactionId, level: compaction.level, upToTurn: compaction.upToTurn, evidenceRefs: compaction.evidenceRefs, turn,
@@ -301,9 +315,11 @@ export function createContextProvider(deps: ControlDeps, config: ResolvedControl
       const snapshot = await snapshotBuilder.build(buildInput, eventContext);
       turnState.turn = turn;
       turnState.snapshot = snapshot;
+      delete turnState.compactedLevel;
 
       const window = epoch && catalog ? catalog.get(epoch.routeId)?.contextWindow : undefined;
-      const viewBudget = config.maxInlineContextTokens ?? (window ? Math.floor(window * 0.6) : DEFAULT_VIEW_TOKENS);
+      const windowBudget = config.maxInlineContextTokens ?? (window ? Math.floor(window * 0.6) : DEFAULT_VIEW_TOKENS);
+      const viewBudget = turnState.viewBudgetCap !== undefined && turnState.viewBudgetCap > 0 ? Math.min(windowBudget, Math.floor(turnState.viewBudgetCap)) : windowBudget;
       let view = workingContext.view({ transcript, compactions, budgetTokens: viewBudget });
       const keepRecentTurns = workingContext.options?.keepRecentTurns ?? DEFAULT_KEEP_RECENT_TURNS;
       const condenserInput = { run, item, agentId: input.agentId, snapshotId: snapshot.snapshotId, eventContext };
@@ -340,6 +356,7 @@ export function createContextProvider(deps: ControlDeps, config: ResolvedControl
           view = workingContext.view({ transcript, compactions: [...compactions, compaction], budgetTokens: viewBudget });
         }
       }
+      turnState.viewTokens = view.tokens;
       const protocolContext = prepareProtocolContext(protocol, { taskId: run.runId, role: item.role, phase: role.phase }).render.content;
       const rolePrompt = `${agentHeader(item)}\n${renderRolePrompt(role, { objective: item.objective, runGoal: run.goal, protocol: protocolContext })}`;
       const assembled = assembler.assemble({

@@ -111,18 +111,20 @@ async function readOracleFile(command: string, cwd: string, file: string): Promi
 
 export const oracleCommand: Command = {
   name: 'oracle',
-  summary: 'oracles: establish one as a human authority; list or decide change proposals',
+  summary: 'oracles: establish one as a human authority; list or decide change proposals; declare a revision invalid',
   usage: [
     'oracle establish <file.yaml> --by <name>',
     'oracle proposals [--run <runId>] [--status s1,s2 | --all] [--json]',
     'oracle decide <proposalId> [--reject] --by <name> --reason "<text>"',
+    'oracle invalidate <oracleId> --revision <n> --by <name> --reason "<text>"',
   ],
   notes: [
     'Correctness criteria are never decided by agents: an oracle is established by a named human (`establish`, or the `oracles:` configuration section) and a run pins it; without an oracle in force the gate is at best inconclusive (C0).',
     'Agents only propose oracle changes; a change that would flip a recorded failure needs an independent (human) decision (I8).',
-    `\`oracle establish\` and \`oracle decide\` are refused (permission_denied) when $${SANDBOX_ENV} is set.`,
+    '(D-10) `invalidate` declares the latest revision of an oracle invalid (append-only: a new revision with status invalid; nothing is rewritten): every decision based on it is marked needs_reassessment, and a run pinned to it is at best inconclusive (C0) until a new revision is approved through a proposal (the run is then re-pinned and replans).',
+    `\`oracle establish\`, \`oracle decide\` and \`oracle invalidate\` are refused (permission_denied) when $${SANDBOX_ENV} is set.`,
   ],
-  options: { reject: { type: 'boolean' }, by: { type: 'string' }, reason: { type: 'string' }, run: { type: 'string' }, status: { type: 'string' }, all: { type: 'boolean' } },
+  options: { reject: { type: 'boolean' }, by: { type: 'string' }, reason: { type: 'string' }, run: { type: 'string' }, status: { type: 'string' }, all: { type: 'boolean' }, revision: { type: 'string' } },
   async run(ctx, values, args) {
     const sub = args[0];
     if (sub === 'establish') {
@@ -169,7 +171,24 @@ export const oracleCommand: Command = {
         return EXIT_CODES.ok;
       });
     }
-    if (sub !== 'decide') throw new UsageError(sub === undefined ? 'missing sub-command (oracle establish <file> | oracle proposals | oracle decide <proposalId>)' : `unknown sub-command oracle ${sub}`, 'oracle');
+    if (sub === 'invalidate') {
+      const [, oracleId] = positionals('oracle', args, ['invalidate', 'oracleId']);
+      const by = deciderName('oracle', values);
+      const reason = required('oracle', values, 'reason');
+      const revisionText = required('oracle', values, 'revision');
+      const revision = Number(revisionText);
+      if (!/^\d+$/.test(revisionText.trim()) || !Number.isInteger(revision) || revision < 1) throw new UsageError(`--revision must be a positive integer, got ${JSON.stringify(revisionText)}`, 'oracle');
+      assertNotSandboxed(ctx.io.env, 'oracle invalidate');
+      return withInstance(ctx, { drivesAgents: false }, async ({ ht }) => {
+        const invalidate = ht.services.oracles.invalidate;
+        if (!invalidate) throw new HypertestError('unavailable', 'this oracle governance cannot declare a revision invalid');
+        const out = await invalidate.call(ht.services.oracles, oracleId!, revision, { kind: 'human', id: by }, reason, { runId: `cli-${oracleId}`, correlationId: `cli-${oracleId}`, actorId: `human:${by}` });
+        if (ctx.global.json) ctx.json({ oracleId, revision, invalidRevision: out.invalid.revision, invalidatedDecisions: out.invalidatedDecisions, by: `human:${by}` });
+        else ctx.out(`oracle ${oracleId} revision ${revision} declared invalid by human:${by} (revision ${out.invalid.revision}); ${out.invalidatedDecisions.length} decision(s) marked needs_reassessment`);
+        return EXIT_CODES.ok;
+      });
+    }
+    if (sub !== 'decide') throw new UsageError(sub === undefined ? 'missing sub-command (oracle establish <file> | oracle proposals | oracle decide <proposalId> | oracle invalidate <oracleId>)' : `unknown sub-command oracle ${sub}`, 'oracle');
     const [, proposalId] = positionals('oracle', args, ['decide', 'proposalId']);
     const by = deciderName('oracle', values);
     const reason = required('oracle', values, 'reason');

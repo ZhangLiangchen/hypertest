@@ -19,6 +19,11 @@ import type { ApiServer, ApiServerOptions, Hypertest, HypertestInstance } from '
  *   GET  /runs/:id/report[?format=markdown]  RunReport JSON (or its markdown)
  *   GET  /runs/:id/evidence/verify        { ok, problems }
  *   POST /runs/:id/cancel                 { reason } → { ok }
+ *   (additive) POST /runs/:id/resume      → { ok, releasedPauses }  (releases model pauses, resumes a paused run; an
+ *                                          operator decision: requires the API token)
+ *   (additive) GET  /runs/:id/agents      { agents } — each agent's engine.inspect state, epoch, model pause (A[4])
+ *   (additive) POST /runs/:id/model-switch { target, routeId, by, reason? } → { switch } (manual model switch, A[3];
+ *                                          an operator decision: requires the API token)
  *   GET  /approvals[?runId=&status=a,b]   { approvals }
  *   POST /approvals/:id                   { approve, by, rationale } → { ok }  (human decision)
  *   POST /oracle-proposals/:id            { approve, by, rationale } → { ok }  (human decision)
@@ -329,6 +334,35 @@ export async function startApiServer(ht: Hypertest, options: ApiServerOptions): 
         allow('GET');
         await mustRun(id);
         sendJson(res, 200, await ht.verifyEvidence(id));
+        return;
+      }
+      if (sub === 'resume' && parts.length === 3) {
+        allow('POST');
+        // an operator decision (it un-pauses a run an operator or the budget paused): an agent reaching the loopback API
+        // must not resume runs (I1)
+        requireDecisionToken();
+        await mustRun(id);
+        const r = await need((ht as Partial<HypertestInstance>).resume?.bind(ht), 'resume')(id);
+        sendJson(res, 200, { ok: true, releasedPauses: r.releasedPauses });
+        return;
+      }
+      if (sub === 'agents' && parts.length === 3) {
+        allow('GET');
+        await mustRun(id);
+        sendJson(res, 200, { agents: (await need((ht as Partial<HypertestInstance>).agents?.bind(ht), 'agent inspection')(id)) as unknown as JsonValue });
+        return;
+      }
+      if (sub === 'model-switch' && parts.length === 3) {
+        allow('POST');
+        // an operator decision: an agent reaching the loopback API must not re-route models (I1)
+        requireDecisionToken();
+        const body = await readJson(req, maxBody);
+        for (const k of Object.keys(body)) if (!['target', 'routeId', 'by', 'reason'].includes(k)) throw new HttpError(400, 'invalid_argument', `unknown field '${k}'`);
+        await mustRun(id);
+        const reason = body['reason'];
+        if (reason !== undefined && typeof reason !== 'string') throw new HttpError(400, 'invalid_argument', 'reason must be a string');
+        const sw = await need((ht as Partial<HypertestInstance>).requestModelSwitch?.bind(ht), 'model switches')(id, requireString(body, 'target'), requireString(body, 'routeId'), { kind: 'human', id: requireString(body, 'by') }, reason as string | undefined);
+        sendJson(res, 200, { switch: sw as unknown as JsonValue });
         return;
       }
       if (sub === 'cancel' && parts.length === 3) {

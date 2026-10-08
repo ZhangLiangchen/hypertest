@@ -19,7 +19,7 @@ import { PI_AGENT_CORE_VERSION, RUNTIME_PI_PACKAGE_VERSION } from '@hypertest/ru
 import { tempDir } from '@hypertest/testkit';
 import type { RunOutcome } from '@hypertest/durable';
 import { createHypertest, hypertestGitSha, startApiServer, type HypertestConfig, type HypertestInstance } from '../src/index.ts';
-import { roleRouter, scriptedConfig, sumRepo, testStore, tinyRunBrains, type BrainView } from './helpers.ts';
+import { FULL_ROUTE, roleRouter, scriptedConfig, sumRepo, testStore, tinyRunBrains, type BrainView } from './helpers.ts';
 
 const ROOT = join(import.meta.dirname, '..', '..', '..');
 const GOAL = 'Is the sum module releasable?';
@@ -54,7 +54,7 @@ describe('createHypertest: a tiny run end to end', () => {
   test('the QualityGate computes the verdict: pass, signed over its content, bound to the sealed evidence root', async () => {
     assert.equal(outcome.status, 'completed');
     const d = outcome.decision!;
-    assert.equal(d.verdict, 'pass');
+    assert.equal(d.verdict, 'pass', d.reasons.join('\n'));
     assert.deepEqual(d.violatedCriteria, []);
     assert.deepEqual(d.unknownCriteria, []);
     const { signature, ...unsigned } = d;
@@ -123,10 +123,11 @@ describe('createHypertest: a tiny run end to end', () => {
     assert.equal(m.hypertest.imageDigest, undefined);
     assert.deepEqual(m.protocol, { id: 'bugate', version: ht.services.protocol.binding.version, digest: ht.services.protocol.binding.digest });
     assert.equal(m.schemas.event, collabMigrations.map((x) => x.id).sort().at(-1));
-    // the catalog completed the route with the defaults and the provider tag
+    // the catalog took the route's declared profile (A[2]: explicit, nothing assumed) and completed the provider tag
     const route = ht.services.catalog.get('sim-large')!;
     assert.equal(route.continuationCompatibilityClass, 'sim:sim-1');
-    assert.equal(route.contextWindow, 128_000);
+    assert.equal(route.contextWindow, FULL_ROUTE.contextWindow);
+    assert.equal(route.maxDataClassification, FULL_ROUTE.maxDataClassification);
     // every built-in and domain tool is in the pinned catalog
     for (const id of ['test.run', 'fs.read', 'load.start', 'plan.propose_revision', 'complete_work']) assert.ok(ht.services.tools.get(id), id);
   });
@@ -208,7 +209,7 @@ describe('composition failures fail fast and leave nothing open', () => {
     await assert.rejects(createHypertest(bad, { scriptedBrains: {} }), (e: unknown) => {
       assert.ok(e instanceof HypertestError && e.code === 'invalid_argument');
       assert.deepEqual((e.details as { errors: string[] }).errors, [
-        "unknown configuration key 'bogus' (expected one of version, project, store, bus, durable, artifacts, models, roles, budget, gate, policy, bugate, engines, sandbox, environments, tools, signing, memory, observability, oracles, runtime)",
+        "unknown configuration key 'bogus' (expected one of version, project, store, bus, durable, artifacts, models, roles, budget, gate, policy, bugate, engines, sandbox, environments, tools, signing, memory, observability, oracles, runtime, plugins)",
         'engines.default: "openhands" is not a registered engine (native, pi, dsh)',
       ]);
       return true;

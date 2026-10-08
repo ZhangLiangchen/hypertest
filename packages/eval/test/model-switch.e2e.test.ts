@@ -53,7 +53,10 @@ test('model-switch: the primary route fails mid-run ⇒ fallback epoch, same age
 });
 
 test('model-switch: a single provider cannot fall back — the trial fails and diverges from its baseline', async () => {
-  const result = await runSuite(modelSwitchSuite(), options('single', [scriptedSingleArm]));
+  // A[0]: with no other route the executor PAUSES (model_unavailable) and retries with a growing backoff instead of
+  // failing at once; the outage never ends, so the trial ends at its timeout (the run is cancelled) — 60 s is plenty
+  // for the baseline trial and bounds the wait.
+  const result = await runSuite(modelSwitchSuite(), { ...options('single', [scriptedSingleArm]), timeoutMs: 60_000 });
   const switched = result.trials.find((t) => t.taskId === 'model-switch')!;
   assert.equal(switched.result, 'fail');
   const failed = switched.graders.filter((g) => !g.pass).map((g) => g.graderId);
