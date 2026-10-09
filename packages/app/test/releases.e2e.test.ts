@@ -52,7 +52,7 @@ async function gatedPromote(ht: HypertestInstance, manifestId: string, input: Pa
     const c = await reg.recordShadowComparison({ manifestId, sourceRunId: `run_prod_${manifestId.slice(3, 11)}`, sourceManifestId: 'rm_production', shadowRunId: `run_mirror_${manifestId.slice(3, 11)}_${Date.now()}`, sourceVerdict: 'fail', shadowVerdict: 'fail', divergences: [], recordedBy: 'ci:shadow' });
     await reg.recordSuiteResult({ manifestId, kind: 'production_replay', suiteId: 'shadow-mirror', passed: true, summary: { total: 1, failed: 0 }, binding: { kind: 'shadow_comparisons', comparisonIds: [c.comparisonId] }, by: 'ci:shadow' });
   } else if (release?.state === 'canary') {
-    await reg.recordSuiteResult({ manifestId, kind: 'release_gate', suiteId: 'core', suiteRevision: 'core-2', passed: true, summary: { total: 7, failed: 0 }, reportDigest: DIGEST, binding: { kind: 'eval_gate', manifestIds: [manifestId], candidateDigest: DIGEST, baselineDigest: DIGEST }, by: 'ci:github' });
+    await reg.recordSuiteResult({ manifestId, kind: 'release_gate', suiteId: 'core', suiteRevision: 'core-2', passed: true, summary: { total: 7, failed: 0 }, reportDigest: DIGEST, binding: { kind: 'eval_gate', manifestIds: [manifestId], candidateDigest: DIGEST, baselineDigest: 'b'.repeat(64) }, by: 'ci:github' });
   }
   return ht.releases.promote(manifestId, input);
 }

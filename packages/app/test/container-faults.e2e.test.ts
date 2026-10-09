@@ -120,7 +120,7 @@ describe('a docker fault experiment in a real run (fake docker on PATH)', () => 
       assert.equal(ops.length, 1);
       assert.equal(ops[0]!.status, 'verified');
       assert.ok(typeof (ops[0]!.result as { effectUntil?: string }).effectUntil === 'string', 'the effect window is on the operation');
-      assert.ok(ops[0]!.experimentId, 'the fault ran for the experiment');
+      assert.ok((ops[0] as { experimentId?: string }).experimentId, 'the fault ran for the experiment (LedgerOperationRecord.experimentId)');
       const actions = await ht.events(outcome.runId, { types: ['experiment.action'] });
       assert.deepEqual(actions.map((e) => (e.payload as { toolId: string; kind?: string }).toolId + ':' + (e.payload as { kind?: string }).kind), ['env.inject_fault:pause']);
       // the reverter ends the time box (it outlives nothing: 600 ms)

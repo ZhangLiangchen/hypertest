@@ -69,8 +69,11 @@ describe('live arm', () => {
     assert.deepEqual(liveArmAvailable({ ...ENV, HYPERTEST_EVAL_LIVE_API_KEY: undefined }), { ok: false, reason: 'HYPERTEST_EVAL_LIVE_API_KEY is not set' });
     assert.deepEqual(liveArmAvailable({ ...ENV, HYPERTEST_EVAL_LIVE_KIND: 'openai-compatible' }), { ok: false, reason: 'HYPERTEST_EVAL_LIVE_BASE_URL is required for openai-compatible' });
     assert.deepEqual(liveArmAvailable(ENV), { ok: true });
-    assert.deepEqual(builtinArms({}).map((a) => a.armId), ['scripted-multi-llm', 'scripted-single']);
-    assert.deepEqual(builtinArms(ENV).map((a) => a.armId), ['scripted-multi-llm', 'scripted-single', 'live']);
+    // (F[8], item 6) the causal arms H0…H6, the product engine arms and the three-provider-class arm are always offered
+    // (scripted, no network); only the live arm is opt-in
+    const always = ['scripted-multi-llm', 'scripted-single', 'h0-single-agent', 'h1-subagents', 'h2-dynamic-scheduler', 'h3-blackboard', 'h4-context-freshness', 'h5-oracle-governance', 'h6-full', 'engine-pi', 'engine-dsh', 'three-provider-classes'];
+    assert.deepEqual(builtinArms({}).map((a) => a.armId), always);
+    assert.deepEqual(builtinArms(ENV).map((a) => a.armId), [...always, 'live']);
   });
 
   test('the key is read through apiKeyEnv at composition, never stored in the config; no scripted brains', () => {

@@ -113,6 +113,18 @@ describe('(review) sandbox egress governance on the production composition', () 
     const confined = await ht.services.toolRuntime!.execute(request('test_executor', ['node', '-e', fetchScript(staging.port, 'POST', '/orders')], 'sess_eg:2:c1'));
     assert.match(confined.modelText, /--- stdout ---\n403 .*POST http:\/\/127\.0\.0\.1:\d+\/orders refused: capability_denied: environment_not_permitted: staging/);
     assert.deepEqual([confined.status, confined.error?.code], ['failed', 'egress_refused'], 'a refused write makes the call a tool fault, never an SUT outcome');
+    // (wave 3, item 9) what the call recorded after its refused write is kept as INCONCLUSIVE evidence (never an outcome),
+    // announced by one evidence.inconclusive event naming every marked record
+    const inconclusive = (await ht.events(run.runId, { types: ['evidence.inconclusive'] }))
+      .map((e) => e.payload as { invocationId: string; reason: string; evidence: Array<{ evidenceId: string; originalEvidenceType: string }> })
+      .filter((p) => p.invocationId === 'sess_eg:2:c1');
+    assert.equal(inconclusive.length, 1);
+    assert.equal(inconclusive[0]!.reason, 'egress_refused');
+    const markedIds = new Set(inconclusive[0]!.evidence.map((x) => x.evidenceId));
+    assert.ok(markedIds.size > 0, 'the call recorded its output after the refusal');
+    const marked = (await ht.services.evidence.query({ runId: run.runId })).filter((e) => markedIds.has(e.evidenceId));
+    assert.equal(marked.length, markedIds.size);
+    assert.ok(marked.every((e) => e.evidenceType === 'inconclusive' && (e.structured as { reason?: string }).reason === 'egress_refused'), JSON.stringify(marked.map((e) => e.evidenceType)));
     const read = await ht.services.toolRuntime!.execute(request('test_executor', ['node', '-e', fetchScript(staging.port, 'GET', '/orders')], 'sess_eg:2:c2'));
     assert.match(read.modelText, /--- stdout ---\n200 /, 'safe methods pass');
     assert.deepEqual(staging.writes, []);

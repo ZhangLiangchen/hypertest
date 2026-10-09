@@ -1,18 +1,61 @@
 /**
  * `hypertest runtime` over the real stack (PGlite, or PostgreSQL 16 with HYPERTEST_TEST_DB=postgres): register the
- * installed runtime, record compatibility suites (explicit and from an eval SuiteResult), promote it step by step to
- * active, list/show it, refuse decisions from a sandbox and malformed command lines, roll back, and migrate a live run
- * pinned to another runtime onto the active one.
+ * installed runtime and walk it through the per-stage release gates (F[0]) with the CLI alone — engine contract
+ * (attested with its report) + compatibility (an eval SuiteResult whose trials ran under THIS manifest, e2e[5]) →
+ * shadow; the shadow mirrors a finished production run dry-run (`runtime shadow`) and the production replay is recorded
+ * from the comparisons → canary; the release gate of the CORE eval against the committed baseline → active. List/show
+ * it, refuse decisions from a sandbox and malformed command lines, roll back, and migrate a live run pinned to another
+ * runtime onto the active one.
  */
 import assert from 'node:assert/strict';
-import { writeFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { after, before, describe, test } from 'node:test';
 import { MemoryLogger } from '@hypertest/core';
-import { createHypertest, loadConfig } from '@hypertest/app';
+import { createHypertest, loadConfig, type HypertestConfig, type HypertestInstance } from '@hypertest/app';
 import type { RuntimeManifest, TestRun } from '@hypertest/domain';
 import { tempDir } from '@hypertest/testkit';
 import { BRAINS, GOAL, cli, parseJson, sumRepo, writeProject, type TestProject } from './helpers.ts';
+import { scenarioBrain } from './fixtures/brains.ts';
+
+/** The committed baseline of the core eval (the release gate compares a core candidate with it). */
+const CORE_BASELINE = fileURLToPath(new URL('../../eval/baselines/core-scripted-multi-llm.json', import.meta.url));
+const ATTESTED = 'a'.repeat(64);
+
+/** A core-suite candidate: the committed baseline's trials, re-run (here: relabelled) under `manifestId`, optionally altered. */
+async function coreCandidate(manifestId: string, alter: (t: Record<string, unknown>, i: number) => void = () => undefined): Promise<string> {
+  const doc = JSON.parse(await readFile(CORE_BASELINE, 'utf8')) as { trials: Array<Record<string, unknown>> };
+  doc.trials.forEach((t, i) => {
+    t['runtimeManifestId'] = manifestId;
+    alter(t, i);
+  });
+  return `${JSON.stringify(doc, null, 2)}\n`;
+}
+
+/**
+ * Walks the release of `ht` through every gate with the release API (test setup of releases this installation's CLI does
+ * not run: another runtime's manifest). The production replay comes from a recorded shadow comparison.
+ */
+async function activateViaApi(ht: HypertestInstance): Promise<void> {
+  const id = ht.manifest.manifestId;
+  const by = 'ci:github';
+  await ht.releases.register({ by: 'human:alice' });
+  await ht.releases.recordSuite({ manifestId: id, kind: 'engine_contract', suiteId: 'agent-engine-abi', passed: true, summary: { total: 21, failed: 0 }, reportDigest: ATTESTED, binding: { kind: 'attested' }, by });
+  await ht.releases.recordEvalSuite({ manifestId: id, kind: 'compatibility', digest: ATTESTED, by, result: { suiteId: 'poc-a-whitebox', revision: 'poc-2', trials: [{ taskId: 't', armId: 'deployment', trial: 0, result: 'pass', runtimeManifestId: id }] } });
+  await ht.releases.promote(id, { by: 'human:alice', reason: 'compatibility green' });
+  const c = await ht.releases.registry.recordShadowComparison({ manifestId: id, sourceRunId: `run_src_${id.slice(3, 11)}`, sourceManifestId: 'rm_production', shadowRunId: `run_src_${id.slice(3, 11)}.shadow`, sourceVerdict: 'pass', shadowVerdict: 'pass', divergences: [], recordedBy: 'ci:shadow' });
+  await ht.releases.registry.recordSuiteResult({ manifestId: id, kind: 'production_replay', suiteId: 'shadow-mirror', passed: true, summary: { total: 1, failed: 0 }, binding: { kind: 'shadow_comparisons', comparisonIds: [c.comparisonId] }, by: 'ci:shadow' });
+  await ht.releases.promote(id, { by: 'human:alice', reason: 'production replay green', canary: { percentage: 100 } });
+  const candidate = { suiteId: 'core', revision: 'core-2', trials: [{ taskId: 'context-freshness', armId: 'deployment', trial: 0, result: 'pass', runtimeManifestId: id }] };
+  await ht.releases.recordReleaseGate({ manifestId: id, candidate, candidateDigest: 'c'.repeat(64), baselineDigest: 'b'.repeat(64), report: { pass: true, suiteId: 'core', checks: [] }, by });
+  await ht.releases.promote(id, { by: 'human:alice', reason: 'release gate green' });
+}
+
+/** Another runtime of this installation (one more policy rule ⇒ another manifest). */
+function otherRuntime(base: HypertestConfig): HypertestConfig {
+  return { ...base, policy: { rules: [{ id: 'site.allow-reads', description: 'site rule', match: { effects: ['read' as const] }, decision: 'allow' as const }] } };
+}
 
 describe('hypertest runtime', () => {
   let dir: Awaited<ReturnType<typeof tempDir>>;
@@ -21,16 +64,28 @@ describe('hypertest runtime', () => {
   let env: Record<string, string>;
   let foreignRun: TestRun;
   let foreignManifest: string;
+  let productionRun: TestRun;
 
   before(async () => {
     dir = await tempDir('ht-cli-runtime-');
     repo = await sumRepo(true);
     project = await writeProject(dir.path);
     env = { ...project.env };
+    const base = await loadConfig(project.configPath, { env: { ...process.env, ...env } });
+    const other = otherRuntime(base);
+    // a FINISHED run of another runtime of this installation (the production run a shadow of this runtime mirrors)
+    {
+      const ht = await createHypertest(other, { env: { ...process.env, ...env }, logger: new MemoryLogger(), scriptedBrains: { sim: scenarioBrain('pass') as never } });
+      try {
+        const o = await ht.run({ goal: GOAL, target: { repoPath: repo.path, commit: repo.head } }, { timeoutMs: 120_000 });
+        assert.deepEqual([o.status, o.decision?.verdict], ['completed', 'pass']);
+        productionRun = (await ht.status(o.runId))!;
+      } finally {
+        await ht.close();
+      }
+    }
     // a live run of ANOTHER runtime of this installation (one more policy rule), created while the store is unmanaged,
     // paused by an operator once its lead's first turn gave its claim back
-    const base = await loadConfig(project.configPath, { env: { ...process.env, ...env } });
-    const other = { ...base, policy: { rules: [{ id: 'site.allow-reads', description: 'site rule', match: { effects: ['read' as const] }, decision: 'allow' as const }] } };
     let entered!: () => void;
     const inLead = new Promise<void>((resolve) => (entered = resolve));
     let release!: () => void;
@@ -97,9 +152,16 @@ describe('hypertest runtime', () => {
       [['runtime', 'register', '--by', ' '], /--by is required/],
       [['runtime', 'register', '--by', 'robot;rm -rf'], /--by must be a person's name/],
       [['runtime', 'register', '--by', 'alice', '--allow-migration', 'events:a=>b'], /--allow-migration must be <schema>:<from>=><to>/],
-      [['runtime', 'record-suite', 'current', '--kind', 'replay', '--suite', 's', '--by', 'ci:gh'], /exactly one of --passed, --failed or --from-eval/],
-      [['runtime', 'record-suite', 'current', '--kind', 'replay', '--suite', 's', '--passed', '--failed', '--by', 'ci:gh'], /exactly one of --passed, --failed or --from-eval/],
-      [['runtime', 'record-suite', 'current', '--kind', 'vibes', '--suite', 's', '--passed', '--by', 'ci:gh'], /--kind must be one of engine_contract, replay/],
+      // (F[0], e2e[5]) a pass is never a bare claim: each suite kind takes its own evidence
+      [['runtime', 'record-suite', 'current', '--kind', 'replay', '--suite', 's', '--by', 'ci:gh'], /give exactly one of --passed, --failed, --run, --from-eval or --from-shadow/],
+      [['runtime', 'record-suite', 'current', '--kind', 'engine_contract', '--suite', 's', '--passed', '--failed', '--by', 'ci:gh'], /give exactly one of --passed, --failed, --run, --from-eval or --from-shadow/],
+      [['runtime', 'record-suite', 'current', '--kind', 'vibes', '--suite', 's', '--passed', '--by', 'ci:gh'], /--kind must be one of engine_contract, compatibility, production_replay, release_gate/],
+      [['runtime', 'record-suite', 'current', '--kind', 'engine_contract', '--suite', 's', '--passed', '--by', 'ci:gh'], /engine_contract --passed attests a CI report: give it with --report <file>/],
+      [['runtime', 'record-suite', 'current', '--kind', 'compatibility', '--suite', 's', '--passed', '--by', 'ci:gh'], /compatibility: --from-eval <SuiteResult\.json> of an eval run on this runtime/],
+      [['runtime', 'record-suite', 'current', '--kind', 'production_replay', '--suite', 's', '--passed', '--by', 'ci:gh'], /production_replay: --from-shadow/],
+      [['runtime', 'record-suite', 'current', '--kind', 'release_gate', '--suite', 's', '--passed', '--by', 'ci:gh'], /release_gate: --from-eval <core SuiteResult\.json> --baseline/],
+      [['runtime', 'record-suite', 'current', '--kind', 'compatibility', '--from-eval', 'x.json', '--baseline', 'b.json', '--by', 'ci:gh'], /--baseline belongs to --kind release_gate/],
+      [['runtime', 'record-suite', 'current', '--kind', 'compatibility', '--from-eval', 'x.json', '--candidate-arm', 'deployment', '--by', 'ci:gh'], /--candidate-arm belongs to --kind release_gate/],
       [['runtime', 'promote', 'current', '--by', 'alice', '--reason', 'r', '--canary-label', 'nokey'], /--canary-label must be key=value/],
       [['runtime', 'promote', 'current', '--by', 'alice', '--reason', 'r', '--canary-percent', '101'], /--canary-percent must be an integer between 0 and 100/],
       [['runtime', 'migrate', 'run_x', '--by', 'alice', '--reason', 'r'], /--to is required/],
@@ -114,44 +176,162 @@ describe('hypertest runtime', () => {
     const reg = parseJson<{ created: boolean; release: { manifestId: string; state: string; registeredBy: string } }>(r);
     assert.deepEqual([reg.created, reg.release.manifestId, reg.release.state, reg.release.registeredBy], [true, current, 'candidate', 'human:alice']);
 
-    // promotion needs passing suites
+    // → shadow: the engine contract (a CI attestation names its report) AND a compatibility eval run under THIS manifest
     r = await run(['runtime', 'promote', 'current', '--by', 'alice', '--reason', 'r']);
     assert.equal(r.code, 1);
     assert.match(r.stderr, /cannot be promoted to shadow: no engine_contract suite result is recorded/);
-    r = await run(['runtime', 'record-suite', current.slice(0, 14), '--kind', 'engine_contract', '--suite', 'agent-engine-abi', '--revision', '1', '--passed', '--total', '21', '--failures', '0', '--by', 'ci:github']);
+    // executed here: the AgentEngine contract suite of the engines this runtime pins (bound: executed under this manifest)
+    r = await run(['runtime', 'record-suite', 'current', '--kind', 'engine_contract', '--run', '--by', 'ci:github', '--json']);
     assert.equal(r.code, 0, r.stderr);
-    assert.match(r.stdout, new RegExp(`^engine_contract suite agent-engine-abi@1 recorded for ${current}: PASS \\(rsr_`), 'a unique prefix names the manifest');
+    const executed = parseJson<{ passed: boolean; suiteId: string; binding: { kind: string; manifestIds: string[] }; summary: { total: number; failed: number; detail: string }; reportDigest: string }>(r);
+    assert.deepEqual([executed.passed, executed.suiteId, executed.binding, executed.summary.failed], [true, 'agent-engine-contract', { kind: 'executed', manifestIds: [current] }, 0]);
+    assert.ok(executed.summary.total > 0, 'the contract suite ran cases');
+    assert.match(executed.summary.detail, /executed here: .*native-engine\.test\.ts/);
+    assert.match(executed.reportDigest, /^[0-9a-f]{64}$/);
+    r = await run(['runtime', 'record-suite', 'current', '--kind', 'engine_contract', '--run', '--report', 'x.tap', '--passed', '--by', 'ci:github']);
+    assert.equal(r.code, 2, 'executed here, or attested: never both');
+    assert.match(r.stderr, /give exactly one of --passed, --failed, --run, --from-eval or --from-shadow/);
+    const ciReport = join(dir.path, 'engine-contract.tap');
+    await writeFile(ciReport, 'TAP version 13\n# pass 21\n# fail 0\n');
+    r = await run(['runtime', 'record-suite', current.slice(0, 14), '--kind', 'engine_contract', '--suite', 'agent-engine-abi', '--revision', '1', '--passed', '--report', ciReport, '--total', '21', '--failures', '0', '--by', 'ci:github', '--json']);
+    assert.equal(r.code, 0, r.stderr);
+    const contract = parseJson<{ passed: boolean; binding: { kind: string }; reportDigest: string; recordedBy: string }>(r);
+    assert.deepEqual([contract.passed, contract.binding.kind, contract.recordedBy], [true, 'attested', 'ci:github'], 'a unique prefix names the manifest');
+    assert.match(contract.reportDigest, /^[0-9a-f]{64}$/);
     // a suite result that reports failures is never recorded as a pass
-    r = await run(['runtime', 'record-suite', 'current', '--kind', 'replay', '--suite', 'poc-a', '--passed', '--total', '3', '--failures', '1', '--by', 'ci:github']);
+    r = await run(['runtime', 'record-suite', 'current', '--kind', 'engine_contract', '--suite', 'agent-engine-abi', '--passed', '--report', ciReport, '--total', '3', '--failures', '1', '--by', 'ci:github']);
     assert.equal(r.code, 1);
     assert.match(r.stderr, /a result with 1 failed case\(s\) cannot be recorded as passed/);
+    r = await run(['runtime', 'promote', 'current', '--by', 'alice', '--reason', 'r']);
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /no compatibility suite result is recorded/);
     // from an eval suite result: one failing trial ⇒ FAIL (bound to the file by its digest), promotion refused
     const failing = join(dir.path, 'suite-fail.json');
-    await writeFile(failing, JSON.stringify({ suiteId: 'poc-a-whitebox', revision: 'poc-1', trials: [{ result: 'pass' }, { result: 'infra_error' }], perArm: {}, comparisons: [] }));
-    r = await run(['runtime', 'record-suite', 'current', '--kind', 'replay', '--from-eval', failing, '--by', 'ci:github', '--json']);
+    await writeFile(failing, JSON.stringify({ suiteId: 'poc-a-whitebox', revision: 'poc-2', trials: [{ result: 'pass', runtimeManifestId: current }, { result: 'infra_error', runtimeManifestId: current }], perArm: {}, comparisons: [] }));
+    r = await run(['runtime', 'record-suite', 'current', '--kind', 'compatibility', '--from-eval', failing, '--by', 'ci:github', '--json']);
     assert.equal(r.code, 0, r.stderr);
     const failed = parseJson<{ passed: boolean; suiteId: string; suiteRevision: string; summary: { total: number; failed: number }; reportDigest: string }>(r);
-    assert.deepEqual([failed.passed, failed.suiteId, failed.suiteRevision, failed.summary.total, failed.summary.failed], [false, 'poc-a-whitebox', 'poc-1', 2, 1]);
+    assert.deepEqual([failed.passed, failed.suiteId, failed.suiteRevision, failed.summary.total, failed.summary.failed], [false, 'poc-a-whitebox', 'poc-2', 2, 1]);
     assert.match(failed.reportDigest, /^[0-9a-f]{64}$/);
     r = await run(['runtime', 'promote', 'current', '--by', 'alice', '--reason', 'r']);
     assert.equal(r.code, 1);
-    assert.match(r.stderr, /the latest replay suite result \(poc-a-whitebox@poc-1, rsr_\w+\) failed/);
+    assert.match(r.stderr, /the latest compatibility suite result \(poc-a-whitebox@poc-2, rsr_\w+\) failed/);
+    // (e2e[5] repro) a passing eval result whose trials ran under ANOTHER manifest certifies nothing here; neither does one
+    // whose trials name no manifest (a hand-written file)
+    const foreignEval = join(dir.path, 'suite-foreign.json');
+    await writeFile(foreignEval, JSON.stringify({ suiteId: 'core', revision: 'core-2', trials: [{ taskId: 't', armId: 'a', trial: 0, result: 'pass', runtimeManifestId: foreignManifest }], perArm: {}, comparisons: [] }));
+    r = await run(['runtime', 'record-suite', 'current', '--kind', 'compatibility', '--from-eval', foreignEval, '--by', 'ci:github']);
+    assert.equal(r.code, 1, r.stdout);
+    assert.match(r.stderr, new RegExp(`the eval result does not certify ${current}: its trials ran under ${foreignManifest}`));
+    const handWritten = join(dir.path, 'suite-hand.json');
+    await writeFile(handWritten, JSON.stringify({ suiteId: 'poc-a-whitebox', revision: 'poc-2', trials: [{ result: 'pass' }, { result: 'pass' }], perArm: {}, comparisons: [] }));
+    r = await run(['runtime', 'record-suite', 'current', '--kind', 'compatibility', '--from-eval', handWritten, '--by', 'ci:github']);
+    assert.equal(r.code, 1, r.stdout);
+    assert.match(r.stderr, /trials without a recorded runtime manifest/);
+    // (review) the partial result of an interrupted `eval run` (marked cancelled; every trial that ran passed) never certifies
+    const partial = join(dir.path, 'suite-cancelled.json');
+    await writeFile(partial, JSON.stringify({ suiteId: 'poc-a-whitebox', revision: 'poc-2', cancelled: true, trials: [{ result: 'pass', runtimeManifestId: current }], perArm: {}, comparisons: [] }));
+    r = await run(['runtime', 'record-suite', 'current', '--kind', 'compatibility', '--from-eval', partial, '--by', 'ci:github']);
+    assert.equal(r.code, 1, r.stdout);
+    assert.match(r.stderr, /CANCELLED \(partial\) eval suite result: it never certifies a release/);
     const passing = join(dir.path, 'suite-pass.json');
-    await writeFile(passing, JSON.stringify({ suiteId: 'poc-a-whitebox', revision: 'poc-1', trials: [{ result: 'pass' }, { result: 'pass' }], perArm: {}, comparisons: [] }));
-    r = await run(['runtime', 'record-suite', 'current', '--kind', 'replay', '--from-eval', passing, '--by', 'ci:github']);
+    await writeFile(passing, JSON.stringify({ suiteId: 'poc-a-whitebox', revision: 'poc-2', trials: [{ result: 'pass', runtimeManifestId: current }, { result: 'pass', runtimeManifestId: current }], perArm: {}, comparisons: [] }));
+    r = await run(['runtime', 'record-suite', 'current', '--kind', 'replay', '--from-eval', passing, '--by', 'ci:github', '--json']);
     assert.equal(r.code, 0, r.stderr);
+    assert.match(r.stderr, /--kind replay is the legacy name of compatibility/);
+    const compat = parseJson<{ kind: string; passed: boolean; binding: { kind: string; manifestIds: string[] } }>(r);
+    assert.deepEqual([compat.kind, compat.passed, compat.binding], ['compatibility', true, { kind: 'eval_trials', manifestIds: [current] }]);
 
     r = await run(['runtime', 'promote', 'current', '--by', 'alice', '--reason', 'contract suite green']);
     assert.equal(r.code, 0, r.stderr);
     assert.match(r.stdout, /promoted candidate → shadow/);
+
+    // → canary: the production replay — a finished production run (of the other runtime) mirrored dry-run on this shadow
+    r = await run(['runtime', 'promote', 'current', '--by', 'alice', '--reason', 'replay green', '--canary-percent', '10']);
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /cannot be promoted to canary: no production_replay suite result is recorded/);
+    r = await run(['runtime', 'record-suite', 'current', '--kind', 'production_replay', '--from-shadow', '--by', 'ci:shadow']);
+    assert.equal(r.code, 0, r.stderr);
+    assert.match(r.stdout, /production_replay suite shadow-mirror recorded for rm_\w+: FAIL \(rsr_\w+\)\n  0 mirrored run\(s\), 1 required/);
+    r = await run(['runtime', 'shadow', '--by', 'ci:shadow', '--scripted-brains', BRAINS]);
+    assert.equal(r.code, 0, r.stderr);
+    assert.match(r.stdout, /no production run to mirror/, 'nothing is selected without an active release');
+    r = await run(['runtime', 'shadow', productionRun.runId, '--by', 'ci:shadow', '--scripted-brains', BRAINS, '--timeout-ms', '120000'], { HT_CLI_SCENARIO: 'pass' });
+    assert.equal(r.code, 0, r.stderr);
+    assert.match(r.stdout, new RegExp(`^${productionRun.runId} → ${productionRun.runId}\\.shadow-\\w+: equivalent \\[verdict pass → pass\\]\\n`));
+    const shadowRunId = /→ (\S+):/.exec(r.stdout)![1]!;
+    r = await run(['status', shadowRunId, '--json']);
+    const mirrored = parseJson<{ run: TestRun }>(r).run;
+    assert.deepEqual([mirrored.status, mirrored.runtimeManifestId, mirrored.labels['hypertest.shadow_of']], ['completed', current, productionRun.runId]);
+    r = await run(['runtime', 'record-suite', 'current', '--kind', 'production_replay', '--from-shadow', '--by', 'ci:shadow', '--json']);
+    assert.equal(r.code, 0, r.stderr);
+    const replay = parseJson<{ passed: boolean; summary: { total: number; failed: number }; binding: { kind: string; comparisonIds: string[] } }>(r);
+    assert.deepEqual([replay.passed, replay.summary.total, replay.summary.failed, replay.binding.kind, replay.binding.comparisonIds.length], [true, 1, 0, 'shadow_comparisons', 1]);
     r = await run(['runtime', 'promote', 'current', '--by', 'alice', '--reason', 'replay green']);
     assert.equal(r.code, 1, 'entering canary needs a selection');
     r = await run(['runtime', 'promote', 'current', '--by', 'alice', '--reason', 'replay green', '--canary-label', 'canary=yes', '--canary-percent', '10']);
     assert.equal(r.code, 0, r.stderr);
     assert.match(r.stdout, /promoted shadow → canary/);
+
+    // → active: the release gate of the CORE eval (trials under THIS manifest) against the committed baseline
+    r = await run(['runtime', 'promote', 'current', '--by', 'ci:release-gate', '--reason', 'release gate green']);
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /cannot be promoted to active: no release_gate suite result is recorded/);
+    const notCore = join(dir.path, 'poc-candidate.json');
+    await writeFile(notCore, JSON.stringify({ ...JSON.parse(await coreCandidate(current)), suiteId: 'poc-all' }));
+    r = await run(['runtime', 'record-suite', 'current', '--kind', 'release_gate', '--from-eval', notCore, '--baseline', CORE_BASELINE, '--by', 'ci:github']);
+    assert.equal(r.code, 1, 'another suite never opens canary → active');
+    assert.match(r.stderr, /the release gate runs the core eval: candidate suite "poc-all" does not count/);
+    // (review) "core" is the BUILT-IN core suite at its current revision and content: a result named core of other content
+    // (e.g. a private suite named core, or an older revision) never opens canary → active — as candidate or as baseline
+    // (before: a candidate AND a baseline of the same other content compared as comparable, and the gate PASSED)
+    const fakeCore = join(dir.path, 'core-fake.json');
+    await writeFile(fakeCore, JSON.stringify({ ...JSON.parse(await coreCandidate(current)), suiteFingerprint: 'f'.repeat(64) }));
+    const fakeBaseline = join(dir.path, 'core-fake-baseline.json');
+    await writeFile(fakeBaseline, JSON.stringify({ ...JSON.parse(await readFile(CORE_BASELINE, 'utf8')), suiteFingerprint: 'f'.repeat(64) }));
+    r = await run(['runtime', 'record-suite', 'current', '--kind', 'release_gate', '--from-eval', fakeCore, '--baseline', fakeBaseline, '--by', 'ci:github']);
+    assert.equal(r.code, 1, r.stdout);
+    assert.match(r.stderr, /--from-eval .*core-fake\.json is not the built-in core suite \(core@core-\d+, content fingerprint [0-9a-f]{12}…\): its result has fingerprint ffffffffffff/);
+    const oldCore = join(dir.path, 'core-old.json');
+    await writeFile(oldCore, JSON.stringify({ ...JSON.parse(await readFile(CORE_BASELINE, 'utf8')), revision: 'core-1' }));
+    r = await run(['runtime', 'record-suite', 'current', '--kind', 'release_gate', '--from-eval', await (async () => { const f = join(dir.path, 'core-ok.json'); await writeFile(f, await coreCandidate(current)); return f; })(), '--baseline', oldCore, '--by', 'ci:github']);
+    assert.equal(r.code, 1, r.stdout);
+    assert.match(r.stderr, /--baseline .*core-old\.json is not the built-in core suite \(core@core-\d+/);
+    const candidateFile = join(dir.path, 'core-candidate.json');
+    await writeFile(candidateFile, await coreCandidate(current));
+    r = await run(['runtime', 'record-suite', 'current', '--kind', 'release_gate', '--from-eval', candidateFile, '--baseline', candidateFile, '--by', 'ci:github']);
+    assert.equal(r.code, 1, 'a candidate gated against itself');
+    assert.match(r.stderr, /the release gate compared the candidate with itself/);
+    // a gate check that fails (a critical false release in the candidate) records a FAILING release gate
+    const regressed = join(dir.path, 'core-regressed.json');
+    await writeFile(regressed, await coreCandidate(current, (t, i) => {
+      if (i === 0) t['outcomeMetrics'] = { ...(t['outcomeMetrics'] as Record<string, number>), criticalFalseRelease: 1 };
+    }));
+    r = await run(['runtime', 'record-suite', 'current', '--kind', 'release_gate', '--from-eval', regressed, '--baseline', CORE_BASELINE, '--by', 'ci:github', '--json']);
+    assert.equal(r.code, 0, r.stderr);
+    const gateFail = parseJson<{ passed: boolean; summary: { detail: string }; binding: { kind: string } }>(r);
+    assert.deepEqual([gateFail.passed, gateFail.binding.kind], [false, 'eval_gate']);
+    assert.match(gateFail.summary.detail, /gate checks failed: .*critical_false_release/);
+    r = await run(['runtime', 'promote', 'current', '--by', 'ci:release-gate', '--reason', 'release gate green']);
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /the latest release_gate suite result \(core@core-\d+, rsr_\w+\) failed/);
+    // a lenient product SLO is still applied by the same gate (row 321): the baseline itself had none, so the pair check fails
+    r = await run(['runtime', 'record-suite', 'current', '--kind', 'release_gate', '--from-eval', regressed, '--baseline', CORE_BASELINE, '--max-critical-false-release', '0.5', '--by', 'ci:github', '--json']);
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(parseJson<{ passed: boolean }>(r).passed, false, 'critical false release worse than the baseline fails whatever the SLO');
+    // the release's own deployment arm against the baseline's scripted arm (the release-eval CI job's comparison)
+    const deploymentFile = join(dir.path, 'core-deployment.json');
+    await writeFile(deploymentFile, await coreCandidate(current, (t) => void (t['armId'] = 'deployment')));
+    r = await run(['runtime', 'record-suite', 'current', '--kind', 'release_gate', '--from-eval', deploymentFile, '--baseline', CORE_BASELINE, '--baseline-arm', 'scripted-multi-llm', '--candidate-arm', 'deployment', '--by', 'ci:github', '--json']);
+    assert.equal(r.code, 0, r.stderr);
+    const gate = parseJson<{ passed: boolean; suiteId: string; binding: { kind: string; manifestIds: string[]; candidateDigest: string; baselineDigest: string } }>(r);
+    assert.deepEqual([gate.passed, gate.suiteId, gate.binding.kind, gate.binding.manifestIds], [true, 'core', 'eval_gate', [current]]);
+    assert.notEqual(gate.binding.candidateDigest, gate.binding.baselineDigest);
     r = await run(['runtime', 'promote', 'current', '--by', 'ci:release-gate', '--reason', 'release gate green']);
     assert.equal(r.code, 0, r.stderr);
     assert.match(r.stdout, /promoted canary → active/);
+    r = await run(['runtime', 'show']);
+    assert.match(r.stdout, /\nsuite {6}release_gate core@core-\d+ PASS \(ci:github, /);
     r = await run(['runtime', 'list']);
     assert.match(r.stdout, new RegExp(`\\n\\* ${current}\\s+active\\s+yes\\s+`));
     r = await run(['runtime', 'rollback', '--by', 'alice', '--reason', 'nothing to go back to']);
@@ -222,8 +402,7 @@ describe('hypertest runtime rollback', () => {
     env = { ...project.env };
     // the manifest of an earlier runtime of this installation (one more policy rule), exported as `runtime show --json` would
     const base = await loadConfig(project.configPath, { env: { ...process.env, ...env } });
-    const other = { ...base, policy: { rules: [{ id: 'site.allow-reads', description: 'site rule', match: { effects: ['read' as const] }, decision: 'allow' as const }] } };
-    const ht = await createHypertest(other, { env: { ...process.env, ...env }, logger: new MemoryLogger(), scriptedBrains: { sim: async () => ({ text: 'noted' }) } });
+    const ht = await createHypertest(otherRuntime(base), { env: { ...process.env, ...env }, logger: new MemoryLogger(), scriptedBrains: { sim: async () => ({ text: 'noted' }) } });
     try {
       previous = ht.manifest.manifestId;
       previousFile = join(dir.path, 'previous-manifest.json');
@@ -240,22 +419,20 @@ describe('hypertest runtime rollback', () => {
 
   test('rollback of the active release: the pointer returns to the previous release, live runs are quarantined, the rolled-back runtime starts no run', async () => {
     const run = (argv: string[]) => cli(argv, { cwd: dir.path, env });
-    const activate = async (ref: string, extra: string[] = []) => {
-      let r = await run(['runtime', 'register', ...extra, '--by', 'alice']);
-      assert.equal(r.code, 0, r.stderr);
-      for (const kind of ['engine_contract', 'replay']) {
-        r = await run(['runtime', 'record-suite', ref, '--kind', kind, '--suite', `${kind}-suite`, '--passed', '--total', '3', '--failures', '0', '--by', 'ci:github']);
-        assert.equal(r.code, 0, r.stderr);
+    // the earlier runtime was active (registered here from its exported manifest); this runtime replaced it — each walked
+    // through every stage gate by its own instance (the gates themselves are exercised by the test above)
+    let r = await run(['runtime', 'register', '--manifest', previousFile, '--by', 'alice']);
+    assert.equal(r.code, 0, r.stderr);
+    const base = await loadConfig(project.configPath, { env: { ...process.env, ...env } });
+    for (const cfg of [otherRuntime(base), base]) {
+      const ht = await createHypertest(cfg, { env: { ...process.env, ...env }, logger: new MemoryLogger(), scriptedBrains: { sim: async () => ({ text: 'noted' }) } });
+      try {
+        await activateViaApi(ht);
+      } finally {
+        await ht.close();
       }
-      for (const step of [[], ['--canary-percent', '100'], []]) {
-        r = await run(['runtime', 'promote', ref, '--by', 'alice', '--reason', 'suites green', ...step]);
-        assert.equal(r.code, 0, r.stderr);
-      }
-    };
-    // the earlier runtime was active; this runtime replaced it
-    await activate(previous, ['--manifest', previousFile]);
-    await activate('current');
-    let r = await run(['runtime', 'list', '--json']);
+    }
+    r = await run(['runtime', 'list', '--json']);
     const current = parseJson<{ current: string }>(r).current;
     assert.notEqual(current, previous);
 

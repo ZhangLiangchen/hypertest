@@ -752,6 +752,8 @@ function validateGate(errors: Errors, gate: unknown, path: string): void {
         if (!objectAt(errors, at, r, true)) return;
         unknownKeys(errors, at, r, ['evidenceType', 'minCount', 'description', 'critical']);
         str(errors, `${at}.evidenceType`, r['evidenceType'], true);
+        // (wave 3, item 9) inconclusive evidence is never counted as evidence of anything
+        if (r['evidenceType'] === 'inconclusive') errors.push(`${at}.evidenceType: 'inconclusive' evidence (recorded after a refused sandbox write) cannot satisfy a requirement`);
         if (r['minCount'] === undefined) errors.push(`${at}.minCount is required (an integer ≥ 1)`);
         else posInt(errors, `${at}.minCount`, r['minCount'], 1);
         if (r['description'] !== undefined && typeof r['description'] !== 'string') errors.push(`${at}.description must be a string`);
@@ -843,6 +845,8 @@ function validateOracles(errors: Errors, oracles: unknown): void {
             str(errors, `${aat}.check.path`, check['path'], true);
           } else if (check['type'] === 'evidence_predicate') {
             str(errors, `${aat}.check.evidenceType`, check['evidenceType'], true);
+            // (wave 3, item 9) evidence marked inconclusive (a refused sandbox write) never satisfies nor violates an assertion
+            if (check['evidenceType'] === 'inconclusive') errors.push(`${aat}.check.evidenceType: 'inconclusive' evidence (recorded after a refused sandbox write) never satisfies nor violates an assertion`);
             str(errors, `${aat}.check.field`, check['field'], true);
             oneOf(errors, `${aat}.check.comparator`, check['comparator'], COMPARATORS, true);
           } else if (check['type'] === 'llm_rubric') str(errors, `${aat}.check.rubric`, check['rubric'], true);

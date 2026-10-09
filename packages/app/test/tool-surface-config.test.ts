@@ -4,7 +4,7 @@
  */
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
-import { MemoryLogger } from '@hypertest/core';
+import { MemoryLogger, isHypertestError } from '@hypertest/core';
 import { BUILTIN_ROLES, RoleCatalog } from '@hypertest/agents';
 import { defaultConfig, validateConfig, type HypertestConfig } from '../src/index.ts';
 import { acpAgentConfigs, computerUseOptions, isolationResolver, mcpServerConfigs, withRemoteWorkers, withToolRoleGrants } from '../src/tool-config.ts';
@@ -178,6 +178,15 @@ describe('sandbox keys and isolation tiers (row 250 / E[6] / stubs[6])', () => {
     has(validateConfig(withSandbox({ roles: { executor: { tier: 'separate', allowedHosts: ['127.0.0.1:1'] } } })), /sandbox\.roles\.executor\.allowedHosts applies only to network 'egress_allowlist'/);
   });
 
+  test('(review) sandbox.image is never accepted and ignored: only the OCI sandbox (base kind or an oci tier without its own image) uses it', () => {
+    has(validateConfig(withSandbox({ image: 'node:22' })), /sandbox\.image applies only to the OCI sandbox .* it would be ignored/);
+    has(validateConfig(withSandbox({ image: 'node:22', roles: { rca: { tier: 'isolated', kind: 'oci', image: 'node:20' } } })), /sandbox\.image applies only to the OCI sandbox/);
+    has(validateConfig(withSandbox({ roles: { rca: { tier: 'isolated', image: 'node:22' } } })), /sandbox\.roles\.rca\.image applies only with kind oci .* it would be ignored/);
+    // used: the base image of an oci tier without its own, and the image of the OCI base sandbox
+    assert.deepEqual(validateConfig(withSandbox({ image: 'node:22', roles: { rca: { tier: 'isolated', kind: 'oci' } } })), []);
+    assert.deepEqual(validateConfig(withSandbox({ kind: 'oci', image: 'node:22', network: 'none' })), []);
+  });
+
   test('isolationResolver: the role tier, made stricter by its work item (no write_workspace ⇒ read-only; no environment ⇒ no egress)', async () => {
     const config = withSandbox({ roles: { executor: { tier: 'separate', network: 'egress_allowlist', allowedHosts: ['127.0.0.1:9000'], memoryMb: 1024 }, reviewer: { tier: 'read_only' } } });
     const items: Record<string, { capabilityRequirements: Array<{ effect: string; resourceScopes: string[] }> }> = {
@@ -199,5 +208,38 @@ describe('sandbox keys and isolation tiers (row 250 / E[6] / stubs[6])', () => {
     assert.equal(reads, 3, 'each work item is read once');
     const switched = isolationResolver(withSandbox({ network: 'egress_allowlist', allowedHosts: ['127.0.0.1:9000'], roles: { executor: { tier: 'separate', network: 'none' } } }), { getWorkItem: async () => undefined });
     assert.deepEqual((await switched({ runId: 'r', workItemId: 'x', role: 'executor', workspace: ws('isolated_worktree') }))?.sandbox, { network: 'none', allowedHosts: [] });
+  });
+
+  test('(review) a work item whose requirements cannot be read fails closed — never the wider tier, and never cached', async () => {
+    const ws = { workspaceId: 'w', kind: 'isolated_worktree', root: '/tmp/x', readOnly: false, sandbox: { kind: 'local', network: 'loopback', envAllowlist: [] }, resourcePrefix: 'workspace/w' } as never;
+    let down = true;
+    let reads = 0;
+    const resolve = isolationResolver(withSandbox({}), {
+      getWorkItem: async () => {
+        reads++;
+        if (down) throw new Error('connection terminated');
+        return { capabilityRequirements: [{ effect: 'execute', resourceScopes: ['workspace/**'] }] };
+      },
+    });
+    // a transient store error: the call is refused (it would otherwise run read-write with egress)
+    await assert.rejects(async () => resolve({ runId: 'r', workItemId: 'wi', role: 'executor', workspace: ws }), (e: unknown) => isHypertestError(e, 'unavailable') && /isolation tier of work item wi could not be determined/.test((e as Error).message));
+    down = false;
+    const d = await resolve({ runId: 'r', workItemId: 'wi', role: 'executor', workspace: ws });
+    assert.deepEqual([d?.tier, d?.readOnly, d?.sandbox?.network], ['read_only', true, 'none'], 'after recovery the work item narrows the call as it must');
+    assert.equal(reads, 2, 'the failure was not cached');
+  });
+});
+
+describe('inconclusive evidence is never an assertion or requirement target (wave 3, item 9)', () => {
+  const oracle = (evidenceType: string) => ({
+    oracleId: 'o1', establishedBy: 'alice', scope: { components: ['c'], description: 'd' }, judgePolicy: { independentReviewerRequired: false },
+    assertions: [{ assertionId: 'a1', description: 'd', kind: 'requirement', severity: 'P1', check: { type: 'evidence_predicate', evidenceType, field: 'passed', comparator: '==', value: true } }],
+  });
+  test('an evidence_predicate on inconclusive evidence and a gate requirement for it are refused; ordinary types are accepted', () => {
+    const bad = validateConfig({ ...defaultConfig(), oracles: [oracle('inconclusive')], gate: { requiredEvidence: [{ evidenceType: 'inconclusive', minCount: 1 }] } } as unknown as HypertestConfig);
+    assert.ok(bad.some((e) => /oracles\[0\]\.assertions\[0\]\.check\.evidenceType: 'inconclusive' evidence .* never satisfies nor violates an assertion/.test(e)), bad.join('\n'));
+    assert.ok(bad.some((e) => /gate\.requiredEvidence\[0\]\.evidenceType: 'inconclusive' evidence .* cannot satisfy a requirement/.test(e)), bad.join('\n'));
+    const good = validateConfig({ ...defaultConfig(), oracles: [oracle('test-result')], gate: { requiredEvidence: [{ evidenceType: 'test-result', minCount: 1 }] } } as unknown as HypertestConfig);
+    assert.deepEqual(good, []);
   });
 });

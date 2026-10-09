@@ -850,8 +850,8 @@ describe('review B2 — a write/fault call acts only on resources its experiment
         ['http.request', { method: 'POST', environmentId: 'other', path: '/orders', body: '{}' }, /env\/other is outside the claims of experiment/],
         ['env.restart', { environmentId: 'other', reason: 'x' }, /env\/other is outside the claims of experiment/],
         ['load.start', { method: 'GET', targetUrl: 'http://127.0.0.1:11/', ratePerSecond: 1, durationMs: 1000 }, /url\/127\.0\.0\.1:11 is outside the claims of experiment/],
-        // the URL of ANOTHER registered environment is that environment: not covered
-        ['http.request', { method: 'POST', url: 'http://127.0.0.1:10/orders', body: '{}' }, /url\/127\.0\.0\.1:10 is outside the claims of experiment/],
+        // the URL of ANOTHER registered environment is that environment (wave 3, e2e[0]: its resource is env/<id>): not covered
+        ['http.request', { method: 'POST', url: 'http://127.0.0.1:10/orders', body: '{}' }, /env\/other is outside the claims of experiment/],
       ];
       for (const [name, args, re] of cases) {
         const denied = await d(name, args);

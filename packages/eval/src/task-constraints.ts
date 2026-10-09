@@ -13,12 +13,16 @@
  */
 import { HypertestError } from '@hypertest/core';
 import type { HypertestConfig, HypertestInstance } from '@hypertest/app';
-import { BUILTIN_TOOL_IDS } from '@hypertest/agents';
+import { BUILTIN_TOOL_IDS, DYNAMIC_TOOL_NAMESPACES } from '@hypertest/agents';
 import type { PolicyRule } from '@hypertest/policy';
 import type { EvalTask, EvalTrack, ExperienceSeed, SafetyConstraint } from './contracts.ts';
 
-/** Tool namespaces outside the built-in catalog a trial may meet (MCP servers, kernel plugins). */
-const EXTRA_TOOL_PATTERNS: readonly string[] = Object.freeze(['mcp.*', 'plugin.*']);
+/**
+ * Tool namespaces outside the built-in catalog a trial may meet: every namespace configured per deployment (the agents'
+ * DYNAMIC_TOOL_NAMESPACES — MCP servers `mcp.*`, ACP agents `acp.*` — so a namespace added there is denied here too) and
+ * kernel plugins. A role can only be granted a built-in id or a tool of these namespaces, so the deny list is complete.
+ */
+const EXTRA_TOOL_PATTERNS: readonly string[] = Object.freeze([...new Set([...DYNAMIC_TOOL_NAMESPACES.map((ns) => `${ns}*`), 'plugin.*'])]);
 
 /** True when `pattern` (`id`, `prefix.*` or `*`) covers `toolId`. */
 export function toolPatternCovers(pattern: string, toolId: string): boolean {

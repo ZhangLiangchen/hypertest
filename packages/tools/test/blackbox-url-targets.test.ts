@@ -22,13 +22,20 @@ function executorCapability() {
 }
 
 describe('urlTargetEnvironments: allowlisted URL targets are black-box environments', () => {
-  test('one environment per URL entry: loopback ⇒ local, else the configured remote class (default sandbox)', () => {
-    const envs = urlTargetEnvironments(['http://127.0.0.1:7450', 'https://api.example.test/v1/', '*.example.org', 'h.example.net:8443', 'http://127.0.0.1:7450'], []);
+  test('one environment per URL entry: loopback ⇒ local, else the configured remote class (no default: unclassified remote URLs are not environments)', () => {
+    const envs = urlTargetEnvironments(['http://127.0.0.1:7450', 'https://api.example.test/v1/', '*.example.org', 'h.example.net:8443', 'http://127.0.0.1:7450'], [], { remoteClass: 'sandbox' });
     assert.deepEqual(envs, [
       { environmentId: 'url-127.0.0.1-7450', environmentClass: 'local', baseUrl: 'http://127.0.0.1:7450', generation: 0 },
       { environmentId: 'url-api.example.test-443', environmentClass: 'sandbox', baseUrl: 'https://api.example.test/v1/', generation: 0 },
     ]);
     assert.equal(urlTargetEnvironments(['https://api.example.test'], [], { remoteClass: 'staging' })[0]!.environmentClass, 'staging');
+    // (review) a remote host is never classified by default: on `sandbox` the default policy would let agents write and
+    // delete there without approval — without tools.urlEnvironmentClass it stays an unclassified url/<host> (named)
+    const unclassified: string[] = [];
+    assert.deepEqual(urlTargetEnvironments(['http://127.0.0.1:7450', 'https://api.example.test/v1/'], [], { onUnclassified: (e) => unclassified.push(e) }), [
+      { environmentId: 'url-127.0.0.1-7450', environmentClass: 'local', baseUrl: 'http://127.0.0.1:7450', generation: 0 },
+    ]);
+    assert.deepEqual(unclassified, ['https://api.example.test/v1/']);
     assert.equal(urlEnvironmentId(new URL('http://[::1]:9000/x')), 'url-__1-9000');
   });
 

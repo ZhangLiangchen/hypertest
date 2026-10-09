@@ -12,16 +12,36 @@
       "fingerprint": "4838f5244d0ea9ae341a3efdaf6163c7535b187e9aa5f19390eb55ac08890615",
       "revision": "1"
     },
+    "blackBoxOnly": {
+      "fingerprint": "79d28640f2716cd7f0c26377703445ac85da634999c2875c652d02f1cb2e955c",
+      "revision": "1"
+    },
+    "budgetExhaustion": {
+      "fingerprint": "ffc762aeb66d763a172d1fbbdc8e5c281315b9b7540435704c533b2e3e83efc9",
+      "revision": "1"
+    },
     "causalChain": {
       "fingerprint": "ec7ec3391fa74a71524f6820a8cc98f54953d7b62814cf8fe5dcc0f3079312de",
+      "revision": "1"
+    },
+    "competingFaultsIsolated": {
+      "fingerprint": "da31f435af3381e2df9afbae653d3969d546c888f5add17a62d90758832b312f",
       "revision": "1"
     },
     "contextIsolation": {
       "fingerprint": "d1038c7d7a8922ef72865b41a0267d7c242c73b9603e751bd9dd6b37c168e604",
       "revision": "1"
     },
+    "convergence": {
+      "fingerprint": "6cdc2c5a55d2a1a7ea2fc94455b20e8c42404c752d82bed6f2411c4958082aa9",
+      "revision": "1"
+    },
     "defectDetected": {
       "fingerprint": "0c0bfe46599de1de33ff2d841fdc7c6b46550921da8102e29b9c6a96599dae5e",
+      "revision": "1"
+    },
+    "delegation": {
+      "fingerprint": "e38f7ff3c8333c6135bb9efac4b06ac9dd2625a0b5b8bb7bb4d1c2c9609ad71a",
       "revision": "1"
     },
     "evidenceCompleteness": {
@@ -30,6 +50,10 @@
     },
     "evidenceIntegrity": {
       "fingerprint": "6d89b239a87ca2d423515904feccaeaa44ff36511267070c21156f0b7fe1d44c",
+      "revision": "1"
+    },
+    "faultTolerance": {
+      "fingerprint": "2aa59dc1a335425861bdaa589313b822199e0637259892f867a7e6c5916b8379",
       "revision": "1"
     },
     "freshnessGuarded": {
@@ -100,6 +124,10 @@
       "fingerprint": "6fb9c6d70e71cbd673247936b3c92f14906f1d11780cd1a78a397f3f1b506ad1",
       "revision": "1"
     },
+    "providerClassesAudited": {
+      "fingerprint": "9062c24ce4920c6ebbaf7276bab057ff21de40413b719a642ee591ae3c173a54",
+      "revision": "1"
+    },
     "rcaMetricsExecutorParallel": {
       "fingerprint": "78de0b1cc7f9980ea751e3f846e9065b4f2f0518a0357f869fd76ffdf4b9addb",
       "revision": "1"
@@ -116,8 +144,20 @@
       "fingerprint": "12cfae77ad50991073bbf9fbc8f0d0f6de63aa02a68f2efd1ec438b03640b904",
       "revision": "1"
     },
+    "tamperDetected": {
+      "fingerprint": "31d6dfcac6278dddca83c6fc18c84fcb7adfab8d2979d1b7a9ebc8523f36a68b",
+      "revision": "1"
+    },
     "testChangeGoverned": {
       "fingerprint": "d38e824ed0f8bbfdd0f51f722816be78904084804518133e63ddcef879f83dcb",
+      "revision": "1"
+    },
+    "uiEvidence": {
+      "fingerprint": "935a692d6be02feb58327a076208ca624de6b05ea4cacfce12dd0692b7db1628",
+      "revision": "1"
+    },
+    "unqueryableEscalated": {
+      "fingerprint": "84e0c4d2f3f7624a80abe0ed2914987e41738638b9ca47436f94a3d8231f10f6",
       "revision": "1"
     },
     "verdict": {

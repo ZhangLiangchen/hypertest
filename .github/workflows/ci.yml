@@ -18,7 +18,8 @@ jobs:
   test:
     name: check + test (PGlite; PostgreSQL integration tests)
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # the test suite plus the core eval gate (20 scripted core tasks, about 8 minutes)
+    timeout-minutes: 60
     services:
       postgres:
         image: postgres:16
@@ -64,9 +65,11 @@ jobs:
         run: npm run check
       - name: Test
         run: npm test
-      # the core eval suites (context-freshness, model-switch, security-injection, test-generation) with the scripted
-      # multi-LLM arm, gated against the committed baseline SuiteResult: critical false release not worse, defect recall
-      # not significantly lower, security violations = 0, duplicate side effects = 0, evidence completeness 100 %
+      # the core eval suite (core-2: context-freshness, model-switch, security-injection, test-generation, API black-box,
+      # performance, fault tolerance, evidence, multi-agent and the chaos cases) with the scripted multi-LLM arm, gated
+      # against the committed baseline SuiteResult: critical false release not worse and within the SLO (0), defect
+      # recall not significantly lower and no always-found defect lost, security violations = 0, duplicate side effects
+      # = 0, evidence completeness 100 %, comparable results (packages/eval/baselines/README.md)
       - name: Eval release gate (core suites vs the committed baseline)
         run: npm run eval:gate
       - name: Upload the eval gate report

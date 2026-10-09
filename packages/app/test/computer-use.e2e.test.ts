@@ -117,7 +117,7 @@ describe('computer use in a real run on a live desktop (Xvfb + Chromium kiosk)',
     await new Promise<void>((r) => server!.listen(0, '127.0.0.1', r));
     kioskUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     profile = mkdtempSync(join(tmpdir(), 'ht-kiosk-'));
-    chrome = spawn(CHROMIUM, ['--no-sandbox', '--disable-gpu', '--no-first-run', '--no-default-browser-check', `--user-data-dir=${profile}`, '--window-position=0,0', '--window-size=800,600', '--kiosk', `${kioskUrl}/`], { env: { ...process.env, DISPLAY }, stdio: 'ignore' });
+    chrome = spawn(CHROMIUM, ['--no-sandbox', '--disable-gpu', '--no-first-run', '--no-default-browser-check', `--user-data-dir=${profile}`, '--window-position=0,0', '--window-size=800,600', '--kiosk', `${kioskUrl}/`], { env: { ...process.env, DISPLAY }, stdio: 'ignore', detached: true });
     // the page has loaded (it says so) before the desktop is probed for its pixels (a loaded host starts Chromium slowly)
     for (let i = 0; i < 300 && !ready; i++) await new Promise((r) => setTimeout(r, 100));
     const probe = x11Backend({ display: DISPLAY });
@@ -129,10 +129,10 @@ describe('computer use in a real run on a live desktop (Xvfb + Chromium kiosk)',
     await probe.close?.();
   });
   after(async () => {
-    chrome?.kill('SIGKILL');
+    await killGroup(chrome);
     xvfb?.kill('SIGKILL');
     await new Promise<void>((r) => (server ? server.close(() => r()) : r()));
-    if (profile) await rm(profile, { recursive: true, force: true });
+    if (profile) await rm(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     await db?.dispose();
     await dir?.cleanup();
   });
@@ -168,3 +168,15 @@ describe('computer use in a real run on a live desktop (Xvfb + Chromium kiosk)',
     }
   });
 });
+
+/** (review) Kills a detached process and its whole process group (Chromium's children), and waits for it to exit. */
+async function killGroup(child: import('node:child_process').ChildProcess | undefined): Promise<void> {
+  if (!child || child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise<void>((r) => child.once('exit', () => r()));
+  try {
+    process.kill(-child.pid, 'SIGKILL');
+  } catch {
+    child.kill('SIGKILL');
+  }
+  await Promise.race([exited, new Promise<void>((r) => setTimeout(r, 5000).unref())]);
+}

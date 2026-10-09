@@ -274,11 +274,14 @@ export function urlEnvironmentId(url: URL): string {
 /**
  * (additive, e2e[0]) The black-box environments the operator's allowlisted URL targets stand for: one per URL entry of
  * `httpAllowlist` (absolute http(s) URL) whose origin no environment of `registered` already serves. Its class is
- * `local` for a loopback host, else `remoteClass` (the operator's `tools.urlEnvironmentClass`, default `sandbox`). No
- * control target: env.* tools refuse it (nothing to restart or fault). Host patterns (`*.example.com`, `host:port`) are
- * not environments and stay `url/<host>` resources no built-in grant covers.
+ * `local` for a loopback host, else `remoteClass` (the operator's `tools.urlEnvironmentClass`). (review) A remote URL is
+ * never classified by default: the class decides what the policy lets agents do there (on `sandbox`, writes and deletes
+ * without approval), so without `remoteClass` a non-loopback entry is NOT an environment (it stays `url/<host>`, which no
+ * built-in grant covers; `onUnclassified` names it). No control target: env.* tools refuse it (nothing to restart or
+ * fault). Host patterns (`*.example.com`, `host:port`) are not environments and stay `url/<host>` resources no built-in
+ * grant covers.
  */
-export function urlTargetEnvironments(httpAllowlist: readonly string[] | undefined, registered: readonly EnvironmentDescriptor[], options: { remoteClass?: string } = {}): EnvironmentDescriptor[] {
+export function urlTargetEnvironments(httpAllowlist: readonly string[] | undefined, registered: readonly EnvironmentDescriptor[], options: { remoteClass?: string; onUnclassified?: (entry: string) => void } = {}): EnvironmentDescriptor[] {
   const out: EnvironmentDescriptor[] = [];
   const served = new Set(registered.flatMap((e) => environmentOrigins(e)));
   const ids = new Set(registered.map((e) => e.environmentId));
@@ -293,9 +296,14 @@ export function urlTargetEnvironments(httpAllowlist: readonly string[] | undefin
     if (served.has(url.origin)) continue;
     const environmentId = urlEnvironmentId(url);
     if (ids.has(environmentId)) continue;
+    const environmentClass = isLoopbackHost(url.hostname) ? 'local' : options.remoteClass;
+    if (environmentClass === undefined) {
+      options.onUnclassified?.(entry);
+      continue;
+    }
     served.add(url.origin);
     ids.add(environmentId);
-    out.push({ environmentId, environmentClass: isLoopbackHost(url.hostname) ? 'local' : (options.remoteClass ?? 'sandbox'), baseUrl: entry, generation: 0 });
+    out.push({ environmentId, environmentClass, baseUrl: entry, generation: 0 });
   }
   return out;
 }

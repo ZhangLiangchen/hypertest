@@ -1,0 +1,84 @@
+{
+  "suites": {
+    "api-ui-blackbox": {
+      "revision": "ext-1",
+      "fingerprint": "f0d2aa0edf1db6a2cf49934bedd792b85318490429d43febb6809287026322c9"
+    },
+    "chaos": {
+      "revision": "ext-1",
+      "fingerprint": "9786a65f52800d47ad1b063b3552b5cf43e90fb4fa1f2f07bbdc2b8608fb42e4"
+    },
+    "context-freshness": {
+      "revision": "core-2",
+      "fingerprint": "e767433bc97bb1f34e8fdce4dda774a44b0a5ed2fe4cda01808c2347bdb05c63"
+    },
+    "core": {
+      "revision": "core-2",
+      "fingerprint": "498e2f0ec31192206c7742d8b6fe2261f9fcdc877931973d95b39aa3217be63b"
+    },
+    "deep": {
+      "revision": "tiers-1",
+      "fingerprint": "997303710ec7f8bd95b3aa2de97ebae0f3d8f5bceeb219a1b1813976bda87d80"
+    },
+    "evidence": {
+      "revision": "ext-1",
+      "fingerprint": "cf48b3e4967c91ab704751cb385f6c512d02a2f1848c626000fe599b0560365d"
+    },
+    "failure-recovery": {
+      "revision": "tiers-1",
+      "fingerprint": "480667ed0824c2340b1143a81e403df1bec0bad7d3bc927e9aa6a635cdda4fa7"
+    },
+    "fault-tolerance": {
+      "revision": "ext-1",
+      "fingerprint": "cb9f743f0f21cce204dc9a95e9da9bb671d6d4347259bc88a1f01f9db0598669"
+    },
+    "model-switch": {
+      "revision": "core-2",
+      "fingerprint": "27b1ebc04ced19a3504639ed84c84065b43153453872ee2e7d1b67ca332cd6da"
+    },
+    "multi-agent": {
+      "revision": "ext-1",
+      "fingerprint": "b886e31d1cc60a4df3cc946dea75d0573ae4e2d7a00f7c408959ea5af8b0e3ef"
+    },
+    "oracle-robustness": {
+      "revision": "poc-2",
+      "fingerprint": "411d601f1bf78623a76cb3837f2fad1d801e3f3b9bd334910c934ee4ddeb2db5"
+    },
+    "performance": {
+      "revision": "ext-1",
+      "fingerprint": "da424db33364329a8d8afdf7038f1cc64a835fc0049f67e160784022b5616ba8"
+    },
+    "poc-a-whitebox": {
+      "revision": "poc-2",
+      "fingerprint": "5e47023ad2cf0da1aaf86b0cd5f2322184f71346cf51cdf38fd1279f557108ee"
+    },
+    "poc-all": {
+      "revision": "poc-2",
+      "fingerprint": "34fed9263a8d817378cd8ee5fe08bb97cab0855e919e89de35997cd6b5f302df"
+    },
+    "poc-b-event-driven": {
+      "revision": "poc-2",
+      "fingerprint": "82dd5468a469175f5e3254f47223ba205b6fe28a59ff0e3ccd5729dd6f726cce"
+    },
+    "poc-c-durable-load": {
+      "revision": "poc-2",
+      "fingerprint": "9fd54c92b9feabaa3f332a2c15b0dd5b3f4b26c489600aa43c10d9855685c85b"
+    },
+    "pr-smoke": {
+      "revision": "tiers-1",
+      "fingerprint": "6efd6fa99891b6c154cfb205312fa1dc351dec7d4a86c41051f3d855a0a87bcb"
+    },
+    "recovery-chaos": {
+      "revision": "poc-2",
+      "fingerprint": "be777dba380a92c42cbb53180e3775be3d03e1879698e56c9cec885b825cd462"
+    },
+    "security-injection": {
+      "revision": "core-2",
+      "fingerprint": "673fe3e3d04d8e06f93a74a2b5322af9ae43d8491bb08b047f378cdd37ef9245"
+    },
+    "test-generation": {
+      "revision": "core-2",
+      "fingerprint": "f13817f66bc7c708ec8fa4d73d017c67542cb75c5195220f159f850407cfe8d3"
+    }
+  }
+}

@@ -100,7 +100,7 @@ export function resolveUrlTarget<T extends { sutUrl?: string; environmentId?: st
   if (!owner) {
     throw new HypertestError(
       'precondition_failed',
-      `the system under test ${url.origin} is neither a registered environment nor on tools.httpAllowlist: its agents could not reach it (add "${url.origin}" to tools.httpAllowlist, or register it under environments: and pass --environment <id>)`,
+      `the system under test ${url.origin} is neither a registered environment nor on tools.httpAllowlist: its agents could not reach it (add "${url.origin}" to tools.httpAllowlist — for a non-loopback host also set tools.urlEnvironmentClass to its environment class — or register it under environments: and pass --environment <id>)`,
       { details: { sutUrl: target.sutUrl } },
     );
   }

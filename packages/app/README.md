@@ -477,9 +477,11 @@ new embedder stay in memory (logged at startup of the first search). Code leaves
 
 Configuration keys (validated in `config.ts`, problems from `tool-config.ts`; every accepted key is honoured or refused):
 
-- `tools.urlEnvironmentClass` — class of non-loopback allowlisted URL targets (default `sandbox`). `compose.ts` registers
-  one environment per `tools.httpAllowlist` URL (`urlTargetEnvironments`); `run({target: {sutUrl}})` resolves the URL to
-  it (`resolveUrlTarget`: ambiguous → invalid_argument, nothing serves it → precondition_failed).
+- `tools.urlEnvironmentClass` — class of non-loopback allowlisted URL targets (no default: without it a non-loopback
+  URL is not an environment and a warning names it — the class decides what the policy lets agents do there).
+  `compose.ts` registers one environment per classified `tools.httpAllowlist` URL (`urlTargetEnvironments`);
+  `run({target: {sutUrl}})` resolves the URL to it (`resolveUrlTarget`: ambiguous → invalid_argument, nothing serves it →
+  precondition_failed).
 - `tools.mcpServers` (`mcpServerProblems`, `mcpServerConfigs`: variables by NAME, a missing one makes the server
   unavailable), `tools.acpAgents` (`acpAgentConfigs`), `tools.remoteWorkers` (`withRemoteWorkers`; `startToolWorker`
   serves `hypertest tool-worker`), `tools.computerUse` (`computerUseOptions`); `withToolRoleGrants` offers `mcp.<id>.*`,
@@ -491,9 +493,53 @@ Configuration keys (validated in `config.ts`, problems from `tool-config.ts`; ev
   `memoryMb` (`sandboxKeyProblems`), and `sandbox.roles.<role>: {tier: read_only | isolated | separate, kind, image,
   network, allowedHosts, cpuLimit, memoryMb}` (`sandboxRoleProblems`; read_only is refused for roles holding workspace
   write tools). `isolationResolver(config, blackboard)` is the ToolRuntime's isolation tier per call (role tier, made
-  stricter by the work item's capability requirements). When a tier names the other sandbox kind both runners are
-  composed (`routedSandbox`).
+  stricter by the work item's capability requirements; a work item whose requirements cannot be read fails the call
+  closed — never the wider role tier — and the failure is not cached). When a tier names the other sandbox kind both
+  runners are composed (`routedSandbox`).
+- Oracles and gate requirements never name evidence type `inconclusive` (refused by `validateConfig`): evidence a call
+  records after a refused sandbox write is kept as `inconclusive` and must not satisfy or violate anything.
 
-Tests: `test/tool-surface-config.test.ts`, `test/environments.test.ts`, `test/mcp-tools.e2e.test.ts`,
+Tests: `test/tool-surface-config.test.ts`, `test/environments.test.ts`, `test/mcp-tools.e2e.test.ts`, `test/container-faults.e2e.test.ts`,
 `test/vision-gui.e2e.test.ts`, `test/acp-agent.e2e.test.ts`, `test/remote-worker.e2e.test.ts`,
 `test/computer-use.e2e.test.ts`, `test/sandbox-tiers.e2e.test.ts`.
+
+## Release stages, verified migration drive, harness features (audit wave 3, unit release-eval, additive)
+
+- **Per-stage release gates (F[0])** — `RuntimeReleaseService` (`releases.ts`): `recordEvalSuite` records a
+  `compatibility` result from an eval SuiteResult only when every trial ran under the certified manifest
+  (`evalTrialManifests`; e2e[5]) and the result is complete (a CANCELLED partial result is refused, as by the release
+  gate); `recordReleaseGate` records the `release_gate` result of a CORE eval candidate
+  (bound to the manifest, with the candidate and baseline digests; a candidate gated against itself or against a
+  baseline that ran under the same release is refused); `mirror(runId)` runs a finished production run again on a SHADOW
+  release (label `hypertest.shadow_of`, admitted only by a shadow — a shadow admits nothing else, also before any
+  release is active; the source must be a run of the active release, or, unmanaged, of no rolled-back/retired one) and records the comparison of decisions
+  (`shadowDivergences`: run status, verdict, violated/unknown criteria, human review); `shadowCandidates()` picks the
+  runs `runtime.shadow: {percentage, labels, minRuns, timeoutMs}` selects; `recordProductionReplay` turns the
+  comparisons into the `production_replay` result (≥ minRuns, no divergence). `compose.ts` wraps every side-effect
+  adapter in `shadowDryRunAdapters`: an operation of a mirrored run is prepared, recorded `not_applied: dry_run` and
+  never dispatched (gateway and reconciler alike).
+- **Migration drive (F[1])** — `migrate(…, {drive: true})` and `drive(runId)` start this runtime's durable loop on a run
+  migrated here and wait for `run.migration_driven` (recorded by the loop's first `recover`, `markDriven`); a previous
+  loop still open (Temporal: the run workflow on the SOURCE manifest's task queue) is woken, and when no source worker
+  is left a handover worker (`handoverControlPlane`, refusing only that run) serves the source queue briefly.
+  `HypertestInstance.resume(runId)` goes through `drive`: a migrated run is never resumed by a silent no-op start
+  (`unavailable` with the remedy instead); so does `resumeIncomplete()` (`hypertest resume` without a run id, `serve`):
+  a migrated run that was not taken over is left out of the resumed runs (warning with the remedy). Item 17: a work item waiting ONLY on model pauses migrates (its pause carries
+  over: `RuntimeEpoch.carriedModelPauses`); any other wait still refuses.
+- **Harness features (F[8])** — `harness.features` (`harness-features.ts`: subagents, dynamicScheduler, blackboard,
+  contextFreshness, oracleGovernance) switch subsystems off for the eval's causal arms, honoured only for an eval trial
+  instance (`HypertestOverrides.evalTrial`); a deployment configuration that disables one is refused at composition.
+- **Arm overrides (item 6)** — `HypertestOverrides.fetch` (the HTTP model adapters' transport) and `env` let the eval's
+  three-provider-class arm run the anthropic, openai-compatible and pi-ai adapters over a scripted wire transport;
+  `configuredModels(config, …)` builds providers and routes for the configured judge.
+
+Contract changes (additive): `RuntimeReleaseService.recordEvalSuite`, `recordReleaseGate` (+ `baseline?`), `mirror`,
+`shadowCandidates`, `recordProductionReplay`, `markDriven`, `drive`; `MigrateRunInput.drive`, `driveTimeoutMs`,
+`signal`; `RunMigrationResult.driven`, `driveProblem`; `config.runtime.shadow`, `config.harness.features`;
+`HypertestOverrides.evalTrial`, `fetch`, `env`. Behaviour change: `resume` of a migrated, not yet driven run waits for
+the take-over (or fails `unavailable`); `resumeIncomplete()` takes such runs over too (or leaves them out).
+
+Tests: `test/release-stages.e2e.test.ts` (shadow mirroring dry-run and decision comparison, each stage's gate and its
+refusals, the item-17 migration and its other-wait refusal, `driven` never claimed without a drive, `resume` refusing
+a take-over that did not happen, and on a live Temporal cluster: the source worker alive, the source runtime gone, and a
+migration without drive taken over by `resume`), `test/releases.e2e.test.ts`, `test/harness-features.test.ts`.

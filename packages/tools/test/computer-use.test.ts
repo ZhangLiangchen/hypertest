@@ -149,7 +149,8 @@ describe('computer.* LIVE: the native X11 backend on Xvfb driving a real Chromiu
     await new Promise<void>((r) => server!.listen(0, '127.0.0.1', r));
     profile = mkdtempSync(join(tmpdir(), 'ht-chrome-'));
     chrome = spawn(CHROMIUM, ['--no-sandbox', '--disable-gpu', '--no-first-run', '--no-default-browser-check', `--user-data-dir=${profile}`, '--window-position=0,0', '--window-size=800,600', '--kiosk', `http://127.0.0.1:${(server.address() as AddressInfo).port}/`], {
-      env: { ...process.env, DISPLAY: display }, stdio: 'ignore',
+      // its own process group: the teardown kills Chromium with every child (renderers keep writing the profile otherwise)
+      env: { ...process.env, DISPLAY: display }, stdio: 'ignore', detached: true,
     });
     backend = x11Backend({ display });
     tools = new Map(computerTools({ backend, displayId: `xvfb-${display.slice(1)}` }).map((t) => [t.id, t]));
@@ -164,10 +165,10 @@ describe('computer.* LIVE: the native X11 backend on Xvfb driving a real Chromiu
   });
   after(async () => {
     await backend?.close?.();
-    chrome?.kill('SIGKILL');
+    await killGroup(chrome);
     xvfb?.kill('SIGKILL');
     await new Promise<void>((r) => (server ? server.close(() => r()) : r()));
-    if (profile) await rm(profile, { recursive: true, force: true });
+    if (profile) await rm(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   test('screenshot is a real PNG of the desktop; click and typing reach the page', async (t) => {
@@ -187,3 +188,15 @@ describe('computer.* LIVE: the native X11 backend on Xvfb driving a real Chromiu
     assert.ok(events.includes('typed:Ada'), `the typed text reached the page: ${JSON.stringify(events)}`);
   });
 });
+
+/** (review) Kills a detached process and its whole process group (Chromium's children), and waits for it to exit. */
+async function killGroup(child: import('node:child_process').ChildProcess | undefined): Promise<void> {
+  if (!child || child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise<void>((r) => child.once('exit', () => r()));
+  try {
+    process.kill(-child.pid, 'SIGKILL');
+  } catch {
+    child.kill('SIGKILL');
+  }
+  await Promise.race([exited, new Promise<void>((r) => setTimeout(r, 5000).unref())]);
+}

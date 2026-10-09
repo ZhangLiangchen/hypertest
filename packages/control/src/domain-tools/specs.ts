@@ -398,7 +398,11 @@ export function specTools(deps: ControlDeps): ToolSpec[] {
               type: 'object',
               additionalProperties: false,
               required: ['kind', 'target'],
-              properties: { kind: { type: 'string', enum: ['process_kill', 'restart', 'latency', 'error_rate', 'partition', 'custom'] }, target: { type: 'string' }, atMs: { type: 'integer', minimum: 0 }, params: { type: 'object' } },
+              // (wave 3) + the docker / Kubernetes container faults env.inject_fault injects (a plan must be able to declare them)
+              properties: {
+                kind: { type: 'string', enum: ['process_kill', 'restart', 'latency', 'error_rate', 'partition', 'custom', 'pause', 'kill', 'network_disconnect', 'netem', 'pod_delete', 'scale_zero', 'network_deny'] },
+                target: { type: 'string' }, atMs: { type: 'integer', minimum: 0 }, params: { type: 'object' },
+              },
             },
           },
           isolation: {

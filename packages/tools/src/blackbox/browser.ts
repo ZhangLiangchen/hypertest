@@ -256,6 +256,31 @@ function withBlocked(outcome: ToolOutcome, blocked: BlockedRequest[]): ToolOutco
   return { ...outcome, structured, text: `${JSON.stringify(structured)}\n[egress guard refused ${blocked.length} request(s) off the allowlist; the page did not leave it]` };
 }
 
+/**
+ * (review) The origins browser.navigate ADMITTED for a page: those of the resource its capability was checked on (the
+ * addressed environment's origins, or the URL's own origin) plus the page's origin when the load finished. A read that
+ * names no environment (browser.text / browser.screenshot) is a read of what navigate admitted — and nothing else: a page
+ * an interaction moved to another origin (a link to another environment the session's egress policy lets through) is
+ * read only by naming its environment, whose `env/<id>` the capability then covers (or refuses).
+ */
+const admittedOrigins = new WeakMap<Page, Set<string>>();
+
+function pageOrigin(page: Page): string {
+  try {
+    return new URL(page.url()).origin;
+  } catch {
+    return 'null';
+  }
+}
+
+/** (review) A read without environmentId: the page must still be on an origin browser.navigate admitted. */
+function assertAdmitted(page: Page, environmentId: string | undefined): void {
+  if (environmentId !== undefined) return;
+  const origin = pageOrigin(page);
+  if (admittedOrigins.get(page)?.has(origin) === true) return;
+  throw new HypertestError('permission_denied', `the page is on ${origin}, which browser.navigate did not admit (an interaction moved it there): name the environment it is on (environmentId) or navigate to it`);
+}
+
 /** When an environmentId is given, the page must currently be on one of that environment's origins. */
 function assertOnEnvironment(page: Page, environmentId: string | undefined, ctx: ToolContext): void {
   if (environmentId === undefined) return;
@@ -273,8 +298,8 @@ function assertOnEnvironment(page: Page, environmentId: string | undefined, ctx:
  * (e2e[1]) Resource keys of a session tool: the environment the call names (`env/<id>`, the page must be on it) — the
  * scope every black-box role's grant covers (`env/**`). The browser session itself is the calling agent's own (keyed by
  * run + agent, never shared), not a governed resource: a read without environmentId touches nothing beyond the page
- * browser.navigate already admitted (capability, policy, egress guard), and an interaction (click/fill, an external
- * effect) must name its environment — so it is classified, claimed and ledgered on it.
+ * browser.navigate already admitted (capability, policy, egress guard; (review) enforced: `assertAdmitted`), and an
+ * interaction (click/fill, an external effect) must name its environment — so it is classified, claimed and ledgered on it.
  */
 function sessionResource(input: { environmentId?: string }): string[] {
   return input.environmentId !== undefined ? [`env/${input.environmentId}`] : [];
@@ -441,6 +466,8 @@ export function browserTools(options: BrowserToolOptions = {}): ToolSpec[] {
           return { status: 'failed', error: { code: 'permission_denied', message: `navigation was redirected off the allowlist: ${after}` } };
         }
         const blocked = await manager.drainBlocked(ctx.runId, ctx.agentId);
+        // (review) what this navigation admitted: the checked resource's origins and where the load ended
+        admittedOrigins.set(page, new Set([...(target.trustedOrigins.length > 0 ? target.trustedOrigins : [target.url.origin]), finalUrl.origin]));
         const title = await page.title();
         const sessionId = input.sessionId ?? 'default';
         // (e2e[1]) the page load is evidence: what the browser received for the document, anchored to its environment
@@ -552,6 +579,7 @@ export function browserTools(options: BrowserToolOptions = {}): ToolSpec[] {
         const page = await manager.existingPage(ctx.runId, ctx.agentId, input.sessionId);
         if (!page) return { status: 'failed', error: { code: 'precondition_failed', message: 'no page in this session; call browser.navigate first' } };
         assertOnEnvironment(page, input.environmentId, ctx);
+        assertAdmitted(page, input.environmentId);
         const selector = input.selector ?? 'body';
         const content = await page.locator(selector).first().innerText({ timeout: input.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS });
         const scrubbed = ctx.secrets ? ctx.secrets.redact(content) : content;
@@ -592,6 +620,7 @@ export function browserTools(options: BrowserToolOptions = {}): ToolSpec[] {
         const page = await manager.existingPage(ctx.runId, ctx.agentId, input.sessionId);
         if (!page) return { status: 'failed', error: { code: 'precondition_failed', message: 'no page in this session; call browser.navigate first' } };
         assertOnEnvironment(page, input.environmentId, ctx);
+        assertAdmitted(page, input.environmentId);
         const png = await page.screenshot({ fullPage: input.fullPage === true, type: 'png' });
         const url = page.url();
         const env = pageEnvironment(page, ctx, input.environmentId);

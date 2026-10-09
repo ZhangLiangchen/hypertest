@@ -882,7 +882,7 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
  * (`ToolSpec.credentialScopes` — what the capability and the permit's credentialScope were checked against), for this run
  * and invocation only; anything else is refused (permission_denied) — a tool can never mint a credential nobody authorized.
  */
-function callScopedSecrets(broker: NonNullable<ToolRuntimeDeps['secrets']>, authorized: readonly string[], runId: string, invocationId: string): NonNullable<ToolContext['secrets']> {
+export function callScopedSecrets(broker: NonNullable<ToolRuntimeDeps['secrets']>, authorized: readonly string[], runId: string, invocationId: string): NonNullable<ToolContext['secrets']> {
   const allowed = new Set(authorized);
   return {
     describe: (environmentId) => broker.describe(environmentId),

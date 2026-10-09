@@ -23,6 +23,8 @@ const MAX_PROMPT_CHARS = 64 * 1024;
 const MAX_TRANSCRIPT_CHARS = 256 * 1024;
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 15 * 60_000;
+/** (review) Longest protocol line accepted from an agent (a line never ends otherwise: memory would grow without bound). */
+export const MAX_ACP_LINE_CHARS = 16 * 1024 * 1024;
 
 export interface AcpAgentConfig {
   /** Agent id (tool id segment: `acp.<id>.prompt`). */
@@ -94,6 +96,7 @@ class JsonRpcPeer {
   }
 
   #onData(chunk: string): void {
+    if (this.#closed) return;
     this.#buf += chunk;
     for (;;) {
       const nl = this.#buf.indexOf('\n');
@@ -122,6 +125,11 @@ class JsonRpcPeer {
         if (msg.error) p.reject(Object.assign(new HypertestError('unavailable', `agent error ${msg.error.code}: ${msg.error.message}`), { rpcCode: msg.error.code }));
         else p.resolve(msg.result);
       }
+    }
+    // (review) bounded: an agent that never ends its line is a protocol failure, not a reason to buffer forever
+    if (this.#buf.length > MAX_ACP_LINE_CHARS) {
+      this.#buf = '';
+      this.close(new HypertestError('unavailable', `the agent sent a protocol line longer than ${MAX_ACP_LINE_CHARS} characters`));
     }
   }
 }

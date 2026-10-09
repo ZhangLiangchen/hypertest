@@ -39,13 +39,19 @@ if (${JSON.stringify(name)} === 'kubectl') {
   process.exit(0);
 }
 if (${JSON.stringify(name)} === 'tcpdump') {
-  if (process.env.FAKE_TCPDUMP_DENY === '1') { process.stderr.write('tcpdump: lo: You don\\'t have permission to capture on that device\\n'); process.exit(1); }
+  if (process.env.FAKE_TCPDUMP_DENY === '1') {
+    // a slow start (FAKE_TCPDUMP_DELAY_MS) answers the missing privilege only after the requested capture duration
+    setTimeout(() => { process.stderr.write('tcpdump: lo: You don\\'t have permission to capture on that device\\n'); process.exit(1); }, Number(process.env.FAKE_TCPDUMP_DELAY_MS ?? '0'));
+    return;
+  }
   const out = args[args.indexOf('-w') + 1];
   const g = Buffer.alloc(24); g.writeUInt32LE(0xa1b2c3d4, 0); g.writeUInt16LE(2, 4); g.writeUInt16LE(4, 6); g.writeUInt32LE(65535, 16); g.writeUInt32LE(1, 20);
   const pkts = [];
   for (let i = 0; i < 3; i++) { const h = Buffer.alloc(16); h.writeUInt32LE(1700000000 + i, 0); h.writeUInt32LE(60, 8); h.writeUInt32LE(60, 12); pkts.push(h, Buffer.alloc(60, i)); }
   fs.writeFileSync(out, Buffer.concat([g, ...pkts]));
   process.on('SIGINT', () => process.exit(0));
+  // like tcpdump: the capture window starts once the device is open (net.capture times durationMs from this line)
+  process.stderr.write('tcpdump: listening on ' + args[args.indexOf('-i') + 1] + ', link-type EN10MB (Ethernet), snapshot length 262144 bytes\\n');
   setInterval(() => {}, 1000);
 }
 `;
@@ -219,11 +225,16 @@ test('net.capture failure paths: no tcpdump ⇒ unsupported; no capture privileg
   assert.deepEqual([m.status, m.error?.code], ['failed', 'unsupported']);
   assert.match(m.error!.message, /tcpdump is not installed/);
   process.env['FAKE_TCPDUMP_DENY'] = '1';
+  // the refusal arrives AFTER durationMs: the capture window only starts once tcpdump listens, so the reason is kept
+  // (it used to be SIGINT-ed at durationMs and reported as an empty capture, `unavailable`)
+  process.env['FAKE_TCPDUMP_DELAY_MS'] = '400';
   try {
     const d = await runtime().execute(toolRequest('net.capture', { environmentId: 'env_docker', durationMs: 100 }));
-    assert.deepEqual([d.status, d.error?.code], ['failed', 'permission_denied']);
+    assert.deepEqual([d.status, d.error?.code], ['failed', 'permission_denied'], d.modelText);
+    assert.match(d.error!.message, /permission to capture/);
   } finally {
     delete process.env['FAKE_TCPDUMP_DENY'];
+    delete process.env['FAKE_TCPDUMP_DELAY_MS'];
   }
 });
 

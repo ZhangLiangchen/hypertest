@@ -110,6 +110,15 @@ describe('acp.<agent>.prompt', () => {
     assert.equal(off.error?.code, 'unavailable');
   });
 
+  test('(review) an agent whose protocol line never ends fails at once (bounded buffer), never buffered until the timeout', async (t) => {
+    if (skip) return t.skip(skip);
+    const started = Date.now();
+    const flooded = await tool(agent('flood', { timeoutMs: 8000 })).execute({ prompt: 'x', timeoutMs: 8000 }, (await ctxFor(ws)).ctx);
+    assert.equal(flooded.status, 'failed', JSON.stringify(flooded.error));
+    assert.match(flooded.error!.message, /protocol line longer than/);
+    assert.ok(Date.now() - started < 7000, 'it failed on the oversized line, not at the timeout');
+  });
+
   async function ctxFor(workspace: WorkspaceHandle) {
     const { fakeContext } = await import('./blackbox-helpers.ts');
     const c = fakeContext();

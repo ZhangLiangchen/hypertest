@@ -6,6 +6,7 @@
 //   env     reports what it can see of its environment (sandbox marker, configured variables)
 //   hang    never answers the prompt (timeouts / cancellation)
 //   crash   exits while the prompt is being processed
+//   flood   (review) answers the prompt with a protocol line that never ends (20 MB without a newline), then hangs
 import { createInterface } from 'node:readline';
 
 const mode = process.env.FAKE_ACP_MODE ?? 'write';
@@ -30,6 +31,11 @@ async function prompt(id, params) {
   const sessionId = params.sessionId;
   if (mode === 'hang') return;
   if (mode === 'crash') process.exit(3);
+  if (mode === 'flood') {
+    const block = 'x'.repeat(1024 * 1024);
+    for (let i = 0; i < 20; i++) process.stdout.write(block);
+    return;
+  }
   if (mode === 'env') {
     say(sessionId, JSON.stringify({ sandbox: process.env.HYPERTEST_SANDBOX ?? null, token: process.env.ACP_TOKEN ?? null, home: process.env.HOME ?? null, secretLeak: process.env.HT_NOT_FOR_AGENTS ?? null }));
     return send({ id, result: { stopReason: 'end_turn' } });

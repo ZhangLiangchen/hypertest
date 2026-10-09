@@ -7,7 +7,7 @@ import { CONTROL_TOKEN_HEADER, errorMessage, publicControlTarget, requireEnviron
 import { mintControlToken } from './secrets.ts';
 import { FENCE_HEADER, OPERATION_HEADER, normalizeFault, type SupervisorFault, type SupervisorOperation } from './process-supervisor.ts';
 import {
-  beginFaultJob, dockerFaultPlan, faultJobDir, kubectlFaultPlan, markFaultApplied, markFaultNotApplied, readFaultJob, revertOverdue, reverterAlive, spawnReverter, unrevertedFaults, type FaultJobView, type FaultPlan,
+  beginFaultJob, dockerFaultPlan, faultJobDir, kubectlFaultPlan, markFaultAbandoned, markFaultApplied, markFaultNotApplied, overdueWithoutReverter, readFaultJob, revertOverdue, spawnReverter, unrevertedFaults, type FaultJobView, type FaultPlan,
 } from './fault-injection.ts';
 import type { FaultJobSpec } from './fault-worker.ts';
 
@@ -282,29 +282,49 @@ function faultDuration(input: EnvFaultInput): number {
   return input.durationMs;
 }
 
+/** (review) Grace on top of the apply commands' timeout before a job without an apply outcome is treated as applied. */
+const FAULT_SETTLE_GRACE_MS = 30_000;
+
 /**
- * Applies a planned container/cluster fault for an operation: records the job (operation-id-labelled), runs the apply
- * commands, starts the detached reverter that ends it at expiry. A refused apply is definitively not applied.
+ * Applies a planned container/cluster fault for an operation: records the job (operation-id-labelled), starts the detached
+ * reverter that ends it at expiry, then runs the apply commands. (review) The reverter is started FIRST: a process that
+ * dies while — or right after — the apply runs never leaves the fault in place past its time box (the reverter reverts
+ * a job without an apply outcome too). Only a definitive refusal (the command ran and exited non-zero, or could not be
+ * started) is "not applied"; an apply that timed out or was aborted may have reached the daemon / API server: its
+ * outcome is unknown (the gateway reconciles it; the reverter still ends the fault at expiry).
  */
-async function applyFault(stateDir: string, op: OperationContext, environmentId: string, plan: FaultPlan, durationMs: number, run: (argv: string[]) => Promise<CommandResult>): Promise<DispatchReceipt> {
+async function applyFault(stateDir: string, op: OperationContext, environmentId: string, plan: FaultPlan, durationMs: number, run: (argv: string[]) => Promise<CommandResult>, commandTimeoutMs: number): Promise<DispatchReceipt> {
   const now = Date.now();
-  const spec: FaultJobSpec = { operationId: op.operation.operationId, environmentId, kind: plan.kind, appliedAt: new Date(now).toISOString(), expiresAt: new Date(now + durationMs).toISOString(), revert: plan.revert };
+  const spec: FaultJobSpec = {
+    operationId: op.operation.operationId, environmentId, kind: plan.kind, appliedAt: new Date(now).toISOString(), expiresAt: new Date(now + durationMs).toISOString(), revert: plan.revert,
+    settleBy: new Date(now + plan.apply.length * commandTimeoutMs + FAULT_SETTLE_GRACE_MS).toISOString(),
+  };
   const prior = readFaultJob(stateDir, spec.operationId);
   // a re-dispatch of an operation whose fault is already recorded never applies it twice
   if (prior.state === 'active' || prior.state === 'reverted' || prior.state === 'revert_failed') {
     return { accepted: true, externalJobId: spec.operationId, receipt: JSON.stringify({ jobDir: faultJobDir(stateDir, spec.operationId), expiresAt: prior.spec.expiresAt }) };
   }
+  // (review) a job without an apply outcome (its applier died): its fault may be in place — never applied a second time
+  if (prior.state === 'dispatching') throw new HypertestError('unavailable', `fault ${spec.operationId} was being applied when its process stopped (outcome unknown); it is reverted at ${prior.spec.expiresAt} at the latest`);
   const dir = beginFaultJob(stateDir, spec);
+  if (spawnReverter(dir) === undefined) {
+    markFaultNotApplied(dir, 'the fault reverter could not be started (nothing applied: a fault is never applied without its time box)');
+    return { accepted: false, notAppliedReason: 'the fault reverter could not be started; nothing was applied' };
+  }
   for (const argv of plan.apply) {
     const r = await run(argv);
-    if (r.exitCode !== 0) {
-      const reason = `${argv.slice(0, 3).join(' ')} … failed (exit ${r.exitCode}${r.spawnError ? `, ${r.spawnError}` : ''}): ${r.stderr.trim().slice(0, 500)}`;
+    if (r.exitCode === 0) continue;
+    const reason = `${argv.slice(0, 3).join(' ')} … failed (exit ${r.exitCode}${r.spawnError ? `, ${r.spawnError}` : ''}${r.timedOut ? ', timed out' : ''}): ${r.stderr.trim().slice(0, 500)}`;
+    // (review) the command ran to its own non-zero exit (or never started): definitively refused
+    if ((r.exitCode !== null && !r.timedOut) || r.spawnError === 'ENOENT' || r.spawnError === 'EACCES') {
       markFaultNotApplied(dir, reason);
       return { accepted: false, notAppliedReason: reason };
     }
+    // timed out / aborted / killed: the daemon may have applied it — unknown (no apply outcome; the reverter ends it at expiry)
+    markFaultAbandoned(dir, reason);
+    throw new HypertestError(r.timedOut ? 'timeout' : 'unavailable', `the apply outcome of fault ${spec.operationId} is unknown (it is reverted at ${spec.expiresAt}): ${reason}`);
   }
   markFaultApplied(dir);
-  spawnReverter(dir);
   return { accepted: true, externalJobId: spec.operationId, receipt: JSON.stringify({ jobDir: dir, expiresAt: spec.expiresAt }) };
 }
 
@@ -312,11 +332,13 @@ async function applyFault(stateDir: string, op: OperationContext, environmentId:
 async function observeFault(stateDir: string, op: OperationContext): Promise<ObservationResult<ContainerFaultObservation>> {
   let view: FaultJobView = readFaultJob(stateDir, op.operation.operationId);
   if (view.state === 'absent' || view.state === 'not_applied') return { state: 'absent' };
-  if (view.state === 'dispatching') return { state: 'uncertain', detail: `fault ${op.operation.operationId} was being applied when it was last seen (no apply outcome recorded)` };
-  if (view.state === 'active' && Date.parse(view.spec.expiresAt) <= Date.now() && !reverterAlive(faultJobDir(stateDir, op.operation.operationId))) {
+  // (review) a job without an apply outcome (an apply in flight, or one whose applier died) whose settle deadline passed
+  // and whose reverter is gone: its fault may be in place — reverted now like an overdue one
+  if ((view.state === 'active' || view.state === 'dispatching') && overdueWithoutReverter(stateDir, view)) {
     const outcome = await revertOverdue(stateDir, view.spec);
     view = { state: outcome.state, spec: view.spec, outcome };
   }
+  if (view.state === 'dispatching') return { state: 'uncertain', detail: `fault ${op.operation.operationId} was being applied when it was last seen (no apply outcome recorded); its reverter ends it by ${view.spec.settleBy ?? view.spec.expiresAt}` };
   const obs: ContainerFaultObservation = { kind: 'container_fault', fault: view.spec.kind, state: view.state, expiresAt: view.spec.expiresAt };
   if (view.state !== 'active') {
     obs.revertedAt = view.outcome.revertedAt;
@@ -447,7 +469,7 @@ export class DockerEnvAdapter implements SideEffectAdapter<EnvInput, DockerEnvOb
     const ds = prepared.desiredState as { action: string; environmentId: string; container: string; fault?: string; params?: Record<string, unknown>; durationMs?: number };
     if (ds.action === 'fault') {
       const plan = dockerFaultPlan(this.#o.docker ?? 'docker', ds.container, ds.fault!, ds.params ?? {});
-      return applyFault(this.#o.stateDir!, op, ds.environmentId, plan, ds.durationMs!, (argv) => this.#docker(argv.slice(1), op.signal));
+      return applyFault(this.#o.stateDir!, op, ds.environmentId, plan, ds.durationMs!, (argv) => this.#docker(argv.slice(1), op.signal), this.#o.commandTimeoutMs ?? 120_000);
     }
     const { container } = ds;
     const dispatchedAt = new Date().toISOString();
@@ -665,7 +687,7 @@ export class KubectlEnvAdapter implements SideEffectAdapter<EnvInput, KubectlEnv
       const dir = faultJobDir(this.#o.stateDir!, op.operation.operationId);
       mkdirSync(dir, { recursive: true });
       const plan = kubectlFaultPlan(this.#prefix(fault.namespace, context), fault.deployment, fault.fault!, { replicas: fault.replicas ?? 1, selector: fault.selector ?? {}, operationId: op.operation.operationId, namespace: fault.namespace, policyFile: join(dir, 'networkpolicy.json') });
-      return applyFault(this.#o.stateDir!, op, fault.environmentId, plan, fault.durationMs!, (argv) => runCommand(argv[0]!, argv.slice(1), { timeoutMs: this.#o.commandTimeoutMs ?? 120_000, signal: op.signal }));
+      return applyFault(this.#o.stateDir!, op, fault.environmentId, plan, fault.durationMs!, (argv) => runCommand(argv[0]!, argv.slice(1), { timeoutMs: this.#o.commandTimeoutMs ?? 120_000, signal: op.signal }), this.#o.commandTimeoutMs ?? 120_000);
     }
     const s = prepared.desiredState as { action: 'restart' | 'deploy'; namespace: string; deployment: string; buildRef?: string; container?: string };
     const operationId = op.operation.operationId;

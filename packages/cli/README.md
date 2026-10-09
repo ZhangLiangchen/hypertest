@@ -207,9 +207,37 @@ absent (`npm run infra:up` writes `.infra/env`).
 
 ## Tool surface (audit wave 3, additive)
 
-- `hypertest run --url <sutUrl>`: the URL must be one of `tools.httpAllowlist`; it resolves to the ad-hoc environment
+- `hypertest run --url <sutUrl>`: the URL must be one of `tools.httpAllowlist` (a non-loopback one also needs
+  `tools.urlEnvironmentClass`: a remote URL is never classified by default); it resolves to the ad-hoc environment
   `url-<host>-<port>` (http.request / load / metrics on it are permitted and evidenced) — test `test/blackbox-url.e2e.test.ts`
-  (scripted brains: probe → evidence → verdict; an unlisted URL is refused before a run is created).
+  (scripted brains: probe → evidence → verdict; an unlisted URL is refused before a run is created; a second run scrapes
+  metrics and runs a load experiment by URL).
 - `hypertest tool-worker --tools <ids> [--id w1] [--listen host:port] [--secret-env NAME]` serves delegated tools to
   `tools.remoteWorkers` over HMAC-signed HTTP (default secret variable `HYPERTEST_TOOL_WORKER_SECRET`; `--json` prints the
   URL); `packages/app/test/remote-worker.e2e.test.ts` runs it as a second process.
+
+## Release stages and the eval platform (audit wave 3, unit release-eval, additive)
+
+- `runtime record-suite … --kind engine_contract|compatibility|production_replay|release_gate` (`replay` = the legacy
+  name of `compatibility`): each kind takes its own evidence — `engine_contract --run` (executed here) or `--passed
+  --report <file>` (a CI attestation with its digest); `compatibility --from-eval` (every trial must have run under the
+  manifest); `production_replay --from-shadow` (the shadow comparisons); `release_gate --from-eval <core> --baseline
+  <file> [--baseline-arm a] [--candidate-arm b] [--max-critical-false-release r] [--bridge f]` (the eval gate of the
+  core suite, computed here). `runtime shadow [<runId> …]` mirrors finished production runs on a shadow release
+  (dry-run). Tests: `test/runtime.e2e.test.ts` (the whole CLI walk through every gate, with the refusals),
+  `test/release-eval.e2e.test.ts` (`eval run --arms deployment` trials run under the deployment's manifest and certify
+  it; another arm's result is refused). (review) The `deployment` arm evaluates on the task's fixtures only: the
+  deployment's own `environments` and `tools.httpAllowlist` targets (not part of the manifest) are left out of its
+  trials (`deploymentTrialConfig`); a cancelled (partial) `eval run` result never certifies a release; `--kind
+  release_gate` refuses a candidate or baseline named core that is not the built-in core suite (revision + content
+  fingerprint), and `eval run --suite-dir` refuses a private suite reusing a built-in suite id.
+- `eval run`: `--tier`, `--track cold|learning`, `--experience`, `--arm-file` (external agent arms), `--suite-dir`
+  (private suites), `sanity --dataset --repos`, `--judge scripted|config`, `--judge-route`, `--judge-packets`,
+  `--calibration`, `--bridge-grader`, `--timeout` / Ctrl-C (cancels through `SuiteOptions.signal`, keeps the partial
+  result, exit 1 / 130), pass@k and pass^k per k in the summary; `eval bridge`, `eval calibrate [label]` (`label` is a
+  human decision: refused when `$HYPERTEST_SANDBOX` is set); `eval gate
+  --max-critical-false-release`, `--bridge`. Tests: `test/eval-platform.test.ts` (real @hypertest/eval exports; a real
+  external-agent trial over a private suite; real cancellation), `test/eval.test.ts`.
+- `test/exit-codes.e2e.test.ts` (e2e[6]): the verdict-aware exit codes from real scripted runs (pass 0, fail 3,
+  conditional 4, inconclusive 5), each run converged (no schema-refused plan, no repetitive loop) — the `fail` fixture
+  proposed an objective status (`failed`) the plan schema refuses; it now uses `unsatisfiable`.

@@ -133,6 +133,18 @@ describe('F[0] shadow mirroring and the per-stage gates (real stack)', { concurr
           ht.releases.recordEvalSuite({ manifestId: id, kind: 'compatibility', digest: DIGEST, by: 'ci:github', result: { suiteId: 'core', trials: [{ taskId: 't', result: 'pass', runtimeManifestId: prodId }] } }),
           (e: unknown) => isHypertestError(e, 'precondition_failed') && /does not certify .*its trials ran under/.test((e as Error).message),
         );
+        // (review) a CANCELLED (partial) result — interrupted between two trials, every trial that ran passed and is bound —
+        // never certifies a release (before the check it was recorded as a passing compatibility result)
+        const partial = { suiteId: 'core', revision: 'core-2', cancelled: true, trials: [{ taskId: 't', armId: 'deployment', trial: 0, result: 'pass', runtimeManifestId: id }] };
+        await assert.rejects(
+          ht.releases.recordEvalSuite({ manifestId: id, kind: 'compatibility', digest: DIGEST, by: 'ci:github', result: partial }),
+          (e: unknown) => isHypertestError(e, 'precondition_failed') && /CANCELLED \(partial\) eval suite result: it never certifies a release/.test((e as Error).message),
+        );
+        await assert.rejects(
+          ht.releases.recordReleaseGate({ manifestId: id, candidate: partial, candidateDigest: DIGEST, baselineDigest: 'e'.repeat(64), report: { pass: true, suiteId: 'core', checks: [] }, by: 'ci:github' }),
+          (e: unknown) => isHypertestError(e, 'precondition_failed') && /the core eval candidate is a CANCELLED/.test((e as Error).message),
+        );
+        assert.deepEqual(await ht.releases.registry.suiteResults(id), [], 'nothing was recorded');
         await compatGate(ht, id);
         await ht.releases.promote(id, { by: ALICE, reason: 'compatibility green' });
         // a shadow creates no ordinary run
@@ -166,7 +178,19 @@ describe('F[0] shadow mirroring and the per-stage gates (real stack)', { concurr
           ht.releases.recordReleaseGate({ manifestId: id, candidate: { suiteId: 'core', trials: [{ result: 'pass', runtimeManifestId: prodId }] }, candidateDigest: DIGEST, baselineDigest: DIGEST, report: { pass: true, suiteId: 'core' }, by: 'ci:github' }),
           /does not certify/,
         );
-        const gateFail = await ht.releases.recordReleaseGate({ manifestId: id, candidate: { suiteId: 'core', trials: [{ result: 'pass', runtimeManifestId: id }] }, candidateDigest: DIGEST, baselineDigest: DIGEST, report: { pass: false, suiteId: 'core', checks: [{ checkId: 'defect_recall', pass: false }] }, by: 'ci:github' });
+        // a release is never gated against itself: the candidate as its own baseline, or a baseline that ran under it
+        await assert.rejects(
+          ht.releases.recordReleaseGate({ manifestId: id, candidate: { suiteId: 'core', trials: [{ result: 'pass', runtimeManifestId: id }] }, candidateDigest: DIGEST, baselineDigest: DIGEST, report: { pass: true, suiteId: 'core' }, by: 'ci:github' }),
+          (e: unknown) => isHypertestError(e, 'precondition_failed') && /compared the candidate with itself/.test((e as Error).message),
+        );
+        await assert.rejects(
+          ht.releases.recordReleaseGate({
+            manifestId: id, candidate: { suiteId: 'core', trials: [{ result: 'pass', runtimeManifestId: id }] }, baseline: { suiteId: 'core', trials: [{ result: 'pass', runtimeManifestId: id }] },
+            candidateDigest: DIGEST, baselineDigest: 'e'.repeat(64), report: { pass: true, suiteId: 'core' }, by: 'ci:github',
+          }),
+          (e: unknown) => isHypertestError(e, 'precondition_failed') && /the baseline ran under .* itself/.test((e as Error).message),
+        );
+        const gateFail = await ht.releases.recordReleaseGate({ manifestId: id, candidate: { suiteId: 'core', trials: [{ result: 'pass', runtimeManifestId: id }] }, candidateDigest: DIGEST, baselineDigest: 'e'.repeat(64), report: { pass: false, suiteId: 'core', checks: [{ checkId: 'defect_recall', pass: false }] }, by: 'ci:github' });
         assert.equal(gateFail.passed, false);
         assert.match(gateFail.summary.detail ?? '', /gate checks failed: defect_recall/);
         await assert.rejects(ht.releases.promote(id, { by: ALICE, reason: 'r' }), /the latest release_gate suite result .* failed/);
@@ -182,6 +206,12 @@ describe('F[0] shadow mirroring and the per-stage gates (real stack)', { concurr
         await ht.releases.register({ by: ALICE });
         await compatGate(ht, id);
         await ht.releases.promote(id, { by: ALICE, reason: 'compatibility green' });
+        // (review) the reference decision is production's: a finished run of a runtime that is NOT the active release is
+        // refused (before the check, its decision was taken as the production reference)
+        const foreign = { ...(await ht.status(r2))!, runId: `${r2}_foreign`, runtimeManifestId: `rm_${'f'.repeat(64)}` };
+        await ht.services.db.query('INSERT INTO ht_runs (run_id, status, goal, run, created_at, updated_at) VALUES ($1, $2, $3, $4::jsonb, $5, $6)', [foreign.runId, foreign.status, foreign.goal, JSON.stringify(foreign), foreign.createdAt, foreign.updatedAt]);
+        await assert.rejects(ht.releases.mirror(foreign.runId, { by: 'ci:shadow' }), (e: unknown) => isHypertestError(e, 'precondition_failed') && /not under the active release .*: a shadow is compared with the decisions of the active release/.test((e as Error).message));
+        assert.deepEqual(await ht.releases.registry.shadowComparisons(id), [], 'nothing was mirrored or recorded');
         const m = await ht.releases.mirror(r2, { by: 'ci:shadow', timeoutMs: 120_000 });
         assert.equal(m.comparison.diverged, true);
         assert.deepEqual([m.comparison.sourceVerdict, m.comparison.shadowVerdict], ['pass', 'fail']);
@@ -255,13 +285,17 @@ describe('F[1] / item 17: a migration reports a drive only when it happened; a m
   let dir: Awaited<ReturnType<typeof tempDir>>;
   let repo: Awaited<ReturnType<typeof sumRepo>>;
   let db: Awaited<ReturnType<typeof testStore>>;
+  // each test owns its store (on PostgreSQL a shared schema would carry the first test's active release into the second)
+  let dbB: Awaited<ReturnType<typeof testStore>>;
   before(async () => {
     dir = await tempDir('ht-app-drive-');
     repo = await sumRepo();
     db = await testStore();
+    dbB = await testStore();
   });
   after(async () => {
     await db.dispose();
+    await dbB.dispose();
     await repo.cleanup();
     await dir.cleanup();
   });
@@ -318,7 +352,7 @@ describe('F[1] / item 17: a migration reports a drive only when it happened; a m
   });
 
   test('a durable start that does not take effect (a previous loop still open) is reported: driven false with the remedy', async () => {
-    const base = config(join(dir.path, 'b'), db.store);
+    const base = config(join(dir.path, 'b'), dbB.store);
     const target = { repoPath: repo.path, commit: repo.head };
     let runId: string;
     {
@@ -344,12 +378,39 @@ describe('F[1] / item 17: a migration reports a drive only when it happened; a m
         const signals: string[] = [];
         durable.startRun = async () => undefined;
         durable.signal = async (_id, s) => void signals.push((s as { type: string }).type);
+        // item 17's limit: only a wait on a model pause migrates — an item ALSO waiting on a child (or an operation) keeps
+        // refusing the migration, and the run is left as it was
+        const waiting = (await ht.services.blackboard.listWorkItems({ runId, states: ['waiting'] }))[0]!;
+        const setWait = (w: string[]) => ht.services.db.query("UPDATE ht_work_items SET item = jsonb_set(item, '{waitingOn}', $2::jsonb) WHERE work_item_id = $1", [waiting.workItemId, JSON.stringify(w)]);
+        const before = (await ht.status(runId))!;
+        await setWait([...waiting.waitingOn, 'child:wi_other']);
+        await assert.rejects(ht.releases.migrate(runId, { to: 'current', by: ALICE, reason: 'consolidate', checkpointTimeoutMs: 10_000 }), (e: unknown) => {
+          assert.ok(isHypertestError(e, 'precondition_failed'), String(e));
+          assert.match((e as Error).message, new RegExp(`waiting on operations or children \\(${waiting.workItemId} on model:\\S+\\+child:wi_other\\)`));
+          return true;
+        });
+        const after = (await ht.status(runId))!;
+        assert.deepEqual([after.status, after.pauseReason, after.runtimeManifestId], [before.status, before.pauseReason, before.runtimeManifestId]);
+        assert.deepEqual(await ht.releases.epochs(runId), []);
+        await setWait(waiting.waitingOn);
         const m = await ht.releases.migrate(runId, { to: 'current', by: ALICE, reason: 'consolidate', drive: true, driveTimeoutMs: 3000, checkpointTimeoutMs: 10_000 });
         assert.equal(m.driven, false, 'no loop took the run over: never reported as driven');
         assert.match(m.driveProblem ?? '', /did not take it over within 3000 ms: its previous loop is probably still open \(Temporal: workflow run-.* on the task queue of rm_/);
         assert.ok(signals.includes('wake'), 'the previous loop was woken so its next tick can end it');
         assert.deepEqual(await ht.events(runId, { types: ['run.migration_driven'] }), []);
         assert.equal((await ht.status(runId))!.runtimeManifestId, ht.manifest.manifestId, 'the migration itself stands');
+        // the take-over later (drive) is just as honest, and `resume` never hides it behind a no-op start
+        const later = await ht.releases.drive(runId, { timeoutMs: 1500 });
+        assert.deepEqual([later.needed, later.driven], [true, false]);
+        assert.match(later.problem ?? '', /did not take it over within 1500 ms/);
+        const drive = ht.releases.drive;
+        ht.releases.drive = (id, input) => drive(id, { ...input, timeoutMs: 1500 });
+        await assert.rejects(ht.resume(runId), (e: unknown) => isHypertestError(e, 'unavailable') && /did not take it over within 1500 ms/.test((e as Error).message));
+        // resumeIncomplete (hypertest resume without a run id, serve) never reports a run it did not take over as resumed
+        ht.releases.drive = (id, input) => drive(id, { ...input, timeoutMs: 1500 });
+        assert.deepEqual(await ht.resumeIncomplete(), [], 'a migrated run whose take-over did not happen is not "resumed"');
+        ht.releases.drive = drive;
+        assert.deepEqual(await ht.events(runId, { types: ['run.migration_driven'] }), []);
       } finally {
         await ht.close();
       }
@@ -419,6 +480,84 @@ describe('F[1] migration drive on Temporal (live cluster)', { concurrency: false
   );
 
   test(
+    'a migration without drive, then `resume` on the target (source runtime gone): resume takes the run over through the handover, never a silent no-op',
+    skipUnless(!!infra.pgUrl && !!infra.temporalAddress, 'HYPERTEST_TEST_PG_URL / HYPERTEST_TEST_TEMPORAL_ADDRESS not set (run npm run infra:up)'),
+    async () => {
+      const repo = await sumRepo();
+      cleanups.push(repo.cleanup);
+      const base = await temporalBase('resume');
+      let runId: string;
+      {
+        const old = await open(base, () => ({ error: 'timeout', message: 'provider down' }));
+        try {
+          runId = await modelPausedRun(old, { repoPath: repo.path, commit: repo.head });
+        } finally {
+          await old.close(); // the run workflow stays open on the old queue, nobody polls it
+        }
+      }
+      const neu = await open(upgraded(base), tinyRunBrains());
+      try {
+        await activateHere(neu);
+        // `hypertest runtime migrate` (no drive): re-pinned, not driven yet
+        const m = await neu.releases.migrate(runId, { to: 'current', by: ALICE, reason: 'temporal handover via resume', checkpointTimeoutMs: 30_000 });
+        assert.equal(m.driven, false);
+        assert.deepEqual(await neu.events(runId, { types: ['run.migration_driven'] }), []);
+        // the audit's silent no-op: startRun of the open workflow did nothing. `resume` now takes the run over for real
+        await neu.resume(runId);
+        assert.equal((await neu.events(runId, { types: ['run.migration_driven'] })).length, 1, 'the target loop drives the migrated run');
+        const outcome = await neu.durable.awaitCompletion(runId, { timeoutMs: 120_000 });
+        assert.deepEqual([outcome.status, outcome.decision?.runtimeManifestId], ['completed', neu.manifest.manifestId]);
+      } finally {
+        await neu.close();
+        const cli = fileURLToPath(new URL('../../../.infra/bin/temporal', import.meta.url));
+        if (existsSync(cli)) {
+          await new Promise<void>((resolve) => execFile(cli, ['workflow', 'terminate', '--workflow-id', `run-${runId}`, '--address', infra.temporalAddress!, '--namespace', 'default', '--reason', 'test cleanup'], () => resolve()));
+        }
+      }
+    },
+  );
+
+  test(
+    'a migration without drive, then `resumeIncomplete` (hypertest resume / serve) on the target with the source gone: the run is taken over, never a silent no-op start',
+    skipUnless(!!infra.pgUrl && !!infra.temporalAddress, 'HYPERTEST_TEST_PG_URL / HYPERTEST_TEST_TEMPORAL_ADDRESS not set (run npm run infra:up)'),
+    async () => {
+      const repo = await sumRepo();
+      cleanups.push(repo.cleanup);
+      const base = await temporalBase('incomplete');
+      let runId: string;
+      {
+        const old = await open(base, () => ({ error: 'timeout', message: 'provider down' }));
+        try {
+          runId = await modelPausedRun(old, { repoPath: repo.path, commit: repo.head });
+        } finally {
+          await old.close(); // the run workflow stays open on the old queue, nobody polls it
+        }
+      }
+      const neu = await open(upgraded(base), tinyRunBrains());
+      try {
+        await activateHere(neu);
+        const m = await neu.releases.migrate(runId, { to: 'current', by: ALICE, reason: 'temporal handover via resumeIncomplete', checkpointTimeoutMs: 30_000 });
+        assert.equal(m.driven, false);
+        // the audit's reproduction: resumeIncomplete listed the run as resumed while startRun of the open workflow did
+        // nothing (0 run.migration_driven, the run never progressed). Now the run is taken over before it is reported.
+        const resumed = await neu.resumeIncomplete();
+        assert.deepEqual(resumed, [runId]);
+        assert.equal((await neu.events(runId, { types: ['run.migration_driven'] })).length, 1, 'the target loop drives the migrated run');
+        // the carried model pause is released by the operator resume; the run completes on the target
+        await neu.resume(runId);
+        const outcome = await neu.durable.awaitCompletion(runId, { timeoutMs: 120_000 });
+        assert.deepEqual([outcome.status, outcome.decision?.runtimeManifestId], ['completed', neu.manifest.manifestId]);
+      } finally {
+        await neu.close();
+        const cli = fileURLToPath(new URL('../../../.infra/bin/temporal', import.meta.url));
+        if (existsSync(cli)) {
+          await new Promise<void>((resolve) => execFile(cli, ['workflow', 'terminate', '--workflow-id', `run-${runId}`, '--address', infra.temporalAddress!, '--namespace', 'default', '--reason', 'test cleanup'], () => resolve()));
+        }
+      }
+    },
+  );
+
+  test(
     'the source runtime is gone (no worker polls its queue): the target hands the open workflow over and drives the run to completion',
     skipUnless(!!infra.pgUrl && !!infra.temporalAddress, 'HYPERTEST_TEST_PG_URL / HYPERTEST_TEST_TEMPORAL_ADDRESS not set (run npm run infra:up)'),
     async () => {
@@ -441,6 +580,7 @@ describe('F[1] migration drive on Temporal (live cluster)', { concurrency: false
         const m = await neu.releases.migrate(runId, { to: 'current', by: ALICE, reason: 'temporal handover', drive: true, driveTimeoutMs: 60_000, checkpointTimeoutMs: 30_000 });
         assert.equal(m.driven, true, m.driveProblem);
         assert.equal((await neu.events(runId, { types: ['run.migration_driven'] })).length, 1);
+        assert.deepEqual(await neu.releases.drive(runId), { needed: false, driven: true }, 'a driven epoch is not taken over twice');
         await neu.resume(runId);
         const outcome = await neu.durable.awaitCompletion(runId, { timeoutMs: 120_000 });
         assert.deepEqual([outcome.status, outcome.decision?.runtimeManifestId], ['completed', neu.manifest.manifestId]);

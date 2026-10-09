@@ -15,7 +15,7 @@ import { join } from 'node:path';
 import { isHypertestError } from '@hypertest/core';
 import type { OperationContext } from '@hypertest/operation';
 import {
-  DockerEnvAdapter, EnvControlAdapter, KubectlEnvAdapter, blackboxTools, builtinSideEffectAdapters, dockerFaultPlan, envInjectFaultTool, envRestartTool, faultJobDir, kubectlFaultPlan, readFaultJob, unrevertedFaults,
+  DockerEnvAdapter, EnvControlAdapter, KubectlEnvAdapter, blackboxTools, dockerFaultPlan as planOf, builtinSideEffectAdapters, dockerFaultPlan, envInjectFaultTool, envRestartTool, faultJobDir, kubectlFaultPlan, readFaultJob, unrevertedFaults,
   type EnvFaultInput, type EnvInput, type ToolSpec,
 } from '../src/index.ts';
 import { CrashAfterDispatch, newGateway, newRuntime, nextInvocationId, openBlackboxEnv, sideEffectRequest, structuredOf, tempDir, toolRequest, waitFor, type BlackboxEnv } from './blackbox-helpers.ts';
@@ -28,6 +28,21 @@ let mode = {};
 try { mode = JSON.parse(fs.readFileSync(${JSON.stringify(modePath)}, 'utf8')); } catch {}
 const verb = args.filter((a, i) => !(a.startsWith('--context') || args[i - 1] === '--context' || a === '-n' || args[i - 1] === '-n'))[0];
 if ((mode.fail || []).includes(verb)) { process.stderr.write(${JSON.stringify(name)} + ': ' + verb + ' refused by the fake\\n'); process.exit(1); }
+if (mode.awaitReverter && verb === mode.awaitReverter.verb) {
+  // (review) is a reverter process already holding the job of the fault being applied? (polls its pid file)
+  const root = mode.awaitReverter.faults;
+  const until = Date.now() + 5000;
+  let seen = false;
+  while (!seen && Date.now() < until) {
+    for (const d of (fs.existsSync(root) ? fs.readdirSync(root) : [])) {
+      const dir = root + '/' + d;
+      if (!fs.existsSync(dir + '/applied.json') && !fs.existsSync(dir + '/not-applied.json') && fs.existsSync(dir + '/pid')) seen = true;
+    }
+    if (!seen) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+  }
+  fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ bin: 'probe', reverterBeforeApply: seen }) + '\\n');
+}
+if ((mode.hang || []).includes(verb)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10000);
 if (${JSON.stringify(name)} === 'kubectl' && verb === 'get') {
   process.stdout.write(JSON.stringify({ metadata: { name: 'checkout', generation: 4, annotations: {} }, spec: { replicas: 3, selector: { matchLabels: { app: 'checkout' } }, template: { spec: { containers: [{ name: 'app', image: 'shop:1' }] } } }, status: { observedGeneration: 4, replicas: 3, updatedReplicas: 3, availableReplicas: 3, readyReplicas: 3 } }) + '\\n');
   process.exit(0);
@@ -55,7 +70,7 @@ function install(name: string): void {
   chmodSync(bin, 0o755);
 }
 
-type LogLine = { bin: string; args?: string[]; manifest?: Record<string, any> };
+type LogLine = { bin: string; args?: string[]; manifest?: Record<string, any>; reverterBeforeApply?: boolean };
 const log = (): LogLine[] => (existsSync(logPath) ? readFileSync(logPath, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l) as LogLine) : []);
 const argvs = (bin: string) => log().filter((l) => l.bin === bin && l.args).map((l) => l.args!);
 const reset = (mode: Record<string, unknown> = {}) => {
@@ -173,16 +188,78 @@ test('docker plans: kill, network_disconnect and netem argv (no shell); invalid 
   ]);
 });
 
-test('docker: a refused apply is not_applied (no reverter, nothing to revert)', async () => {
+test('docker: a refused apply is not_applied (its reverter ends without reverting: nothing to revert)', async () => {
   reset({ fail: ['kill'] });
   const { gateway } = newGateway(env, adapters().all);
   const out = await gateway.run(fault({ environmentId: 'env_docker2', kind: 'kill', params: {}, durationMs: 200 }));
   assert.equal(out.status, 'not_applied', JSON.stringify(out));
   assert.match((out as { reason: string }).reason, /docker kill shop-db … failed \(exit 1\).*refused by the fake/);
   assert.equal(readFaultJob(stateDir, out.operation.operationId).state, 'not_applied');
-  assert.equal(existsSync(join(faultJobDir(stateDir, out.operation.operationId), 'pid')), false, 'no reverter was started');
+  // (review) the reverter is started BEFORE the apply (a crash mid-apply must not leave a fault without its time box); on a
+  // definitive refusal it is told to stop and exits without running any revert command
+  const jobDir = faultJobDir(stateDir, out.operation.operationId);
+  const pid = Number(await waitFor(() => (existsSync(join(jobDir, 'pid')) ? readFileSync(join(jobDir, 'pid'), 'utf8') : undefined), 5000, 20, 'reverter pid'));
+  await waitFor(() => {
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch {
+      return true;
+    }
+  }, 5000, 20, 'the reverter of a refused fault exits');
   await new Promise((r) => setTimeout(r, 400));
+  assert.equal(existsSync(join(jobDir, 'state.json')), false, 'nothing was reverted');
   assert.deepEqual(argvs('docker'), [['kill', 'shop-db']], 'no start (revert) for a fault that never applied');
+});
+
+test('(review) the reverter holds the time box BEFORE the fault is applied', async () => {
+  reset({ awaitReverter: { verb: 'pause', faults: join(stateDir, 'faults') } });
+  const { gateway } = newGateway(env, adapters().all);
+  const out = await gateway.run(fault({ environmentId: 'env_docker2', kind: 'pause', params: {}, durationMs: 300 }));
+  assert.equal(out.status, 'verified', JSON.stringify(out));
+  assert.deepEqual(log().filter((l) => l.bin === 'probe').map((l) => l.reverterBeforeApply), [true], 'a reverter process was holding the job while docker pause ran');
+  await waitFor(() => readFaultJob(stateDir, out.operation.operationId).state === 'reverted', 10_000, 50, 'revert');
+  assert.deepEqual(argvs('docker'), [['pause', 'shop-db'], ['unpause', 'shop-db']]);
+});
+
+test('(review) an apply that times out has an unknown outcome — never "not applied": the reverter still ends the fault at expiry', async () => {
+  reset({ hang: ['pause'] });
+  const docker = new DockerEnvAdapter({ environments: env.environments, stateDir, commandTimeoutMs: 300 });
+  const operationId = `op_timeout_${Date.now()}`;
+  const prepared = await docker.prepare(opCtx(operationId, 'env_docker2'), { environmentId: 'env_docker2', kind: 'pause', params: {}, durationMs: 1200 } as EnvFaultInput);
+  // the docker CLI was killed at its timeout: the daemon may have paused the container all the same
+  await assert.rejects(docker.dispatch(prepared, opCtx(operationId, 'env_docker2')), (e: unknown) => isHypertestError(e, 'timeout') && /outcome of fault .* is unknown/.test((e as Error).message));
+  const view = readFaultJob(stateDir, operationId);
+  assert.equal(view.state, 'dispatching', 'no apply outcome is recorded (it is not "not_applied")');
+  // while it may be in place, the environment is under that fault: a second fault is refused
+  assert.deepEqual((await unrevertedFaults(stateDir, 'env_docker2')).map((f) => [f.operationId, f.state]), [[operationId, 'active']]);
+  const job = await waitFor(() => {
+    const v = readFaultJob(stateDir, operationId);
+    return v.state === 'reverted' ? v : undefined;
+  }, 10_000, 50, 'the reverter reverts a fault whose apply timed out');
+  assert.equal(job.outcome.by, 'reverter');
+  assert.deepEqual(argvs('docker'), [['pause', 'shop-db'], ['unpause', 'shop-db']]);
+  const obs = await docker.observe(opCtx(operationId, 'env_docker2'));
+  assert.equal((obs as { observation: { state: string } }).observation.state, 'reverted');
+});
+
+test('(review) the applier died mid-apply and its reverter is gone: the job is never ignored — it blocks the environment, and is reverted at its settle deadline', async () => {
+  reset();
+  const operationId = `op_died_${Date.now()}`;
+  const jobDir = faultJobDir(stateDir, operationId);
+  mkdirSync(jobDir, { recursive: true });
+  const revert = planOf('docker', 'shop-db', 'pause', {}).revert;
+  // exactly what a process killed after `docker pause` and before recording its outcome leaves behind
+  const spec = (expiresAt: number, settleBy: number) => ({ operationId, environmentId: 'env_docker2', kind: 'pause', appliedAt: new Date().toISOString(), expiresAt: new Date(expiresAt).toISOString(), settleBy: new Date(settleBy).toISOString(), revert });
+  writeFileSync(join(jobDir, 'spec.json'), JSON.stringify(spec(Date.now() - 1000, Date.now() + 60_000)));
+  assert.deepEqual((await unrevertedFaults(stateDir, 'env_docker2')).map((f) => [f.operationId, f.state]), [[operationId, 'active']], 'inside its settle window: treated as in place (blocks a second fault)');
+  assert.deepEqual(argvs('docker'), [], 'not reverted while its apply may still be running');
+  writeFileSync(join(jobDir, 'spec.json'), JSON.stringify(spec(Date.now() - 1000, Date.now() - 500)));
+  assert.deepEqual(await unrevertedFaults(stateDir, 'env_docker2'), [], 'past its settle deadline: reverted by the adapter');
+  assert.deepEqual(argvs('docker'), [['unpause', 'shop-db']]);
+  const job = readFaultJob(stateDir, operationId);
+  assert.equal(job.state, 'reverted');
+  assert.equal((job as { outcome: { by: string } }).outcome.by, 'adapter');
 });
 
 test('docker: a failed revert is revert_failed — observed as failed, and the environment refuses further operations until repaired', async (t) => {

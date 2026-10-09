@@ -362,10 +362,14 @@ describe('resolveGrader', () => {
       assert.equal((await r.grader(ctx(data({ decision: decision('fail') })))).graderId, 'verdict');
     }
     assert.deepEqual(Object.keys(GRADERS).sort(), [
-      'auditReconstruction', 'causalChain', 'contextIsolation', 'defectDetected', 'evidenceCompleteness', 'evidenceIntegrity', 'freshnessGuarded', 'generatedTestsGoverned',
-      'independentReview', 'injectionContained', 'insufficientDataNotPassed', 'llmRubric', 'loadJobReattached', 'modelFallback', 'modelSwitchContinuity', 'noDuplicateSideEffects',
-      'noOrphanOperations', 'offloadBounded', 'planDynamics', 'pocAWorkflow', 'pocBWorkflow', 'pocCWorkflow', 'policyViolation', 'recoveryAudit', 'reportTracesToEvidence',
-      'singleLeaseOwner', 'testChangeGoverned', 'verdict',
+      // (wave 3) anomalyReaction / rcaMetricsExecutorParallel (PoC C anomaly), the extended suites' graders (blackBoxOnly,
+      // uiEvidence, faultTolerance, tamperDetected, delegation, convergence), the chaos cases' (budgetExhaustion,
+      // competingFaultsIsolated, unqueryableEscalated) and the three-provider-class arm's (providerClassesAudited)
+      'anomalyReaction', 'auditReconstruction', 'blackBoxOnly', 'budgetExhaustion', 'causalChain', 'competingFaultsIsolated', 'contextIsolation', 'convergence', 'defectDetected',
+      'delegation', 'evidenceCompleteness', 'evidenceIntegrity', 'faultTolerance', 'freshnessGuarded', 'generatedTestsGoverned', 'independentReview', 'injectionContained',
+      'insufficientDataNotPassed', 'llmRubric', 'loadJobReattached', 'modelFallback', 'modelSwitchContinuity', 'noDuplicateSideEffects', 'noOrphanOperations', 'offloadBounded',
+      'planDynamics', 'pocAWorkflow', 'pocBWorkflow', 'pocCWorkflow', 'policyViolation', 'providerClassesAudited', 'rcaMetricsExecutorParallel', 'recoveryAudit',
+      'reportTracesToEvidence', 'singleLeaseOwner', 'tamperDetected', 'testChangeGoverned', 'uiEvidence', 'unqueryableEscalated', 'verdict',
     ]);
   });
 
@@ -377,7 +381,7 @@ describe('resolveGrader', () => {
   });
 
   test('unknown ids, empty specs and parameters on a parameterless grader are refused', () => {
-    assert.throws(() => resolveGrader('llmJudge'), (e: unknown) => invalid(e) && /unknown grader 'llmJudge' \(known: auditReconstruction, causalChain, contextIsolation, defectDetected/.test((e as Error).message));
+    assert.throws(() => resolveGrader('llmJudge'), (e: unknown) => invalid(e) && /unknown grader 'llmJudge' \(known: anomalyReaction, auditReconstruction, blackBoxOnly, budgetExhaustion, causalChain/.test((e as Error).message));
     assert.throws(() => resolveGrader(''), invalid);
     assert.throws(() => resolveGrader('verdict?x=1'), (e: unknown) => invalid(e) && /takes no parameters/.test((e as Error).message));
   });

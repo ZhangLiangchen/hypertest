@@ -191,7 +191,11 @@ export interface WorkloadSpec {
 }
 
 export interface FaultSpec {
-  kind: 'process_kill' | 'restart' | 'latency' | 'error_rate' | 'partition' | 'custom';
+  /**
+   * (additive, wave 3) + the container faults of docker environments (`pause`, `kill`, `network_disconnect`, `netem`)
+   * and Kubernetes environments (`pod_delete`, `scale_zero`, `network_deny`) that env.inject_fault injects.
+   */
+  kind: 'process_kill' | 'restart' | 'latency' | 'error_rate' | 'partition' | 'custom' | 'pause' | 'kill' | 'network_disconnect' | 'netem' | 'pod_delete' | 'scale_zero' | 'network_deny';
   target: string;
   atMs?: number;
   params?: Record<string, number | string | boolean>;

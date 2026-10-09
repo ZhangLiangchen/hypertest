@@ -214,6 +214,11 @@ describe('evaluateReleaseGate (wave 3: product SLO, per-task defect regression, 
     assert.match(checkOf(empty, 'comparable').detail, /compared no trial/);
   });
 
+  test('(F[14]) a cancelled (partial) result never gates: neither as the candidate nor as the baseline', () => {
+    assert.throws(() => evaluateReleaseGate(suite(tasks()), { ...suite(tasks()), cancelled: true }), (e: unknown) => isHypertestError(e, 'invalid_argument') && /the candidate is a CANCELLED \(partial\) suite result/.test((e as Error).message));
+    assert.throws(() => evaluateReleaseGate({ ...suite(tasks()), cancelled: true }, suite(tasks())), (e: unknown) => isHypertestError(e, 'invalid_argument') && /the baseline is a CANCELLED \(partial\) suite result/.test((e as Error).message));
+  });
+
   test('(F[12]) the same suite revision over different content (fingerprint) is not comparable', () => {
     const a = suite(tasks(), { suiteFingerprint: 'a'.repeat(64) });
     const b = suite(tasks(), { suiteFingerprint: 'b'.repeat(64) });

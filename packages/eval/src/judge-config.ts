@@ -5,7 +5,7 @@
  * turns a packet + a human label into a calibration item. The judge always runs LAST (graderOrderProblems) and may answer
  * `unknown`; its results count only when calibrated on the answering route.
  */
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { HypertestError, canonicalJson, sha256Hex, type JsonValue, type Logger } from '@hypertest/core';
 import { configuredModels, type HypertestConfig } from '@hypertest/app';
@@ -102,6 +102,9 @@ export function labelCalibrationItem(input: { setFile: string; packetFile: strin
   // a changed set is a new revision of it: calibrations of the old one stay what they were
   const n = Number(set.revision);
   const next: CalibrationSet = { ...set, revision: Number.isSafeInteger(n) ? String(n + 1) : `${set.revision}+${set.items.length + 1}`, items: [...set.items, item] };
-  writeFileSync(input.setFile, `${JSON.stringify(next, null, 2)}\n`);
+  // (review) atomically: a crash mid-write never leaves a truncated calibration set (the labels are human work)
+  const tmp = `${input.setFile}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`);
+  renameSync(tmp, input.setFile);
   return { set: next, item };
 }

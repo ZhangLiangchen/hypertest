@@ -130,6 +130,33 @@ test('interactions need a page and must stay on the named environment', async (t
   assert.equal(spec.environmentClass!({ selector: 'x' }, { environments: envs }), undefined, 'without environmentId the policy cannot classify it');
 });
 
+test('(review) a read that names no environment reads only what browser.navigate admitted: a page an interaction moved elsewhere must be named', async (t) => {
+  if (skipReason) return t.skip(skipReason);
+  const ctx = fakeContext({ environments: envs });
+  ctx.ctx.agentId = 'agent_moved';
+  // env_ui is local: its session's egress policy lets loopback through — a link takes the page to env_other's origin,
+  // an environment this call's capability was never checked for
+  assert.equal((await call('browser.navigate', { environmentId: 'env_ui', path: '/links' }, ctx)).status, 'success');
+  const own = await call('browser.text', { selector: '#p' }, ctx);
+  assert.equal(own.status, 'success', 'the admitted page is read without naming its environment');
+  const click = await call('browser.click', { selector: '#away', environmentId: 'env_ui' }, ctx);
+  assert.equal(click.status, 'success', JSON.stringify(click.error));
+  assert.ok(String(structuredOf(click)['url']).startsWith(other.url), 'the page is now on env_other');
+  const before = ctx.evidence.length;
+  const text = await call('browser.text', {}, ctx);
+  assert.equal(text.status, 'failed');
+  assert.equal(text.error?.code, 'permission_denied');
+  assert.match(text.error!.message, /did not admit/);
+  const shot = await call('browser.screenshot', {}, ctx);
+  assert.equal(shot.error?.code, 'permission_denied');
+  assert.equal(ctx.evidence.length, before, 'nothing of the other environment was recorded');
+  // naming it makes the read a call on env/env_other (the runtime checks the capability for that resource)
+  assert.deepEqual(tools.get('browser.text')!.resources!({ environmentId: 'env_other' }, { environments: envs } as never), ['env/env_other']);
+  const named = await call('browser.text', { environmentId: 'env_other' }, ctx);
+  assert.equal(named.status, 'success', JSON.stringify(named.error));
+  await manager.closeSession(ctx.ctx.runId, 'agent_moved');
+});
+
 test('a missing Chromium executable is reported as unavailable, not thrown', async () => {
   const broken = new BrowserSessionManager({ chromiumPath: '/nonexistent/chromium', launchTimeoutMs: 5000 });
   const nav = browserTools({ manager: broken }).find((s) => s.id === 'browser.navigate')!;

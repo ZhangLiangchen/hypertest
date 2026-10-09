@@ -44,7 +44,10 @@ export async function runEngineContract(engines: readonly string[], options: { r
   }
   if (files.length === 0) throw new HypertestError('precondition_failed', 'the manifest pins no engine with a contract suite');
   const out = await new Promise<string>((resolveOut, reject) => {
-    const child = spawn(process.execPath, ['--test', '--test-reporter=tap', '--test-name-pattern=^AgentEngine contract', ...files], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
+    // a parent that is itself a node:test run (NODE_TEST_CONTEXT) would switch the child to its internal protocol: no TAP
+    const env = { ...process.env };
+    delete env['NODE_TEST_CONTEXT'];
+    const child = spawn(process.execPath, ['--test', '--test-reporter=tap', '--test-name-pattern=^AgentEngine contract', ...files], { cwd: root, env, stdio: ['ignore', 'pipe', 'pipe'] });
     const chunks: Buffer[] = [];
     child.stdout.on('data', (d: Buffer) => chunks.push(d));
     child.stderr.on('data', () => undefined);
@@ -168,7 +171,7 @@ export const runtimeCommand: Command = {
     'runtime record-suite <manifestId>|current --kind engine_contract --suite <id> [--revision <r>] (--passed --report <file> | --failed) [--total n] [--failures n] [--detail "<text>"] --by <name>',
     'runtime record-suite <manifestId>|current --kind compatibility --from-eval <SuiteResult.json> --by <name>',
     'runtime record-suite <manifestId>|current --kind production_replay --from-shadow [--min-runs n] --by <name>',
-    'runtime record-suite <manifestId>|current --kind release_gate --from-eval <core-SuiteResult.json> --baseline <SuiteResult.json> [--alpha p] [--max-critical-false-release r] [--bridge <bridge.json> …] --by <name>',
+    'runtime record-suite <manifestId>|current --kind release_gate --from-eval <core-SuiteResult.json> --baseline <SuiteResult.json> [--baseline-arm a] [--candidate-arm b] [--alpha p] [--max-critical-false-release r] [--bridge <bridge.json> …] --by <name>',
     'runtime shadow [<runId> …] [--limit n] [--timeout-ms n] --by <name>',
     'runtime promote <manifestId>|current --by <name> --reason "<text>" [--canary-percent n] [--canary-label key=value …]',
     'runtime rollback [<manifestId>] --by <name> --reason "<text>"',
@@ -185,6 +188,8 @@ export const runtimeCommand: Command = {
     ['--from-eval <file>', 'an eval SuiteResult JSON (eval run --out): every trial must pass AND have run under the manifest'],
     ['--from-shadow', 'production_replay: summarize this shadow release\'s recorded comparisons (no divergence allowed)'],
     ['--baseline <file>', 'release_gate: the committed baseline SuiteResult the core candidate is gated against (eval gate)'],
+    ['--baseline-arm / --candidate-arm', 'release_gate: the arms compared (e.g. the baseline\'s scripted-multi-llm vs the candidate\'s deployment)'],
+    ['--max-critical-false-release <r>', 'release_gate: the product SLO on the candidate\'s critical false release rate (default 0)'],
     ['--limit <n>', 'shadow: how many selected production runs to mirror (default 10)'],
     ['--timeout-ms <n>', 'shadow: how long one mirrored run may take (default runtime.shadow.timeoutMs or 600000)'],
     ['--canary-percent <n>', 'entering canary: the share of new runs (by run id) the canary serves'],
@@ -221,6 +226,8 @@ export const runtimeCommand: Command = {
     baseline: { type: 'string' },
     alpha: { type: 'string' },
     'max-critical-false-release': { type: 'string' },
+    'baseline-arm': { type: 'string' },
+    'candidate-arm': { type: 'string' },
     bridge: { type: 'string', multiple: true },
     limit: { type: 'string' },
     'timeout-ms': { type: 'string' },
@@ -322,7 +329,9 @@ export const runtimeCommand: Command = {
       if (kind === 'compatibility' && (passedFlag || runHere || fromShadow)) throw new UsageError('compatibility: --from-eval <SuiteResult.json> of an eval run on this runtime (or --failed)', 'runtime');
       if (kind === 'production_replay' && !fromShadow) throw new UsageError('production_replay: --from-shadow (the comparisons `hypertest runtime shadow` recorded on the shadow release)', 'runtime');
       if (kind === 'release_gate' && fromEval === undefined) throw new UsageError('release_gate: --from-eval <core SuiteResult.json> --baseline <baseline SuiteResult.json>', 'runtime');
-      if (kind !== 'release_gate' && str(values, 'baseline') !== undefined) throw new UsageError('--baseline belongs to --kind release_gate', 'runtime');
+      for (const option of ['baseline', 'baseline-arm', 'candidate-arm', 'alpha', 'max-critical-false-release', 'bridge']) {
+        if (kind !== 'release_gate' && (option === 'bridge' ? list(values, option).length > 0 : str(values, option) !== undefined)) throw new UsageError(`--${option} belongs to --kind release_gate`, 'runtime');
+      }
       assertNotSandboxed(ctx.io.env, 'record-suite');
       const readText = async (option: string, file: string): Promise<string> => {
         try {
@@ -363,6 +372,22 @@ export const runtimeCommand: Command = {
           throw new HypertestError('unavailable', `the eval platform (@hypertest/eval) could not be loaded: ${(e as Error).message}`, { cause: e });
         }
         if (typeof ev.evaluateReleaseGate !== 'function') throw new HypertestError('unsupported', '@hypertest/eval does not export evaluateReleaseGate');
+        // (review, F[13]) "core" is the BUILT-IN core suite at its current revision and content (a private suite or another
+        // revision named core is not the core eval): candidate and baseline alike. Another suite id is refused by the
+        // release service (candidate) or makes the gate not comparable (baseline)
+        const coreSuite = ev['coreSuite'];
+        const fingerprintOf = ev['suiteFingerprint'];
+        if (typeof coreSuite !== 'function' || typeof fingerprintOf !== 'function') throw new HypertestError('unsupported', '@hypertest/eval does not export coreSuite / suiteFingerprint: the core suite cannot be verified');
+        const core = (coreSuite as () => { suiteId: string; revision: string; tasks: unknown[] })();
+        const expected = (fingerprintOf as (s: unknown) => string)(core);
+        for (const [option, file, doc] of [['from-eval', fromEval!, candidate], ['baseline', baselinePath, baseline]] as const) {
+          const d = (doc ?? {}) as { suiteId?: unknown; revision?: unknown; suiteFingerprint?: unknown };
+          if (d.suiteId !== core.suiteId) continue;
+          if (d.revision !== core.revision || d.suiteFingerprint !== expected) {
+            const has = d.revision !== core.revision ? `revision ${String(d.revision)}` : `fingerprint ${typeof d.suiteFingerprint === 'string' ? d.suiteFingerprint.slice(0, 12) : 'none'}`;
+            throw new HypertestError('precondition_failed', `--${option} ${file} is not the built-in core suite (${core.suiteId}@${core.revision}, content fingerprint ${expected.slice(0, 12)}…): its result has ${has} — run \`hypertest eval run core\` of this installation`);
+          }
+        }
         let report;
         try {
           report = ev.evaluateReleaseGate(baseline as never, candidate as never, options);
@@ -372,7 +397,7 @@ export const runtimeCommand: Command = {
         }
         return withInstance(ctx, { drivesAgents: false }, async ({ ht }) => {
           const manifestId = await ht.releases.resolve(ref!);
-          const result = await ht.releases.recordReleaseGate({ manifestId, candidate, candidateDigest: sha256Hex(candidateText), baselineDigest: sha256Hex(baselineText), report, by });
+          const result = await ht.releases.recordReleaseGate({ manifestId, candidate, baseline, candidateDigest: sha256Hex(candidateText), baselineDigest: sha256Hex(baselineText), report, by });
           return print(result, manifestId);
         });
       }

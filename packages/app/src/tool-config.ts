@@ -490,6 +490,12 @@ export function sandboxKeyProblems(profile: Record<string, unknown>, at: string)
 /** Problems of `sandbox.roles` (tier per role; keys honoured like the base profile's). */
 export function sandboxRoleProblems(sandbox: Record<string, unknown>): string[] {
   const roles = sandbox['roles'];
+  // (review) no accepted-but-ignored key: the base `image` is used only by the OCI sandbox — the base kind, or a role tier
+  // that switches to oci without an image of its own
+  if (sandbox['image'] !== undefined && sandbox['kind'] !== 'oci') {
+    const usedByTier = isPlainObject(roles) && Object.values(roles).some((t) => isPlainObject(t) && t['kind'] === 'oci' && t['image'] === undefined);
+    if (!usedByTier) return ['sandbox.image applies only to the OCI sandbox (kind: oci, or a sandbox.roles tier with kind oci and no image of its own): it would be ignored', ...sandboxRoleProblems({ ...sandbox, image: undefined })];
+  }
   if (roles === undefined) return [];
   if (!isPlainObject(roles)) return ['sandbox.roles must be a mapping of role name to { tier, … }'];
   const errors: string[] = [];
@@ -508,6 +514,7 @@ export function sandboxRoleProblems(sandbox: Record<string, unknown>): string[] 
     const merged: Record<string, unknown> = { ...sandbox, ...raw };
     if (clearsAllowedHosts(raw)) merged['allowedHosts'] = [];
     if (merged['kind'] === 'oci' && !nonEmpty(merged['image'])) errors.push(`${at}: kind oci needs an image (here or in sandbox.image)`);
+    if (raw['image'] !== undefined && merged['kind'] !== 'oci') errors.push(`${at}.image applies only with kind oci (here or in sandbox.kind): it would be ignored`);
     errors.push(...sandboxKeyProblems(merged, at));
     // a read-only tier for a role whose tools write its worktree would only make it fail: refused up front
     const def = BUILTIN_ROLES.find((r) => r.role === role);
@@ -553,7 +560,12 @@ export function isolationResolver(config: HypertestConfig, workItems: { getWorkI
             noEgress: !reqs.some((r) => r.resourceScopes.some((sc) => sc === '**' || sc.startsWith('env/') || sc.startsWith('url/'))),
           };
         },
-        () => ({ readOnly: false, noEgress: false }),
+        (e: unknown) => {
+          // (review) fail closed and never cached: a work item whose requirements cannot be read right now must not run its
+          // commands with the role's (wider) tier — nor keep that wider tier for the rest of the process
+          cache.delete(workItemId);
+          throw new HypertestError('unavailable', `the isolation tier of work item ${workItemId} could not be determined (its capability requirements could not be read): ${e instanceof Error ? e.message : String(e)}`, { cause: e });
+        },
       );
       // bounded: the oldest entries go first (a long-lived instance sees many work items)
       if (cache.size >= 10_000) cache.delete(cache.keys().next().value!);

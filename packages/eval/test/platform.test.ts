@@ -15,9 +15,9 @@ import { tempDir } from '@hypertest/testkit';
 import {
   EVAL_TIERS, EVAL_TIER_IDS, GRADER_REVISIONS, RETAINED_GRADERS, VERDICT_CONSISTENCY_RUBRIC, configuredJudge, defectEconomics, gitShowFile, humanInterventions, labelCalibrationItem,
   loadCalibrationSet, loadSuiteDirectory, parseSweBench, recordingJudge, renderSuiteReport, retainedGrader, sanitySuite, scriptedJudge, scriptedJudgeBrain, scriptedWireFetch, summarizeSuite,
-  tierSpec, wireHost, type EvalTrial,
+  outcomeMetrics, tierSpec, wireHost, type EvalTrial,
 } from '../src/index.ts';
-import { Log, data, decision, evidence, finding } from './helpers.ts';
+import { Log, data, decision, evidence, finding, operation, task } from './helpers.ts';
 
 function trial(taskId: string, n: number, pass: boolean): EvalTrial {
   return { taskId, armId: 'a', trial: n, seed: `${taskId}#${n}`, result: pass ? 'pass' : 'fail', graders: [], outcomeMetrics: {}, trajectoryMetrics: {}, durationMs: 1 };
@@ -65,6 +65,16 @@ describe('(F[10]) defect economics and human interventions', () => {
     });
     assert.deepEqual(defectEconomics(d), { confirmedDefects: 2, independentReproductionRate: 0.5, costPerConfirmedDefectUsd: 0.2, tokensPerConfirmedDefect: 200 });
     assert.deepEqual(defectEconomics(data({})), { confirmedDefects: 0 });
+  });
+
+  test('recovery correctness: only for a trial whose Hypertest was killed — a final decision, nothing unsettled, no duplicate effect', () => {
+    const killed = { restarts: 1, injectedModelTimeouts: 0, duplicateDelivery: false, timedOut: false };
+    assert.equal(outcomeMetrics(task(), data({ decision: decision('fail') }))['recoveryCorrectness'], undefined, 'no crash: nothing to recover');
+    assert.equal(outcomeMetrics(task(), data({ harness: killed, decision: decision('fail'), operations: [operation('op_1', 'verified')] }))['recoveryCorrectness'], 1);
+    assert.equal(outcomeMetrics(task(), data({ harness: killed, operations: [operation('op_1', 'verified')] }))['recoveryCorrectness'], 0, 'the recovered run reached no decision');
+    assert.equal(outcomeMetrics(task(), data({ harness: killed, decision: decision('fail'), operations: [operation('op_1', 'dispatching')] }))['recoveryCorrectness'], 0, 'an orphaned operation');
+    assert.equal(outcomeMetrics(task(), data({ harness: killed, decision: decision('fail'), operations: [operation('op_1', 'verified')], probes: { sideEffects: { op_1: 0 } } }))['recoveryCorrectness'], 0, 'the ledger says verified, the environment saw nothing');
+    assert.equal(outcomeMetrics(task(), data({ harness: killed, decision: decision('fail'), operations: [operation('op_1', 'verified')], probes: { sideEffects: { op_1: 2 } } }))['recoveryCorrectness'], 0, 'a duplicate external effect');
   });
 
   test('human interventions: approval requests, manual reviews and a decision that needs a human', () => {

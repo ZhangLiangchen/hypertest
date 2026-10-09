@@ -110,7 +110,8 @@ export interface HypertestConfig {
   /**
    * (additive, e2e[0]) `urlEnvironmentClass`: the environment class of the black-box environments the URL entries of
    * `httpAllowlist` stand for (`url-<host>-<port>`, the target of `hypertest run --url`) when their host is not loopback
-   * (loopback hosts are always `local`). Default `sandbox`. Never allowlist a production URL under a lower class.
+   * (loopback hosts are always `local`). (review) No default: without it a non-loopback URL entry is not an environment
+   * (the class decides what agents may do there). Never allowlist a production URL under a lower class.
    */
   tools?: {
     shellAllowlist?: string[]; httpAllowlist?: string[]; enableBrowser?: boolean; urlEnvironmentClass?: string;
@@ -302,7 +303,11 @@ export interface Hypertest {
   start(input: StartRunInput): Promise<TestRun>;
   /** Starts a run and waits for its outcome. */
   run(input: StartRunInput, options?: { timeoutMs?: number }): Promise<RunOutcome>;
-  /** Resumes the non-terminal runs pinned to this runtime's manifest (I11; runs of other manifests are left alone). */
+  /**
+   * Resumes the non-terminal runs pinned to this runtime's manifest (I11; runs of other manifests are left alone).
+   * (additive, F[1]) A run migrated here and not driven yet is taken over first (`releases.drive`); one that was not taken
+   * over is left out of the result (a warning names the remedy).
+   */
   resumeIncomplete(): Promise<string[]>;
   status(runId: string): Promise<TestRun | undefined>;
   report(runId: string): Promise<RunReport>;
@@ -543,6 +548,14 @@ export interface RuntimeReleaseService {
    */
   markDriven(runId: string): Promise<boolean>;
   /**
+   * (additive, F[1]) Takes over a run migrated onto THIS runtime whose latest RuntimeEpoch was not driven yet: starts this
+   * runtime's durable loop and waits until it really drives the run (`run.migration_driven`) — waking (and, on Temporal,
+   * handing over) a previous loop still open on the source runtime. `needed: false` when the run has no such epoch (or
+   * it was driven already); `driven: false` with the `problem` when the take-over did not happen within `timeoutMs`.
+   * `hypertest resume` goes through it: a migrated run is never resumed by a silent no-op start.
+   */
+  drive(runId: string, input?: { timeoutMs?: number; signal?: AbortSignal }): Promise<{ needed: boolean; driven: boolean; problem?: string }>;
+  /**
    * (additive, F[0], e2e[5]) Records a `compatibility` result from an eval SuiteResult: passing only when every trial
    * passed AND every trial ran under `manifestId` (binding eval_trials); a passing result of other manifests is refused.
    */
@@ -559,6 +572,11 @@ export interface RuntimeReleaseService {
     baselineDigest: string;
     report: { pass: boolean; suiteId: string; checks?: Array<{ checkId: string; pass: boolean }> };
     by: string;
+    /**
+     * (additive) The baseline SuiteResult the candidate was gated against: refused when its trials ran under this very
+     * release (a release is never its own baseline). A baseline identical to the candidate (same digest) is always refused.
+     */
+    baseline?: unknown;
   }): Promise<CompatibilitySuiteResult>;
   /**
    * (additive, F[0]) Mirrors a FINISHED production run onto this runtime, which must be the shadow release: a new run

@@ -23,12 +23,12 @@ import {
 import { LEDGER_ORACLE } from './poc-a.ts';
 import { OBSERVATIONS_PROBE, observationsFile, observationsProbe } from './common.ts';
 import {
-  apiBlackboxTask, chaosBudgetExhaustionTask, chaosCompetingFaultsTask, chaosKillAfterSuccessTask, chaosUnqueryableTargetTask, evidenceMissingTask, evidenceTamperTask, faultToleranceErrorsTask,
+  apiBlackboxTask, chaosBudgetExhaustionTask, chaosCompetingFaultsTask, chaosKillAfterSuccessTask, chaosUnqueryableTargetTask, evidenceMissingTask, faultToleranceErrorsTask,
   faultToleranceLatencyTask, multiAgentConvergenceTask, multiAgentDelegationTask, performanceRegressionTask, performanceSloTask,
 } from './extended.ts';
 
 /** Revision of the core suites. */
-/** core-2: the core suite also runs the extended core suites (F[5]/F[6]/F[7]) except the browser task (CI has no Chromium). */
+/** core-2: the core suite also runs the extended core suites (F[5]/F[6]/F[7]) except the browser and the evidence-tamper tasks. */
 export const CORE_SUITE_REVISION = 'core-2';
 
 export const CONTEXT_FRESHNESS_TASK_ID = 'context-freshness';
@@ -285,8 +285,9 @@ export function testGenerationSuite(): EvalSuite {
 /**
  * Every core-suite task: the suite of the eval release gate (`hypertest eval run core --out …`, then `eval gate`; promotion
  * of a runtime release to active needs it bound to the release's manifest). core-2 (F[5]/F[6]/F[7]): plus the extended
- * core suites — API black-box, Performance, FaultTolerance, Evidence, MultiAgent and the chaos cases. The UI black-box
- * task needs a local Chromium and stays in the `api-ui-blackbox` suite and the `deep` tier.
+ * core suites — API black-box, Performance, FaultTolerance, Evidence (missing evidence), MultiAgent and the chaos cases.
+ * Not in the gate suite: the UI black-box task (needs a local Chromium) and the evidence-TAMPER task (its attack leaves a
+ * store that does not verify, which the gate's evidence criterion rightly fails) — both run in their suites and `deep`.
  */
 export function coreSuite(): EvalSuite {
   return {
@@ -294,7 +295,7 @@ export function coreSuite(): EvalSuite {
     revision: CORE_SUITE_REVISION,
     tasks: [
       contextFreshnessTask(), modelSwitchBaselineTask(), modelSwitchTask(), securityInjectionTask(), testGenerationTask(), testGenerationInsensitiveTask(), testGenerationDefectTask(),
-      apiBlackboxTask(), performanceSloTask(), performanceRegressionTask(), faultToleranceLatencyTask(), faultToleranceErrorsTask(), evidenceTamperTask(), evidenceMissingTask(),
+      apiBlackboxTask(), performanceSloTask(), performanceRegressionTask(), faultToleranceLatencyTask(), faultToleranceErrorsTask(), evidenceMissingTask(),
       multiAgentDelegationTask(), multiAgentConvergenceTask(), chaosKillAfterSuccessTask(), chaosBudgetExhaustionTask(), chaosCompetingFaultsTask(), chaosUnqueryableTargetTask(),
     ],
   };

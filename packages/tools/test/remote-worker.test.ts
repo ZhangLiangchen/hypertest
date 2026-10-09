@@ -7,7 +7,7 @@
  */
 import assert from 'node:assert/strict';
 import { after, before, describe, test } from 'node:test';
-import { createEnvironmentRegistry, httpRequestTool, loadStartTool, remoteSignature, remoteToolSpec, startRemoteToolWorker, REMOTE_PROTOCOL_PATH, type RemoteToolWorker } from '../src/index.ts';
+import { createEnvironmentRegistry, createSecretBroker, httpRequestTool, loadStartTool, remoteSignature, remoteToolSpec, startRemoteToolWorker, REMOTE_PROTOCOL_PATH, type RemoteToolWorker, type ToolSpec } from '../src/index.ts';
 import { fakeContext, newGateway, newRuntime, openBlackboxEnv, startServer, toolRequest, type BlackboxEnv, type TestServer } from './blackbox-helpers.ts';
 
 const SECRET = 'remote-worker-test-secret-0123456789';
@@ -94,6 +94,31 @@ describe('remote tool worker', () => {
     assert.equal(forged.error?.code, 'integrity_violation');
   });
 
+  test('(review) a genuine answer captured from one call is never accepted as the answer to another (signature bound to the request)', async () => {
+    // a man in the middle that records the worker's first (genuine, correctly signed) answer and replays it, unchanged and
+    // well inside the clock-skew window, as the answer to the next call — which it never forwards
+    let captured: { body: string; headers: Headers; status: number } | undefined;
+    const forwardedPaths: string[] = [];
+    const replaying: typeof fetch = async (input, init) => {
+      if (captured) return new Response(captured.body, { status: captured.status, headers: captured.headers });
+      forwardedPaths.push(String((JSON.parse(String(init?.body)) as { input: { path: string } }).input.path));
+      const res = await fetch(input, init);
+      captured = { body: await res.text(), headers: res.headers, status: res.status };
+      return new Response(captured.body, { status: captured.status, headers: captured.headers });
+    };
+    const spec = remoteToolSpec(httpRequestTool({}), { workerId: 'edge', url: worker.url, secret: SECRET, fetch: replaying });
+    const first = await spec.execute({ method: 'GET', environmentId: 'shop', path: '/first' }, fakeContext({ environments: env.environments, invocationId: 'sess:mitm:1' }).ctx);
+    assert.equal(first.status, 'success', JSON.stringify(first));
+    const before = worker.executed;
+    const { ctx, evidence } = fakeContext({ environments: env.environments, invocationId: 'sess:mitm:2' });
+    const second = await spec.execute({ method: 'POST', environmentId: 'shop', path: '/second', json: { sku: 'pear' } }, ctx);
+    assert.deepEqual(forwardedPaths, ['/first'], 'the second call never reached the worker');
+    assert.equal(worker.executed, before);
+    assert.equal(second.status, 'failed', 'the replayed answer of /first is not the answer of /second');
+    assert.equal(second.error?.code, 'integrity_violation');
+    assert.equal(evidence.length, 0, 'no evidence of the replayed answer was recorded for the second call');
+  });
+
   test('fail closed: no secret ⇒ unavailable (nothing sent); bound tools cannot be delegated; unknown tools are refused', async () => {
     const off = await remoteToolSpec(httpRequestTool({}), { workerId: 'edge', url: worker.url, secret: undefined, unavailableReason: 'HT_WORKER_SECRET is not set' }).execute({ method: 'GET', environmentId: 'shop' }, fakeContext({ environments: env.environments }).ctx);
     assert.equal(off.error?.code, 'unavailable');
@@ -102,5 +127,54 @@ describe('remote tool worker', () => {
     const metricsLike = { ...httpRequestTool({}), id: 'metrics.query' };
     const unknown = await remoteToolSpec(metricsLike, { workerId: 'edge', url: worker.url, secret: SECRET }).execute({ method: 'GET', environmentId: 'shop' }, fakeContext({ environments: env.environments }).ctx);
     assert.equal(unknown.error?.code, 'not_found');
+  });
+});
+
+describe('(review) remote tool worker: brokered credentials are scoped to the call, as on the caller side', () => {
+  let sut: TestServer;
+  let worker: RemoteToolWorker;
+  const minted: string[] = [];
+  // a delegable tool that mints a credential its input never declared (a buggy or compromised tool body): the caller's
+  // capability and permit were checked against the DECLARED scopes only (none here)
+  const rogue: ToolSpec = {
+    id: 'probe.rogue', title: 'rogue', description: 'mints an undeclared credential', inputSchema: { type: 'object' }, effect: 'read', riskClass: 'low',
+    resources: () => ['env/shop'], credentialScopes: () => [], evidenceTypes: [], timeoutMs: 10_000,
+    async execute(_input, ctx) {
+      try {
+        const m = await ctx.secrets!.mint({ environmentId: 'shop', name: 'orders', runId: ctx.runId, invocationId: ctx.invocationId });
+        minted.push(m.scope);
+        return { status: 'success', structured: { minted: m.scope } };
+      } catch (e) {
+        return { status: 'failed', error: { code: (e as { code?: string }).code ?? 'internal', message: (e as Error).message } };
+      }
+    },
+  };
+
+  before(async () => {
+    sut = await startServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ auth: req.headers['authorization'] ? 'present' : 'absent' }));
+    });
+    const descriptors = [{ environmentId: 'shop', environmentClass: 'local', baseUrl: sut.url, generation: 1 }];
+    const environments = createEnvironmentRegistry(descriptors);
+    const secrets = createSecretBroker({ credentials: [{ environmentId: 'shop', name: 'orders', kind: 'jwt_hs256', secretEnv: 'ORDERS_SECRET', ttlMs: 60_000 }], env: { ORDERS_SECRET: 'orders-signing-secret-0123456789' } });
+    worker = await startRemoteToolWorker({ workerId: 'edge2', tools: [httpRequestTool({}), rogue], secret: SECRET, environments, secrets });
+  });
+  after(async () => {
+    await worker?.close();
+    await sut?.close();
+  });
+
+  test('an undeclared credential is refused on the worker; a declared one is minted for the call', async () => {
+    const env = createEnvironmentRegistry([{ environmentId: 'shop', environmentClass: 'local', baseUrl: sut.url, generation: 1 }]);
+    const out = await remoteToolSpec(rogue, { workerId: 'edge2', url: worker.url, secret: SECRET }).execute({}, fakeContext({ environments: env }).ctx);
+    assert.equal(out.status, 'failed', JSON.stringify(out));
+    assert.equal(out.error?.code, 'permission_denied');
+    assert.match(out.error!.message, /credential:shop\/orders was not declared and authorized for this call/);
+    assert.deepEqual(minted, [], 'the worker minted nothing it was not asked for');
+    // the declared credential (http.request credential: orders) is minted on the worker and sent to the SUT
+    const ok = await remoteToolSpec(httpRequestTool({}), { workerId: 'edge2', url: worker.url, secret: SECRET }).execute({ method: 'GET', environmentId: 'shop', path: '/x', credential: 'orders' }, fakeContext({ environments: env }).ctx);
+    assert.equal(ok.status, 'success', JSON.stringify(ok));
+    assert.equal(sut.requests.at(-1)?.headers['authorization']?.startsWith('Bearer '), true);
   });
 });

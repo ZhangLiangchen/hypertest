@@ -12,6 +12,7 @@ import { aborted, brainMap, findConfig, isPlainObject, loadBrainsModule, loadCli
 import type { EvalModuleLike, ScriptedBrainMap } from '../contracts.ts';
 import { EXIT_CODES } from '../exit-codes.ts';
 import { table } from '../format.ts';
+import { SANDBOX_ENV } from './decide.ts';
 
 /** `poc-a-whitebox` → `pocAWhiteboxSuite` (the factory names of the eval contract). */
 export function suiteFactoryName(suiteId: string): string {
@@ -91,6 +92,31 @@ async function configArm(ctx: CommandContext): Promise<EvalArm | undefined> {
 }
 
 /**
+ * (F[13], review) The configuration a `deployment`-arm trial composes: the deployment's whole configuration (everything its
+ * RuntimeManifest pins: models, roles, policies, gate, tools, engines, …) over what isolates the trial (data directory,
+ * store, artifacts, durable runtime, log level) — WITHOUT the deployment's own targets: its registered `environments`
+ * and the URL targets of `tools.httpAllowlist` (neither is part of the manifest). A trial evaluates the release on the
+ * task's fixtures only; with the deployment's targets an agent of an evaluation (live models in the release-eval job)
+ * could act on the deployment's real systems — and the trial's sandbox egress would reach them.
+ */
+export function deploymentTrialConfig(config: HypertestConfig, base: HypertestConfig): HypertestConfig {
+  const { environments: _targets, ...rest } = config;
+  const out: HypertestConfig = {
+    ...rest,
+    project: { ...config.project, dataDir: base.project.dataDir },
+    store: base.store,
+    artifacts: base.artifacts,
+    durable: base.durable,
+    ...(base.observability ? { observability: base.observability } : {}),
+  };
+  if (config.tools) {
+    const { httpAllowlist: _urls, urlEnvironmentClass: _class, ...tools } = config.tools;
+    out.tools = { ...tools, httpAllowlist: [] };
+  }
+  return out;
+}
+
+/**
  * (F[13]) The `deployment` arm: the WHOLE configuration file (models, roles, policies, gate, tools, sandbox, runtime, …)
  * over the trial's base configuration — only what isolates the trial is the trial's (data directory, store, artifacts,
  * durable runtime, log level). Its trials run under the deployment's runtime manifest, so a result of the core suite on
@@ -103,7 +129,7 @@ async function deploymentArm(ctx: CommandContext, ev: EvalModuleLike): Promise<E
   const arm: EvalArm = {
     armId: 'deployment',
     description: `the deployment configuration ${path} (release evaluation)`,
-    config: (base: HypertestConfig) => ({ ...config, project: { ...config.project, dataDir: base.project.dataDir }, store: base.store, artifacts: base.artifacts, durable: base.durable, ...(base.observability ? { observability: base.observability } : {}) }),
+    config: (base: HypertestConfig) => deploymentTrialConfig(config, base),
   };
   const brains = await configBrains(ctx, config);
   if (brains) arm.brains = brains;
@@ -331,6 +357,10 @@ async function calibrate(ctx: CommandContext, values: OptionValues, args: string
     const by = required('eval', values, 'by').trim();
     const human = by.startsWith('human:') ? by : `human:${by}`;
     const note = str(values, 'note');
+    // (review) an expert label decides whether the judge's results count: a human decision, never taken by an agent
+    if (ctx.io.env[SANDBOX_ENV]) {
+      throw new HypertestError('permission_denied', `eval calibrate label is a human decision and cannot be taken from inside a Hypertest sandbox (${SANDBOX_ENV} is set): an agent never labels the calibration of its own judge`);
+    }
     const labelItem = fn<(i: Record<string, unknown>) => { set: CalibrationSet; item: { itemId: string } }>(ev, 'labelCalibrationItem', 'human calibration');
     let r;
     try {
@@ -410,6 +440,10 @@ async function resolveRun(ctx: CommandContext, ev: EvalModuleLike, values: Optio
       if (isHypertestError(e, 'invalid_argument')) throw new UsageError(e.message, 'eval');
       throw e;
     }
+    // (review) a private suite never takes the id of a built-in one (a directory's `core` would run instead of the CORE eval)
+    const builtin = availableSuites(ev);
+    const shadowed = [...loaded.keys()].filter((id) => builtin.has(id) || id === 'sanity').sort();
+    if (shadowed.length > 0) throw new UsageError(`--suite-dir ${suiteDir}: private suite ${shadowed.map((id) => JSON.stringify(id)).join(', ')} reuses the id of a built-in suite (choose another suiteId)`, 'eval');
     const hit = loaded.get(suiteId);
     if (hit) suite = hit.suite;
     else if (!availableSuites(ev).has(suiteId)) throw new UsageError(`unknown suite ${JSON.stringify(suiteId)} (in ${suiteDir}: ${[...loaded.keys()].sort().join(', ') || 'none'})`, 'eval');
@@ -469,6 +503,11 @@ async function resolveRun(ctx: CommandContext, ev: EvalModuleLike, values: Optio
   }
 
   const registry = availableArms(ev, suite);
+  // (F[8]) product baselines invoked as a command (Claude Code, Codex, OpenHands, …): `--arm-file` defines them
+  for (const arm of await externalArmsFrom(ctx, ev, values)) {
+    if (registry.has(arm.armId)) throw new UsageError(`--arm-file: arm ${arm.armId} already exists (choose another id)`, 'eval');
+    registry.set(arm.armId, arm);
+  }
   const wanted = list(values, 'arms');
   const needConfigArm = wanted.includes('config') || (wanted.length === 0 && registry.size === 0);
   if (needConfigArm && !registry.has('config')) {
@@ -485,15 +524,57 @@ async function resolveRun(ctx: CommandContext, ev: EvalModuleLike, values: Optio
     if (unknown.length > 0) throw new UsageError(`unknown arm${unknown.length === 1 ? '' : 's'} ${unknown.join(', ')} (available: ${[...registry.keys()].sort().join(', ') || 'none'})`, 'eval');
     arms = [...new Set(wanted)].map((a) => registry.get(a)!);
   } else {
-    // the default arms: the model-variation arms (scripted multi/single, live when configured) — causal and product arms
-    // are opt-in by name
-    arms = [...registry.values()].filter((a) => a.family === undefined || a.family === 'model');
+    // the default arms: the plain model arms (scripted multi/single, live when configured, the CLI's config arm) — causal,
+    // product and other special arms (family set: e.g. the three-provider-class acceptance arm, which runs in-process only)
+    // are opt-in by name; (review) in child-process mode only arms that can run as a child process
+    arms = [...registry.values()].filter((a) => a.family === undefined && (mode !== 'child-process' || a.child !== undefined));
     if (arms.length === 0) throw new HypertestError('precondition_failed', 'no eval arms: @hypertest/eval provides none and no configuration file was found for the `config` arm');
   }
   const out: ResolvedSuite = { suite, arms, trials, options };
   if (mode !== undefined) out.mode = mode as 'in-process' | 'child-process';
   if (tier !== undefined) out.tier = tier;
   if (bridgeGrader !== undefined) out.bridgeGrader = bridgeGrader;
+  return out;
+}
+
+/**
+ * (F[8]) External agent arms of `--arm-file <file.json>` (repeatable): `{ "arms": [{ "armId", "description"?, "external":
+ * { "command", "args" (with {goal} {workspace} {sutUrl} {report}), "envPassthrough"? (variable NAMES), "timeoutMs"? } }] }`.
+ * The agent runs as a command in the fixture's workspace and is graded on its reported outcome only (externalAgentArm).
+ */
+export async function externalArmsFrom(ctx: CommandContext, ev: EvalModuleLike, values: OptionValues): Promise<EvalArm[]> {
+  const files = list(values, 'arm-file');
+  if (files.length === 0) return [];
+  const make = fn<(armId: string, description: string, spec: EvalArm['external'] & object) => EvalArm>(ev, 'externalAgentArm', 'external agent arms');
+  const out: EvalArm[] = [];
+  for (const file of files) {
+    const doc = await readJson(ctx, 'arm-file', file);
+    const arms = isPlainObject(doc) && Array.isArray(doc['arms']) ? (doc['arms'] as unknown[]) : undefined;
+    if (!arms) throw new UsageError(`--arm-file ${file} must be {"arms": [{armId, external: {command, args}}]}`, 'eval');
+    for (const [i, raw] of arms.entries()) {
+      const at = `--arm-file ${file}: arms[${i}]`;
+      if (!isPlainObject(raw)) throw new UsageError(`${at} must be an object`, 'eval');
+      const armId = raw['armId'];
+      if (typeof armId !== 'string' || !/^[a-z][a-z0-9-]{0,62}$/.test(armId)) throw new UsageError(`${at}.armId must be a lower-case id (letters, digits, -)`, 'eval');
+      const ext = raw['external'];
+      if (!isPlainObject(ext)) throw new UsageError(`${at}.external must be {command, args, envPassthrough?, timeoutMs?}`, 'eval');
+      for (const k of Object.keys(ext)) if (!['command', 'args', 'envPassthrough', 'timeoutMs'].includes(k)) throw new UsageError(`${at}.external: unknown key ${k}`, 'eval');
+      const { command, args, envPassthrough, timeoutMs } = ext as Record<string, unknown>;
+      if (typeof command !== 'string' || command.trim() === '') throw new UsageError(`${at}.external.command must be a non-empty string`, 'eval');
+      if (!Array.isArray(args) || args.some((a) => typeof a !== 'string')) throw new UsageError(`${at}.external.args must be a list of strings`, 'eval');
+      if (envPassthrough !== undefined && (!Array.isArray(envPassthrough) || envPassthrough.some((n) => typeof n !== 'string' || !/^[A-Z_][A-Z0-9_]*$/.test(n)))) {
+        throw new UsageError(`${at}.external.envPassthrough must be a list of variable NAMES (never values)`, 'eval');
+      }
+      if (timeoutMs !== undefined && !(typeof timeoutMs === 'number' && Number.isSafeInteger(timeoutMs) && timeoutMs > 0)) throw new UsageError(`${at}.external.timeoutMs must be an integer > 0`, 'eval');
+      const description = typeof raw['description'] === 'string' ? raw['description'] : `external agent ${command}`;
+      try {
+        out.push(make(armId, description, { command, args: args as string[], ...(envPassthrough ? { envPassthrough: envPassthrough as string[] } : {}), ...(timeoutMs !== undefined ? { timeoutMs: timeoutMs as number } : {}) }));
+      } catch (e) {
+        if (isHypertestError(e, 'invalid_argument')) throw new UsageError(`${at}: ${e.message}`, 'eval');
+        throw e;
+      }
+    }
+  }
   return out;
 }
 
@@ -637,7 +718,7 @@ export const evalCommand: Command = {
   name: 'eval',
   summary: 'run an evaluation suite (fresh environment per trial) and compare arms; gate a candidate against a baseline; bridge grader revisions; calibrate the judge',
   usage: [
-    'eval run [<suite>] [--tier pr-smoke|release-core|deep|failure-recovery] [--trials n] [--arms a,b] [--track cold|learning] [--experience <items.json>] [--suite-dir <dir>] [--dataset <instances.jsonl> --repos <dir>] [--work-dir <dir>] [--keep-work-dir] [--timeout-ms n] [--timeout n] [--cancel-grace-ms n] [--mode in-process|child-process] [--judge scripted|config] [--judge-route r] [--judge-packets <dir>] [--calibration <set.json>] [--bridge-grader <id>@<rev>] [--out <suite-result.json>] [--report <file>] [--json]',
+    'eval run [<suite>] [--tier pr-smoke|release-core|deep|failure-recovery] [--trials n] [--arms a,b] [--arm-file <arms.json> …] [--track cold|learning] [--experience <items.json>] [--suite-dir <dir>] [--dataset <instances.jsonl> --repos <dir>] [--work-dir <dir>] [--keep-work-dir] [--timeout-ms n] [--timeout n] [--cancel-grace-ms n] [--mode in-process|child-process] [--judge scripted|config] [--judge-route r] [--judge-packets <dir>] [--calibration <set.json>] [--bridge-grader <id>@<rev>] [--out <suite-result.json>] [--report <file>] [--json]',
     'eval gate --baseline <suite-result.json> --candidate <suite-result.json> [--baseline-arm a] [--candidate-arm b] [--alpha 0.05] [--max-critical-false-release r] [--bridge <bridge.json> …] [--report <file>] [--json]',
     'eval bridge [<suite>] --grader <id>@<revision> --out <bridge.json> [--tier t] [--arms a] [--trials n] [--result-out <suite-result.json>]',
     'eval calibrate [--judge scripted|config] [--judge-route r] [--set <calibration.json>] [--json]',
@@ -647,7 +728,8 @@ export const evalCommand: Command = {
   optionHelp: [
     ['--tier <tier>', 'pr-smoke (fast subset ×1), release-core (core ×5), deep (everything ×5), failure-recovery (chaos ×10, child-process): suite, trials and mode (each overridable)'],
     ['--trials <n>', 'trials per task and arm (default the tier\'s, else 1); reports pass@k and pass^k per k'],
-    ['--arms <list>', 'arms to compare (default: the model arms @hypertest/eval provides, else `config`); causal H0…H6 and product arms by name; `deployment` = this configuration file'],
+    ['--arms <list>', 'arms to compare (default: the plain model arms @hypertest/eval provides — scripted multi/single, live when configured — that can run in the mode, else `config`); causal H0…H6, product and the three-provider-classes arm by name; `deployment` = this configuration file'],
+    ['--arm-file <file>', 'external agent arms (Claude Code, Codex, OpenHands, … invoked as a command): {"arms": [{armId, external: {command, args with {goal} {workspace} {sutUrl} {report}, envPassthrough?, timeoutMs?}}]}; graded on their reported outcome only'],
     ['--track <track>', 'cold (default: no long-term memory across trials) or learning (approved experience only, --experience)'],
     ['--experience <file>', 'learning track: experience items seeded into every trial (only approved/published ones are admitted)'],
     ['--suite-dir <dir>', 'the customer/private layer: *.suite.json / *.suite.mjs files of that directory'],
@@ -684,7 +766,7 @@ export const evalCommand: Command = {
     'eval run: exit code 0 when every trial passed, 1 otherwise (and on --timeout), 130 when interrupted (the partial result is still written to --out, marked cancelled).',
     'eval apply-scores: derives per-route, per-role quality scores from a SuiteResult (graded trials whose agents of the role ran on the route; (passes + 1) / (trials + 2)) and writes them with their provenance to --out. Point models.scoresFile at it: the next start routes with the scores, and its RuntimeManifest records them (modelScores).',
     'eval gate: exit code 0 when the candidate passes every check (critical false release not worse and within the SLO, defect recall not significantly lower and no hidden defect lost on every trial, security violations = 0, duplicate side effects = 0, evidence completeness 100% for critical decisions, comparable results — a grader change only through a bridge without discontinuity — full coverage), 1 otherwise.',
-    'eval calibrate: exit 0 when the judge meets the calibration thresholds on the set (its results count), 1 otherwise; `calibrate label` adds a human expert label (a new set revision).',
+    `eval calibrate: exit 0 when the judge meets the calibration thresholds on the set (its results count), 1 otherwise; \`calibrate label\` adds a human expert label (a new set revision) and is refused (permission_denied) when $${SANDBOX_ENV} is set.`,
   ],
   options: {
     trials: { type: 'string' }, arms: { type: 'string' }, 'work-dir': { type: 'string' }, 'keep-work-dir': { type: 'boolean' }, 'timeout-ms': { type: 'string' }, timeout: { type: 'string' }, mode: { type: 'string' },
@@ -693,7 +775,7 @@ export const evalCommand: Command = {
     'max-critical-false-release': { type: 'string' }, bridge: { type: 'string', multiple: true }, 'bridge-grader': { type: 'string' }, grader: { type: 'string' }, 'result-out': { type: 'string' },
     tier: { type: 'string' }, track: { type: 'string' }, experience: { type: 'string' }, 'suite-dir': { type: 'string' }, dataset: { type: 'string' }, repos: { type: 'string' }, limit: { type: 'string' },
     set: { type: 'string' }, packet: { type: 'string' }, label: { type: 'string' }, by: { type: 'string' }, note: { type: 'string' },
-    'min-trials': { type: 'string' }, 'cancel-grace-ms': { type: 'string' },
+    'min-trials': { type: 'string' }, 'cancel-grace-ms': { type: 'string' }, 'arm-file': { type: 'string', multiple: true },
   },
   longRunning: true,
   async run(ctx, values, args) {

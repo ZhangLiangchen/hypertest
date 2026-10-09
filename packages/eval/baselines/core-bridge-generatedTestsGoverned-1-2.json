@@ -1,0 +1,28 @@
+{
+  "suiteId": "core",
+  "revision": "core-2",
+  "suiteFingerprint": "498e2f0ec31192206c7742d8b6fe2261f9fcdc877931973d95b39aa3217be63b",
+  "reportDigest": "fe9d3625aaffe0b76723ffe5dfef3e5aeb64f7de43f871157555914e8a95c389",
+  "reports": [
+    {
+      "graderId": "generatedTestsGoverned",
+      "fromRevision": "1",
+      "toRevision": "2",
+      "pairs": 3,
+      "agreement": 1,
+      "newlyFailing": [],
+      "newlyPassing": [],
+      "mcnemarP": 1,
+      "meanScoreDelta": 0,
+      "scoreMapping": [
+        {
+          "from": 1,
+          "to": 1,
+          "n": 3
+        }
+      ],
+      "discontinuity": false,
+      "statement": "generatedTestsGoverned 1 → 2: continuous over 3 bridge trial(s) (no outcome flipped)"
+    }
+  ]
+}

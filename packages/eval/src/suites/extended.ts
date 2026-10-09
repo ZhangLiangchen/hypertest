@@ -328,8 +328,18 @@ export function chaosBudgetExhaustionTask(overrides: Partial<EvalTask> = {}): Ev
 export function chaosCompetingFaultsTask(overrides: Partial<EvalTask> = {}): EvalTask {
   return faultToleranceTask(CHAOS_COMPETING_FAULTS_TASK_ID, 'Chaos: two fault experiments compete for one environment', 'fail', {
     goal: 'Measure kv-service under a latency fault and under an error-rate fault (two independent experiments) and decide whether it tolerates them.',
-    // two load jobs by design: the per-operation effect counts are checked by competingFaultsIsolated (one fault, one job each)
-    graders: ['verdict', 'competingFaultsIsolated', 'noOrphanOperations', ...COMMON_GRADERS],
+    // two load jobs by design (one per experiment): the side-effect ground truth counts effects PER OPERATION only — the
+    // environment-wide job/worker totals of the PoC C fixture (one job expected there) would read as duplicates here
+    async setup(ctx) {
+      const f = await kvFixture(ctx);
+      const all = f.probes!['sideEffects']!;
+      f.probes!['sideEffects'] = async (): Promise<JsonValue> => {
+        const counts = (await all()) as Record<string, number>;
+        return Object.fromEntries(Object.entries(counts).filter(([k]) => !k.startsWith('loadgen:')));
+      };
+      return f;
+    },
+    graders: ['verdict', 'competingFaultsIsolated', 'noDuplicateSideEffects', 'noOrphanOperations', ...COMMON_GRADERS],
     ...overrides,
   });
 }

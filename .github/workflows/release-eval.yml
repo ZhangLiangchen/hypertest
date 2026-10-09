@@ -1,0 +1,78 @@
+name: Release eval (deployment manifest)
+
+# Every runtime release runs the CORE eval on ITS OWN manifest (architecture-improvements §工程交付评估清单, F[13]):
+# the `deployment` arm evaluates the whole deployment configuration (its live model routes, roles, policies, gate), so
+# the trials run under the deployment's RuntimeManifest and the result can be recorded as that release's gate
+# (`runtime record-suite current --kind release_gate`). Run it manually (or from a release pipeline) for each candidate
+# release of a deployment; it needs the deployment's configuration file in the repository and its secrets (the model
+# API keys its routes read through apiKeyEnv, the store URL its `store.urlEnv` names) as repository secrets.
+#
+# Live model calls cost money: this workflow is never triggered by a push.
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        description: 'Deployment configuration file (hypertest.config.yaml of the release)'
+        required: true
+        default: deploy/hypertest.config.yaml
+      trials:
+        description: 'Trials per core task (release-core tier: 5)'
+        required: true
+        default: '5'
+      record:
+        description: 'Record the release gate on the deployment store (runtime record-suite current --kind release_gate)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  release-eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      # the deployment's secrets, by the variable NAMES its configuration reads (apiKeyEnv / urlEnv); adjust to yours
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      HYPERTEST_STORE_URL: ${{ secrets.HYPERTEST_STORE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: npm
+      - name: Git identity for fixture repositories
+        run: |
+          git config --global user.name "Hypertest CI"
+          git config --global user.email "ci@hypertest.invalid"
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+      - name: The release's runtime manifest
+        run: node bin/hypertest.js -c "${{ inputs.config }}" runtime show
+      # the core suite × N trials on the deployment arm: every trial runs under the deployment's manifest
+      - name: Core eval on the deployment arm
+        run: >-
+          node bin/hypertest.js -c "${{ inputs.config }}" eval run core --arms deployment --trials "${{ inputs.trials }}"
+          --out .hypertest-eval/core-deployment.json --report .hypertest-eval/core-deployment.md
+      # the eval release gate against the committed baseline (critical false release within the SLO, recall, security,
+      # duplicate effects, evidence completeness, comparability)
+      - name: Eval release gate
+        run: >-
+          node bin/hypertest.js eval gate --baseline packages/eval/baselines/core-scripted-multi-llm.json
+          --candidate .hypertest-eval/core-deployment.json --candidate-arm deployment --baseline-arm scripted-multi-llm
+          --report .hypertest-eval/core-deployment-gate.md
+      # binds the gate to THIS manifest in the deployment's release registry (canary → active needs it)
+      - name: Record the release gate
+        if: ${{ inputs.record }}
+        run: >-
+          node bin/hypertest.js -c "${{ inputs.config }}" runtime record-suite current --kind release_gate
+          --from-eval .hypertest-eval/core-deployment.json --baseline packages/eval/baselines/core-scripted-multi-llm.json
+          --baseline-arm scripted-multi-llm --candidate-arm deployment --by "ci:${{ github.workflow }}#${{ github.run_number }}"
+      - name: Upload the release eval
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-eval
+          path: .hypertest-eval/
+          if-no-files-found: ignore

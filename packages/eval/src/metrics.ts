@@ -45,7 +45,7 @@ const bit = (b: boolean): number => (b ? 1 : 0);
  *   confirmed product finding; only with ≥ 1), `humanInterventions` (approvals the run had to ask a human for +
  *   operations escalated to manual review + a final decision that requires human review), `recoveryCorrectness` (only
  *   for a trial whose Hypertest process was killed: 1 when the recovered run reached a final decision with no duplicate
- *   side effect and no orphan operation, else 0);
+ *   side effect, no orphan operation and a ledger that matches the environment's ground truth, else 0);
  * - probes `metric.<name>` (finite numbers) override/add `<name>`: the environment's ground truth wins.
  */
 export function outcomeMetrics(task: EvalTask, data: TrialData): Record<string, number> {
@@ -77,7 +77,7 @@ export function outcomeMetrics(task: EvalTask, data: TrialData): Record<string, 
   Object.assign(out, defectEconomics(data));
   out['humanInterventions'] = humanInterventions(data);
   if (data.harness.restarts > 0) {
-    out['recoveryCorrectness'] = bit(data.decision !== undefined && effects.unsettled.length === 0 && (!effects.probed || effects.duplicates === 0));
+    out['recoveryCorrectness'] = bit(data.decision !== undefined && effects.unsettled.length === 0 && effects.mismatches.length === 0 && (!effects.probed || effects.duplicates === 0));
   }
   for (const [name, value] of Object.entries(data.probes)) {
     if (name.startsWith(METRIC_PROBE_PREFIX) && typeof value === 'number' && Number.isFinite(value)) out[name.slice(METRIC_PROBE_PREFIX.length)] = value;

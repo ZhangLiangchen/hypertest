@@ -8,6 +8,10 @@
  * (`resource_out_of_scope: url/<host>`), recorded 0 evidence and ended inconclusive (exit 5).
  * Failure paths: a `--url` the operator did not allowlist (and no registered environment serves) is refused before any
  * run is created; a host the allowlist does not name stays refused by the egress guard.
+ * Load and metrics by URL (scenario load-probe): in the same kind of run the executor also scrapes the SUT's metrics by
+ * URL, defines a load experiment on the URL's environment and drives load by URL (load.start {targetUrl}) — permitted
+ * under env/<id>, admitted by the experiment's claim on that environment, one verified load.start operation, metric
+ * evidence from load.observe; the verdict is still the gate's (fail).
  */
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
@@ -15,7 +19,7 @@ import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { after, before, describe, test } from 'node:test';
 import { tempDir } from '@hypertest/testkit';
-import { toolOutcomes } from './fixtures/blackbox-brains.ts';
+import { URL_LOAD, toolOutcomes } from './fixtures/blackbox-brains.ts';
 import { cli, parseJson, writeProject, type TestProject } from './helpers.ts';
 
 const BB_BRAINS = join(import.meta.dirname, 'fixtures', 'blackbox-brains.ts');
@@ -117,5 +121,49 @@ describe('hypertest run --url <sutUrl>: the allowlisted URL is a black-box envir
     assert.match(r.stderr, /tools\.httpAllowlist/);
     const afterRuns = parseJson<unknown[]>(await cli(['status', '--json'], { cwd: dir.path, env })).length;
     assert.equal(afterRuns, before, 'no run was created');
+  });
+});
+
+describe('hypertest run --url <sutUrl>: metrics and load by URL on the allowlisted environment', () => {
+  let dir: Awaited<ReturnType<typeof tempDir>>;
+  let sut: Awaited<ReturnType<typeof startSut>>;
+  let project: TestProject;
+  let env: Record<string, string>;
+  let result: Awaited<ReturnType<typeof cli>>;
+  let run: RunJson;
+
+  before(async () => {
+    dir = await tempDir('ht-cli-bb-load-');
+    sut = await startSut();
+    project = await writeProject(dir.path, { oracles: [PRICE_ORACLE], tools: { httpAllowlist: [sut.url] } });
+    env = { ...project.env, HT_BB_SUT: sut.url, HT_BB_SCENARIO: 'load-probe' };
+    result = await cli(['run', GOAL, '--url', sut.url, '--scripted-brains', BB_BRAINS, '--json', '--timeout-ms', '180000'], { cwd: dir.path, env });
+    run = parseJson<RunJson>(result);
+  });
+  after(async () => {
+    await project?.dispose();
+    await sut?.close();
+    await dir?.cleanup();
+  });
+
+  test('metrics.scrape {url} and load.start {targetUrl} are permitted on env/<id>, ledgered and recorded as evidence; the gate decides', async () => {
+    const ev = await cli(['events', run.runId, '--json'], { cwd: dir.path, env });
+    assert.equal(ev.code, 0, ev.stderr);
+    const events = ev.stdout.trim().split('\n').map((l) => JSON.parse(l) as { eventType: string; payload: Record<string, unknown> });
+    assert.deepEqual(events.filter((e) => e.eventType === 'tool.denied').map((e) => e.payload), [], 'no call by URL was denied');
+    const envId = `url-127.0.0.1-${new URL(sut.url).port}`;
+    const called = (toolId: string) => events.filter((e) => e.eventType === 'tool.called' && e.payload['toolId'] === toolId);
+    assert.deepEqual(called('metrics.scrape').map((e) => e.payload['resources']), [[`env/${envId}`]]);
+    assert.deepEqual(called('load.start').map((e) => (e.payload['resources'] as string[])[0]), [`env/${envId}`], 'the load job by URL addresses the URL environment');
+    // the job really ran against the SUT (by URL) and was observed
+    const loadHits = sut.requests.filter((r) => r === 'GET /price?unit=1&qty=1').length;
+    assert.ok(loadHits >= URL_LOAD.ratePerSecond * (URL_LOAD.durationMs / 1000) * 0.5, `the load job reached the SUT (${loadHits} requests)`);
+    assert.ok(sut.requests.includes('GET /metrics'), 'metrics were scraped by URL');
+    const ok = (name: string) => toolOutcomes.filter((o) => (o.name === name || o.name === name.replace('.', '__')) && !o.isError);
+    for (const id of ['metrics.scrape', 'experiment.define', 'load.observe']) assert.equal(ok(id).length, 1, `${id}: ${JSON.stringify(toolOutcomes.filter((o) => o.name.replace('__', '.') === id))}`);
+    const metricEvidence = events.filter((e) => e.eventType === 'evidence.attached' && e.payload['evidenceType'] === 'metric');
+    assert.ok(metricEvidence.length >= 2, `metric evidence from the scrape and the load job (${metricEvidence.length})`);
+    assert.equal(result.code, 3, `${result.stderr}\n${result.stdout}`);
+    assert.equal(run.verdict, 'fail');
   });
 });

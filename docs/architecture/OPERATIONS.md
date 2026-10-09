@@ -151,8 +151,10 @@ production deployment.
 ### Tool surface: URL targets, MCP, ACP, remote workers, gRPC, computer use, observation, isolation tiers
 
 Black-box runs against a URL: every `tools.httpAllowlist` URL becomes an environment `url-<host>-<port>` (class `local`
-for loopback, else `tools.urlEnvironmentClass`, default `sandbox` — never allowlist a production URL under a lower
-class). `hypertest run --url http://127.0.0.1:8080 --goal …` targets it; a URL nothing serves is refused.
+for loopback, else `tools.urlEnvironmentClass` — never allowlist a production URL under a lower class).
+`tools.urlEnvironmentClass` has no default: without it a non-loopback URL is not an environment (a warning names it),
+because the class decides what agents may do there (on `sandbox` the default policy allows writes and deletes without
+approval). `hypertest run "<goal>" --url http://127.0.0.1:8080` targets it; a URL nothing serves is refused.
 
 ```yaml
 tools:
@@ -179,8 +181,10 @@ environments:
 ```
 
 The remote worker: `HT_WORKER_SECRET=… hypertest -c worker.yaml tool-worker --tools http.request,metrics.query --id w1
---listen 0.0.0.0:7441` (secret of at least 32 characters, by name only). Tools with their own side-effect adapter
-(env.*, load.*) are not delegable.
+--listen 0.0.0.0:7441` (secret of at least 16 characters, by name only). Tools with their own side-effect adapter
+(env.*, load.*) are not delegable. Requests and answers are HMAC-signed; an answer's signature also covers the request
+it answers, so a captured answer is never accepted for another call. Upgrade the main process and its workers together
+(an older worker's answers no longer verify).
 
 Observation tools (all reads): `logs.query` (supervisor output — start the supervisor with `--log-file` —,
 `docker logs`, `kubectl logs`, declared files), `trace.query` (OTLP/JSON file, Jaeger, Tempo), `net.capture` (a pcap of
@@ -191,9 +195,11 @@ true` to record every HTTP exchange of their commands. Code intelligence: `lsp.*
 
 Fault injection: `env.inject_fault` kinds `latency`/`error_rate` (process environments), `pause`/`kill`/
 `network_disconnect`/`netem` (docker; netem needs `tc` and NET_ADMIN in the container), `pod_delete`/`scale_zero`/
-`network_deny` (kubectl). A fault is time-boxed: a detached reverter undoes it at `durationMs` even if Hypertest stops
-(jobs under `<dataDir>/state/faults/<operationId>`). If a revert fails, the environment refuses further operations
-until you repair it and delete that job directory.
+`network_deny` (kubectl). A fault is time-boxed: a detached reverter, started before the fault is applied, undoes it at
+`durationMs` even if Hypertest stops (jobs under `<dataDir>/state/faults/<operationId>`). An apply whose outcome is
+unknown (its command timed out, or Hypertest died while it ran) is treated as applied: it blocks a second fault on the
+environment and is reverted at expiry. If a revert fails, the environment refuses further operations until you repair
+it and delete that job directory.
 
 Isolation tiers and sandbox keys — every accepted key is enforced or the start/command is refused:
 
@@ -319,11 +325,16 @@ the data directory), then from the new installation:
 | Step | Command | Notes |
 |---|---|---|
 | 1. Register | `hypertest runtime register --by <name> [--allow-migration <schema>:<from>=><to> …]` | The manifest becomes a `candidate`. `--allow-migration` names the schema changes that runs of older releases may take when they are migrated onto this one; it is fixed at registration. To register another installation's manifest, export it there with `hypertest runtime show current --json > manifest.json`, then run `register --manifest manifest.json`. |
-| 2. Engine contract | Run the AgentEngine contract suites of the engines you use (`node scripts/run-tests.mjs --package runtime`, `--package runtime-pi`, `--package runtime-dsh`), then `hypertest runtime record-suite current --kind engine_contract --suite agent-engine-contract --passed --total <n> --by ci:<pipeline>` | Record a failure with `--failed --failures <n>`. A pass claimed over failed cases or over zero cases is refused. |
-| 3. Replay | `hypertest eval run core --arms scripted-multi-llm --out core.json`, then `hypertest runtime record-suite current --kind replay --from-eval core.json --by ci:<pipeline>` | `--from-eval` takes the suite id, revision and result from the SuiteResult (every trial must pass) and binds the record to the file's sha256. `--arms config` evaluates the configuration's own models (their key variables must be set). `hypertest eval gate --baseline <file> --candidate core.json` compares the result with a baseline first. |
-| 4. Shadow | `hypertest runtime promote current --by <name> --reason "…"` | candidate → shadow. Each promotion needs the latest `engine_contract` and `replay` results of the manifest to be passes; a later failing result blocks the next step. A shadow release starts no runs in the store (eval trials use their own fresh stores). |
-| 5. Canary | `hypertest runtime promote current --by <name> --reason "…" --canary-percent 10 [--canary-label key=value …]` | shadow → canary. Entering canary needs a selection: a share of new run ids and/or labels (`hypertest run --label key=value`). There is at most one canary. |
-| 6. Activate | `hypertest runtime promote current --by <name> --reason "…"` | canary → active. The active pointer moves; the previous active release becomes `retiring` (its live runs continue on it) and is retired once no live run is pinned to it (`runtime list` and `promote` retire drained releases). |
+| 2. Engine contract | `hypertest runtime record-suite current --kind engine_contract --run --by ci:<pipeline>` executes the AgentEngine contract suites of the engines this runtime pins (bound: executed here). A CI attestation instead: `--kind engine_contract --suite agent-engine-contract --passed --report <tap-file> --total <n> --by ci:<pipeline>` | The report's sha256 is recorded with the attestation (`--passed` without `--report` is refused). Record a failure with `--failed --failures <n>`. A pass claimed over failed cases or over zero cases is refused. |
+| 3. Compatibility | `hypertest eval run <suite> --arms deployment --out compat.json`, then `hypertest runtime record-suite current --kind compatibility --from-eval compat.json --by ci:<pipeline>` | The `deployment` arm evaluates this very configuration file, so its trials run under this manifest. A passing result is accepted only when EVERY trial ran under the manifest it certifies (an eval file of another runtime, one whose trials name no manifest, or the partial result of a cancelled `eval run`, is refused); its digest is recorded. |
+| 4. Shadow | `hypertest runtime promote current --by <name> --reason "…"` | candidate → shadow: needs the latest `engine_contract` and `compatibility` results, both bound passes. A shadow release creates no ordinary run; it only mirrors production runs (next step). |
+| 5. Production replay | On the shadow installation: `hypertest runtime shadow [<runId> …] --by ci:<pipeline>`, then `hypertest runtime record-suite current --kind production_replay --from-shadow --by ci:<pipeline>` | `shadow` re-runs finished runs of the active release (the given ones, else those `runtime.shadow: {percentage, labels}` selects; a run of another release is refused — the reference is production's decision) on this release with every external effect DRY-RUN — recorded `not_applied: dry_run`, never dispatched — and compares outcome, verdict, violated/unknown criteria and human review with the production decision. The production replay passes with at least `runtime.shadow.minRuns` (default 1) mirrored runs and NO divergence; the summary is re-counted from the recorded comparisons. |
+| 6. Canary | `hypertest runtime promote current --by <name> --reason "…" --canary-percent 10 [--canary-label key=value …]` | shadow → canary: needs the production replay too. Entering canary needs a selection: a share of new run ids and/or labels (`hypertest run --label key=value`). There is at most one canary. |
+| 7. Release gate | `hypertest eval run core --arms deployment [--trials 5] --out core.json`, then `hypertest runtime record-suite current --kind release_gate --from-eval core.json --baseline packages/eval/baselines/core-scripted-multi-llm.json [--baseline-arm scripted-multi-llm --candidate-arm deployment] [--max-critical-false-release r] [--bridge <bridge.json>] --by ci:<pipeline>` | The eval release gate of the CORE suite (any other suite id is refused, and so is a result named core that is not the built-in core suite at its current revision and content) against the committed baseline, with every candidate trial run under this manifest. A candidate gated against itself (same file, or a baseline that ran under this release) is refused. The `Release eval` workflow (`.github/workflows/release-eval.yml`, manual dispatch) runs this step for a deployment configuration with its live routes. |
+| 8. Activate | `hypertest runtime promote current --by <name> --reason "…"` | canary → active: needs the release gate too. The active pointer moves; the previous active release becomes `retiring` (its live runs continue on it) and is retired once no live run is pinned to it (`runtime list` and `promote` retire drained releases). |
+
+Each promotion re-checks the LATEST result of every kind its stage needs; a later failing result of an earlier kind
+blocks every later step. Results recorded before the stage gates (`replay`) count for nothing.
 
 `hypertest runtime list` shows every release with its state, the active pointer, the canary share and its live runs;
 `hypertest runtime show <manifestId>` shows a manifest and its recorded suite results. With Temporal, keep the workers
@@ -343,25 +354,36 @@ A quarantined run, or any live run that should move to another release, is migra
 
 ```bash
 hypertest runtime migrate <runId> --to <manifestId>|current --by <name> --reason "…" [--checkpoint-timeout-ms n]
-hypertest resume            # on the target runtime: the migration itself never drives the run
+hypertest resume <runId>    # on the target runtime: takes the migrated run over (the migration itself never drives it)
 ```
 
 The migration checkpoints the run (in-flight turns give their claims back; default wait 90 s), takes a canonical
 snapshot and reconciles its operations (refused while an operation is unsettled or a work item is waiting). It then
 checks compatibility: the target is active or canary, the schemas are equal or covered by an allowed migration, the
 engines the run used are pinned, and the protocol is the same. One transaction records a RuntimeEpoch and
-`run.migrated`, re-pins the run and resumes it. A refused migration leaves the run as it was. Alternatively cancel the
-run with `hypertest cancel <runId> --reason "…"`.
+`run.migrated`, re-pins the run and resumes it. A refused migration leaves the run as it was. A work item waiting only on a
+model pause (`model:<agent>`, the provider was unavailable) holds no turn and no effect: it migrates, and its pause
+carries over to the new epoch (`carriedModelPauses`); a wait on an operation, a child or an approval refuses the
+migration until it settles. Alternatively cancel the run with `hypertest cancel <runId> --reason "…"`.
+
+`resume` on the target verifies the take-over: it waits until the target's durable loop really drives the run
+(`run.migration_driven`). With Temporal the run's previous workflow may still be open on the SOURCE manifest's task
+queue (its `startRun` would be a silent no-op): it is woken so its next tick ends at the pin refusal, and when no worker
+of the source runtime is left, the target briefly serves that queue with a handover worker that refuses exactly this
+run. If the take-over does not happen within 30 s, `resume` fails (`unavailable`) with the remedy (e.g. `temporal
+workflow terminate --workflow-id run-<runId>`) — it never reports a run as resumed that nobody drives. `hypertest resume`
+without a run id and `hypertest serve` (which resume every incomplete run of the runtime) take migrated runs over the same
+way; a migrated run whose take-over did not happen is left out of the resumed runs and a warning names the remedy.
 
 If the migrating process dies between the checkpoint and the re-pin, the run stays paused `migrating` and cannot be
 resumed. `hypertest runtime migrate <runId> --abort --by <name> --reason "…"` releases the checkpoint
 (`run.migration_released`), and the run continues on the runtime it is still pinned to (a run of a rolled-back release
 is quarantined instead).
 
-Limits: suite results are attested by whoever records them, and `promote` accepts any passing replay suite, so make your
-release pipeline record the core suite. Migration was exercised with the local durable runtime, not against a live
-Temporal server (with Temporal the source workflow fails at its next tick, and `resume` on the target starts the run's
-workflow on the target's task queue).
+Limits: an `engine_contract` attestation (`--passed --report`) is vouched for by whoever records it (its report digest
+is kept); every other kind is bound to evidence the registry checks (trial manifests, shadow comparisons, the gate's
+digests). Migration and its take-over are exercised with the local durable runtime and against a live Temporal server
+(source worker still running; source runtime gone).
 
 ### 5.4 Unmanaged upgrades and database migrations
 
@@ -378,6 +400,26 @@ Rolling back means redeploying the old code and configuration; the same content 
 old runtime can drive its runs again. In both modes database migrations are forward-only (there are no
 down-migrations) and must stay compatible with the release that is still running (expand, then contract): try a
 rollback against a copy of the database first.
+
+### 5.5 Evaluating a runtime (`hypertest eval`)
+
+| Need | Command |
+|---|---|
+| A tier | `eval run --tier pr-smoke` (fast subset ×1, every change) · `--tier release-core` (core ×5) · `--tier deep` (everything ×5) · `--tier failure-recovery` (chaos ×10, child-process SIGKILLs); `--trials`, `--mode` or an explicit suite override the tier |
+| This deployment's configuration | `--arms deployment` (the whole configuration file; trials run under its manifest, on the task's fixtures only: the deployment's own `environments` and `tools.httpAllowlist` targets — not part of the manifest — are left out) · `--arms config` (its models and role policies only) |
+| Controlled causal arms (fixed model, harness varies) | `--arms h0-single-agent,h1-subagents,…,h6-full` (eval trial instances only: a deployment configuration that switches a subsystem off is refused) |
+| Product baselines | `--arms engine-pi,engine-dsh` (same model, other agent engine) · external agents: `--arm-file arms.json --arms claude-code` with `{"arms":[{"armId":"claude-code","external":{"command":"claude","args":["-p","{goal}","--report","{report}"],"envPassthrough":["ANTHROPIC_API_KEY"]}}]}` (graded on the reported outcome only; its claims count as no evidence) |
+| Provider classes | `--arms three-provider-classes` (anthropic, openai-compatible and pi-ai adapters over the scripted wire transport; in-process; opt-in by name — without `--arms` a run uses the plain model arms, scripted multi/single and live when configured, that can run in the mode) |
+| Private / public layers | `--suite-dir <dir>` (`*.suite.json` / `*.suite.mjs`: your historical bugs and release rules; versioned by content; a private suite may not reuse a built-in suite id) · `eval run sanity --dataset swe.jsonl --repos <local mirrors>` (SWE-bench-style; never downloads) |
+| Learning track | Trials are COLD by default (no long-term memory crosses trials; a shared memory backend is refused). `--track learning --experience items.json` seeds only approved/published experience |
+| Independent judge | `--judge scripted` (the calibrated CI judge) or `--judge config [--judge-route r]` (your configuration's routes); `--judge-packets <dir>` keeps what it saw; `eval calibrate [--set file]` measures agreement and kappa (exit 1 when uncalibrated: its results never count); `eval calibrate label --set file --packet p --label pass|fail|unknown --by <name>` adds a human label (refused inside a Hypertest sandbox) |
+| Cancellation | Ctrl-C (exit 130) or `--timeout <ms>` (exit 1): the running trial is cancelled, the partial result is still written to `--out`, marked `cancelled` — it never gates anything |
+| Release gate | `eval gate --baseline b.json --candidate c.json [--max-critical-false-release r] [--bridge bridge.json]`: critical false release not worse AND its rate within the product SLO (default 0), defect recall not significantly lower and no defect the baseline always found lost, security violations 0, duplicate effects 0, evidence completeness 100 %, comparable results |
+| A grader changed | `eval bridge core --grader <id>@<old revision> --out bridge.json` grades the same trials with the retained old revision; `eval gate --bridge bridge.json` accepts the change only without a discontinuity — otherwise re-baseline |
+
+Suite revisions are pinned to their content (`packages/eval/suites.lock.json`: tasks, brains, fixtures): a change under
+an old revision fails the test suite; bump the revision and re-baseline. Re-baselining the committed core baseline is
+documented in `packages/eval/baselines/README.md`.
 
 ## 6. Observability
 

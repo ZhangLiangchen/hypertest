@@ -138,7 +138,8 @@ function visionGui(results: Array<{ name: string; content: string; isError: bool
       case 3: return call('browser.click', { role: 'button', name: 'Greet', environmentId: ENV_ID });
       case 4: return call('browser.text', { selector: '#out', environmentId: ENV_ID });
       case 5: return call('http.request', { method: 'GET', environmentId: ENV_ID, path: '/api/greetings', expectJson: true });
-      case 6: return call('browser.screenshot', { environmentId: ENV_ID });
+      // the audit's exact call (no environmentId): a read of the page navigate already admitted, attributed to its environment
+      case 6: return call('browser.screenshot', {});
       default: {
         const [nav, dom, api, shot] = [ids(0), ids(4), ids(5), ids(6)];
         return call('complete_work', {
@@ -206,6 +207,7 @@ describe('vision_gui in a real run: DOM first, API second, screenshots as eviden
       const shots = byType('screenshot');
       assert.equal(shots.length, 1);
       assert.equal(shots[0]!.artifact.mimeType, 'image/png');
+      assert.equal(shots[0]!.environment?.environmentId, ENV_ID, 'the screenshot is attributed to the environment the page is on');
       const png = await ht.services.artifacts.get(shots[0]!.artifact.uri);
       assert.deepEqual([...png.subarray(0, 4)], [0x89, 0x50, 0x4e, 0x47], 'the screenshot is stored as a PNG artifact');
       // the interactions changed the SUT: they ran as ledgered operations on the environment

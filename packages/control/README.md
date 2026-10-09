@@ -753,3 +753,6 @@ write/fault/load call needs an active experiment; validation evidence must be bo
   them to an agent's root capability. Tests: `test/tool-grants.test.ts`.
 - `request_approval`'s description now says it is for decisions that are not tool calls; an action that needs approval
   is filed by the policy gate itself (`approval_required`).
+- `experiment.define`'s fault plan accepts the container fault kinds env.inject_fault injects (`pause`, `kill`,
+  `network_disconnect`, `netem` for docker; `pod_delete`, `scale_zero`, `network_deny` for Kubernetes), so a container
+  fault can run for a declared experiment (`packages/app/test/container-faults.e2e.test.ts`).

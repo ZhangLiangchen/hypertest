@@ -28,6 +28,8 @@ import { OPERATION_HEADER } from './process-supervisor.ts';
 const MAX_LOG_LINES = 5000;
 const MAX_TRACE_BYTES = 32 * 1024 * 1024;
 const MAX_PCAP_BYTES = 64 * 1024 * 1024;
+/** How long net.capture waits for tcpdump to report "listening on …" before its capture window starts anyway. */
+const CAPTURE_START_GRACE_MS = 10_000;
 
 function failure(e: unknown): ToolOutcome {
   if (isHypertestError(e)) return { status: 'failed', error: { code: e.code, message: e.message } };
@@ -551,20 +553,33 @@ export function netCaptureTool(options: { tcpdump?: string } = {}): ToolSpec<Net
         const result = await new Promise<{ code: number | null; stderr: string; spawnError?: string }>((resolve) => {
           const child = spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'] });
           let stderr = '';
+          // the capture window starts when tcpdump has opened the device ("listening on …"): a SIGINT before that would
+          // end a capture that never ran (and hide why it could not start, e.g. a missing privilege). A tcpdump that never
+          // says so is given CAPTURE_START_GRACE_MS before the window starts anyway.
+          let stop: NodeJS.Timeout | undefined;
+          const startWindow = () => {
+            if (stop !== undefined) return;
+            clearTimeout(grace);
+            stop = setTimeout(() => child.kill('SIGINT'), input.durationMs);
+          };
+          const grace = setTimeout(startWindow, CAPTURE_START_GRACE_MS);
           child.stderr.on('data', (c: Buffer) => {
             if (stderr.length < 8192) stderr += c.toString('utf8');
+            if (/listening on /.test(stderr)) startWindow();
           });
-          const stop = setTimeout(() => child.kill('SIGINT'), input.durationMs);
           const abort = () => child.kill('SIGKILL');
           ctx.signal.addEventListener('abort', abort, { once: true });
-          child.on('error', (e) => {
-            clearTimeout(stop);
+          const settle = () => {
+            clearTimeout(grace);
+            if (stop !== undefined) clearTimeout(stop);
             ctx.signal.removeEventListener('abort', abort);
+          };
+          child.on('error', (e) => {
+            settle();
             resolve({ code: null, stderr, spawnError: (e as NodeJS.ErrnoException).code ?? e.message });
           });
           child.on('close', (code) => {
-            clearTimeout(stop);
-            ctx.signal.removeEventListener('abort', abort);
+            settle();
             resolve({ code, stderr });
           });
         });

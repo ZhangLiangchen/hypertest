@@ -210,7 +210,7 @@ describe('composition failures fail fast and leave nothing open', () => {
     await assert.rejects(createHypertest(bad, { scriptedBrains: {} }), (e: unknown) => {
       assert.ok(e instanceof HypertestError && e.code === 'invalid_argument');
       assert.deepEqual((e.details as { errors: string[] }).errors, [
-        "unknown configuration key 'bogus' (expected one of version, project, store, bus, durable, artifacts, models, roles, budget, gate, policy, bugate, engines, sandbox, environments, tools, signing, memory, observability, oracles, runtime, plugins, retrieval, skills)",
+        "unknown configuration key 'bogus' (expected one of version, project, store, bus, durable, artifacts, models, roles, budget, gate, policy, bugate, engines, sandbox, environments, tools, signing, memory, observability, oracles, runtime, plugins, retrieval, skills, harness)",
         'engines.default: "openhands" is not a registered engine (native, pi, dsh)',
       ]);
       return true;

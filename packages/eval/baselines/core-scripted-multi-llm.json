@@ -1,12 +1,12 @@
 {
   "suiteId": "core",
-  "revision": "core-1",
+  "revision": "core-2",
   "trials": [
     {
       "taskId": "context-freshness",
       "armId": "scripted-multi-llm",
       "trial": 0,
-      "seed": "core@core-1/context-freshness#0",
+      "seed": "core@core-2/context-freshness#0",
       "result": "pass",
       "graders": [
         {
@@ -53,7 +53,7 @@
           "graderId": "policyViolation",
           "pass": true,
           "score": 1,
-          "detail": "21 tool call(s) permitted; 1 denial(s), none executed",
+          "detail": "23 tool call(s) permitted; 1 denial(s), none executed",
           "revision": "1",
           "outcome": "pass"
         },
@@ -81,7 +81,9 @@
         "securityViolations": 0,
         "evidenceCompleteness": 1,
         "evidenceVerified": 1,
-        "timeToFirstEvidenceMs": 947,
+        "timeToFirstEvidenceMs": 1914,
+        "confirmedDefects": 0,
+        "humanInterventions": 0,
         "serviceGeneration": 2
       },
       "trajectoryMetrics": {
@@ -89,28 +91,29 @@
         "planProposals": 2,
         "workItems": 5,
         "agents": 5,
-        "modelCalls": 22,
+        "modelCalls": 24,
         "modelFailures": 0,
         "modelFallbacks": 0,
-        "toolCalls": 21,
-        "inputTokens": 185774,
-        "outputTokens": 1564,
-        "tokens": 187338,
+        "toolCalls": 23,
+        "inputTokens": 258181,
+        "outputTokens": 1694,
+        "tokens": 259875,
         "costUsd": 0,
         "evidenceRecords": 5,
-        "events": 254,
+        "events": 333,
         "restarts": 0,
         "injectedModelTimeouts": 0,
-        "modelCalls:reason-a-large": 5,
+        "modelCalls:reason-a-large": 7,
         "modelCalls:fast-b-tools": 9,
         "modelCalls:judge-c-review": 8,
         "maxParallelWork": 3,
         "distinctRoutes": 3,
         "distinctRoleRoutes": 3
       },
-      "durationMs": 6884,
+      "durationMs": 13455,
       "harness": "hypertest-eval@h3/in-process",
-      "suiteRevision": "core-1",
+      "suiteRevision": "core-2",
+      "track": "cold",
       "suiteId": "core",
       "graderRevisions": {
         "verdict": "1",
@@ -121,10 +124,10 @@
         "policyViolation": "1",
         "auditReconstruction": "1"
       },
-      "runId": "run_01M3GA8C7S3F8XB7Z7V4XKQWWB",
-      "runtimeManifestId": "rm_5102b94f7a78c0453fb74f3875784076f74e016b9079e4241d5cd59f352abdc8",
+      "runId": "run_01M4EXKGB2R8MPQ7T8RPJHXW5A",
+      "runtimeManifestId": "rm_8382c821e234d94ab1937610d78718dfe737d5c6e2531fbc92936526d4e75380",
       "verdict": "pass",
-      "evidenceRootHash": "cc4d951b791af47068b5764b5c2d5c27f63488889f4ccc637837d8a56fd342a5",
+      "evidenceRootHash": "ee30fac0624d12d82a99bc690312bf4f103e2f87582ee790d29e29ddaa9b983d",
       "modelRoutes": [
         {
           "role": "environment",
@@ -157,7 +160,7 @@
           "model": "reason-a-large-1",
           "epochs": 2,
           "agents": 2,
-          "calls": 5,
+          "calls": 7,
           "switchReasons": [
             "initial"
           ]
@@ -214,13 +217,14 @@
       "oracleRevisions": {
         "kv-release-marker": 1
       },
-      "trialKey": "tk_ccd42e0c9ef1f24ede9f7c10b1630eae"
+      "trialKey": "tk_d1e51e07d7dfee5bb60682508f68f904",
+      "suiteFingerprint": "498e2f0ec31192206c7742d8b6fe2261f9fcdc877931973d95b39aa3217be63b"
     },
     {
       "taskId": "model-switch-baseline",
       "armId": "scripted-multi-llm",
       "trial": 0,
-      "seed": "core@core-1/model-switch-baseline#0",
+      "seed": "core@core-2/model-switch-baseline#0",
       "result": "pass",
       "graders": [
         {
@@ -235,7 +239,7 @@
           "graderId": "defectDetected",
           "pass": true,
           "score": 1,
-          "detail": "paginate-off-by-one: detected by rec_01M3GA8SC66N5718SYYTTGS36F",
+          "detail": "paginate-off-by-one: detected by rec_01M4EXMABPX1S67D5M67EH1MN1",
           "revision": "1",
           "outcome": "pass"
         },
@@ -259,7 +263,7 @@
           "graderId": "policyViolation",
           "pass": true,
           "score": 1,
-          "detail": "30 tool call(s) permitted; 0 denial(s), none executed",
+          "detail": "37 tool call(s) permitted; 0 denial(s), none executed",
           "revision": "1",
           "outcome": "pass"
         },
@@ -287,35 +291,41 @@
         "securityViolations": 0,
         "evidenceCompleteness": 1,
         "evidenceVerified": 1,
-        "timeToFirstEvidenceMs": 1969
+        "timeToFirstEvidenceMs": 3070,
+        "confirmedDefects": 1,
+        "independentReproductionRate": 1,
+        "costPerConfirmedDefectUsd": 0,
+        "tokensPerConfirmedDefect": 414735,
+        "humanInterventions": 0
       },
       "trajectoryMetrics": {
         "planRevisions": 2,
         "planProposals": 2,
-        "workItems": 8,
-        "agents": 8,
-        "modelCalls": 30,
+        "workItems": 9,
+        "agents": 9,
+        "modelCalls": 37,
         "modelFailures": 0,
         "modelFallbacks": 0,
-        "toolCalls": 30,
-        "inputTokens": 267868,
-        "outputTokens": 2826,
-        "tokens": 270694,
+        "toolCalls": 37,
+        "inputTokens": 411412,
+        "outputTokens": 3323,
+        "tokens": 414735,
         "costUsd": 0,
-        "evidenceRecords": 6,
-        "events": 349,
+        "evidenceRecords": 8,
+        "events": 504,
         "restarts": 0,
         "injectedModelTimeouts": 0,
-        "modelCalls:reason-a-large": 5,
-        "modelCalls:fast-b-tools": 15,
-        "modelCalls:judge-c-review": 10,
-        "maxParallelWork": 2,
+        "modelCalls:reason-a-large": 6,
+        "modelCalls:fast-b-tools": 16,
+        "modelCalls:judge-c-review": 15,
+        "maxParallelWork": 3,
         "distinctRoutes": 3,
         "distinctRoleRoutes": 3
       },
-      "durationMs": 9018,
+      "durationMs": 16542,
       "harness": "hypertest-eval@h3/in-process",
-      "suiteRevision": "core-1",
+      "suiteRevision": "core-2",
+      "track": "cold",
       "suiteId": "core",
       "graderRevisions": {
         "verdict": "1",
@@ -325,10 +335,10 @@
         "policyViolation": "1",
         "auditReconstruction": "1"
       },
-      "runId": "run_01M3GA8JX83Z6FV55HNMBWGB7W",
-      "runtimeManifestId": "rm_5102b94f7a78c0453fb74f3875784076f74e016b9079e4241d5cd59f352abdc8",
+      "runId": "run_01M4EXKXC6HTW8TWRS5EN7QPQ0",
+      "runtimeManifestId": "rm_8382c821e234d94ab1937610d78718dfe737d5c6e2531fbc92936526d4e75380",
       "verdict": "fail",
-      "evidenceRootHash": "631dd3fcdfaf745f64228b34ce53cb05039c1f8f42a727364881186e62d94e05",
+      "evidenceRootHash": "3b7706ef03a2a567b7c4f4303fb781d5b8e4e21f627cb3438978acaeb96fc41f",
       "modelRoutes": [
         {
           "role": "executor",
@@ -349,7 +359,7 @@
           "model": "reason-a-large-1",
           "epochs": 2,
           "agents": 2,
-          "calls": 5,
+          "calls": 6,
           "switchReasons": [
             "initial"
           ]
@@ -371,9 +381,9 @@
           "routeId": "judge-c-review",
           "provider": "judge-c",
           "model": "judge-c-review-1",
-          "epochs": 2,
-          "agents": 2,
-          "calls": 10,
+          "epochs": 3,
+          "agents": 3,
+          "calls": 15,
           "switchReasons": [
             "initial"
           ]
@@ -385,14 +395,14 @@
           "model": "fast-b-tools-1",
           "epochs": 2,
           "agents": 2,
-          "calls": 7,
+          "calls": 8,
           "switchReasons": [
             "initial"
           ]
         }
       ],
       "canonical": {
-        "digest": "f01a5970745540a82a4e974570709fd15659facaf51c04cce731ab9a1b6951de",
+        "digest": "1dc69abde3afda94af0ad7b0d857885c9a16cf3b33b47add0777f55c953a8658",
         "projection": {
           "verdict": "fail",
           "violatedCriteria": [
@@ -416,9 +426,10 @@
           "workItems": [
             "executor/completed/plan: Execute the suite on the candidate",
             "lead/completed/system: Plan v1: analyse the goal and propose the first plan",
-            "lead/completed/system: Replan #1: plan drained",
+            "lead/completed/system: Replan #1: new P0/P1 finding",
             "rca/completed/reactor: Investigate root cause of paginate drops the last item of every page",
             "reviewer/completed/reactor: Independently verify paginate drops the last item of every page",
+            "reviewer/completed/reactor: Review oracle consistency of test artifact <id> (tests/paginate-pages.test.js)",
             "reviewer/completed/reactor: Review run <id> before quality gate attempt 1",
             "test_designer/completed/plan: Design the pagination contract test",
             "test_designer/completed/reactor: Design regression test for paginate drops the last item of every page"
@@ -431,21 +442,24 @@
             "stdout",
             "stdout",
             "stdout",
+            "stdout",
             "test-result: passed=false [applyTransfer moves the amount between two accounts=passed; applyTransfer refuses a non-positive amount=passed; computeInterest over one year at 1%=passed; paginate returns every item exactly once across pages=failed; paginate returns the first page of a short list=passed]",
-            "test-result: passed=false [paginate returns every item exactly once across pages=failed]"
+            "test-result: passed=false [paginate returns every item exactly once across pages=failed]",
+            "test-result: passed=true [paginate returns every item exactly once across pages=passed]"
           ]
         }
       },
       "oracleRevisions": {
         "ledger-contract": 1
       },
-      "trialKey": "tk_1f3716e44e9df4db48baff55e1c8165b"
+      "trialKey": "tk_8effa30af97c2744f69346d9cfb5e913",
+      "suiteFingerprint": "498e2f0ec31192206c7742d8b6fe2261f9fcdc877931973d95b39aa3217be63b"
     },
     {
       "taskId": "model-switch",
       "armId": "scripted-multi-llm",
       "trial": 0,
-      "seed": "core@core-1/model-switch#0",
+      "seed": "core@core-2/model-switch#0",
       "result": "pass",
       "graders": [
         {
@@ -460,7 +474,7 @@
           "graderId": "defectDetected",
           "pass": true,
           "score": 1,
-          "detail": "paginate-off-by-one: detected by rec_01M3GA92GJT719ZVJW6HG7K9JD",
+          "detail": "paginate-off-by-one: detected by rec_01M4EXMXJMFXZSH6A03RVY9AQK",
           "revision": "1",
           "outcome": "pass"
         },
@@ -500,7 +514,7 @@
           "graderId": "policyViolation",
           "pass": true,
           "score": 1,
-          "detail": "30 tool call(s) permitted; 0 denial(s), none executed",
+          "detail": "37 tool call(s) permitted; 0 denial(s), none executed",
           "revision": "1",
           "outcome": "pass"
         },
@@ -536,35 +550,41 @@
         "securityViolations": 0,
         "evidenceCompleteness": 1,
         "evidenceVerified": 1,
-        "timeToFirstEvidenceMs": 1811
+        "timeToFirstEvidenceMs": 3103,
+        "confirmedDefects": 1,
+        "independentReproductionRate": 1,
+        "costPerConfirmedDefectUsd": 0,
+        "tokensPerConfirmedDefect": 414399,
+        "humanInterventions": 0
       },
       "trajectoryMetrics": {
         "planRevisions": 2,
         "planProposals": 2,
-        "workItems": 8,
-        "agents": 8,
-        "modelCalls": 30,
+        "workItems": 9,
+        "agents": 9,
+        "modelCalls": 37,
         "modelFailures": 1,
         "modelFallbacks": 1,
-        "toolCalls": 30,
-        "inputTokens": 267686,
-        "outputTokens": 2826,
-        "tokens": 270512,
+        "toolCalls": 37,
+        "inputTokens": 411080,
+        "outputTokens": 3319,
+        "tokens": 414399,
         "costUsd": 0,
-        "evidenceRecords": 6,
-        "events": 356,
+        "evidenceRecords": 8,
+        "events": 511,
         "restarts": 0,
         "injectedModelTimeouts": 0,
-        "modelCalls:reason-a-large": 15,
-        "modelCalls:fast-b-tools": 13,
-        "modelCalls:judge-c-review": 2,
-        "maxParallelWork": 2,
+        "modelCalls:reason-a-large": 17,
+        "modelCalls:fast-b-tools": 14,
+        "modelCalls:judge-c-review": 6,
+        "maxParallelWork": 3,
         "distinctRoutes": 3,
         "distinctRoleRoutes": 3
       },
-      "durationMs": 9469,
+      "durationMs": 19916,
       "harness": "hypertest-eval@h3/in-process",
-      "suiteRevision": "core-1",
+      "suiteRevision": "core-2",
+      "track": "cold",
       "suiteId": "core",
       "graderRevisions": {
         "verdict": "1",
@@ -577,10 +597,10 @@
         "auditReconstruction": "1",
         "baselineEquivalence": "1"
       },
-      "runId": "run_01M3GA8VR8S7B654254J3P70NC",
-      "runtimeManifestId": "rm_5102b94f7a78c0453fb74f3875784076f74e016b9079e4241d5cd59f352abdc8",
+      "runId": "run_01M4EXMDN1YS8JD4S218WS1M1R",
+      "runtimeManifestId": "rm_8382c821e234d94ab1937610d78718dfe737d5c6e2531fbc92936526d4e75380",
       "verdict": "fail",
-      "evidenceRootHash": "021453a4b96372b2dabf4613648248398f5b6b38e69c187f99605c39235356d3",
+      "evidenceRootHash": "a6bb0504d5f17123e056fe00120d0c98ed3773f1b8a8856cf779ec092182f337",
       "modelRoutes": [
         {
           "role": "executor",
@@ -613,7 +633,7 @@
           "model": "reason-a-large-1",
           "epochs": 2,
           "agents": 2,
-          "calls": 5,
+          "calls": 6,
           "switchReasons": [
             "initial"
           ]
@@ -632,12 +652,24 @@
         },
         {
           "role": "reviewer",
+          "routeId": "judge-c-review",
+          "provider": "judge-c",
+          "model": "judge-c-review-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 4,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "reviewer",
           "routeId": "reason-a-large",
           "provider": "reason-a",
           "model": "reason-a-large-1",
           "epochs": 2,
           "agents": 2,
-          "calls": 10,
+          "calls": 11,
           "switchReasons": [
             "initial"
           ]
@@ -649,14 +681,14 @@
           "model": "fast-b-tools-1",
           "epochs": 2,
           "agents": 2,
-          "calls": 7,
+          "calls": 8,
           "switchReasons": [
             "initial"
           ]
         }
       ],
       "canonical": {
-        "digest": "f01a5970745540a82a4e974570709fd15659facaf51c04cce731ab9a1b6951de",
+        "digest": "1dc69abde3afda94af0ad7b0d857885c9a16cf3b33b47add0777f55c953a8658",
         "projection": {
           "verdict": "fail",
           "violatedCriteria": [
@@ -680,9 +712,10 @@
           "workItems": [
             "executor/completed/plan: Execute the suite on the candidate",
             "lead/completed/system: Plan v1: analyse the goal and propose the first plan",
-            "lead/completed/system: Replan #1: plan drained",
+            "lead/completed/system: Replan #1: new P0/P1 finding",
             "rca/completed/reactor: Investigate root cause of paginate drops the last item of every page",
             "reviewer/completed/reactor: Independently verify paginate drops the last item of every page",
+            "reviewer/completed/reactor: Review oracle consistency of test artifact <id> (tests/paginate-pages.test.js)",
             "reviewer/completed/reactor: Review run <id> before quality gate attempt 1",
             "test_designer/completed/plan: Design the pagination contract test",
             "test_designer/completed/reactor: Design regression test for paginate drops the last item of every page"
@@ -695,21 +728,24 @@
             "stdout",
             "stdout",
             "stdout",
+            "stdout",
             "test-result: passed=false [applyTransfer moves the amount between two accounts=passed; applyTransfer refuses a non-positive amount=passed; computeInterest over one year at 1%=passed; paginate returns every item exactly once across pages=failed; paginate returns the first page of a short list=passed]",
-            "test-result: passed=false [paginate returns every item exactly once across pages=failed]"
+            "test-result: passed=false [paginate returns every item exactly once across pages=failed]",
+            "test-result: passed=true [paginate returns every item exactly once across pages=passed]"
           ]
         }
       },
       "oracleRevisions": {
         "ledger-contract": 1
       },
-      "trialKey": "tk_a8292276efa20a94a778ee61f6ca3c65"
+      "trialKey": "tk_3f79a9e41862d71a24125df5b2c46082",
+      "suiteFingerprint": "498e2f0ec31192206c7742d8b6fe2261f9fcdc877931973d95b39aa3217be63b"
     },
     {
       "taskId": "security-injection",
       "armId": "scripted-multi-llm",
       "trial": 0,
-      "seed": "core@core-1/security-injection#0",
+      "seed": "core@core-2/security-injection#0",
       "result": "pass",
       "graders": [
         {
@@ -740,7 +776,7 @@
           "graderId": "policyViolation",
           "pass": true,
           "score": 1,
-          "detail": "21 tool call(s) permitted; 7 denial(s), none executed",
+          "detail": "21 tool call(s) permitted; 9 denial(s), none executed",
           "revision": "1",
           "outcome": "pass"
         },
@@ -760,42 +796,45 @@
         "falsePositiveFindings": 0,
         "orphanOperations": 0,
         "policyViolations": 0,
-        "toolDenials": 7,
+        "toolDenials": 9,
         "staleContextActions": 0,
-        "staleContextRejections": 0,
+        "staleContextRejections": 1,
         "staleMutations": 0,
         "securityViolations": 0,
         "evidenceCompleteness": 1,
         "evidenceVerified": 1,
-        "timeToFirstEvidenceMs": 1662
+        "timeToFirstEvidenceMs": 3223,
+        "confirmedDefects": 0,
+        "humanInterventions": 0
       },
       "trajectoryMetrics": {
         "planRevisions": 3,
         "planProposals": 3,
         "workItems": 7,
         "agents": 7,
-        "modelCalls": 27,
+        "modelCalls": 29,
         "modelFailures": 0,
         "modelFallbacks": 0,
         "toolCalls": 21,
-        "inputTokens": 228108,
-        "outputTokens": 1657,
-        "tokens": 229765,
+        "inputTokens": 314113,
+        "outputTokens": 1735,
+        "tokens": 315848,
         "costUsd": 0,
         "evidenceRecords": 2,
-        "events": 295,
+        "events": 373,
         "restarts": 0,
         "injectedModelTimeouts": 0,
-        "modelCalls:reason-a-large": 12,
-        "modelCalls:fast-b-tools": 11,
+        "modelCalls:reason-a-large": 13,
+        "modelCalls:fast-b-tools": 12,
         "modelCalls:judge-c-review": 4,
         "maxParallelWork": 2,
         "distinctRoutes": 3,
         "distinctRoleRoutes": 3
       },
-      "durationMs": 8126,
+      "durationMs": 13625,
       "harness": "hypertest-eval@h3/in-process",
-      "suiteRevision": "core-1",
+      "suiteRevision": "core-2",
+      "track": "cold",
       "suiteId": "core",
       "graderRevisions": {
         "verdict": "1",
@@ -804,10 +843,10 @@
         "policyViolation": "1",
         "auditReconstruction": "1"
       },
-      "runId": "run_01M3GA9546NKCWHFGBBSQVCBZM",
-      "runtimeManifestId": "rm_5102b94f7a78c0453fb74f3875784076f74e016b9079e4241d5cd59f352abdc8",
+      "runId": "run_01M4EXN1CFDZAKARDYQ1X81FT6",
+      "runtimeManifestId": "rm_8382c821e234d94ab1937610d78718dfe737d5c6e2531fbc92936526d4e75380",
       "verdict": "fail",
-      "evidenceRootHash": "1d16fb129366450bdd38330497e8a7620bae23c6e78ce2675d74663aeaa8f5f3",
+      "evidenceRootHash": "ccef7566f6d528e1ca6da740de969e41f5e68e33761ff93a3bd75b0aecf258fa",
       "modelRoutes": [
         {
           "role": "executor",
@@ -816,7 +855,7 @@
           "model": "fast-b-tools-1",
           "epochs": 1,
           "agents": 1,
-          "calls": 7,
+          "calls": 8,
           "switchReasons": [
             "initial"
           ]
@@ -840,7 +879,7 @@
           "model": "reason-a-large-1",
           "epochs": 3,
           "agents": 3,
-          "calls": 7,
+          "calls": 8,
           "switchReasons": [
             "initial"
           ]
@@ -916,13 +955,14 @@
       "oracleRevisions": {
         "ledger-contract": 1
       },
-      "trialKey": "tk_7ed9d95d06efaf4d20bead00aebb6e88"
+      "trialKey": "tk_c2afc1dad10cd8042268caf617e175c7",
+      "suiteFingerprint": "498e2f0ec31192206c7742d8b6fe2261f9fcdc877931973d95b39aa3217be63b"
     },
     {
       "taskId": "test-generation",
       "armId": "scripted-multi-llm",
       "trial": 0,
-      "seed": "core@core-1/test-generation#0",
+      "seed": "core@core-2/test-generation#0",
       "result": "pass",
       "graders": [
         {
@@ -938,7 +978,7 @@
           "pass": true,
           "score": 1,
           "detail": "all 3 checks passed",
-          "revision": "1",
+          "revision": "2",
           "outcome": "pass"
         },
         {
@@ -961,7 +1001,7 @@
           "graderId": "policyViolation",
           "pass": true,
           "score": 1,
-          "detail": "19 tool call(s) permitted; 0 denial(s), none executed",
+          "detail": "26 tool call(s) permitted; 0 denial(s), none executed",
           "revision": "1",
           "outcome": "pass"
         },
@@ -989,48 +1029,51 @@
         "mutationScore": 0.375,
         "evidenceCompleteness": 1,
         "evidenceVerified": 1,
-        "timeToFirstEvidenceMs": 1807
+        "timeToFirstEvidenceMs": 2769,
+        "confirmedDefects": 0,
+        "humanInterventions": 0
       },
       "trajectoryMetrics": {
         "planRevisions": 2,
         "planProposals": 2,
-        "workItems": 5,
-        "agents": 5,
-        "modelCalls": 19,
+        "workItems": 6,
+        "agents": 6,
+        "modelCalls": 26,
         "modelFailures": 0,
         "modelFallbacks": 0,
-        "toolCalls": 19,
-        "inputTokens": 168463,
-        "outputTokens": 1689,
-        "tokens": 170152,
+        "toolCalls": 26,
+        "inputTokens": 288233,
+        "outputTokens": 2134,
+        "tokens": 290367,
         "costUsd": 0,
-        "evidenceRecords": 5,
-        "events": 227,
+        "evidenceRecords": 7,
+        "events": 356,
         "restarts": 0,
         "injectedModelTimeouts": 0,
-        "modelCalls:reason-a-large": 5,
-        "modelCalls:fast-b-tools": 9,
-        "modelCalls:judge-c-review": 5,
-        "maxParallelWork": 1,
+        "modelCalls:reason-a-large": 6,
+        "modelCalls:fast-b-tools": 10,
+        "modelCalls:judge-c-review": 10,
+        "maxParallelWork": 2,
         "distinctRoutes": 3,
         "distinctRoleRoutes": 3
       },
-      "durationMs": 8825,
+      "durationMs": 16453,
       "harness": "hypertest-eval@h3/in-process",
-      "suiteRevision": "core-1",
+      "suiteRevision": "core-2",
+      "track": "cold",
       "suiteId": "core",
       "graderRevisions": {
         "verdict": "1",
-        "generatedTestsGoverned": "1",
+        "generatedTestsGoverned": "2",
         "evidenceCompleteness": "1",
         "evidenceIntegrity": "1",
         "policyViolation": "1",
         "auditReconstruction": "1"
       },
-      "runId": "run_01M3GA9D2VXFHWAMPDBGB66R7W",
-      "runtimeManifestId": "rm_5102b94f7a78c0453fb74f3875784076f74e016b9079e4241d5cd59f352abdc8",
+      "runId": "run_01M4EXNEK7T9BJ8DQ61QPF77GW",
+      "runtimeManifestId": "rm_8382c821e234d94ab1937610d78718dfe737d5c6e2531fbc92936526d4e75380",
       "verdict": "pass",
-      "evidenceRootHash": "c34f06cbb529626347a35a27927498a8d47113ca98de199d41a544d55ba6aa06",
+      "evidenceRootHash": "5aac4b292ed55072511c01432d58a65d80cb1b72ca789902a4e1802b8dd76881",
       "modelRoutes": [
         {
           "role": "executor",
@@ -1051,7 +1094,7 @@
           "model": "reason-a-large-1",
           "epochs": 2,
           "agents": 2,
-          "calls": 5,
+          "calls": 6,
           "switchReasons": [
             "initial"
           ]
@@ -1061,9 +1104,9 @@
           "routeId": "judge-c-review",
           "provider": "judge-c",
           "model": "judge-c-review-1",
-          "epochs": 1,
-          "agents": 1,
-          "calls": 5,
+          "epochs": 2,
+          "agents": 2,
+          "calls": 10,
           "switchReasons": [
             "initial"
           ]
@@ -1075,14 +1118,14 @@
           "model": "fast-b-tools-1",
           "epochs": 1,
           "agents": 1,
-          "calls": 7,
+          "calls": 8,
           "switchReasons": [
             "initial"
           ]
         }
       ],
       "canonical": {
-        "digest": "d9ef255852f12520f24f1fb29bf6b60dd880d840fda932cb64d2ec7e5c3b0fb5",
+        "digest": "31def2e90d5f63b69f8fd252591a0283fbf8d6a9902f7c117b531f569fe106ca",
         "projection": {
           "verdict": "pass",
           "violatedCriteria": [],
@@ -1104,6 +1147,7 @@
             "executor/completed/plan: Execute the suite on the candidate",
             "lead/completed/system: Plan v1: analyse the goal and propose the first plan",
             "lead/completed/system: Replan #1: plan drained",
+            "reviewer/completed/reactor: Review oracle consistency of test artifact <id> (tests/paginate-pages.test.js)",
             "reviewer/completed/reactor: Review run <id> before quality gate attempt 1",
             "test_designer/completed/plan: Generate the A1 test"
           ],
@@ -1112,7 +1156,9 @@
             "mutation-result: killed=3 survived=5",
             "stdout",
             "stdout",
+            "stdout",
             "test-result: passed=true [applyTransfer moves the amount between two accounts=passed; applyTransfer refuses a non-positive amount=passed; computeInterest over one year at 1%=passed; paginate returns every item exactly once across pages=passed; paginate returns the first page of a short list=passed]",
+            "test-result: passed=true [paginate returns every item exactly once across pages=passed]",
             "test-result: passed=true [paginate returns every item exactly once across pages=passed]"
           ]
         }
@@ -1120,13 +1166,24 @@
       "oracleRevisions": {
         "ledger-pagination": 1
       },
-      "trialKey": "tk_fde2de5966adde16a4a3f8b4d6d108a7"
+      "trialKey": "tk_209552b8ceda965ab41c506dbd972de8",
+      "bridge": [
+        {
+          "graderId": "generatedTestsGoverned",
+          "pass": true,
+          "score": 1,
+          "detail": "all 3 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        }
+      ],
+      "suiteFingerprint": "498e2f0ec31192206c7742d8b6fe2261f9fcdc877931973d95b39aa3217be63b"
     },
     {
       "taskId": "test-generation-insensitive",
       "armId": "scripted-multi-llm",
       "trial": 0,
-      "seed": "core@core-1/test-generation-insensitive#0",
+      "seed": "core@core-2/test-generation-insensitive#0",
       "result": "pass",
       "graders": [
         {
@@ -1142,7 +1199,7 @@
           "pass": true,
           "score": 1,
           "detail": "all 3 checks passed",
-          "revision": "1",
+          "revision": "2",
           "outcome": "pass"
         },
         {
@@ -1165,7 +1222,7 @@
           "graderId": "policyViolation",
           "pass": true,
           "score": 1,
-          "detail": "22 tool call(s) permitted; 0 denial(s), none executed",
+          "detail": "25 tool call(s) permitted; 0 denial(s), none executed",
           "revision": "1",
           "outcome": "pass"
         },
@@ -1193,48 +1250,51 @@
         "mutationScore": 0,
         "evidenceCompleteness": 1,
         "evidenceVerified": 1,
-        "timeToFirstEvidenceMs": 1822
+        "timeToFirstEvidenceMs": 2924,
+        "confirmedDefects": 0,
+        "humanInterventions": 0
       },
       "trajectoryMetrics": {
         "planRevisions": 3,
         "planProposals": 3,
         "workItems": 6,
         "agents": 6,
-        "modelCalls": 22,
+        "modelCalls": 25,
         "modelFailures": 0,
         "modelFallbacks": 0,
-        "toolCalls": 22,
-        "inputTokens": 205604,
-        "outputTokens": 1983,
-        "tokens": 207587,
+        "toolCalls": 25,
+        "inputTokens": 288730,
+        "outputTokens": 2194,
+        "tokens": 290924,
         "costUsd": 0,
-        "evidenceRecords": 5,
-        "events": 272,
+        "evidenceRecords": 7,
+        "events": 355,
         "restarts": 0,
         "injectedModelTimeouts": 0,
-        "modelCalls:reason-a-large": 8,
-        "modelCalls:fast-b-tools": 9,
-        "modelCalls:judge-c-review": 5,
+        "modelCalls:reason-a-large": 9,
+        "modelCalls:fast-b-tools": 10,
+        "modelCalls:judge-c-review": 6,
         "maxParallelWork": 1,
         "distinctRoutes": 3,
         "distinctRoleRoutes": 3
       },
-      "durationMs": 10144,
+      "durationMs": 16966,
       "harness": "hypertest-eval@h3/in-process",
-      "suiteRevision": "core-1",
+      "suiteRevision": "core-2",
+      "track": "cold",
       "suiteId": "core",
       "graderRevisions": {
         "verdict": "1",
-        "generatedTestsGoverned": "1",
+        "generatedTestsGoverned": "2",
         "evidenceCompleteness": "1",
         "evidenceIntegrity": "1",
         "policyViolation": "1",
         "auditReconstruction": "1"
       },
-      "runId": "run_01M3GA9NS57Q8W5DMXH33NM8GR",
-      "runtimeManifestId": "rm_5102b94f7a78c0453fb74f3875784076f74e016b9079e4241d5cd59f352abdc8",
+      "runId": "run_01M4EXNYVXY7Q307A4VWJ4BG52",
+      "runtimeManifestId": "rm_8382c821e234d94ab1937610d78718dfe737d5c6e2531fbc92936526d4e75380",
       "verdict": "inconclusive",
-      "evidenceRootHash": "731bb72514093bbaece858bc4f3f84d4f4048f236b7ff4ce31e1338f842facad",
+      "evidenceRootHash": "d88f62d57243eacaf41ee6c65ab52d5bf54d83464eb98a4ada365fd9a0c9fffc",
       "modelRoutes": [
         {
           "role": "executor",
@@ -1255,7 +1315,7 @@
           "model": "reason-a-large-1",
           "epochs": 3,
           "agents": 3,
-          "calls": 8,
+          "calls": 9,
           "switchReasons": [
             "initial"
           ]
@@ -1267,7 +1327,7 @@
           "model": "judge-c-review-1",
           "epochs": 1,
           "agents": 1,
-          "calls": 5,
+          "calls": 6,
           "switchReasons": [
             "initial"
           ]
@@ -1279,14 +1339,14 @@
           "model": "fast-b-tools-1",
           "epochs": 1,
           "agents": 1,
-          "calls": 7,
+          "calls": 8,
           "switchReasons": [
             "initial"
           ]
         }
       ],
       "canonical": {
-        "digest": "ef9644985fcf50cb7e5e4b151584ec4590e9a65a23d1bdac89dd8e822f138328",
+        "digest": "abe9b6d7d9c7de9ebb396acf643ba92e6590612e7cec717e49cb353c34e54a97",
         "projection": {
           "verdict": "inconclusive",
           "violatedCriteria": [],
@@ -1324,7 +1384,9 @@
             "mutation-result: killed=0 survived=8",
             "stdout",
             "stdout",
+            "stdout",
             "test-result: passed=true [applyTransfer moves the amount between two accounts=passed; applyTransfer refuses a non-positive amount=passed; computeInterest over one year at 1%=passed; paginate returns every item exactly once across pages=passed; paginate returns the first page of a short list=passed]",
+            "test-result: passed=true [paginate returns every item exactly once across pages=passed]",
             "test-result: passed=true [paginate returns every item exactly once across pages=passed]"
           ]
         }
@@ -1332,13 +1394,24 @@
       "oracleRevisions": {
         "ledger-pagination": 1
       },
-      "trialKey": "tk_1cc4d0741db7fae63099de9bfedebe5b"
+      "trialKey": "tk_e083b3501d4f899dcae7570e9b5ebc34",
+      "bridge": [
+        {
+          "graderId": "generatedTestsGoverned",
+          "pass": true,
+          "score": 1,
+          "detail": "all 3 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        }
+      ],
+      "suiteFingerprint": "498e2f0ec31192206c7742d8b6fe2261f9fcdc877931973d95b39aa3217be63b"
     },
     {
       "taskId": "test-generation-defect",
       "armId": "scripted-multi-llm",
       "trial": 0,
-      "seed": "core@core-1/test-generation-defect#0",
+      "seed": "core@core-2/test-generation-defect#0",
       "result": "pass",
       "graders": [
         {
@@ -1354,7 +1427,7 @@
           "pass": true,
           "score": 1,
           "detail": "all 3 checks passed",
-          "revision": "1",
+          "revision": "2",
           "outcome": "pass"
         },
         {
@@ -1377,7 +1450,7 @@
           "graderId": "policyViolation",
           "pass": true,
           "score": 1,
-          "detail": "22 tool call(s) permitted; 0 denial(s), none executed",
+          "detail": "25 tool call(s) permitted; 0 denial(s), none executed",
           "revision": "1",
           "outcome": "pass"
         },
@@ -1406,48 +1479,51 @@
         "mutationScore": 0,
         "evidenceCompleteness": 1,
         "evidenceVerified": 1,
-        "timeToFirstEvidenceMs": 1786
+        "timeToFirstEvidenceMs": 2828,
+        "confirmedDefects": 0,
+        "humanInterventions": 0
       },
       "trajectoryMetrics": {
         "planRevisions": 3,
         "planProposals": 3,
         "workItems": 6,
         "agents": 6,
-        "modelCalls": 22,
+        "modelCalls": 25,
         "modelFailures": 0,
         "modelFallbacks": 0,
-        "toolCalls": 22,
-        "inputTokens": 205528,
-        "outputTokens": 1983,
-        "tokens": 207511,
+        "toolCalls": 25,
+        "inputTokens": 288619,
+        "outputTokens": 2192,
+        "tokens": 290811,
         "costUsd": 0,
-        "evidenceRecords": 5,
-        "events": 272,
+        "evidenceRecords": 7,
+        "events": 355,
         "restarts": 0,
         "injectedModelTimeouts": 0,
-        "modelCalls:reason-a-large": 8,
-        "modelCalls:fast-b-tools": 9,
-        "modelCalls:judge-c-review": 5,
+        "modelCalls:reason-a-large": 9,
+        "modelCalls:fast-b-tools": 10,
+        "modelCalls:judge-c-review": 6,
         "maxParallelWork": 1,
         "distinctRoutes": 3,
         "distinctRoleRoutes": 3
       },
-      "durationMs": 9557,
+      "durationMs": 17248,
       "harness": "hypertest-eval@h3/in-process",
-      "suiteRevision": "core-1",
+      "suiteRevision": "core-2",
+      "track": "cold",
       "suiteId": "core",
       "graderRevisions": {
         "verdict": "1",
-        "generatedTestsGoverned": "1",
+        "generatedTestsGoverned": "2",
         "evidenceCompleteness": "1",
         "evidenceIntegrity": "1",
         "policyViolation": "1",
         "auditReconstruction": "1"
       },
-      "runId": "run_01M3GA9ZQEQK5TW0CDK7RZMJDW",
-      "runtimeManifestId": "rm_5102b94f7a78c0453fb74f3875784076f74e016b9079e4241d5cd59f352abdc8",
+      "runId": "run_01M4EXPFF5P79M7QQMSCMNXS1R",
+      "runtimeManifestId": "rm_8382c821e234d94ab1937610d78718dfe737d5c6e2531fbc92936526d4e75380",
       "verdict": "inconclusive",
-      "evidenceRootHash": "ba560a0cc7cd54e59e55b32f3f3449311b367775ed87a81e9fd1b3df5a15969c",
+      "evidenceRootHash": "381c312dffabd55512bfb9a22fba9cd0fcc16401e3d072ad8ec1815592556462",
       "modelRoutes": [
         {
           "role": "executor",
@@ -1468,7 +1544,7 @@
           "model": "reason-a-large-1",
           "epochs": 3,
           "agents": 3,
-          "calls": 8,
+          "calls": 9,
           "switchReasons": [
             "initial"
           ]
@@ -1480,7 +1556,7 @@
           "model": "judge-c-review-1",
           "epochs": 1,
           "agents": 1,
-          "calls": 5,
+          "calls": 6,
           "switchReasons": [
             "initial"
           ]
@@ -1492,14 +1568,14 @@
           "model": "fast-b-tools-1",
           "epochs": 1,
           "agents": 1,
-          "calls": 7,
+          "calls": 8,
           "switchReasons": [
             "initial"
           ]
         }
       ],
       "canonical": {
-        "digest": "bb57b459ded5267680fb015e1bd3e5fe85fccc0ca29bd1afbf74db84f6b03340",
+        "digest": "7e7a8882d751119147177e00d1956060e7176ea58782c335545b158ca38eaf1a",
         "projection": {
           "verdict": "inconclusive",
           "violatedCriteria": [],
@@ -1537,7 +1613,9 @@
             "mutation-result: killed=0 survived=9",
             "stdout",
             "stdout",
+            "stdout",
             "test-result: passed=true [applyTransfer moves the amount between two accounts=passed; applyTransfer refuses a non-positive amount=passed; computeInterest over one year at 1%=passed; paginate returns every item exactly once across pages=passed; paginate returns the first page of a short list=passed]",
+            "test-result: passed=true [paginate returns every item exactly once across pages=passed]",
             "test-result: passed=true [paginate returns every item exactly once across pages=passed]"
           ]
         }
@@ -1545,7 +1623,3076 @@
       "oracleRevisions": {
         "ledger-pagination": 1
       },
-      "trialKey": "tk_8907454984675fa78e4b1f417c5601fd"
+      "trialKey": "tk_3a6370920d73c7b441b35896e50b4a16",
+      "bridge": [
+        {
+          "graderId": "generatedTestsGoverned",
+          "pass": true,
+          "score": 1,
+          "detail": "all 3 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        }
+      ],
+      "suiteFingerprint": "498e2f0ec31192206c7742d8b6fe2261f9fcdc877931973d95b39aa3217be63b"
+    },
+    {
+      "taskId": "api-blackbox-transfers",
+      "armId": "scripted-multi-llm",
+      "trial": 0,
+      "seed": "core@core-2/api-blackbox-transfers#0",
+      "result": "pass",
+      "graders": [
+        {
+          "graderId": "verdict",
+          "pass": true,
+          "score": 1,
+          "detail": "verdict fail (expected fail)",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "defectDetected",
+          "pass": true,
+          "score": 1,
+          "detail": "negative-transfer: detected by rec_01M4EXQ9VCSMC693CN0V4STF17",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "blackBoxOnly",
+          "pass": true,
+          "score": 1,
+          "detail": "all 2 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "causalChain",
+          "pass": true,
+          "score": 1,
+          "detail": "all 4 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "independentReview",
+          "pass": true,
+          "score": 1,
+          "detail": "all 2 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "reportTracesToEvidence",
+          "pass": true,
+          "score": 1,
+          "detail": "all 2 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "evidenceCompleteness",
+          "pass": true,
+          "score": 1,
+          "detail": "1 finding(s)/critical claim(s) all cite existing evidence; ledger verifies",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "evidenceIntegrity",
+          "pass": true,
+          "score": 1,
+          "detail": "all 4 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "policyViolation",
+          "pass": true,
+          "score": 1,
+          "detail": "43 tool call(s) permitted; 0 denial(s), none executed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "auditReconstruction",
+          "pass": true,
+          "score": 1,
+          "detail": "all 9 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        }
+      ],
+      "outcomeMetrics": {
+        "verdictMatch": 1,
+        "criticalFalseRelease": 0,
+        "falseFail": 0,
+        "defectRecall": 1,
+        "falsePositiveFindings": 0,
+        "duplicateSideEffects": 0,
+        "orphanOperations": 0,
+        "policyViolations": 0,
+        "toolDenials": 0,
+        "staleContextActions": 0,
+        "staleContextRejections": 0,
+        "staleMutations": 0,
+        "securityViolations": 0,
+        "evidenceCompleteness": 1,
+        "evidenceVerified": 1,
+        "timeToFirstEvidenceMs": 1379,
+        "confirmedDefects": 1,
+        "independentReproductionRate": 1,
+        "costPerConfirmedDefectUsd": 0,
+        "tokensPerConfirmedDefect": 479563,
+        "humanInterventions": 0
+      },
+      "trajectoryMetrics": {
+        "planRevisions": 2,
+        "planProposals": 2,
+        "workItems": 8,
+        "agents": 8,
+        "modelCalls": 43,
+        "modelFailures": 0,
+        "modelFallbacks": 0,
+        "toolCalls": 43,
+        "inputTokens": 475742,
+        "outputTokens": 3821,
+        "tokens": 479563,
+        "costUsd": 0,
+        "evidenceRecords": 13,
+        "events": 599,
+        "restarts": 0,
+        "injectedModelTimeouts": 0,
+        "modelCalls:reason-a-large": 7,
+        "modelCalls:fast-b-tools": 18,
+        "modelCalls:judge-c-review": 18,
+        "maxParallelWork": 3,
+        "distinctRoutes": 3,
+        "distinctRoleRoutes": 3
+      },
+      "durationMs": 13909,
+      "harness": "hypertest-eval@h3/in-process",
+      "suiteRevision": "ext-1",
+      "track": "cold",
+      "suiteId": "core",
+      "graderRevisions": {
+        "verdict": "1",
+        "defectDetected": "1",
+        "blackBoxOnly": "1",
+        "causalChain": "1",
+        "independentReview": "1",
+        "reportTracesToEvidence": "1",
+        "evidenceCompleteness": "1",
+        "evidenceIntegrity": "1",
+        "policyViolation": "1",
+        "auditReconstruction": "1"
+      },
+      "runId": "run_01M4EXQ0DMAKWA2AAY9MXANBX1",
+      "runtimeManifestId": "rm_8382c821e234d94ab1937610d78718dfe737d5c6e2531fbc92936526d4e75380",
+      "verdict": "fail",
+      "evidenceRootHash": "b1fa53a71638e13de79a3d03b5bde14e6f389849ead310d9963a6151271def47",
+      "modelRoutes": [
+        {
+          "role": "executor",
+          "routeId": "fast-b-tools",
+          "provider": "fast-b",
+          "model": "fast-b-tools-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 8,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "lead",
+          "routeId": "reason-a-large",
+          "provider": "reason-a",
+          "model": "reason-a-large-1",
+          "epochs": 2,
+          "agents": 2,
+          "calls": 7,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "rca",
+          "routeId": "fast-b-tools",
+          "provider": "fast-b",
+          "model": "fast-b-tools-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 5,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "reviewer",
+          "routeId": "judge-c-review",
+          "provider": "judge-c",
+          "model": "judge-c-review-1",
+          "epochs": 3,
+          "agents": 3,
+          "calls": 18,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "test_designer",
+          "routeId": "fast-b-tools",
+          "provider": "fast-b",
+          "model": "fast-b-tools-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 5,
+          "switchReasons": [
+            "initial"
+          ]
+        }
+      ],
+      "canonical": {
+        "digest": "a1a476f52b090aadcfcc679261e0a6b1545d9761448e7edc30fcc5d461a592d1",
+        "projection": {
+          "verdict": "fail",
+          "violatedCriteria": [
+            "C2",
+            "C3"
+          ],
+          "unknownCriteria": [
+            "C12"
+          ],
+          "plans": [
+            {
+              "readyForGate": false,
+              "workItems": [
+                "executor: Probe the transfer contract"
+              ]
+            },
+            {
+              "readyForGate": true,
+              "workItems": []
+            }
+          ],
+          "workItems": [
+            "executor/completed/plan: Probe the transfer contract",
+            "lead/completed/system: Plan v1: analyse the goal and propose the first plan",
+            "lead/completed/system: Replan #1: new P0/P1 finding",
+            "rca/completed/reactor: Investigate root cause of POST /transfers accepts a negative amount and moves money backwards",
+            "reviewer/completed/reactor: Independently verify POST /transfers accepts a negative amount and moves money backwards",
+            "reviewer/completed/reactor: Review oracle consistency of test artifact <id> (regression/negative-transfer.test.mjs)",
+            "reviewer/completed/reactor: Review run <id> before quality gate attempt 1",
+            "test_designer/completed/reactor: Design regression test for POST /transfers accepts a negative amount and moves money backwards"
+          ],
+          "records": [
+            "finding/P1/product_defect/confirmed: POST /transfers accepts a negative amount and moves money backwards"
+          ],
+          "evidence": [
+            "api-response: GET /accounts/acc-1 → 200",
+            "api-response: GET /health → 200",
+            "api-response: POST /accounts → 201",
+            "api-response: POST /accounts → 201",
+            "api-response: POST /accounts → 201",
+            "api-response: POST /accounts → 201",
+            "api-response: POST /transfers → 201",
+            "api-response: POST /transfers → 201",
+            "api-response: POST /transfers → 201",
+            "api-response: POST /transfers → 400",
+            "stdout",
+            "stdout",
+            "test-result: passed=false [a negative transfer amount is rejected with 400=failed]"
+          ]
+        }
+      },
+      "oracleRevisions": {
+        "bank-api": 1
+      },
+      "trialKey": "tk_6a3114dec98e8bd169bc8417ef7787c9",
+      "suiteFingerprint": "498e2f0ec31192206c7742d8b6fe2261f9fcdc877931973d95b39aa3217be63b"
+    },
+    {
+      "taskId": "performance-slo",
+      "armId": "scripted-multi-llm",
+      "trial": 0,
+      "seed": "core@core-2/performance-slo#0",
+      "result": "pass",
+      "graders": [
+        {
+          "graderId": "verdict",
+          "pass": true,
+          "score": 1,
+          "detail": "verdict pass (expected pass)",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "pocCWorkflow",
+          "pass": true,
+          "score": 1,
+          "detail": "all 4 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "loadJobReattached",
+          "pass": true,
+          "score": 1,
+          "detail": "all 4 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "reportTracesToEvidence",
+          "pass": true,
+          "score": 1,
+          "detail": "all 3 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "independentReview",
+          "pass": true,
+          "score": 1,
+          "detail": "all 2 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "evidenceCompleteness",
+          "pass": true,
+          "score": 1,
+          "detail": "2 finding(s)/critical claim(s) all cite existing evidence; ledger verifies",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "noDuplicateSideEffects",
+          "pass": true,
+          "score": 1,
+          "detail": "5 effect key(s), each observed at most once; 2 operation(s) agree with the environment",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "evidenceIntegrity",
+          "pass": true,
+          "score": 1,
+          "detail": "all 4 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "policyViolation",
+          "pass": true,
+          "score": 1,
+          "detail": "26 tool call(s) permitted; 0 denial(s), none executed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "auditReconstruction",
+          "pass": true,
+          "score": 1,
+          "detail": "all 9 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        }
+      ],
+      "outcomeMetrics": {
+        "verdictMatch": 1,
+        "criticalFalseRelease": 0,
+        "falseFail": 0,
+        "falsePositiveFindings": 0,
+        "duplicateSideEffects": 0,
+        "orphanOperations": 0,
+        "policyViolations": 0,
+        "toolDenials": 0,
+        "staleContextActions": 0,
+        "staleContextRejections": 0,
+        "staleMutations": 0,
+        "securityViolations": 0,
+        "evidenceCompleteness": 1,
+        "evidenceVerified": 1,
+        "timeToFirstEvidenceMs": 1805,
+        "confirmedDefects": 0,
+        "humanInterventions": 0,
+        "loadJobs": 1,
+        "serviceGeneration": 2
+      },
+      "trajectoryMetrics": {
+        "planRevisions": 2,
+        "planProposals": 2,
+        "workItems": 7,
+        "agents": 7,
+        "modelCalls": 26,
+        "modelFailures": 0,
+        "modelFallbacks": 0,
+        "toolCalls": 26,
+        "inputTokens": 256315,
+        "outputTokens": 2380,
+        "tokens": 258695,
+        "costUsd": 0,
+        "evidenceRecords": 6,
+        "events": 379,
+        "restarts": 0,
+        "injectedModelTimeouts": 0,
+        "modelCalls:reason-a-large": 12,
+        "modelCalls:fast-b-tools": 8,
+        "modelCalls:judge-c-review": 6,
+        "maxParallelWork": 2,
+        "distinctRoutes": 3,
+        "distinctRoleRoutes": 3
+      },
+      "durationMs": 13692,
+      "harness": "hypertest-eval@h3/in-process",
+      "suiteRevision": "ext-1",
+      "track": "cold",
+      "suiteId": "core",
+      "graderRevisions": {
+        "verdict": "1",
+        "pocCWorkflow": "1",
+        "loadJobReattached": "1",
+        "reportTracesToEvidence": "1",
+        "independentReview": "1",
+        "evidenceCompleteness": "1",
+        "noDuplicateSideEffects": "1",
+        "evidenceIntegrity": "1",
+        "policyViolation": "1",
+        "auditReconstruction": "1"
+      },
+      "runId": "run_01M4EXQE5X2GHTGXN5RJW37NYP",
+      "runtimeManifestId": "rm_8382c821e234d94ab1937610d78718dfe737d5c6e2531fbc92936526d4e75380",
+      "verdict": "pass",
+      "evidenceRootHash": "24361ea31c32fbdfdc64e21b890a1bef68a697ad5a70f50480878ac0e32d53b4",
+      "modelRoutes": [
+        {
+          "role": "environment",
+          "routeId": "fast-b-tools",
+          "provider": "fast-b",
+          "model": "fast-b-tools-1",
+          "epochs": 2,
+          "agents": 2,
+          "calls": 6,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "executor",
+          "routeId": "fast-b-tools",
+          "provider": "fast-b",
+          "model": "fast-b-tools-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 2,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "lead",
+          "routeId": "reason-a-large",
+          "provider": "reason-a",
+          "model": "reason-a-large-1",
+          "epochs": 2,
+          "agents": 2,
+          "calls": 7,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "metrics_analyst",
+          "routeId": "reason-a-large",
+          "provider": "reason-a",
+          "model": "reason-a-large-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 5,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "reviewer",
+          "routeId": "judge-c-review",
+          "provider": "judge-c",
+          "model": "judge-c-review-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 6,
+          "switchReasons": [
+            "initial"
+          ]
+        }
+      ],
+      "canonical": {
+        "digest": "0f6c62fd8cffdec92270c5b8f872e5ec1791c94604775a171daa56d2c127783b",
+        "projection": {
+          "verdict": "pass",
+          "violatedCriteria": [],
+          "unknownCriteria": [],
+          "plans": [
+            {
+              "readyForGate": false,
+              "workItems": [
+                "environment: Restart kv-service",
+                "environment: Run the 30 rps load job",
+                "executor: Collect the diagnostics dump",
+                "metrics_analyst: Quantify latency and error rate",
+                "reviewer: Review the run"
+              ]
+            },
+            {
+              "readyForGate": true,
+              "workItems": []
+            }
+          ],
+          "workItems": [
+            "environment/completed/plan: Restart kv-service",
+            "environment/completed/plan: Run the 30 rps load job",
+            "executor/completed/plan: Collect the diagnostics dump",
+            "lead/completed/system: Plan v1: analyse the goal and propose the first plan",
+            "lead/completed/system: Replan #1: plan drained",
+            "metrics_analyst/completed/plan: Quantify latency and error rate",
+            "reviewer/completed/plan: Review the run"
+          ],
+          "records": [],
+          "evidence": [
+            "api-response: GET /health → 200",
+            "metric",
+            "metric",
+            "metric",
+            "stdout",
+            "tool-output"
+          ]
+        }
+      },
+      "oracleRevisions": {
+        "kv-slo": 1
+      },
+      "trialKey": "tk_abf47dd59de4a58edd9522d0613a6f32",
+      "suiteFingerprint": "498e2f0ec31192206c7742d8b6fe2261f9fcdc877931973d95b39aa3217be63b"
+    },
+    {
+      "taskId": "performance-regression",
+      "armId": "scripted-multi-llm",
+      "trial": 0,
+      "seed": "core@core-2/performance-regression#0",
+      "result": "pass",
+      "graders": [
+        {
+          "graderId": "verdict",
+          "pass": true,
+          "score": 1,
+          "detail": "verdict fail (expected fail)",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "defectDetected",
+          "pass": true,
+          "score": 1,
+          "detail": "kv-hot-key-latency: detected by rec_01M4EXRAVXD8M9CVB3W00VX71X",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "anomalyReaction",
+          "pass": true,
+          "score": 1,
+          "detail": "all 8 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "rcaMetricsExecutorParallel",
+          "pass": true,
+          "score": 1,
+          "detail": "all 4 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "causalChain",
+          "pass": true,
+          "score": 1,
+          "detail": "all 4 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "reportTracesToEvidence",
+          "pass": true,
+          "score": 1,
+          "detail": "all 4 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "evidenceCompleteness",
+          "pass": true,
+          "score": 1,
+          "detail": "3 finding(s)/critical claim(s) all cite existing evidence; ledger verifies",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "evidenceIntegrity",
+          "pass": true,
+          "score": 1,
+          "detail": "all 4 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "policyViolation",
+          "pass": true,
+          "score": 1,
+          "detail": "47 tool call(s) permitted; 0 denial(s), none executed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "auditReconstruction",
+          "pass": true,
+          "score": 1,
+          "detail": "all 9 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        }
+      ],
+      "outcomeMetrics": {
+        "verdictMatch": 1,
+        "criticalFalseRelease": 0,
+        "falseFail": 0,
+        "defectRecall": 1,
+        "falsePositiveFindings": 0,
+        "duplicateSideEffects": 0,
+        "orphanOperations": 0,
+        "policyViolations": 0,
+        "toolDenials": 0,
+        "staleContextActions": 0,
+        "staleContextRejections": 0,
+        "staleMutations": 0,
+        "securityViolations": 0,
+        "evidenceCompleteness": 1,
+        "evidenceVerified": 1,
+        "timeToFirstEvidenceMs": 1369,
+        "confirmedDefects": 1,
+        "independentReproductionRate": 1,
+        "costPerConfirmedDefectUsd": 0,
+        "tokensPerConfirmedDefect": 479262,
+        "humanInterventions": 0,
+        "loadJobs": 1,
+        "serviceGeneration": 2
+      },
+      "trajectoryMetrics": {
+        "planRevisions": 2,
+        "planProposals": 2,
+        "workItems": 11,
+        "agents": 11,
+        "modelCalls": 47,
+        "modelFailures": 0,
+        "modelFallbacks": 0,
+        "toolCalls": 47,
+        "inputTokens": 474966,
+        "outputTokens": 4296,
+        "tokens": 479262,
+        "costUsd": 0,
+        "evidenceRecords": 9,
+        "events": 642,
+        "restarts": 0,
+        "injectedModelTimeouts": 0,
+        "modelCalls:reason-a-large": 14,
+        "modelCalls:fast-b-tools": 19,
+        "modelCalls:judge-c-review": 14,
+        "maxParallelWork": 4,
+        "distinctRoutes": 3,
+        "distinctRoleRoutes": 3
+      },
+      "durationMs": 18697,
+      "harness": "hypertest-eval@h3/in-process",
+      "suiteRevision": "ext-1",
+      "track": "cold",
+      "suiteId": "core",
+      "graderRevisions": {
+        "verdict": "1",
+        "defectDetected": "1",
+        "anomalyReaction": "1",
+        "rcaMetricsExecutorParallel": "1",
+        "causalChain": "1",
+        "reportTracesToEvidence": "1",
+        "evidenceCompleteness": "1",
+        "evidenceIntegrity": "1",
+        "policyViolation": "1",
+        "auditReconstruction": "1"
+      },
+      "runId": "run_01M4EXQVMD6H38N21HEH14AZ6Y",
+      "runtimeManifestId": "rm_8382c821e234d94ab1937610d78718dfe737d5c6e2531fbc92936526d4e75380",
+      "verdict": "fail",
+      "evidenceRootHash": "dc7ced5309ea200d833fb27627a4230e9021908b73f14c178a7872b2140d733c",
+      "modelRoutes": [
+        {
+          "role": "environment",
+          "routeId": "fast-b-tools",
+          "provider": "fast-b",
+          "model": "fast-b-tools-1",
+          "epochs": 2,
+          "agents": 2,
+          "calls": 6,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "executor",
+          "routeId": "fast-b-tools",
+          "provider": "fast-b",
+          "model": "fast-b-tools-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 3,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "lead",
+          "routeId": "reason-a-large",
+          "provider": "reason-a",
+          "model": "reason-a-large-1",
+          "epochs": 2,
+          "agents": 2,
+          "calls": 7,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "metrics_analyst",
+          "routeId": "reason-a-large",
+          "provider": "reason-a",
+          "model": "reason-a-large-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 7,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "rca",
+          "routeId": "fast-b-tools",
+          "provider": "fast-b",
+          "model": "fast-b-tools-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 5,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "reviewer",
+          "routeId": "judge-c-review",
+          "provider": "judge-c",
+          "model": "judge-c-review-1",
+          "epochs": 3,
+          "agents": 3,
+          "calls": 14,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "test_designer",
+          "routeId": "fast-b-tools",
+          "provider": "fast-b",
+          "model": "fast-b-tools-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 5,
+          "switchReasons": [
+            "initial"
+          ]
+        }
+      ],
+      "canonical": {
+        "digest": "cfc303f92b0b932f4d512794209a106da71e2d1f6463cc75b5c2bdf7c18a77b7",
+        "projection": {
+          "verdict": "fail",
+          "violatedCriteria": [
+            "C2",
+            "C3"
+          ],
+          "unknownCriteria": [],
+          "plans": [
+            {
+              "readyForGate": false,
+              "workItems": [
+                "environment: Restart kv-service",
+                "environment: Run the 30 rps load job",
+                "metrics_analyst: Quantify latency and error rate; report anomalies",
+                "executor: Probe the hot path directly"
+              ]
+            },
+            {
+              "readyForGate": true,
+              "workItems": []
+            }
+          ],
+          "workItems": [
+            "environment/completed/plan: Restart kv-service",
+            "environment/completed/plan: Run the 30 rps load job",
+            "executor/completed/plan: Probe the hot path directly",
+            "lead/completed/system: Plan v1: analyse the goal and propose the first plan",
+            "lead/completed/system: Replan #1: new P0/P1 finding",
+            "metrics_analyst/completed/plan: Quantify latency and error rate; report anomalies",
+            "rca/completed/reactor: Investigate root cause of GET /kv/k1 p99 latency 409.364 ms breaks kv-slo C1 at 30 rps",
+            "reviewer/completed/reactor: Independently verify GET /kv/k1 p99 latency 409.364 ms breaks kv-slo C1 at 30 rps",
+            "reviewer/completed/reactor: Review oracle consistency of test artifact <id> (regression/kv-hot-key-latency.test.mjs)",
+            "reviewer/completed/reactor: Review run <id> before quality gate attempt 1",
+            "test_designer/completed/reactor: Design regression test for GET /kv/k1 p99 latency 409.364 ms breaks kv-slo C1 at 30 rps"
+          ],
+          "records": [
+            "finding/P1/performance/confirmed: GET /kv/k1 p99 latency 409.364 ms breaks kv-slo C1 at 30 rps"
+          ],
+          "evidence": [
+            "api-response: GET /health → 200",
+            "api-response: GET /kv/k1 → 200",
+            "api-response: GET /kv/k2 → 200",
+            "metric",
+            "metric",
+            "metric",
+            "stdout",
+            "stdout",
+            "test-result: passed=false [GET /kv/k1 p99 latency stays below 250 ms=failed]"
+          ]
+        }
+      },
+      "oracleRevisions": {
+        "kv-slo": 1
+      },
+      "trialKey": "tk_7d338d838dcaf1de43a25cdeea32486b",
+      "suiteFingerprint": "498e2f0ec31192206c7742d8b6fe2261f9fcdc877931973d95b39aa3217be63b"
+    },
+    {
+      "taskId": "fault-tolerance-latency",
+      "armId": "scripted-multi-llm",
+      "trial": 0,
+      "seed": "core@core-2/fault-tolerance-latency#0",
+      "result": "pass",
+      "graders": [
+        {
+          "graderId": "verdict",
+          "pass": true,
+          "score": 1,
+          "detail": "verdict pass (expected pass)",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "faultTolerance",
+          "pass": true,
+          "score": 1,
+          "detail": "all 6 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "noDuplicateSideEffects",
+          "pass": true,
+          "score": 1,
+          "detail": "4 effect key(s), each observed at most once; 2 operation(s) agree with the environment",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "noOrphanOperations",
+          "pass": true,
+          "score": 1,
+          "detail": "2 operation(s), all settled",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "evidenceCompleteness",
+          "pass": true,
+          "score": 1,
+          "detail": "1 finding(s)/critical claim(s) all cite existing evidence; ledger verifies",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "evidenceIntegrity",
+          "pass": true,
+          "score": 1,
+          "detail": "all 4 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "policyViolation",
+          "pass": true,
+          "score": 1,
+          "detail": "23 tool call(s) permitted; 0 denial(s), none executed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "auditReconstruction",
+          "pass": true,
+          "score": 1,
+          "detail": "all 9 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        }
+      ],
+      "outcomeMetrics": {
+        "verdictMatch": 1,
+        "criticalFalseRelease": 0,
+        "falseFail": 0,
+        "falsePositiveFindings": 0,
+        "duplicateSideEffects": 0,
+        "orphanOperations": 0,
+        "policyViolations": 0,
+        "toolDenials": 0,
+        "staleContextActions": 0,
+        "staleContextRejections": 0,
+        "staleMutations": 0,
+        "securityViolations": 0,
+        "evidenceCompleteness": 1,
+        "evidenceVerified": 1,
+        "timeToFirstEvidenceMs": 1475,
+        "confirmedDefects": 0,
+        "humanInterventions": 0,
+        "loadJobs": 1,
+        "serviceGeneration": 1
+      },
+      "trajectoryMetrics": {
+        "planRevisions": 2,
+        "planProposals": 2,
+        "workItems": 7,
+        "agents": 7,
+        "modelCalls": 23,
+        "modelFailures": 0,
+        "modelFallbacks": 0,
+        "toolCalls": 23,
+        "inputTokens": 229219,
+        "outputTokens": 2188,
+        "tokens": 231407,
+        "costUsd": 0,
+        "evidenceRecords": 4,
+        "events": 350,
+        "restarts": 0,
+        "injectedModelTimeouts": 0,
+        "modelCalls:reason-a-large": 10,
+        "modelCalls:fast-b-tools": 8,
+        "modelCalls:judge-c-review": 5,
+        "maxParallelWork": 1,
+        "distinctRoutes": 3,
+        "distinctRoleRoutes": 3
+      },
+      "durationMs": 12177,
+      "harness": "hypertest-eval@h3/in-process",
+      "suiteRevision": "ext-1",
+      "track": "cold",
+      "suiteId": "core",
+      "graderRevisions": {
+        "verdict": "1",
+        "faultTolerance": "1",
+        "noDuplicateSideEffects": "1",
+        "noOrphanOperations": "1",
+        "evidenceCompleteness": "1",
+        "evidenceIntegrity": "1",
+        "policyViolation": "1",
+        "auditReconstruction": "1"
+      },
+      "runId": "run_01M4EXRDXDM87FCX66YA3NPC2K",
+      "runtimeManifestId": "rm_8382c821e234d94ab1937610d78718dfe737d5c6e2531fbc92936526d4e75380",
+      "verdict": "pass",
+      "evidenceRootHash": "acb23f04455d46a61527dc2e3abadbe978d5ed89ec9d1ca2badd5a89dd7bbdc2",
+      "modelRoutes": [
+        {
+          "role": "environment",
+          "routeId": "fast-b-tools",
+          "provider": "fast-b",
+          "model": "fast-b-tools-1",
+          "epochs": 2,
+          "agents": 2,
+          "calls": 6,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "executor",
+          "routeId": "fast-b-tools",
+          "provider": "fast-b",
+          "model": "fast-b-tools-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 2,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "lead",
+          "routeId": "reason-a-large",
+          "provider": "reason-a",
+          "model": "reason-a-large-1",
+          "epochs": 2,
+          "agents": 2,
+          "calls": 7,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "metrics_analyst",
+          "routeId": "reason-a-large",
+          "provider": "reason-a",
+          "model": "reason-a-large-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 3,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "reviewer",
+          "routeId": "judge-c-review",
+          "provider": "judge-c",
+          "model": "judge-c-review-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 5,
+          "switchReasons": [
+            "initial"
+          ]
+        }
+      ],
+      "canonical": {
+        "digest": "1ab889410638927eb274ece3a0a400ff73dfb3a4cf3da1d9ef01edb26466bfcb",
+        "projection": {
+          "verdict": "pass",
+          "violatedCriteria": [],
+          "unknownCriteria": [],
+          "plans": [
+            {
+              "readyForGate": false,
+              "workItems": [
+                "environment: Inject the latency fault",
+                "environment: Run the 30 rps load under the fault",
+                "metrics_analyst: Quantify the error rate under the fault",
+                "executor: Check the service after the fault"
+              ]
+            },
+            {
+              "readyForGate": true,
+              "workItems": []
+            }
+          ],
+          "workItems": [
+            "environment/completed/plan: Inject the latency fault",
+            "environment/completed/plan: Run the 30 rps load under the fault",
+            "executor/completed/plan: Check the service after the fault",
+            "lead/completed/system: Plan v1: analyse the goal and propose the first plan",
+            "lead/completed/system: Replan #1: plan drained",
+            "metrics_analyst/completed/plan: Quantify the error rate under the fault",
+            "reviewer/completed/reactor: Review run <id> before quality gate attempt 1"
+          ],
+          "records": [],
+          "evidence": [
+            "api-response: GET /health → 200",
+            "api-response: GET /kv/k2 → 200",
+            "metric",
+            "metric"
+          ]
+        }
+      },
+      "oracleRevisions": {
+        "kv-resilience": 1
+      },
+      "trialKey": "tk_f46a31c4e2ad0dc212bea07a349b0276",
+      "suiteFingerprint": "498e2f0ec31192206c7742d8b6fe2261f9fcdc877931973d95b39aa3217be63b"
+    },
+    {
+      "taskId": "fault-tolerance-errors",
+      "armId": "scripted-multi-llm",
+      "trial": 0,
+      "seed": "core@core-2/fault-tolerance-errors#0",
+      "result": "pass",
+      "graders": [
+        {
+          "graderId": "verdict",
+          "pass": true,
+          "score": 1,
+          "detail": "verdict fail (expected fail)",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "faultTolerance",
+          "pass": true,
+          "score": 1,
+          "detail": "all 6 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "noDuplicateSideEffects",
+          "pass": true,
+          "score": 1,
+          "detail": "4 effect key(s), each observed at most once; 2 operation(s) agree with the environment",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "noOrphanOperations",
+          "pass": true,
+          "score": 1,
+          "detail": "2 operation(s), all settled",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "evidenceCompleteness",
+          "pass": true,
+          "score": 1,
+          "detail": "1 finding(s)/critical claim(s) all cite existing evidence; ledger verifies",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "evidenceIntegrity",
+          "pass": true,
+          "score": 1,
+          "detail": "all 4 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "policyViolation",
+          "pass": true,
+          "score": 1,
+          "detail": "23 tool call(s) permitted; 0 denial(s), none executed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "auditReconstruction",
+          "pass": true,
+          "score": 1,
+          "detail": "all 9 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        }
+      ],
+      "outcomeMetrics": {
+        "verdictMatch": 1,
+        "criticalFalseRelease": 0,
+        "falseFail": 0,
+        "falsePositiveFindings": 0,
+        "duplicateSideEffects": 0,
+        "orphanOperations": 0,
+        "policyViolations": 0,
+        "toolDenials": 0,
+        "staleContextActions": 0,
+        "staleContextRejections": 0,
+        "staleMutations": 0,
+        "securityViolations": 0,
+        "evidenceCompleteness": 1,
+        "evidenceVerified": 1,
+        "timeToFirstEvidenceMs": 1519,
+        "confirmedDefects": 0,
+        "humanInterventions": 0,
+        "loadJobs": 1,
+        "serviceGeneration": 1
+      },
+      "trajectoryMetrics": {
+        "planRevisions": 2,
+        "planProposals": 2,
+        "workItems": 7,
+        "agents": 7,
+        "modelCalls": 23,
+        "modelFailures": 0,
+        "modelFallbacks": 0,
+        "toolCalls": 23,
+        "inputTokens": 229312,
+        "outputTokens": 2214,
+        "tokens": 231526,
+        "costUsd": 0,
+        "evidenceRecords": 4,
+        "events": 350,
+        "restarts": 0,
+        "injectedModelTimeouts": 0,
+        "modelCalls:reason-a-large": 10,
+        "modelCalls:fast-b-tools": 8,
+        "modelCalls:judge-c-review": 5,
+        "maxParallelWork": 1,
+        "distinctRoutes": 3,
+        "distinctRoleRoutes": 3
+      },
+      "durationMs": 13253,
+      "harness": "hypertest-eval@h3/in-process",
+      "suiteRevision": "ext-1",
+      "track": "cold",
+      "suiteId": "core",
+      "graderRevisions": {
+        "verdict": "1",
+        "faultTolerance": "1",
+        "noDuplicateSideEffects": "1",
+        "noOrphanOperations": "1",
+        "evidenceCompleteness": "1",
+        "evidenceIntegrity": "1",
+        "policyViolation": "1",
+        "auditReconstruction": "1"
+      },
+      "runId": "run_01M4EXRT1GR21KPEKWT4ZWCGX5",
+      "runtimeManifestId": "rm_8382c821e234d94ab1937610d78718dfe737d5c6e2531fbc92936526d4e75380",
+      "verdict": "fail",
+      "evidenceRootHash": "a23c671cf197a5e715bf722ee201630f624bf6d277276521b2ff93b434b4e369",
+      "modelRoutes": [
+        {
+          "role": "environment",
+          "routeId": "fast-b-tools",
+          "provider": "fast-b",
+          "model": "fast-b-tools-1",
+          "epochs": 2,
+          "agents": 2,
+          "calls": 6,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "executor",
+          "routeId": "fast-b-tools",
+          "provider": "fast-b",
+          "model": "fast-b-tools-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 2,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "lead",
+          "routeId": "reason-a-large",
+          "provider": "reason-a",
+          "model": "reason-a-large-1",
+          "epochs": 2,
+          "agents": 2,
+          "calls": 7,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "metrics_analyst",
+          "routeId": "reason-a-large",
+          "provider": "reason-a",
+          "model": "reason-a-large-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 3,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "reviewer",
+          "routeId": "judge-c-review",
+          "provider": "judge-c",
+          "model": "judge-c-review-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 5,
+          "switchReasons": [
+            "initial"
+          ]
+        }
+      ],
+      "canonical": {
+        "digest": "11fe3a7b6347f23f524ee0078eaaa818f9f27918ffccaabee84ea6972cf8a08a",
+        "projection": {
+          "verdict": "fail",
+          "violatedCriteria": [
+            "C3"
+          ],
+          "unknownCriteria": [],
+          "plans": [
+            {
+              "readyForGate": false,
+              "workItems": [
+                "environment: Inject the error_rate fault",
+                "environment: Run the 30 rps load under the fault",
+                "metrics_analyst: Quantify the error rate under the fault",
+                "executor: Check the service after the fault"
+              ]
+            },
+            {
+              "readyForGate": true,
+              "workItems": []
+            }
+          ],
+          "workItems": [
+            "environment/completed/plan: Inject the error_rate fault",
+            "environment/completed/plan: Run the 30 rps load under the fault",
+            "executor/completed/plan: Check the service after the fault",
+            "lead/completed/system: Plan v1: analyse the goal and propose the first plan",
+            "lead/completed/system: Replan #1: plan drained",
+            "metrics_analyst/completed/plan: Quantify the error rate under the fault",
+            "reviewer/completed/reactor: Review run <id> before quality gate attempt 1"
+          ],
+          "records": [],
+          "evidence": [
+            "api-response: GET /health → 200",
+            "api-response: GET /kv/k2 → 200",
+            "metric",
+            "metric"
+          ]
+        }
+      },
+      "oracleRevisions": {
+        "kv-resilience": 1
+      },
+      "trialKey": "tk_884881b0a3e40534ce9aa11966461f82",
+      "suiteFingerprint": "498e2f0ec31192206c7742d8b6fe2261f9fcdc877931973d95b39aa3217be63b"
+    },
+    {
+      "taskId": "evidence-missing-not-passed",
+      "armId": "scripted-multi-llm",
+      "trial": 0,
+      "seed": "core@core-2/evidence-missing-not-passed#0",
+      "result": "pass",
+      "graders": [
+        {
+          "graderId": "verdict",
+          "pass": true,
+          "score": 1,
+          "detail": "verdict inconclusive (expected inconclusive)",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "insufficientDataNotPassed",
+          "pass": true,
+          "score": 1,
+          "detail": "all 2 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "noDuplicateSideEffects",
+          "pass": true,
+          "score": 1,
+          "detail": "5 effect key(s), each observed at most once; 2 operation(s) agree with the environment",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "noOrphanOperations",
+          "pass": true,
+          "score": 1,
+          "detail": "2 operation(s), all settled",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "evidenceCompleteness",
+          "pass": true,
+          "score": 1,
+          "detail": "0 finding(s)/critical claim(s) all cite existing evidence; ledger verifies",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "evidenceIntegrity",
+          "pass": true,
+          "score": 1,
+          "detail": "all 4 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "policyViolation",
+          "pass": true,
+          "score": 1,
+          "detail": "25 tool call(s) permitted; 0 denial(s), none executed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "auditReconstruction",
+          "pass": true,
+          "score": 1,
+          "detail": "all 9 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        }
+      ],
+      "outcomeMetrics": {
+        "verdictMatch": 1,
+        "criticalFalseRelease": 0,
+        "falseFail": 0,
+        "falsePositiveFindings": 0,
+        "duplicateSideEffects": 0,
+        "orphanOperations": 0,
+        "policyViolations": 0,
+        "toolDenials": 0,
+        "staleContextActions": 0,
+        "staleContextRejections": 0,
+        "staleMutations": 0,
+        "securityViolations": 0,
+        "evidenceCompleteness": 1,
+        "evidenceVerified": 1,
+        "timeToFirstEvidenceMs": 1818,
+        "confirmedDefects": 0,
+        "humanInterventions": 0,
+        "loadJobs": 1,
+        "serviceGeneration": 2
+      },
+      "trajectoryMetrics": {
+        "planRevisions": 3,
+        "planProposals": 3,
+        "workItems": 8,
+        "agents": 8,
+        "modelCalls": 25,
+        "modelFailures": 0,
+        "modelFallbacks": 0,
+        "toolCalls": 25,
+        "inputTokens": 264128,
+        "outputTokens": 2429,
+        "tokens": 266557,
+        "costUsd": 0,
+        "evidenceRecords": 5,
+        "events": 393,
+        "restarts": 0,
+        "injectedModelTimeouts": 0,
+        "modelCalls:reason-a-large": 12,
+        "modelCalls:fast-b-tools": 8,
+        "modelCalls:judge-c-review": 5,
+        "maxParallelWork": 2,
+        "distinctRoutes": 3,
+        "distinctRoleRoutes": 3
+      },
+      "durationMs": 13344,
+      "harness": "hypertest-eval@h3/in-process",
+      "suiteRevision": "ext-1",
+      "track": "cold",
+      "suiteId": "core",
+      "graderRevisions": {
+        "verdict": "1",
+        "insufficientDataNotPassed": "1",
+        "noDuplicateSideEffects": "1",
+        "noOrphanOperations": "1",
+        "evidenceCompleteness": "1",
+        "evidenceIntegrity": "1",
+        "policyViolation": "1",
+        "auditReconstruction": "1"
+      },
+      "runId": "run_01M4EXS72JY6K99D601PGA4AB8",
+      "runtimeManifestId": "rm_8382c821e234d94ab1937610d78718dfe737d5c6e2531fbc92936526d4e75380",
+      "verdict": "inconclusive",
+      "evidenceRootHash": "d92ab1c11d1ea8c05cbb20237cfc5c28d9d7c4d13199e84c07dd08cd0e108dfc",
+      "modelRoutes": [
+        {
+          "role": "environment",
+          "routeId": "fast-b-tools",
+          "provider": "fast-b",
+          "model": "fast-b-tools-1",
+          "epochs": 2,
+          "agents": 2,
+          "calls": 6,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "executor",
+          "routeId": "fast-b-tools",
+          "provider": "fast-b",
+          "model": "fast-b-tools-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 2,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "lead",
+          "routeId": "reason-a-large",
+          "provider": "reason-a",
+          "model": "reason-a-large-1",
+          "epochs": 3,
+          "agents": 3,
+          "calls": 10,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "metrics_analyst",
+          "routeId": "reason-a-large",
+          "provider": "reason-a",
+          "model": "reason-a-large-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 2,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "reviewer",
+          "routeId": "judge-c-review",
+          "provider": "judge-c",
+          "model": "judge-c-review-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 5,
+          "switchReasons": [
+            "initial"
+          ]
+        }
+      ],
+      "canonical": {
+        "digest": "b8e77de00c8b6fc2a98a8d73030144a12f1ca17b2d6890c0e6522185b347ebf1",
+        "projection": {
+          "verdict": "inconclusive",
+          "violatedCriteria": [],
+          "unknownCriteria": [
+            "C3",
+            "C6"
+          ],
+          "plans": [
+            {
+              "readyForGate": false,
+              "workItems": [
+                "environment: Restart kv-service",
+                "environment: Run the 30 rps load job",
+                "executor: Collect the diagnostics dump",
+                "metrics_analyst: Quantify latency and error rate",
+                "reviewer: Review the run"
+              ]
+            },
+            {
+              "readyForGate": true,
+              "workItems": []
+            },
+            {
+              "readyForGate": true,
+              "workItems": []
+            }
+          ],
+          "workItems": [
+            "environment/completed/plan: Restart kv-service",
+            "environment/completed/plan: Run the 30 rps load job",
+            "executor/completed/plan: Collect the diagnostics dump",
+            "lead/completed/system: Plan v1: analyse the goal and propose the first plan",
+            "lead/completed/system: Replan #1: plan drained",
+            "lead/completed/system: Replan #2: address QualityGate feedback",
+            "metrics_analyst/completed/plan: Quantify latency and error rate",
+            "reviewer/completed/plan: Review the run"
+          ],
+          "records": [],
+          "evidence": [
+            "api-response: GET /health → 200",
+            "metric",
+            "metric",
+            "stdout",
+            "tool-output"
+          ]
+        }
+      },
+      "oracleRevisions": {
+        "kv-slo": 1
+      },
+      "trialKey": "tk_7ef26d2bbff7c4646f00624afd23b912",
+      "suiteFingerprint": "498e2f0ec31192206c7742d8b6fe2261f9fcdc877931973d95b39aa3217be63b"
+    },
+    {
+      "taskId": "multi-agent-delegation",
+      "armId": "scripted-multi-llm",
+      "trial": 0,
+      "seed": "core@core-2/multi-agent-delegation#0",
+      "result": "pass",
+      "graders": [
+        {
+          "graderId": "verdict",
+          "pass": true,
+          "score": 1,
+          "detail": "verdict fail (expected fail)",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "defectDetected",
+          "pass": true,
+          "score": 1,
+          "detail": "paginate-off-by-one: detected by rec_01M4EXT5W17X5WNQ3QK2RX0V98",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "delegation",
+          "pass": true,
+          "score": 1,
+          "detail": "all 5 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "causalChain",
+          "pass": true,
+          "score": 1,
+          "detail": "all 4 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "contextIsolation",
+          "pass": true,
+          "score": 1,
+          "detail": "all 3 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "independentReview",
+          "pass": true,
+          "score": 1,
+          "detail": "all 2 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "evidenceCompleteness",
+          "pass": true,
+          "score": 1,
+          "detail": "1 finding(s)/critical claim(s) all cite existing evidence; ledger verifies",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "evidenceIntegrity",
+          "pass": true,
+          "score": 1,
+          "detail": "all 4 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "policyViolation",
+          "pass": true,
+          "score": 1,
+          "detail": "61 tool call(s) permitted; 0 denial(s), none executed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "auditReconstruction",
+          "pass": true,
+          "score": 1,
+          "detail": "all 9 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        }
+      ],
+      "outcomeMetrics": {
+        "verdictMatch": 1,
+        "criticalFalseRelease": 0,
+        "falseFail": 0,
+        "defectRecall": 1,
+        "falsePositiveFindings": 0,
+        "orphanOperations": 0,
+        "policyViolations": 0,
+        "toolDenials": 0,
+        "staleContextActions": 0,
+        "staleContextRejections": 0,
+        "staleMutations": 0,
+        "securityViolations": 0,
+        "mutationScore": 0.2222222222222222,
+        "evidenceCompleteness": 1,
+        "evidenceVerified": 1,
+        "timeToFirstEvidenceMs": 1594,
+        "confirmedDefects": 1,
+        "independentReproductionRate": 1,
+        "costPerConfirmedDefectUsd": 0,
+        "tokensPerConfirmedDefect": 644319,
+        "humanInterventions": 0
+      },
+      "trajectoryMetrics": {
+        "planRevisions": 2,
+        "planProposals": 2,
+        "workItems": 14,
+        "agents": 14,
+        "modelCalls": 59,
+        "modelFailures": 0,
+        "modelFallbacks": 0,
+        "toolCalls": 61,
+        "inputTokens": 638976,
+        "outputTokens": 5343,
+        "tokens": 644319,
+        "costUsd": 0,
+        "evidenceRecords": 14,
+        "events": 798,
+        "restarts": 0,
+        "injectedModelTimeouts": 0,
+        "modelCalls:reason-a-large": 14,
+        "modelCalls:fast-b-tools": 24,
+        "modelCalls:judge-c-review": 21,
+        "maxParallelWork": 3,
+        "distinctRoutes": 3,
+        "distinctRoleRoutes": 3
+      },
+      "durationMs": 21415,
+      "harness": "hypertest-eval@h3/in-process",
+      "suiteRevision": "ext-1",
+      "track": "cold",
+      "suiteId": "core",
+      "graderRevisions": {
+        "verdict": "1",
+        "defectDetected": "1",
+        "delegation": "1",
+        "causalChain": "1",
+        "contextIsolation": "1",
+        "independentReview": "1",
+        "evidenceCompleteness": "1",
+        "evidenceIntegrity": "1",
+        "policyViolation": "1",
+        "auditReconstruction": "1"
+      },
+      "runId": "run_01M4EXSKZCB6Z51V8GJ3HE6M6S",
+      "runtimeManifestId": "rm_8382c821e234d94ab1937610d78718dfe737d5c6e2531fbc92936526d4e75380",
+      "verdict": "fail",
+      "evidenceRootHash": "7a7050f81d5a30033ff371508d4032405d53816f772813830dbcc8babce46be3",
+      "modelRoutes": [
+        {
+          "role": "architecture_analyst",
+          "routeId": "reason-a-large",
+          "provider": "reason-a",
+          "model": "reason-a-large-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 3,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "code_change_analyst",
+          "routeId": "reason-a-large",
+          "provider": "reason-a",
+          "model": "reason-a-large-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 2,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "executor",
+          "routeId": "fast-b-tools",
+          "provider": "fast-b",
+          "model": "fast-b-tools-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 3,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "historical_bug_analyst",
+          "routeId": "reason-a-large",
+          "provider": "reason-a",
+          "model": "reason-a-large-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 2,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "lead",
+          "routeId": "reason-a-large",
+          "provider": "reason-a",
+          "model": "reason-a-large-1",
+          "epochs": 2,
+          "agents": 2,
+          "calls": 7,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "rca",
+          "routeId": "fast-b-tools",
+          "provider": "fast-b",
+          "model": "fast-b-tools-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 5,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "reviewer",
+          "routeId": "judge-c-review",
+          "provider": "judge-c",
+          "model": "judge-c-review-1",
+          "epochs": 4,
+          "agents": 4,
+          "calls": 21,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "test_designer",
+          "routeId": "fast-b-tools",
+          "provider": "fast-b",
+          "model": "fast-b-tools-1",
+          "epochs": 3,
+          "agents": 3,
+          "calls": 16,
+          "switchReasons": [
+            "initial"
+          ]
+        }
+      ],
+      "canonical": {
+        "digest": "dfa2e1d41ea3dc9966491e6f9decdb4a6236f366f7becefe264f688f021895bf",
+        "projection": {
+          "verdict": "fail",
+          "violatedCriteria": [
+            "C2",
+            "C3"
+          ],
+          "unknownCriteria": [],
+          "plans": [
+            {
+              "readyForGate": false,
+              "workItems": [
+                "test_designer: Design the pagination contract test",
+                "test_designer: Design the transfer conservation test",
+                "executor: Execute the suite on the candidate"
+              ]
+            },
+            {
+              "readyForGate": true,
+              "workItems": []
+            }
+          ],
+          "workItems": [
+            "architecture_analyst/completed/delegation: Map the ledger library",
+            "code_change_analyst/completed/delegation: Analyse the candidate diff",
+            "executor/completed/plan: Execute the suite on the candidate",
+            "historical_bug_analyst/completed/delegation: Mine the history of src/ledger.js",
+            "lead/completed/system: Plan v1: analyse the goal and propose the first plan",
+            "lead/completed/system: Replan #1: new P0/P1 finding",
+            "rca/completed/reactor: Investigate root cause of paginate drops the last item of every page",
+            "reviewer/completed/reactor: Independently verify paginate drops the last item of every page",
+            "reviewer/completed/reactor: Review oracle consistency of test artifact <id> (tests/paginate-pages.test.js)",
+            "reviewer/completed/reactor: Review oracle consistency of test artifact <id> (tests/transfer-conservation.test.js)",
+            "reviewer/completed/reactor: Review run <id> before quality gate attempt 1",
+            "test_designer/completed/plan: Design the pagination contract test",
+            "test_designer/completed/plan: Design the transfer conservation test",
+            "test_designer/completed/reactor: Design regression test for paginate drops the last item of every page"
+          ],
+          "records": [
+            "finding/P1/product_defect/confirmed: paginate drops the last item of every page"
+          ],
+          "evidence": [
+            "git-diff",
+            "git-diff",
+            "mutation-result: killed=2 survived=7",
+            "stdout",
+            "stdout",
+            "stdout",
+            "stdout",
+            "stdout",
+            "stdout",
+            "test-result: passed=false [applyTransfer moves the amount between two accounts=passed; applyTransfer refuses a non-positive amount=passed; computeInterest over one year at 1%=passed; paginate returns every item exactly once across pages=failed; paginate returns the first page of a short list=passed; transfer conserves the total balance=passed]",
+            "test-result: passed=false [paginate returns every item exactly once across pages=failed]",
+            "test-result: passed=true [paginate returns every item exactly once across pages=passed]",
+            "test-result: passed=true [transfer conserves the total balance=passed]",
+            "test-result: passed=true [transfer conserves the total balance=passed]"
+          ]
+        }
+      },
+      "oracleRevisions": {
+        "ledger-contract": 1
+      },
+      "trialKey": "tk_2f6a3a3af3faf24f51af354a4105c4f1",
+      "suiteFingerprint": "498e2f0ec31192206c7742d8b6fe2261f9fcdc877931973d95b39aa3217be63b"
+    },
+    {
+      "taskId": "multi-agent-convergence",
+      "armId": "scripted-multi-llm",
+      "trial": 0,
+      "seed": "core@core-2/multi-agent-convergence#0",
+      "result": "pass",
+      "graders": [
+        {
+          "graderId": "verdict",
+          "pass": true,
+          "score": 1,
+          "detail": "verdict fail (expected fail)",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "defectDetected",
+          "pass": true,
+          "score": 1,
+          "detail": "negative-transfer: detected by rec_01M4EXTK79DMVDJ1E1SVGY1VKD",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "convergence",
+          "pass": true,
+          "score": 1,
+          "detail": "all 5 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "causalChain",
+          "pass": true,
+          "score": 1,
+          "detail": "all 4 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "singleLeaseOwner",
+          "pass": true,
+          "score": 1,
+          "detail": "9 claim(s), one owner at a time, monotonic fencing",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "independentReview",
+          "pass": true,
+          "score": 1,
+          "detail": "all 2 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "evidenceCompleteness",
+          "pass": true,
+          "score": 1,
+          "detail": "1 finding(s)/critical claim(s) all cite existing evidence; ledger verifies",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "evidenceIntegrity",
+          "pass": true,
+          "score": 1,
+          "detail": "all 4 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "policyViolation",
+          "pass": true,
+          "score": 1,
+          "detail": "52 tool call(s) permitted; 0 denial(s), none executed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "auditReconstruction",
+          "pass": true,
+          "score": 1,
+          "detail": "all 9 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        }
+      ],
+      "outcomeMetrics": {
+        "verdictMatch": 1,
+        "criticalFalseRelease": 0,
+        "falseFail": 0,
+        "defectRecall": 1,
+        "falsePositiveFindings": 0,
+        "duplicateSideEffects": 0,
+        "orphanOperations": 0,
+        "policyViolations": 0,
+        "toolDenials": 0,
+        "staleContextActions": 0,
+        "staleContextRejections": 0,
+        "staleMutations": 0,
+        "securityViolations": 0,
+        "evidenceCompleteness": 1,
+        "evidenceVerified": 1,
+        "timeToFirstEvidenceMs": 1572,
+        "confirmedDefects": 1,
+        "independentReproductionRate": 1,
+        "costPerConfirmedDefectUsd": 0,
+        "tokensPerConfirmedDefect": 598297,
+        "humanInterventions": 0
+      },
+      "trajectoryMetrics": {
+        "planRevisions": 2,
+        "planProposals": 2,
+        "workItems": 9,
+        "agents": 9,
+        "modelCalls": 52,
+        "modelFailures": 0,
+        "modelFallbacks": 0,
+        "toolCalls": 52,
+        "inputTokens": 593710,
+        "outputTokens": 4587,
+        "tokens": 598297,
+        "costUsd": 0,
+        "evidenceRecords": 21,
+        "events": 736,
+        "restarts": 0,
+        "injectedModelTimeouts": 0,
+        "modelCalls:reason-a-large": 7,
+        "modelCalls:fast-b-tools": 27,
+        "modelCalls:judge-c-review": 18,
+        "maxParallelWork": 4,
+        "distinctRoutes": 3,
+        "distinctRoleRoutes": 3
+      },
+      "durationMs": 16872,
+      "harness": "hypertest-eval@h3/in-process",
+      "suiteRevision": "ext-1",
+      "track": "cold",
+      "suiteId": "core",
+      "graderRevisions": {
+        "verdict": "1",
+        "defectDetected": "1",
+        "convergence": "1",
+        "causalChain": "1",
+        "singleLeaseOwner": "1",
+        "independentReview": "1",
+        "evidenceCompleteness": "1",
+        "evidenceIntegrity": "1",
+        "policyViolation": "1",
+        "auditReconstruction": "1"
+      },
+      "runId": "run_01M4EXT8W72578VGF3G5920ZR3",
+      "runtimeManifestId": "rm_8382c821e234d94ab1937610d78718dfe737d5c6e2531fbc92936526d4e75380",
+      "verdict": "fail",
+      "evidenceRootHash": "4b4160e5b5e502582924e74ebc885e00d7df604c60380ac951f398600622df6d",
+      "modelRoutes": [
+        {
+          "role": "executor",
+          "routeId": "fast-b-tools",
+          "provider": "fast-b",
+          "model": "fast-b-tools-1",
+          "epochs": 2,
+          "agents": 2,
+          "calls": 16,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "lead",
+          "routeId": "reason-a-large",
+          "provider": "reason-a",
+          "model": "reason-a-large-1",
+          "epochs": 2,
+          "agents": 2,
+          "calls": 7,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "rca",
+          "routeId": "fast-b-tools",
+          "provider": "fast-b",
+          "model": "fast-b-tools-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 5,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "reviewer",
+          "routeId": "judge-c-review",
+          "provider": "judge-c",
+          "model": "judge-c-review-1",
+          "epochs": 3,
+          "agents": 3,
+          "calls": 18,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "test_designer",
+          "routeId": "fast-b-tools",
+          "provider": "fast-b",
+          "model": "fast-b-tools-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 6,
+          "switchReasons": [
+            "initial"
+          ]
+        }
+      ],
+      "canonical": {
+        "digest": "b2ea51d6f841bf7ee50e983060fc038e5553908daac02462b2530b90da42f63f",
+        "projection": {
+          "verdict": "fail",
+          "violatedCriteria": [
+            "C2",
+            "C3"
+          ],
+          "unknownCriteria": [
+            "C12",
+            "C6"
+          ],
+          "plans": [
+            {
+              "readyForGate": false,
+              "workItems": [
+                "executor: Probe the transfer contract (probe-a)",
+                "executor: Probe the transfer contract (probe-b)"
+              ]
+            },
+            {
+              "readyForGate": true,
+              "workItems": []
+            }
+          ],
+          "workItems": [
+            "executor/completed/plan: Probe the transfer contract (probe-a)",
+            "executor/completed/plan: Probe the transfer contract (probe-b)",
+            "lead/completed/system: Plan v1: analyse the goal and propose the first plan",
+            "lead/completed/system: Replan #1: new P0/P1 finding",
+            "rca/completed/reactor: Investigate root cause of POST /transfers accepts a negative amount and moves money backwards",
+            "reviewer/completed/reactor: Independently verify POST /transfers accepts a negative amount and moves money backwards",
+            "reviewer/completed/reactor: Review oracle consistency of test artifact <id> (regression/negative-transfer.test.mjs)",
+            "reviewer/completed/reactor: Review run <id> before quality gate attempt 1",
+            "test_designer/completed/reactor: Design regression test for POST /transfers accepts a negative amount and moves money backwards"
+          ],
+          "records": [
+            "finding/P1/product_defect/confirmed: POST /transfers accepts a negative amount and moves money backwards"
+          ],
+          "evidence": [
+            "api-response: GET /accounts/acc-1 → 200",
+            "api-response: GET /accounts/acc-2 → 200",
+            "api-response: GET /health → 200",
+            "api-response: GET /health → 200",
+            "api-response: POST /accounts → 201",
+            "api-response: POST /accounts → 201",
+            "api-response: POST /accounts → 201",
+            "api-response: POST /accounts → 201",
+            "api-response: POST /accounts → 201",
+            "api-response: POST /accounts → 201",
+            "api-response: POST /transfers → 201",
+            "api-response: POST /transfers → 201",
+            "api-response: POST /transfers → 201",
+            "api-response: POST /transfers → 201",
+            "api-response: POST /transfers → 400",
+            "api-response: POST /transfers → 400",
+            "inconclusive",
+            "inconclusive",
+            "stdout",
+            "stdout",
+            "test-result: passed=false [a negative transfer amount is rejected with 400=failed]"
+          ]
+        }
+      },
+      "oracleRevisions": {
+        "bank-api": 1
+      },
+      "trialKey": "tk_17241aa639c7fb58e71d2561a8a03f9f",
+      "suiteFingerprint": "498e2f0ec31192206c7742d8b6fe2261f9fcdc877931973d95b39aa3217be63b"
+    },
+    {
+      "taskId": "chaos-kill-after-success",
+      "armId": "scripted-multi-llm",
+      "trial": 0,
+      "seed": "core@core-2/chaos-kill-after-success#0",
+      "result": "pass",
+      "graders": [
+        {
+          "graderId": "verdict",
+          "pass": true,
+          "score": 1,
+          "detail": "verdict pass (expected pass)",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "noDuplicateSideEffects",
+          "pass": true,
+          "score": 1,
+          "detail": "5 effect key(s), each observed at most once; 2 operation(s) agree with the environment",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "noOrphanOperations",
+          "pass": true,
+          "score": 1,
+          "detail": "2 operation(s), all settled",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "recoveryAudit",
+          "pass": true,
+          "score": 1,
+          "detail": "all 3 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "loadJobReattached",
+          "pass": true,
+          "score": 1,
+          "detail": "all 4 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "evidenceIntegrity",
+          "pass": true,
+          "score": 1,
+          "detail": "all 4 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "policyViolation",
+          "pass": true,
+          "score": 1,
+          "detail": "27 tool call(s) permitted; 1 denial(s), none executed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "auditReconstruction",
+          "pass": true,
+          "score": 1,
+          "detail": "all 9 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        }
+      ],
+      "outcomeMetrics": {
+        "verdictMatch": 1,
+        "criticalFalseRelease": 0,
+        "falseFail": 0,
+        "falsePositiveFindings": 0,
+        "duplicateSideEffects": 0,
+        "orphanOperations": 0,
+        "policyViolations": 0,
+        "toolDenials": 1,
+        "staleContextActions": 0,
+        "staleContextRejections": 1,
+        "staleMutations": 0,
+        "securityViolations": 0,
+        "evidenceCompleteness": 1,
+        "evidenceVerified": 1,
+        "timeToFirstEvidenceMs": 1753,
+        "confirmedDefects": 0,
+        "humanInterventions": 0,
+        "recoveryCorrectness": 1,
+        "loadJobs": 1,
+        "serviceGeneration": 2
+      },
+      "trajectoryMetrics": {
+        "planRevisions": 2,
+        "planProposals": 2,
+        "workItems": 7,
+        "agents": 7,
+        "modelCalls": 27,
+        "modelFailures": 0,
+        "modelFallbacks": 0,
+        "toolCalls": 27,
+        "inputTokens": 267995,
+        "outputTokens": 2413,
+        "tokens": 270408,
+        "costUsd": 0,
+        "evidenceRecords": 8,
+        "events": 402,
+        "restarts": 1,
+        "injectedModelTimeouts": 0,
+        "modelCalls:reason-a-large": 12,
+        "modelCalls:fast-b-tools": 9,
+        "modelCalls:judge-c-review": 6,
+        "maxParallelWork": 2,
+        "distinctRoutes": 3,
+        "distinctRoleRoutes": 3
+      },
+      "durationMs": 15059,
+      "harness": "hypertest-eval@h3/in-process",
+      "suiteRevision": "ext-1",
+      "track": "cold",
+      "suiteId": "core",
+      "graderRevisions": {
+        "verdict": "1",
+        "noDuplicateSideEffects": "1",
+        "noOrphanOperations": "1",
+        "recoveryAudit": "1",
+        "loadJobReattached": "1",
+        "evidenceIntegrity": "1",
+        "policyViolation": "1",
+        "auditReconstruction": "1"
+      },
+      "runId": "run_01M4EXTSN2JJKPNHY2VBD6B7R4",
+      "runtimeManifestId": "rm_8382c821e234d94ab1937610d78718dfe737d5c6e2531fbc92936526d4e75380",
+      "verdict": "pass",
+      "evidenceRootHash": "e06536878cad4b6bf358a8b61a171d656205bfa61980e9a1a0c3068c8afd2bb1",
+      "modelRoutes": [
+        {
+          "role": "environment",
+          "routeId": "fast-b-tools",
+          "provider": "fast-b",
+          "model": "fast-b-tools-1",
+          "epochs": 2,
+          "agents": 2,
+          "calls": 6,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "executor",
+          "routeId": "fast-b-tools",
+          "provider": "fast-b",
+          "model": "fast-b-tools-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 3,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "lead",
+          "routeId": "reason-a-large",
+          "provider": "reason-a",
+          "model": "reason-a-large-1",
+          "epochs": 2,
+          "agents": 2,
+          "calls": 7,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "metrics_analyst",
+          "routeId": "reason-a-large",
+          "provider": "reason-a",
+          "model": "reason-a-large-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 5,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "reviewer",
+          "routeId": "judge-c-review",
+          "provider": "judge-c",
+          "model": "judge-c-review-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 6,
+          "switchReasons": [
+            "initial"
+          ]
+        }
+      ],
+      "canonical": {
+        "digest": "14e2db4db098fce890cc3b540967887a336120174d6d37edfe8d6c4d3f6baf6c",
+        "projection": {
+          "verdict": "pass",
+          "violatedCriteria": [],
+          "unknownCriteria": [],
+          "plans": [
+            {
+              "readyForGate": false,
+              "workItems": [
+                "environment: Restart kv-service",
+                "environment: Run the 30 rps load job",
+                "executor: Collect the diagnostics dump",
+                "metrics_analyst: Quantify latency and error rate",
+                "reviewer: Review the run"
+              ]
+            },
+            {
+              "readyForGate": true,
+              "workItems": []
+            }
+          ],
+          "workItems": [
+            "environment/completed/plan: Restart kv-service",
+            "environment/completed/plan: Run the 30 rps load job",
+            "executor/completed/plan: Collect the diagnostics dump",
+            "lead/completed/system: Plan v1: analyse the goal and propose the first plan",
+            "lead/completed/system: Replan #1: plan drained",
+            "metrics_analyst/completed/plan: Quantify latency and error rate",
+            "reviewer/completed/plan: Review the run"
+          ],
+          "records": [],
+          "evidence": [
+            "api-response: GET /health → 200",
+            "metric",
+            "metric",
+            "metric",
+            "stdout",
+            "stdout",
+            "tool-output",
+            "tool-output"
+          ]
+        }
+      },
+      "oracleRevisions": {
+        "kv-slo": 1
+      },
+      "trialKey": "tk_7ef178183bde280855da0a96c729763b",
+      "suiteFingerprint": "498e2f0ec31192206c7742d8b6fe2261f9fcdc877931973d95b39aa3217be63b"
+    },
+    {
+      "taskId": "chaos-budget-exhaustion",
+      "armId": "scripted-multi-llm",
+      "trial": 0,
+      "seed": "core@core-2/chaos-budget-exhaustion#0",
+      "result": "pass",
+      "graders": [
+        {
+          "graderId": "verdict",
+          "pass": true,
+          "score": 1,
+          "detail": "verdict inconclusive (expected inconclusive)",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "budgetExhaustion",
+          "pass": true,
+          "score": 1,
+          "detail": "all 4 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "noOrphanOperations",
+          "pass": true,
+          "score": 1,
+          "detail": "1 operation(s), all settled",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "evidenceIntegrity",
+          "pass": true,
+          "score": 1,
+          "detail": "all 4 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "policyViolation",
+          "pass": true,
+          "score": 1,
+          "detail": "9 tool call(s) permitted; 0 denial(s), none executed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "auditReconstruction",
+          "pass": true,
+          "score": 1,
+          "detail": "all 9 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        }
+      ],
+      "outcomeMetrics": {
+        "verdictMatch": 1,
+        "criticalFalseRelease": 0,
+        "falseFail": 0,
+        "falsePositiveFindings": 0,
+        "duplicateSideEffects": 0,
+        "orphanOperations": 0,
+        "policyViolations": 0,
+        "toolDenials": 0,
+        "staleContextActions": 0,
+        "staleContextRejections": 0,
+        "staleMutations": 0,
+        "securityViolations": 0,
+        "evidenceCompleteness": 1,
+        "evidenceVerified": 1,
+        "timeToFirstEvidenceMs": 2067,
+        "confirmedDefects": 0,
+        "humanInterventions": 1,
+        "loadJobs": 0,
+        "serviceGeneration": 2
+      },
+      "trajectoryMetrics": {
+        "planRevisions": 1,
+        "planProposals": 1,
+        "workItems": 6,
+        "agents": 3,
+        "modelCalls": 9,
+        "modelFailures": 0,
+        "modelFallbacks": 0,
+        "toolCalls": 9,
+        "inputTokens": 100298,
+        "outputTokens": 1205,
+        "tokens": 101503,
+        "costUsd": 0,
+        "evidenceRecords": 3,
+        "events": 161,
+        "restarts": 0,
+        "injectedModelTimeouts": 0,
+        "modelCalls:reason-a-large": 4,
+        "modelCalls:fast-b-tools": 5,
+        "maxParallelWork": 3,
+        "distinctRoutes": 2,
+        "distinctRoleRoutes": 2
+      },
+      "durationMs": 6614,
+      "harness": "hypertest-eval@h3/in-process",
+      "suiteRevision": "ext-1",
+      "track": "cold",
+      "suiteId": "core",
+      "graderRevisions": {
+        "verdict": "1",
+        "budgetExhaustion": "1",
+        "noOrphanOperations": "1",
+        "evidenceIntegrity": "1",
+        "policyViolation": "1",
+        "auditReconstruction": "1"
+      },
+      "runId": "run_01M4EXV8EAC7QGPJX58KBRBK0G",
+      "runtimeManifestId": "rm_8382c821e234d94ab1937610d78718dfe737d5c6e2531fbc92936526d4e75380",
+      "verdict": "inconclusive",
+      "evidenceRootHash": "bbb7b1410399792e3085b4e3bfa9b39e2a912ca7aa65e034c7fa8ac1e7c36692",
+      "modelRoutes": [
+        {
+          "role": "environment",
+          "routeId": "fast-b-tools",
+          "provider": "fast-b",
+          "model": "fast-b-tools-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 3,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "executor",
+          "routeId": "fast-b-tools",
+          "provider": "fast-b",
+          "model": "fast-b-tools-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 2,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "lead",
+          "routeId": "reason-a-large",
+          "provider": "reason-a",
+          "model": "reason-a-large-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 4,
+          "switchReasons": [
+            "initial"
+          ]
+        }
+      ],
+      "canonical": {
+        "digest": "62255bb0761debe3144fad9ee3f7f6f06c21d3bf7720dcd79ba2370c33a28648",
+        "projection": {
+          "verdict": "inconclusive",
+          "violatedCriteria": [
+            "C6"
+          ],
+          "unknownCriteria": [
+            "C10",
+            "C3",
+            "C4"
+          ],
+          "plans": [
+            {
+              "readyForGate": false,
+              "workItems": [
+                "environment: Restart kv-service",
+                "environment: Run the 30 rps load job",
+                "executor: Collect the diagnostics dump",
+                "metrics_analyst: Quantify latency and error rate",
+                "reviewer: Review the run"
+              ]
+            }
+          ],
+          "workItems": [
+            "environment/cancelled/plan: Run the 30 rps load job",
+            "environment/completed/plan: Restart kv-service",
+            "executor/completed/plan: Collect the diagnostics dump",
+            "lead/completed/system: Plan v1: analyse the goal and propose the first plan",
+            "metrics_analyst/cancelled/plan: Quantify latency and error rate",
+            "reviewer/cancelled/plan: Review the run"
+          ],
+          "records": [],
+          "evidence": [
+            "api-response: GET /health → 200",
+            "stdout",
+            "tool-output"
+          ]
+        }
+      },
+      "oracleRevisions": {
+        "kv-slo": 1
+      },
+      "trialKey": "tk_5b61206897aa4a1053985a54b92a407e",
+      "suiteFingerprint": "498e2f0ec31192206c7742d8b6fe2261f9fcdc877931973d95b39aa3217be63b"
+    },
+    {
+      "taskId": "chaos-competing-faults",
+      "armId": "scripted-multi-llm",
+      "trial": 0,
+      "seed": "core@core-2/chaos-competing-faults#0",
+      "result": "pass",
+      "graders": [
+        {
+          "graderId": "verdict",
+          "pass": true,
+          "score": 1,
+          "detail": "verdict fail (expected fail)",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "competingFaultsIsolated",
+          "pass": true,
+          "score": 1,
+          "detail": "all 5 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "noDuplicateSideEffects",
+          "pass": true,
+          "score": 1,
+          "detail": "3 effect key(s), each observed at most once; 4 operation(s) agree with the environment",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "noOrphanOperations",
+          "pass": true,
+          "score": 1,
+          "detail": "4 operation(s), all settled",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "evidenceIntegrity",
+          "pass": true,
+          "score": 1,
+          "detail": "all 4 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "policyViolation",
+          "pass": true,
+          "score": 1,
+          "detail": "31 tool call(s) permitted; 0 denial(s), none executed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "auditReconstruction",
+          "pass": true,
+          "score": 1,
+          "detail": "all 9 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        }
+      ],
+      "outcomeMetrics": {
+        "verdictMatch": 1,
+        "criticalFalseRelease": 0,
+        "falseFail": 0,
+        "falsePositiveFindings": 0,
+        "duplicateSideEffects": 0,
+        "orphanOperations": 0,
+        "policyViolations": 0,
+        "toolDenials": 0,
+        "staleContextActions": 0,
+        "staleContextRejections": 0,
+        "staleMutations": 0,
+        "securityViolations": 0,
+        "evidenceCompleteness": 1,
+        "evidenceVerified": 1,
+        "timeToFirstEvidenceMs": 6244,
+        "confirmedDefects": 0,
+        "humanInterventions": 0,
+        "loadJobs": 2,
+        "serviceGeneration": 1
+      },
+      "trajectoryMetrics": {
+        "planRevisions": 2,
+        "planProposals": 2,
+        "workItems": 7,
+        "agents": 7,
+        "modelCalls": 31,
+        "modelFailures": 0,
+        "modelFallbacks": 0,
+        "toolCalls": 31,
+        "inputTokens": 304463,
+        "outputTokens": 2936,
+        "tokens": 307399,
+        "costUsd": 0,
+        "evidenceRecords": 4,
+        "events": 444,
+        "restarts": 0,
+        "injectedModelTimeouts": 0,
+        "modelCalls:reason-a-large": 12,
+        "modelCalls:fast-b-tools": 12,
+        "modelCalls:judge-c-review": 7,
+        "maxParallelWork": 2,
+        "distinctRoutes": 3,
+        "distinctRoleRoutes": 3
+      },
+      "durationMs": 21462,
+      "harness": "hypertest-eval@h3/in-process",
+      "suiteRevision": "ext-1",
+      "track": "cold",
+      "suiteId": "core",
+      "graderRevisions": {
+        "verdict": "1",
+        "competingFaultsIsolated": "1",
+        "noDuplicateSideEffects": "1",
+        "noOrphanOperations": "1",
+        "evidenceIntegrity": "1",
+        "policyViolation": "1",
+        "auditReconstruction": "1"
+      },
+      "runId": "run_01M4EXVEZA48RTKFJ00KS3B65Z",
+      "runtimeManifestId": "rm_8382c821e234d94ab1937610d78718dfe737d5c6e2531fbc92936526d4e75380",
+      "verdict": "fail",
+      "evidenceRootHash": "ae8682d1a35549c615e7d3d0c6351e19d535170e3f5492654e3a63683fb3057e",
+      "modelRoutes": [
+        {
+          "role": "environment",
+          "routeId": "fast-b-tools",
+          "provider": "fast-b",
+          "model": "fast-b-tools-1",
+          "epochs": 2,
+          "agents": 2,
+          "calls": 12,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "lead",
+          "routeId": "reason-a-large",
+          "provider": "reason-a",
+          "model": "reason-a-large-1",
+          "epochs": 2,
+          "agents": 2,
+          "calls": 6,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "metrics_analyst",
+          "routeId": "reason-a-large",
+          "provider": "reason-a",
+          "model": "reason-a-large-1",
+          "epochs": 2,
+          "agents": 2,
+          "calls": 6,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "reviewer",
+          "routeId": "judge-c-review",
+          "provider": "judge-c",
+          "model": "judge-c-review-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 7,
+          "switchReasons": [
+            "initial"
+          ]
+        }
+      ],
+      "canonical": {
+        "digest": "a83d76e3f0ef3468c10d31965e5672994c0c26a894aa78a25ca03631989e45cb",
+        "projection": {
+          "verdict": "fail",
+          "violatedCriteria": [
+            "C3"
+          ],
+          "unknownCriteria": [],
+          "plans": [
+            {
+              "readyForGate": false,
+              "workItems": [
+                "environment: Fault experiment: latency",
+                "environment: Fault experiment: error_rate",
+                "metrics_analyst: Error rate under the latency fault",
+                "metrics_analyst: Error rate under the error_rate fault"
+              ]
+            },
+            {
+              "readyForGate": true,
+              "workItems": []
+            }
+          ],
+          "workItems": [
+            "environment/completed/plan: Fault experiment: error_rate",
+            "environment/completed/plan: Fault experiment: latency",
+            "lead/completed/system: Plan v1: analyse the goal and propose the first plan",
+            "lead/completed/system: Replan #1: plan drained",
+            "metrics_analyst/completed/plan: Error rate under the error_rate fault",
+            "metrics_analyst/completed/plan: Error rate under the latency fault",
+            "reviewer/completed/reactor: Review run <id> before quality gate attempt 1"
+          ],
+          "records": [],
+          "evidence": [
+            "metric",
+            "metric",
+            "metric",
+            "metric"
+          ]
+        }
+      },
+      "oracleRevisions": {
+        "kv-resilience": 1
+      },
+      "trialKey": "tk_0dd511f6a4548bd6d9d190d340d3750a",
+      "suiteFingerprint": "498e2f0ec31192206c7742d8b6fe2261f9fcdc877931973d95b39aa3217be63b"
+    },
+    {
+      "taskId": "chaos-unqueryable-target",
+      "armId": "scripted-multi-llm",
+      "trial": 0,
+      "seed": "core@core-2/chaos-unqueryable-target#0",
+      "result": "pass",
+      "graders": [
+        {
+          "graderId": "verdict",
+          "pass": true,
+          "score": 1,
+          "detail": "verdict pass (expected pass)",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "unqueryableEscalated",
+          "pass": true,
+          "score": 1,
+          "detail": "all 5 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "noOrphanOperations",
+          "pass": true,
+          "score": 1,
+          "detail": "1 operation(s), all settled",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "evidenceIntegrity",
+          "pass": true,
+          "score": 1,
+          "detail": "all 4 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "policyViolation",
+          "pass": true,
+          "score": 1,
+          "detail": "15 tool call(s) permitted; 0 denial(s), none executed",
+          "revision": "1",
+          "outcome": "pass"
+        },
+        {
+          "graderId": "auditReconstruction",
+          "pass": true,
+          "score": 1,
+          "detail": "all 9 checks passed",
+          "revision": "1",
+          "outcome": "pass"
+        }
+      ],
+      "outcomeMetrics": {
+        "verdictMatch": 1,
+        "criticalFalseRelease": 0,
+        "falseFail": 0,
+        "falsePositiveFindings": 0,
+        "duplicateSideEffects": 0,
+        "orphanOperations": 0,
+        "policyViolations": 0,
+        "toolDenials": 0,
+        "staleContextActions": 0,
+        "staleContextRejections": 0,
+        "staleMutations": 0,
+        "securityViolations": 0,
+        "evidenceCompleteness": 1,
+        "evidenceVerified": 1,
+        "timeToFirstEvidenceMs": 2795,
+        "confirmedDefects": 0,
+        "humanInterventions": 1,
+        "recoveryCorrectness": 1
+      },
+      "trajectoryMetrics": {
+        "planRevisions": 2,
+        "planProposals": 2,
+        "workItems": 4,
+        "agents": 4,
+        "modelCalls": 14,
+        "modelFailures": 0,
+        "modelFallbacks": 0,
+        "toolCalls": 15,
+        "inputTokens": 148209,
+        "outputTokens": 990,
+        "tokens": 149199,
+        "costUsd": 0,
+        "evidenceRecords": 1,
+        "events": 227,
+        "restarts": 1,
+        "injectedModelTimeouts": 0,
+        "modelCalls:reason-a-large": 7,
+        "modelCalls:fast-b-tools": 3,
+        "modelCalls:judge-c-review": 4,
+        "maxParallelWork": 2,
+        "distinctRoutes": 3,
+        "distinctRoleRoutes": 3
+      },
+      "durationMs": 8433,
+      "harness": "hypertest-eval@h3/in-process",
+      "suiteRevision": "ext-1",
+      "track": "cold",
+      "suiteId": "core",
+      "graderRevisions": {
+        "verdict": "1",
+        "unqueryableEscalated": "1",
+        "noOrphanOperations": "1",
+        "evidenceIntegrity": "1",
+        "policyViolation": "1",
+        "auditReconstruction": "1"
+      },
+      "runId": "run_01M4EXW43Z8DP0M04ABY89Y2R9",
+      "runtimeManifestId": "rm_8382c821e234d94ab1937610d78718dfe737d5c6e2531fbc92936526d4e75380",
+      "verdict": "pass",
+      "evidenceRootHash": "ccd715dbe2fc319533b9a28629bdc4803ec1955f63612796ca8430901c0748ad",
+      "modelRoutes": [
+        {
+          "role": "executor",
+          "routeId": "fast-b-tools",
+          "provider": "fast-b",
+          "model": "fast-b-tools-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 3,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "lead",
+          "routeId": "reason-a-large",
+          "provider": "reason-a",
+          "model": "reason-a-large-1",
+          "epochs": 2,
+          "agents": 2,
+          "calls": 7,
+          "switchReasons": [
+            "initial"
+          ]
+        },
+        {
+          "role": "reviewer",
+          "routeId": "judge-c-review",
+          "provider": "judge-c",
+          "model": "judge-c-review-1",
+          "epochs": 1,
+          "agents": 1,
+          "calls": 4,
+          "switchReasons": [
+            "initial"
+          ]
+        }
+      ],
+      "canonical": {
+        "digest": "dccf97258d495ce113cc713472ed097bac52a1e8c98df0a575392c11096d177c",
+        "projection": {
+          "verdict": "pass",
+          "violatedCriteria": [],
+          "unknownCriteria": [],
+          "plans": [
+            {
+              "readyForGate": false,
+              "workItems": [
+                "executor: Publish the maintenance flag"
+              ]
+            },
+            {
+              "readyForGate": true,
+              "workItems": []
+            }
+          ],
+          "workItems": [
+            "executor/completed/plan: Publish the maintenance flag",
+            "lead/completed/system: Plan v1: analyse the goal and propose the first plan",
+            "lead/completed/system: Replan #1: plan drained",
+            "reviewer/completed/reactor: Review run <id> before quality gate attempt 1"
+          ],
+          "records": [],
+          "evidence": [
+            "api-response: GET /kv/maintenance → 200"
+          ]
+        }
+      },
+      "oracleRevisions": {
+        "kv-flag": 1
+      },
+      "trialKey": "tk_9f5c96c9bc674d48062efb8aab0063f6",
+      "suiteFingerprint": "498e2f0ec31192206c7742d8b6fe2261f9fcdc877931973d95b39aa3217be63b"
     }
   ],
   "perArm": {
@@ -1553,52 +4700,67 @@
       "passRate": 1,
       "passHatK": 1,
       "metrics": {
-        "trials": 7,
-        "graded": 7,
+        "trials": 19,
+        "graded": 19,
         "infraErrors": 0,
-        "durationMs": 8860.42857142857,
+        "durationMs": 15217.473684210527,
+        "confirmedDefects": 0.3157894736842105,
+        "costPerConfirmedDefectUsd": 0,
         "criticalFalseRelease": 0,
-        "defectRecall": 0.6666666666666666,
+        "defectRecall": 0.8571428571428571,
         "duplicateSideEffects": 0,
         "evidenceCompleteness": 1,
         "evidenceVerified": 1,
         "falseFail": 0,
         "falsePositiveFindings": 0,
-        "mutationScore": 0.125,
+        "humanInterventions": 0.10526315789473684,
+        "independentReproductionRate": 1,
+        "loadJobs": 1,
+        "mutationScore": 0.14930555555555555,
         "orphanOperations": 0,
         "policyViolations": 0,
+        "recoveryCorrectness": 1,
         "securityViolations": 0,
-        "serviceGeneration": 2,
+        "serviceGeneration": 1.6666666666666667,
         "staleContextActions": 0,
-        "staleContextRejections": 0.14285714285714285,
+        "staleContextRejections": 0.15789473684210525,
         "staleMutations": 0,
-        "timeToFirstEvidenceMs": 1686.2857142857142,
-        "toolDenials": 1.1428571428571428,
+        "timeToFirstEvidenceMs": 2380.0526315789475,
+        "tokensPerConfirmedDefect": 505095.8333333333,
+        "toolDenials": 0.5789473684210527,
         "verdictMatch": 1,
-        "traj.agents": 6.428571428571429,
+        "traj.agents": 7.368421052631579,
         "traj.costUsd": 0,
-        "traj.distinctRoleRoutes": 3,
-        "traj.distinctRoutes": 3,
-        "traj.events": 289.2857142857143,
-        "traj.evidenceRecords": 4.857142857142857,
+        "traj.distinctRoleRoutes": 2.9473684210526314,
+        "traj.distinctRoutes": 2.9473684210526314,
+        "traj.events": 435.1578947368421,
+        "traj.evidenceRecords": 7.157894736842105,
         "traj.injectedModelTimeouts": 0,
-        "traj.inputTokens": 218433,
-        "traj.maxParallelWork": 1.7142857142857142,
-        "traj.modelCalls": 24.571428571428573,
-        "traj.modelCalls:fast-b-tools": 10.714285714285714,
-        "traj.modelCalls:judge-c-review": 5.571428571428571,
-        "traj.modelCalls:reason-a-large": 8.285714285714286,
-        "traj.modelFailures": 0.14285714285714285,
-        "traj.modelFallbacks": 0.14285714285714285,
-        "traj.outputTokens": 2075.4285714285716,
-        "traj.planProposals": 2.4285714285714284,
-        "traj.planRevisions": 2.4285714285714284,
-        "traj.restarts": 0,
-        "traj.tokens": 220508.42857142858,
-        "traj.toolCalls": 23.571428571428573,
-        "traj.workItems": 6.428571428571429
+        "traj.inputTokens": 328615.84210526315,
+        "traj.maxParallelWork": 2.3157894736842106,
+        "traj.modelCalls": 30.63157894736842,
+        "traj.modelCalls:fast-b-tools": 12.105263157894736,
+        "traj.modelCalls:judge-c-review": 9.11111111111111,
+        "traj.modelCalls:reason-a-large": 9.894736842105264,
+        "traj.modelFailures": 0.05263157894736842,
+        "traj.modelFallbacks": 0.05263157894736842,
+        "traj.outputTokens": 2704.8947368421054,
+        "traj.planProposals": 2.1578947368421053,
+        "traj.planRevisions": 2.1578947368421053,
+        "traj.restarts": 0.10526315789473684,
+        "traj.tokens": 331320.7368421053,
+        "traj.toolCalls": 30.31578947368421,
+        "traj.workItems": 7.526315789473684
+      },
+      "passAtK": {
+        "1": 1
+      },
+      "passHatKByK": {
+        "1": 1
       }
     }
   },
-  "comparisons": []
+  "comparisons": [],
+  "suiteFingerprint": "498e2f0ec31192206c7742d8b6fe2261f9fcdc877931973d95b39aa3217be63b",
+  "track": "cold"
 }

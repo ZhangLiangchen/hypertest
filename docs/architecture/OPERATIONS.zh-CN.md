@@ -137,8 +137,10 @@ embedder。代码工具（`code.symbols`、`code.references`）和提示中的�
 ### 工具面：URL 目标、MCP、ACP、远程 worker、gRPC、computer use、观测、隔离层级
 
 针对 URL 的黑盒运行：`tools.httpAllowlist` 中的每个 URL 都成为环境 `url-<host>-<port>`（回环地址为 `local` 类别，
-否则为 `tools.urlEnvironmentClass`，默认 `sandbox`——绝不要把生产 URL 以更低的类别加入允许列表）。
-`hypertest run --url http://127.0.0.1:8080 --goal …` 以它为目标；没有任何环境提供的 URL 会被拒绝。
+否则为 `tools.urlEnvironmentClass`——绝不要把生产 URL 以更低的类别加入允许列表）。`tools.urlEnvironmentClass`
+没有默认值：未设置时，非回环 URL 不会成为环境（会有一条警告指出它），因为类别决定 Agent 在那里能做什么（在
+`sandbox` 上，默认策略允许无需审批的写入与删除）。`hypertest run "<goal>" --url http://127.0.0.1:8080` 以它为目标；
+没有任何环境提供的 URL 会被拒绝。
 
 ```yaml
 tools:
@@ -165,7 +167,9 @@ environments:
 ```
 
 远程 worker：`HT_WORKER_SECRET=… hypertest -c worker.yaml tool-worker --tools http.request,metrics.query --id w1
---listen 0.0.0.0:7441`（密钥至少 32 个字符，只给变量名）。带有自身副作用适配器的工具（env.*、load.*）不能委派。
+--listen 0.0.0.0:7441`（密钥至少 16 个字符，只给变量名）。带有自身副作用适配器的工具（env.*、load.*）不能委派。
+请求与应答都经过 HMAC 签名；应答的签名还覆盖它所应答的请求，因此截获的应答永远不会被另一次调用接受。主进程与
+其 worker 需要一起升级（旧版 worker 的应答将无法通过校验）。
 
 观测工具（全部为只读）：`logs.query`（监督器输出——用 `--log-file` 启动监督器——、`docker logs`、`kubectl logs`、
 声明的文件）、`trace.query`（OTLP/JSON 文件、Jaeger、Tempo）、`net.capture`（环境 host:port 的 pcap；需要具备抓包
@@ -175,8 +179,9 @@ mysql）。`test.run` 与 `shell.exec` 接受 `captureNetwork: true`，记录其
 
 故障注入：`env.inject_fault` 的类型为 `latency`/`error_rate`（进程环境）、`pause`/`kill`/`network_disconnect`/`netem`
 （docker；netem 需要容器内有 `tc` 与 NET_ADMIN）、`pod_delete`/`scale_zero`/`network_deny`（kubectl）。故障有时限：
-即使 Hypertest 停止，独立的回滚进程也会在 `durationMs` 到期时撤销故障（作业位于 `<dataDir>/state/faults/<operationId>`）。
-回滚失败时，该环境拒绝后续操作，直到你修复它并删除该作业目录。
+独立的回滚进程在故障施加之前启动，即使 Hypertest 停止，也会在 `durationMs` 到期时撤销故障（作业位于
+`<dataDir>/state/faults/<operationId>`）。结果未知的施加（命令超时，或 Hypertest 在其运行期间退出）按已施加处理：
+它阻止同一环境上的第二个故障，并在到期时被撤销。回滚失败时，该环境拒绝后续操作，直到你修复它并删除该作业目录。
 
 隔离层级与沙箱键——每个被接受的键都会被执行，否则启动或命令被拒绝：
 
@@ -292,11 +297,16 @@ Oracle、预算与门禁设置属于运行输入，不在清单中。`GET /healt
 | 步骤 | 命令 | 说明 |
 |---|---|---|
 | 1. 注册 | `hypertest runtime register --by <name> [--allow-migration <schema>:<from>=><to> …]` | 清单成为 `candidate`。`--allow-migration` 指定较早发布的运行在迁移到本发布时可以采用的 schema 变化；注册时即固定。要注册另一个安装的清单，先在那里用 `hypertest runtime show current --json > manifest.json` 导出，再执行 `register --manifest manifest.json`。 |
-| 2. 引擎契约 | 运行所用引擎的 AgentEngine 契约套件（`node scripts/run-tests.mjs --package runtime`、`--package runtime-pi`、`--package runtime-dsh`），然后执行 `hypertest runtime record-suite current --kind engine_contract --suite agent-engine-contract --passed --total <n> --by ci:<pipeline>` | 失败用 `--failed --failures <n>` 记录。声称通过但有失败用例或零个用例的结果会被拒绝。 |
-| 3. 回放 | `hypertest eval run core --arms scripted-multi-llm --out core.json`，然后执行 `hypertest runtime record-suite current --kind replay --from-eval core.json --by ci:<pipeline>` | `--from-eval` 从 SuiteResult 中读取套件 id、修订与结果（所有试验都必须通过），并把记录绑定到文件的 sha256。`--arms config` 评测配置中自己的模型（需要设置其密钥变量）。可先用 `hypertest eval gate --baseline <file> --candidate core.json` 与基线比较。 |
-| 4. Shadow | `hypertest runtime promote current --by <name> --reason "…"` | candidate → shadow。每次晋级都要求该清单最新的 `engine_contract` 与 `replay` 结果为通过；之后记录的失败结果会阻止下一步。shadow 发布不会在存储中启动运行（评测试验使用各自的全新存储）。 |
-| 5. Canary | `hypertest runtime promote current --by <name> --reason "…" --canary-percent 10 [--canary-label key=value …]` | shadow → canary。进入 canary 需要选择条件：新运行 id 的比例和/或标签（`hypertest run --label key=value`）。最多一个 canary。 |
-| 6. 激活 | `hypertest runtime promote current --by <name> --reason "…"` | canary → active。active 指针移动；上一个 active 发布变为 `retiring`（其存活运行继续在其上运行），当没有存活运行固定在它上面时退役（`runtime list` 与 `promote` 会让已排空的发布退役）。 |
+| 2. 引擎契约 | `hypertest runtime record-suite current --kind engine_contract --run --by ci:<pipeline>` 在本安装上执行本运行时所固定引擎的 AgentEngine 契约套件（绑定方式：在此执行）。也可以由 CI 证明：`--kind engine_contract --suite agent-engine-contract --passed --report <tap-file> --total <n> --by ci:<pipeline>` | 证明会记录报告的 sha256（没有 `--report` 的 `--passed` 会被拒绝）。失败用 `--failed --failures <n>` 记录。声称通过但有失败用例或零个用例的结果会被拒绝。 |
+| 3. 兼容性 | `hypertest eval run <suite> --arms deployment --out compat.json`，然后执行 `hypertest runtime record-suite current --kind compatibility --from-eval compat.json --by ci:<pipeline>` | `deployment` 臂评测的正是本配置文件，因此其试验运行在本清单之下。只有当**每个**试验都运行在它所证明的清单之下时，通过的结果才会被接受（其他运行时的评测文件、试验未记录清单的文件、或被取消的 `eval run` 的部分结果都会被拒绝）；文件摘要会被记录。 |
+| 4. Shadow | `hypertest runtime promote current --by <name> --reason "…"` | candidate → shadow：需要最新的 `engine_contract` 与 `compatibility` 结果，且均为已绑定的通过。shadow 发布不创建普通运行，只镜像生产运行（下一步）。 |
+| 5. 生产回放 | 在 shadow 安装上：`hypertest runtime shadow [<runId> …] --by ci:<pipeline>`，然后执行 `hypertest runtime record-suite current --kind production_replay --from-shadow --by ci:<pipeline>` | `shadow` 在本发布上重新运行 active 发布已结束的运行（指定的运行，否则按 `runtime.shadow: {percentage, labels}` 选择；其他发布的运行会被拒绝——参照的是生产的决策），每个外部副作用都**空跑**——记录为 `not_applied: dry_run`，从不派发——并把结果、裁决、违反/未知准则与人工评审与生产决策比较。至少有 `runtime.shadow.minRuns`（默认 1）个镜像运行且**没有任何**分歧时生产回放才通过；汇总会根据已记录的比较重新计数。 |
+| 6. Canary | `hypertest runtime promote current --by <name> --reason "…" --canary-percent 10 [--canary-label key=value …]` | shadow → canary：还需要生产回放。进入 canary 需要选择条件：新运行 id 的比例和/或标签（`hypertest run --label key=value`）。最多一个 canary。 |
+| 7. 发布门禁 | `hypertest eval run core --arms deployment [--trials 5] --out core.json`，然后执行 `hypertest runtime record-suite current --kind release_gate --from-eval core.json --baseline packages/eval/baselines/core-scripted-multi-llm.json [--baseline-arm scripted-multi-llm --candidate-arm deployment] [--max-critical-false-release r] [--bridge <bridge.json>] --by ci:<pipeline>` | **核心**套件（其他套件 id 会被拒绝；名为 core 但不是当前修订与内容的内置核心套件的结果同样会被拒绝）相对已提交基线的评测发布门禁，且每个候选试验都运行在本清单之下。与自身比较的候选（同一文件，或运行在本发布之下的基线）会被拒绝。`Release eval` 工作流（`.github/workflows/release-eval.yml`，手动触发）会针对带真实路由的部署配置执行这一步。 |
+| 8. 激活 | `hypertest runtime promote current --by <name> --reason "…"` | canary → active：还需要发布门禁。active 指针移动；上一个 active 发布变为 `retiring`（其存活运行继续在其上运行），当没有存活运行固定在它上面时退役（`runtime list` 与 `promote` 会让已排空的发布退役）。 |
+
+每次晋级都会重新检查该阶段所需每类结果中的**最新**一条；早先类别的后续失败结果会阻止之后的每一步。阶段门禁之前记录的
+结果（`replay`）不计入。
 
 `hypertest runtime list` 显示每个发布的状态、active 指针、canary 比例及其存活运行；`hypertest runtime show <manifestId>`
 显示一个清单及其已记录的套件结果。使用 Temporal 时，请保留仍有存活运行的每个发布的 worker：每个清单轮询自己的任务队列。
@@ -313,21 +323,30 @@ active 发布回滚到上一个 active 发布（该发布必须仍已注册且�
 
 ```bash
 hypertest runtime migrate <runId> --to <manifestId>|current --by <name> --reason "…" [--checkpoint-timeout-ms n]
-hypertest resume            # 在目标运行时上执行：迁移本身从不驱动运行
+hypertest resume <runId>    # 在目标运行时上执行：接管已迁移的运行（迁移本身从不驱动运行）
 ```
 
 迁移会为运行建立检查点（进行中的回合交还 claim；默认等待 90 秒），生成规范快照并对账其操作（有未结算操作或有工作项
 在等待时拒绝）。然后检查兼容性：目标为 active 或 canary，schema 相同或被允许的迁移覆盖，运行用过的引擎都已固定，
-协议相同。一个事务中记录 RuntimeEpoch 与 `run.migrated`，重新固定运行并恢复它。被拒绝的迁移不会改变运行。也可以用
+协议相同。一个事务中记录 RuntimeEpoch 与 `run.migrated`，重新固定运行并恢复它。被拒绝的迁移不会改变运行。只在等待模型暂停
+（`model:<agent>`，提供方不可用）的工作项不持有回合也没有副作用：它可以迁移，其暂停会延续到新纪元
+（`carriedModelPauses`）；等待操作、子任务或审批的工作项会拒绝迁移，直到其结算。也可以用
 `hypertest cancel <runId> --reason "…"` 取消运行。
+
+目标上的 `resume` 会验证接管：它等待目标的持久循环真正驱动该运行（`run.migration_driven`）。使用 Temporal 时，该运行的
+旧工作流可能仍在**源**清单的任务队列上打开（此时 `startRun` 只是静默的空操作）：它会被唤醒，使其下一次 tick 在固定
+检查处被拒绝而结束；若源运行时已没有 worker，目标会用一个只拒绝该运行的交接 worker 短暂服务该队列。若 30 秒内没有完成
+接管，`resume` 会失败（`unavailable`）并给出补救办法（例如 `temporal workflow terminate --workflow-id run-<runId>`）——
+它绝不会把无人驱动的运行报告为已恢复。不带运行 id 的 `hypertest resume` 与 `hypertest serve`（二者会恢复该运行时的所有
+未完成运行）以同样方式接管迁移来的运行；未能完成接管的迁移运行不会计入已恢复的运行，并会输出一条给出补救办法的警告。
 
 如果迁移进程在检查点与重新固定之间退出，运行会保持 `migrating` 暂停状态且无法恢复。
 `hypertest runtime migrate <runId> --abort --by <name> --reason "…"` 会释放检查点（`run.migration_released`），运行在其
 仍固定的运行时上继续（已回滚发布的运行则会被隔离）。
 
-限制：套件结果由记录者证明，且 `promote` 接受任何通过的回放套件，因此请让发布流水线记录核心套件。迁移已在本地持久
-运行时上验证，未在真实 Temporal 服务上验证（使用 Temporal 时，源工作流会在下一次 tick 时失败，目标运行时上的
-`resume` 会在目标任务队列上启动该运行的工作流）。
+限制：`engine_contract` 的证明（`--passed --report`）由记录者担保（保留其报告摘要）；其他各类结果都绑定到注册表会检查的
+证据（试验清单、shadow 比较、门禁摘要）。迁移及其接管已在本地持久运行时以及真实 Temporal 服务上验证（源 worker 仍在运行；
+源运行时已不存在）。
 
 ### 5.4 非受管升级与数据库迁移
 
@@ -340,6 +359,25 @@ hypertest resume            # 在目标运行时上执行：迁移本身从不�
 
 回滚即重新部署旧的代码与配置；相同内容得到相同的清单 id，因此旧运行时可以再次驱动它的运行。两种模式下数据库迁移都
 只能向前（没有回退迁移），并且必须与仍在运行的发布兼容（先扩展，再收缩）：请先在数据库副本上演练回滚。
+
+### 5.5 评测运行时（`hypertest eval`）
+
+| 需求 | 命令 |
+|---|---|
+| 分层 | `eval run --tier pr-smoke`（快速子集 ×1，每次变更）· `--tier release-core`（核心 ×5）· `--tier deep`（全部 ×5）· `--tier failure-recovery`（混沌 ×10，子进程真实 SIGKILL）；`--trials`、`--mode` 或显式套件会覆盖分层设置 |
+| 本部署的配置 | `--arms deployment`（整个配置文件；试验运行在其清单之下，且只针对任务的夹具：部署自身的 `environments` 与 `tools.httpAllowlist` 目标——不属于清单——会被排除）· `--arms config`（只用其模型与角色策略） |
+| 受控因果臂（固定模型，只改变 harness） | `--arms h0-single-agent,h1-subagents,…,h6-full`（仅限评测试验实例：关闭子系统的部署配置会被拒绝） |
+| 产品基线 | `--arms engine-pi,engine-dsh`（相同模型，不同 agent 引擎）· 外部 agent：`--arm-file arms.json --arms claude-code`，文件形如 `{"arms":[{"armId":"claude-code","external":{"command":"claude","args":["-p","{goal}","--report","{report}"],"envPassthrough":["ANTHROPIC_API_KEY"]}}]}`（只按其报告的结果评分；其声明不算证据） |
+| 提供方类别 | `--arms three-provider-classes`（anthropic、openai-compatible 与 pi-ai 适配器经脚本化线协议传输；进程内；需按名称显式选择——不带 `--arms` 时只使用能在该模式下运行的普通模型臂：脚本化 multi/single，配置后另含 live） |
+| 私有 / 公共层 | `--suite-dir <dir>`（`*.suite.json` / `*.suite.mjs`：你的历史缺陷与发布规则；按内容版本化；私有套件不得复用内置套件 id）· `eval run sanity --dataset swe.jsonl --repos <本地镜像>`（SWE-bench 风格；从不下载） |
+| 学习轨道 | 试验默认是**冷**的（长期记忆不跨试验；共享记忆后端会被拒绝）。`--track learning --experience items.json` 只注入已批准/已发布的经验 |
+| 独立评审模型 | `--judge scripted`（已校准的 CI 评审）或 `--judge config [--judge-route r]`（你配置中的路由）；`--judge-packets <dir>` 保存其看到的内容；`eval calibrate [--set file]` 计算一致率与 kappa（未校准时退出码 1：其结果从不计入）；`eval calibrate label --set file --packet p --label pass|fail|unknown --by <name>` 添加人工标注（在 Hypertest 沙箱内会被拒绝） |
+| 取消 | Ctrl-C（退出码 130）或 `--timeout <ms>`（退出码 1）：正在运行的试验被取消，部分结果仍写入 `--out` 并标记为 `cancelled`——它从不参与任何门禁 |
+| 发布门禁 | `eval gate --baseline b.json --candidate c.json [--max-critical-false-release r] [--bridge bridge.json]`：关键误放行不变差且其比率在产品 SLO 之内（默认 0），缺陷召回不显著下降且不丢失基线总能发现的缺陷，安全违规为 0，重复副作用为 0，证据完整性 100%，结果可比 |
+| 评分器变化 | `eval bridge core --grader <id>@<旧修订> --out bridge.json` 用保留的旧修订对相同试验评分；`eval gate --bridge bridge.json` 只在没有断层时接受该变化——否则重新建立基线 |
+
+套件修订固定到其内容（`packages/eval/suites.lock.json`：任务、brains、fixtures）：在旧修订下改变内容会使测试失败；请提升
+修订并重新建立基线。已提交核心基线的重建过程记录在 `packages/eval/baselines/README.md` 中。
 
 ## 6. 可观测性
 

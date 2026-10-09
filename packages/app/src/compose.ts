@@ -809,7 +809,11 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
     // its agents probe it — by URL or by id — under their env/** grant (every process derives the same set from the config)
     const configuredEnvironments = [
       ...operatorEnvironments,
-      ...urlTargetEnvironments(config.tools?.httpAllowlist, operatorEnvironments, config.tools?.urlEnvironmentClass !== undefined ? { remoteClass: config.tools.urlEnvironmentClass } : {}),
+      ...urlTargetEnvironments(config.tools?.httpAllowlist, operatorEnvironments, {
+        ...(config.tools?.urlEnvironmentClass !== undefined ? { remoteClass: config.tools.urlEnvironmentClass } : {}),
+        // (review) a remote URL is never classified by default (the class decides what agents may do there)
+        onUnclassified: (entry) => logger.warn('tools.httpAllowlist: a non-loopback URL is not a black-box environment until tools.urlEnvironmentClass names its class (it cannot be targeted with --url)', { entry }),
+      }),
     ];
     // H12: workers sharing one PostgreSQL store share the generations (and bumps by operation) in SQL — a worker never
     // validates freshness against a generation another worker already bumped; the embedded store keeps its state file
@@ -1309,6 +1313,7 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
         const resumed: string[] = [];
         const foreign: Array<{ runId: string; runtimeManifestId: string }> = [];
         const quarantined: string[] = [];
+        const undriven: Array<{ runId: string; problem: string }> = [];
         for (const run of resumable) {
           if (run.runtimeManifestId !== manifest.manifestId) {
             foreign.push({ runId: run.runId, runtimeManifestId: run.runtimeManifestId });
@@ -1323,8 +1328,17 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
           // A[0]: an operator resume lets agents paused for model unavailability try their routes again now
           await control.releaseModelPauses?.(run.runId, 'operator:resume');
           await durable.startRun(run.runId);
+          // (F[1], review) a run migrated onto this runtime and not driven yet is taken over verifiably, as by `resume`:
+          // on Temporal its previous workflow may still be open on the source runtime's queue (startRun alone would be a
+          // silent no-op). A run that was not taken over is not reported as resumed (the warning names the remedy).
+          const drive = await releases.drive(run.runId);
+          if (drive.needed && !drive.driven) {
+            undriven.push({ runId: run.runId, problem: drive.problem ?? 'this runtime did not take the migrated run over' });
+            continue;
+          }
           resumed.push(run.runId);
         }
+        if (undriven.length > 0) logger.warn('runs migrated to this runtime were not taken over (not resumed)', { manifestId: manifest.manifestId, runs: undriven });
         if (foreign.length > 0) logger.warn('incomplete runs pinned to another runtime manifest are not resumed by this runtime (I11)', { manifestId: manifest.manifestId, runs: foreign });
         if (quarantined.length > 0) logger.warn('incomplete runs of this rolled-back runtime release are quarantined, not resumed', { manifestId: manifest.manifestId, runs: quarantined });
         if (resumed.length > 0) logger.info('resumed incomplete runs', { runs: resumed });
@@ -1433,6 +1447,10 @@ export async function createHypertest(input: HypertestConfig, overrides: Hyperte
         const releasedNow = (await control.releaseModelPauses?.(runId, 'operator:resume')) ?? [];
         const releasedPauses = [...new Set([...waitingBefore, ...releasedNow])].sort();
         await durable.startRun(runId);
+        // (F[1]) a run migrated onto this runtime and not driven yet is taken over verifiably (on Temporal its previous
+        // workflow may still be open on the source runtime's queue: startRun alone would be a silent no-op)
+        const drive = await releases.drive(runId);
+        if (drive.needed && !drive.driven) throw new HypertestError('unavailable', drive.problem ?? `run ${runId} was migrated here but this runtime did not take it over`, { details: { runId } });
         await wake(runId);
         return { releasedPauses };
       },

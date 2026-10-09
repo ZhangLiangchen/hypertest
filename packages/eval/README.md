@@ -438,6 +438,38 @@ Security violations, duplicate side effects and unpaired critical false releases
 that recorded them, infra errors included; a result holding one arm/task/trial twice is refused.
 `eval run --out <file>` persists the SuiteResult JSON the gate reads (and `hypertest runtime record-suite --from-eval`).
 
+## Wave 3 — release evaluation, causal and product arms, tiers, tracks (audit fixes)
+
+Each item has a failing-then-passing test (or a test that pins the new behaviour); see the test files named.
+
+| Area | What | Where | Tests |
+|---|---|---|---|
+| PoC C complete (F[4], coverage[9], coverage[10]) | `poc-c-anomaly`: kv-service with a seeded hot-key latency anomaly; the metrics analyst posts a performance finding citing metric evidence → the reactors (not the lead) create RCA and TestDesigner work; RCA, the metrics analysis and the executor run at the same time; RCA posts an evidence-backed hypothesis on the finding's lineage; the TestDesigner's targeted regression test (bound to the oracle assertion) fails on the anomaly; Hypertest is SIGKILLed after the load job is acknowledged | `suites/poc-c.ts` (`pocCAnomalyTask`, in `poc-c-durable-load`), `brains/poc-c-anomaly.ts`, graders `anomalyReaction`, `rcaMetricsExecutorParallel` | `test/poc-c-anomaly.e2e.test.ts` (and a run WITHOUT the flow fails both graders) |
+| Missing core suites (F[5], F[7]) | `api-ui-blackbox` (HTTP-only and real-browser black-box), `performance` (SLO pass; hot-key regression found, analysed, covered), `fault-tolerance` (controlled latency / error-rate faults through `env.inject_fault` + an invariant), `evidence` (tampered/deleted/rewritten evidence named by the independent verifier; missing critical evidence ⇒ inconclusive), `multi-agent` (delegation in parallel; convergence on one finding) | `suites/extended.ts`, `brains/extended.ts`, `extended-graders.ts` (`blackBoxOnly`, `uiEvidence`, `faultTolerance`, `tamperDetected`, `delegation`, `convergence`) | `test/extended-suites.e2e.test.ts`, `test/extended-graders.test.ts` |
+| Chaos cases (F[6]) | kill right after an external success; budget exhaustion (converges inconclusive, never pass); competing fault experiments (serialized by admission, each measurement under its own fault); unknown outcome on an unqueryable target (manual review, never re-sent, a scripted human operator resolves it) | `suites/extended.ts` (`chaos`), `TrialFixture.operator`, graders `budgetExhaustion`, `competingFaultsIsolated`, `unqueryableEscalated` | `test/chaos-suite.e2e.test.ts` |
+| Core suite (F[13]) | `core` (revision `core-2`) = the four core suites + the API black-box, Performance, FaultTolerance, Evidence (missing evidence), MultiAgent tasks and the chaos cases (19 tasks). Not in the gate suite: the browser task (needs Chromium) and the evidence-TAMPER task (its attack leaves a store that does not verify, which the gate's evidence criterion rightly fails) — both in their suites and `deep` | `suites/core.ts` | `npm run eval:gate`, `test/suite-versions.test.ts` (the committed baseline is the locked core suite and passes the gate against itself) |
+| Causal arms H0…H6 (F[8]) | the same scripted multi-LLM model; `harness.features` (`subagents`, `dynamicScheduler`, `blackboard`, `contextFreshness`, `oracleGovernance`) switched on cumulatively, honoured only for eval trial instances (`HypertestOverrides.evalTrial`), recorded per trial (`EvalTrial.harnessFeatures`) | `arms.ts` (`CAUSAL_ARMS`), `@hypertest/app` `harness-features.ts` | `test/arms.e2e.test.ts` (H2 without the blackboard loses the RCA/regression reaction; H0 lead alone never passes), `packages/app/test/harness-features.test.ts` |
+| Product arms (F[8]) | `engine-pi`, `engine-dsh` (same model and harness on another agent engine); external agents invoked as a command (`externalAgentArm`, CLI `--arm-file`), graded on their reported outcome only (their claims are no evidence) | `arms.ts`, `external.ts` | `test/arms.e2e.test.ts`, `packages/cli/test/eval-platform.test.ts` |
+| Three provider classes (item 6) | `three-provider-classes`: reason-a over the Anthropic adapter, fast-b over OpenAI-compatible, judge-c over pi-ai, all through the scripted WIRE transport (real HTTP formats, no request leaves the process); a scripted outage makes the router switch class mid-run; every exchange is logged and graded against L0 (`providerClassesAudited`) | `arms.ts`, `wire.ts` | `test/arms.e2e.test.ts`, `test/wire.test.ts` |
+| Layers (coverage[14]) | private suites from a directory (`loadSuiteDirectory`: `*.suite.json` declarative git-fixture tasks, `*.suite.mjs`), versioned by content; public sanity layer (`sanitySuite`: SWE-bench-style instances over local mirrors, a fixed and an unfixed variant each; never downloads) | `layers.ts` | `test/platform.test.ts`, CLI `--suite-dir` |
+| Statistics (F[9]) | `perArm.passAtK` / `passHatKByK` for k = 1, 3, 5 and the largest trial count (only tasks with ≥ k trials); the report's reliability table | `suite.ts` | `test/platform.test.ts` |
+| Metrics (F[10]) | `independentReproductionRate`, `confirmedDefects`, `costPerConfirmedDefectUsd`, `tokensPerConfirmedDefect`, `humanInterventions`, `recoveryCorrectness` (killed trials: decision, nothing unsettled, ledger = ground truth, no duplicate) | `metrics.ts` | `test/platform.test.ts` |
+| Judge (F[11], stubs[5]) | `configuredJudge(config, {routeIds})` over a configuration's routes, `recordingJudge` (packets for humans), `labelCalibrationItem` (a human label ⇒ a new set revision) | `judge-config.ts` | `test/platform.test.ts`, `packages/cli/test/eval-platform.test.ts` |
+| Versioning (F[12], item 18) | `suiteFingerprint` (task definitions + built-in brains/suites/fixtures), `suites.lock.json`; `EvalTrial.environmentImageDigest`; retained grader revisions (`retainedGrader('generatedTestsGoverned@1')`) for `eval bridge`; the gate accepts a grader change only through a bridge without discontinuity and refuses same-revision suites of different content | `suite-versions.ts`, `retained-graders.ts`, `release-gate.ts` | `test/suite-versions.test.ts`, `test/release-gate.test.ts` |
+| Gate (row 321, F[13]) | the critical-false-release product SLO (`maxCriticalFalseReleaseRate`, default 0); per-task defect regression (a defect the baseline always found and the candidate never did fails even without McNemar significance); cancelled results never gate | `release-gate.ts` | `test/release-gate.test.ts` |
+| Cancellation (F[14]) | a cancelled suite rejects `cancelled` with the PARTIAL result (`cancelled: true`; the cancelled trial marked) in `details.result` | `suite.ts`, `harness.ts` | `test/trial-controls.e2e.test.ts`, CLI tests |
+| Task controls (rows 310, 319) | `EvalTask.allowedTools` and `safetyConstraints` become deny rules of the trial's own policy (`withTaskConstraints`), recorded on the trial; `environmentImageDigest` / `fixtureFiles` | `task-constraints.ts`, `harness.ts` | `test/trial-controls.e2e.test.ts` |
+| Tiers and tracks (coverage[15], coverage[16]) | `EVAL_TIERS` (pr-smoke ×1, release-core ×5, deep ×5, failure-recovery ×10 child-process); `track: cold` (default; a memory backend outside the trial directory is refused) or `learning` (`experience`: approved/published items only are seeded) | `tiers.ts`, `task-constraints.ts` | `test/trial-controls.e2e.test.ts`, `packages/cli/test/eval-platform.test.ts` |
+
+Contract changes (additive): `EvalTask.allowedTools`, `safetyConstraints`, `environmentImageDigest`, `fixtureFiles`, `tiers`,
+`configure`; `TrialFixture.operator`, `afterRun`; `EvalArm.family`, `external`, `overrides`; `EvalTrial.cancelled`,
+`track`, `allowedTools`, `safetyConstraints`, `environmentImageDigest`, `harnessFeatures`, `suiteFingerprint`;
+`SuiteOptions.tier`; `HarnessOptions.track`, `experience`; `SuiteResult.perArm[].passAtK`, `passHatKByK`, `cancelled`,
+`tier`, `track`, `suiteFingerprint`; `ReleaseGateOptions.maxCriticalFalseReleaseRate`, `bridges`; check ids
+`critical_false_release_slo`, `defect_regression`; `ReleaseGateReport.bridgesUsed`; `bridgeCompare(…, {bridgeIsPrevious})`.
+Behaviour changes reflected in existing tests: the registry tests list the new graders and arms; `evaluateReleaseGate`
+refuses cancelled inputs; `allowedTools` denies every dynamic tool namespace (`mcp.*`, `acp.*`) and `plugin.*`.
+
 ## Scripted brains and the L1 prompt (context-learning)
 
 The L1 prompt now lists every agent's available tools (`## Available tools`), so a scripted brain must never dispatch on
@@ -454,8 +486,8 @@ agent's tool list contains — the restart item would otherwise start a second l
   the kill is reported as not exercised rather than carried over.
 - `evidenceIntegrity` seals the chain again while grading (a write to the trial's own store; custom graders running
   after it see that extra seal).
-- PoC C's "RCA: an anomaly automatically creates hypotheses/work" row needs an anomaly; the PoC C service is healthy
-  (expected `pass`), so the event-driven RCA loop is proven by PoC B (and PoC A), not PoC C.
+- (resolved in wave 3) PoC C's "RCA: an anomaly automatically creates hypotheses/work" row is exercised by
+  `poc-c-anomaly` (a seeded hot-key latency anomaly; graders `anomalyReaction`, `rcaMetricsExecutorParallel`).
 - The oracle `test_outcome` selectors are globs over recorded test case names (`*paginate*`, `*transfer conserves*`)
   rather than the bare words of the task description (a bare `paginate` would only match a case named exactly that).
 - With the multi arm, the gate still reports C6 (no independent approving review of the RUN) for PoC A/B — their
@@ -470,9 +502,9 @@ agent's tool list contains — the restart item would otherwise start a second l
 - (Part 3) The grader fingerprint covers the grader function and the shared analyses it declares
   (`GRADER_DEPENDENCIES`); module-private helpers of the grader modules are not part of it (a change there needs the same
   revision bump, by review).
-- (Part 3) The live LLM judge is configured through `createLlmJudge` (routes + providers from `@hypertest/model`); the CLI
-  offers only the scripted judge. The calibration set is small (14 labelled items for one rubric); its thresholds are a
-  product decision.
+- (Part 3, updated in wave 3) The CLI builds the judge from the configuration's routes (`--judge config`,
+  `configuredJudge`) or uses the scripted CI judge; the calibration set is small (14 labelled items for one rubric); its
+  thresholds are a product decision. A live judge's calibration needs live calls (validation phase).
 - (Part 3) The context-freshness brains coordinate through the observation log with a 60 s wait: on a host too slow for
   that, the scenario does not happen and the trial is `infra_error` (never a pass).
 - (Part 3) The committed expert labels (`calibration/verdict-consistency.json`, `labelledBy: human:qa-lead`) were
@@ -484,8 +516,24 @@ agent's tool list contains — the restart item would otherwise start a second l
   never counts: the agreement is not attributable to one model. Per-route calibration of a multi-route judge is not
   implemented (calibrate a single-route judge per model instead).
 - (Part 3) The committed release-gate baseline is the scripted arm's result: a new suite, grader or eval harness revision
-  needs a new baseline (regenerate it with `hypertest eval run core --arms scripted-multi-llm --out …` after the
-  bridge).
+  needs a new baseline — see `baselines/README.md` (the wave-3 re-baseline to `core-2`, with its bridge report).
+- (wave 3) The suite fingerprint covers ALL built-in brains, suites and fixtures (`SUITE_SOURCE_PATHS`), not the files a
+  given suite uses: any change there needs a revision bump of every built-in suite (and a new baseline). Coarse, but it
+  never lets a changed suite pass under its old revision.
+- (wave 3) Chaos-suite cases still outside the eval platform: a stale lease whose old worker resumes (the fence is proven
+  by `packages/control` and `packages/collab` tests, `stale_fence` / `lease_lost`), real NATS redelivery (eval trials use
+  the in-process bus's injected duplicates; NATS redelivery is proven by `packages/collab` integration tests) and a
+  Temporal activity retry (eval trials run on the local durable runtime; `packages/durable/test/temporal.int.test.ts`).
+- (wave 3) The fault-tolerance and chaos cases run real load jobs under real (time-boxed) faults, and their scripted
+  agents wait a bounded time (admission back-off, load completion within the tool call): on a heavily oversubscribed
+  host one of them can end `inconclusive` (observed once with two cores taken by runaway processes) — a failed trial,
+  never a pass. The committed baseline was produced on an unloaded host.
+- (wave 3) H5 and H6 have the same feature set (every subsystem on): H6 is the full product; they are separate arms so a
+  later feature lands between them without renaming. Under an ablated harness the scripted brains show what breaks
+  without a subsystem; a causal measurement of MODEL behaviour needs live models (the live arms).
+- (wave 3) External product arms (Claude Code, Codex, OpenHands through `--arm-file`) are exercised with a fake agent
+  command; live product runs need the products and their credentials (validation phase). The public sanity layer reads
+  a local SWE-bench-style dataset and local repository mirrors; the live dataset is not downloaded here.
 - Reviewer independence (agents `independentFromRoles`, control `PRODUCER_ROLES`) covers executor / test designer /
   RCA / fixer, not the metrics analyst or the environment operator whose claims and load evidence a PoC C reviewer
   judges; PoC C's reviewer is independent anyway (judge-c).

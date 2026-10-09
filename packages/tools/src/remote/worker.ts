@@ -5,8 +5,9 @@ import { tmpdir } from 'node:os';
 import { HypertestError, abortReason, noopLogger, type JsonValue, type Logger } from '@hypertest/core';
 import type { EvidenceRecord, Provenance } from '@hypertest/domain';
 import { MemoryArtifactStore } from '@hypertest/evidence';
-import type { ActionPermit } from '@hypertest/policy';
+import { matchesToolPattern, type ActionPermit } from '@hypertest/policy';
 import type { EnvironmentRegistry, SecretBroker, ToolContext, ToolOutcome, ToolSpec, WorkspaceHandle } from '../contracts.ts';
+import { callScopedSecrets } from '../whitebox/runtime.ts';
 
 /**
  * Remote tool workers (technology-selection §Tool Runtime "Remote Worker"): the BODY of a tool call executes in another
@@ -21,7 +22,8 @@ import type { EnvironmentRegistry, SecretBroker, ToolContext, ToolOutcome, ToolS
  *
  * Authentication: HMAC-SHA256 over `timestamp \n method \n path \n sha256(body)` with a shared secret (from a variable
  * the operator names; never configured inline), both directions — a request outside ±5 minutes, with a bad signature, or
- * a response whose signature does not verify is refused. Idempotency: the worker remembers each invocation's result (by
+ * a response whose signature does not verify is refused. (review) A response's signature also covers the digest of the
+ * request it answers (`responseSignature`): a genuine answer to one call can never be replayed as the answer to another. Idempotency: the worker remembers each invocation's result (by
  * invocation id and request digest): a resend (a durable retry) gets the recorded result and never executes twice; the
  * same invocation id with another request is a conflict. Only tools without a side-effect binding may be delegated (their
  * effect is the call itself; bound tools' adapters keep running here).
@@ -41,6 +43,14 @@ const DEFAULT_MAX_CACHED = 10_000;
 export function remoteSignature(secret: string, timestamp: string, method: string, path: string, body: string | Buffer): string {
   const digest = createHash('sha256').update(body).digest('hex');
   return `v1=${createHmac('sha256', secret).update(`${timestamp}\n${method.toUpperCase()}\n${path}\n${digest}`).digest('hex')}`;
+}
+
+/**
+ * (review) The signature of a worker's ANSWER: bound to the sha256 of the request it answers (`requestDigest`, `none` when
+ * the request body could not be read), so a captured genuine answer is never accepted for another call.
+ */
+export function responseSignature(secret: string, timestamp: string, requestDigest: string, body: string | Buffer): string {
+  return remoteSignature(secret, timestamp, 'RESPONSE', `${REMOTE_PROTOCOL_PATH}#${requestDigest}`, body);
 }
 
 /** Verifies a signature and its timestamp; the reason when it fails. */
@@ -150,10 +160,11 @@ export async function startRemoteToolWorker(options: RemoteToolWorkerOptions): P
   const max = options.maxCached ?? DEFAULT_MAX_CACHED;
   let executed = 0;
 
-  const send = (res: ServerResponse, status: number, payload: unknown) => {
+  // (review) every answer is signed together with the digest of the request it answers (never replayable for another call)
+  const send = (res: ServerResponse, status: number, payload: unknown, requestDigest = 'none') => {
     const body = JSON.stringify(payload);
     const ts = String(Date.now());
-    res.writeHead(status, { 'content-type': 'application/json', [TIMESTAMP_HEADER]: ts, [SIGNATURE_HEADER]: remoteSignature(options.secret, ts, 'RESPONSE', REMOTE_PROTOCOL_PATH, body), [WORKER_HEADER]: options.workerId });
+    res.writeHead(status, { 'content-type': 'application/json', [TIMESTAMP_HEADER]: ts, [SIGNATURE_HEADER]: responseSignature(options.secret, ts, requestDigest, body), [WORKER_HEADER]: options.workerId });
     res.end(body);
   };
 
@@ -188,7 +199,20 @@ export async function startRemoteToolWorker(options: RemoteToolWorkerOptions): P
       logger: logger.child({ toolId: request.toolId, invocationId: request.invocationId }),
       environments: options.environments,
     };
-    if (options.secrets) ctx.secrets = options.secrets;
+    if (options.secrets) {
+      // (review) as on the caller's side: the tool mints only the credentials its input declares (what the caller's
+      // capability and permit were checked against), narrowed by the permit's credentialScope — never the worker's whole
+      // broker — and only for this run and invocation
+      let declared: string[] = [];
+      try {
+        declared = spec.credentialScopes?.(request.input as never, { environments: options.environments }) ?? [];
+      } catch {
+        declared = [];
+      }
+      const permitted = request.permit.constraints?.credentialScope;
+      const authorized = declared.filter((c) => typeof c === 'string' && (permitted === undefined || permitted.some((p) => matchesToolPattern(p, c))));
+      ctx.secrets = callScopedSecrets(options.secrets, authorized, request.runId, request.invocationId);
+    }
     if (request.operationId !== undefined) ctx.operationId = request.operationId;
     if (request.experimentId !== undefined) ctx.experimentId = request.experimentId;
     let outcome: ToolOutcome;
@@ -225,38 +249,38 @@ export async function startRemoteToolWorker(options: RemoteToolWorkerOptions): P
         send(res, 413, { error: { code: 'invalid_argument', message: (e as Error).message } });
         return;
       }
+      const digest = createHash('sha256').update(body).digest('hex');
       const why = verifyRemoteSignature(options.secret, { timestamp: req.headers[TIMESTAMP_HEADER] as string | undefined, signature: req.headers[SIGNATURE_HEADER] as string | undefined }, 'POST', REMOTE_PROTOCOL_PATH, body);
       if (why !== undefined) {
         logger.warn('remote tool worker: refused an unauthenticated request', { reason: why });
-        send(res, 401, { error: { code: 'permission_denied', message: `unauthenticated: ${why}` } });
+        send(res, 401, { error: { code: 'permission_denied', message: `unauthenticated: ${why}` } }, digest);
         return;
       }
       let request: RemoteExecuteRequest;
       try {
         request = JSON.parse(body.toString('utf8')) as RemoteExecuteRequest;
       } catch {
-        send(res, 400, { error: { code: 'invalid_argument', message: 'malformed JSON' } });
+        send(res, 400, { error: { code: 'invalid_argument', message: 'malformed JSON' } }, digest);
         return;
       }
       if (typeof request?.toolId !== 'string' || typeof request.invocationId !== 'string' || typeof request.runId !== 'string' || !request.permit || typeof request.permit.decisionId !== 'string') {
-        send(res, 400, { error: { code: 'invalid_argument', message: 'malformed execute request' } });
+        send(res, 400, { error: { code: 'invalid_argument', message: 'malformed execute request' } }, digest);
         return;
       }
       if (!tools.has(request.toolId)) {
-        send(res, 404, { error: { code: 'not_found', message: `tool ${request.toolId} is not executed by worker ${options.workerId}` } });
+        send(res, 404, { error: { code: 'not_found', message: `tool ${request.toolId} is not executed by worker ${options.workerId}` } }, digest);
         return;
       }
-      const digest = createHash('sha256').update(body).digest('hex');
       const key = `${request.runId}\u0000${request.invocationId}`;
       const prior = done.get(key);
       if (prior) {
         if (prior.digest !== digest) {
-          send(res, 409, { error: { code: 'conflict', message: `invocation ${request.invocationId} was already executed with another request` } });
+          send(res, 409, { error: { code: 'conflict', message: `invocation ${request.invocationId} was already executed with another request` } }, digest);
           return;
         }
         // a resend of the same invocation: the recorded result, never a second execution (I4)
         const recorded = await prior.result;
-        send(res, 200, { ...recorded, replayed: true });
+        send(res, 200, { ...recorded, replayed: true }, digest);
         return;
       }
       const ac = new AbortController();
@@ -268,7 +292,7 @@ export async function startRemoteToolWorker(options: RemoteToolWorkerOptions): P
       const result = execute(request, ac.signal).finally(() => clearTimeout(timer));
       done.set(key, { digest, result });
       if (done.size > max) done.delete(done.keys().next().value!);
-      send(res, 200, await result);
+      send(res, 200, await result, digest);
     })().catch((e: unknown) => {
       logger.error('remote tool worker: request failed', { error: (e as Error).message });
       if (!res.headersSent) send(res, 500, { error: { code: 'internal', message: (e as Error).message } });
@@ -348,7 +372,9 @@ export function remoteToolSpec(local: ToolSpec, target: RemoteToolTarget): ToolS
         return { status: 'failed', error: { code: 'unavailable', message: `remote worker ${target.workerId} unreachable: ${(e as Error).message}` } };
       }
       const raw = Buffer.from(await res.arrayBuffer());
-      const why = verifyRemoteSignature(target.secret, { timestamp: res.headers.get(TIMESTAMP_HEADER) ?? undefined, signature: res.headers.get(SIGNATURE_HEADER) ?? undefined }, 'RESPONSE', REMOTE_PROTOCOL_PATH, raw);
+      // (review) the answer must be the worker's answer to THIS request (its signature covers the request digest)
+      const requestDigest = createHash('sha256').update(body).digest('hex');
+      const why = verifyRemoteSignature(target.secret, { timestamp: res.headers.get(TIMESTAMP_HEADER) ?? undefined, signature: res.headers.get(SIGNATURE_HEADER) ?? undefined }, 'RESPONSE', `${REMOTE_PROTOCOL_PATH}#${requestDigest}`, raw);
       if (why !== undefined) {
         // an answer we cannot authenticate is never trusted (its evidence could be forged)
         return { status: 'failed', error: { code: 'integrity_violation', message: `the answer of remote worker ${target.workerId} is not authentic: ${why}` } };

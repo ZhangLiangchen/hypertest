@@ -74,8 +74,10 @@ describe('registry', () => {
       assert.equal(resolveGrader(id).id, id);
     }
     assert.deepEqual(Object.keys(POC_GRADERS).sort(), [
-      'causalChain', 'contextIsolation', 'independentReview', 'insufficientDataNotPassed', 'loadJobReattached', 'modelFallback', 'noOrphanOperations', 'offloadBounded',
-      'pocAWorkflow', 'pocBWorkflow', 'pocCWorkflow', 'recoveryAudit', 'reportTracesToEvidence', 'singleLeaseOwner', 'testChangeGoverned',
+      // (F[4]) anomalyReaction and rcaMetricsExecutorParallel: the PoC C anomaly flow
+      'anomalyReaction', 'causalChain', 'contextIsolation', 'independentReview', 'insufficientDataNotPassed', 'loadJobReattached', 'modelFallback', 'noOrphanOperations',
+      'offloadBounded', 'pocAWorkflow', 'pocBWorkflow', 'pocCWorkflow', 'rcaMetricsExecutorParallel', 'recoveryAudit', 'reportTracesToEvidence', 'singleLeaseOwner',
+      'testChangeGoverned',
     ]);
   });
 });

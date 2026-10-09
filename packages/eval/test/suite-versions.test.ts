@@ -97,3 +97,19 @@ describe('suite fingerprints', () => {
     }
   });
 });
+
+describe('the committed core baseline (item 18)', () => {
+  test('it is the current core suite (revision, content fingerprint, tasks), every trial passed, and it passes the release gate against itself', async () => {
+    const { readFileSync } = await import('node:fs');
+    const baseline = JSON.parse(readFileSync(new URL('../baselines/core-scripted-multi-llm.json', import.meta.url), 'utf8')) as ev.SuiteResult;
+    const core = ev.coreSuite();
+    assert.equal(baseline.revision, core.revision, 'a new core revision needs a new baseline (baselines/README.md)');
+    assert.equal(baseline.suiteFingerprint, readSuiteLock().suites['core']!.fingerprint, 'the baseline was produced by the locked core suite content');
+    assert.deepEqual([...new Set(baseline.trials.map((t) => t.taskId))].sort(), core.tasks.map((t) => t.taskId).sort());
+    assert.deepEqual(baseline.trials.filter((t) => t.result !== 'pass').map((t) => t.taskId), []);
+    // a baseline that fails the gate against itself would fail every candidate (e.g. a task whose ground truth reads as a
+    // duplicate effect, or an attack that leaves an unverifiable store)
+    const report = ev.evaluateReleaseGate(baseline, baseline);
+    assert.deepEqual(report.checks.filter((c) => !c.pass).map((c) => `${c.checkId}: ${c.detail}`), []);
+  });
+});

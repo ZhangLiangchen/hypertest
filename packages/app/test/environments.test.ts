@@ -5,7 +5,8 @@ import { after, before, describe, test } from 'node:test';
 import { HypertestError, MemoryLogger } from '@hypertest/core';
 import { createEnvironmentRegistry, splitControlTarget, type EnvironmentDescriptor } from '@hypertest/tools';
 import { tempDir } from '@hypertest/testkit';
-import { persistentEnvironmentRegistry, resolveEnvironments, resolveUrlTarget } from '../src/index.ts';
+import { createHypertest, persistentEnvironmentRegistry, resolveEnvironments, resolveUrlTarget } from '../src/index.ts';
+import { roleRouter, scriptedConfig, testStore } from './helpers.ts';
 
 const env = (generation: number, extra: Partial<EnvironmentDescriptor> = {}): EnvironmentDescriptor => ({
   environmentId: 'shop', environmentClass: 'local', baseUrl: 'http://127.0.0.1:8080', generation, ...extra,
@@ -129,5 +130,44 @@ describe('(e2e[0]) URL run targets: resolveUrlTarget', () => {
     assert.throws(() => resolveUrlTarget({ sutUrl: 'http://127.0.0.1:7450', environmentId: 'shop' }, registry), (e: unknown) => e instanceof HypertestError && e.code === 'invalid_argument' && /not served by environment shop/.test(e.message));
     assert.throws(() => resolveUrlTarget({ sutUrl: 'ftp://127.0.0.1/x' }, registry), (e: unknown) => e instanceof HypertestError && e.code === 'invalid_argument');
     assert.throws(() => resolveUrlTarget({ sutUrl: 'not a url' }, registry), (e: unknown) => e instanceof HypertestError && e.code === 'invalid_argument');
+  });
+});
+
+describe('(review) remote URL targets on the production composition: never classified by default', () => {
+  let dir: Awaited<ReturnType<typeof tempDir>>;
+  before(async () => {
+    dir = await tempDir('ht-app-url-class-');
+  });
+  after(async () => {
+    await dir?.cleanup();
+  });
+
+  test('without tools.urlEnvironmentClass a non-loopback allowlisted URL is no environment (warned by entry) and --url to it is refused before any run', async () => {
+    const db = await testStore();
+    const logger = new MemoryLogger();
+    const base = scriptedConfig(join(dir.path, 'a'), { tools: { httpAllowlist: ['http://127.0.0.1:7450', 'https://api.example.test'] } } as never);
+    const ht = await createHypertest(db.store ? { ...base, store: db.store } : base, { scriptedBrains: { sim: roleRouter({}) }, logger });
+    try {
+      // a sandbox class here would let agents write and delete on that host without approval (default policy)
+      assert.deepEqual(ht.services.environments.list().map((e) => [e.environmentId, e.environmentClass]), [['url-127.0.0.1-7450', 'local']]);
+      assert.ok(logger.entries.some((e) => /urlEnvironmentClass/.test(e.msg) && e.fields?.['entry'] === 'https://api.example.test'), JSON.stringify(logger.entries.map((e) => e.msg)));
+      await assert.rejects(ht.run({ goal: 'probe', target: { sutUrl: 'https://api.example.test/v1' } }), (e: unknown) => e instanceof HypertestError && e.code === 'precondition_failed' && /tools\.urlEnvironmentClass/.test(e.message));
+      assert.deepEqual(await ht.listRuns(), [], 'no run was created');
+    } finally {
+      await ht.close();
+      await db.dispose();
+    }
+  });
+
+  test('with tools.urlEnvironmentClass the operator names the class of remote URL targets', async () => {
+    const db = await testStore();
+    const base = scriptedConfig(join(dir.path, 'b'), { tools: { httpAllowlist: ['https://api.example.test'], urlEnvironmentClass: 'staging' } } as never);
+    const ht = await createHypertest(db.store ? { ...base, store: db.store } : base, { scriptedBrains: { sim: roleRouter({}) }, logger: new MemoryLogger() });
+    try {
+      assert.deepEqual(ht.services.environments.list().map((e) => [e.environmentId, e.environmentClass]), [['url-api.example.test-443', 'staging']]);
+    } finally {
+      await ht.close();
+      await db.dispose();
+    }
   });
 });

@@ -143,6 +143,10 @@ function revisionsByTask(trials: readonly EvalTrial[], field: 'graderRevisions' 
 export function evaluateReleaseGate(baselineInput: SuiteResult, candidateInput: SuiteResult, options: ReleaseGateOptions = {}): ReleaseGateReport {
   const baseline = assertSuiteResult(baselineInput, 'the baseline');
   const candidate = assertSuiteResult(candidateInput, 'the candidate');
+  // (F[14]) a cancelled (partial) result holds only what ran before the cancellation: it never gates, as either side
+  for (const [what, r] of [['the baseline', baseline], ['the candidate', candidate]] as const) {
+    if (r.cancelled === true) throw invalid(`${what} is a CANCELLED (partial) suite result: it never gates a release`);
+  }
   const alpha = options.alpha ?? DEFAULT_ALPHA;
   if (!(typeof alpha === 'number' && alpha > 0 && alpha < 1)) throw invalid(`alpha must be in (0, 1), got ${String(alpha)}`);
   const { base, cand } = pickArms(baseline, candidate, options);

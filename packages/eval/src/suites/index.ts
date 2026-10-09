@@ -10,7 +10,7 @@ import { pocBTask } from './poc-b.ts';
 import { pocCAnomalyTask, pocCInsufficientTask, pocCTask, recoveryChaosTask } from './poc-c.ts';
 import { oracleRobustnessTask } from './robustness.ts';
 import { contextFreshnessTask, coreSuite, securityInjectionTask, testGenerationTask } from './core.ts';
-import { apiBlackboxTask, chaosBudgetExhaustionTask, chaosCompetingFaultsTask, chaosKillAfterSuccessTask, faultToleranceLatencyTask, uiBlackboxTask } from './extended.ts';
+import { apiBlackboxTask, chaosBudgetExhaustionTask, chaosCompetingFaultsTask, chaosKillAfterSuccessTask, evidenceTamperTask, faultToleranceLatencyTask, uiBlackboxTask } from './extended.ts';
 
 export function pocAWhiteboxSuite(): EvalSuite {
   return { suiteId: 'poc-a-whitebox', revision: POC_SUITE_REVISION, tasks: [pocATask()] };
@@ -56,10 +56,10 @@ export function prSmokeSuite(): EvalSuite {
   return { suiteId: 'pr-smoke', revision: TIER_SUITE_REVISION, tasks: [contextFreshnessTask(), securityInjectionTask(), testGenerationTask(), apiBlackboxTask(), faultToleranceLatencyTask()] };
 }
 
-/** (coverage[15]) Tier `deep`: every core task, every PoC task and the browser task (monthly / major architecture change). */
+/** (coverage[15]) Tier `deep`: every core task, every PoC task, the browser and the evidence-tamper tasks (monthly / major architecture change). */
 export function deepSuite(): EvalSuite {
   const seen = new Set<string>();
-  const tasks = [...coreSuite().tasks, uiBlackboxTask(), pocATask(), pocBTask(), pocCTask(), pocCInsufficientTask(), pocCAnomalyTask(), oracleRobustnessTask(), recoveryChaosTask()].filter((t) => !seen.has(t.taskId) && seen.add(t.taskId));
+  const tasks = [...coreSuite().tasks, uiBlackboxTask(), evidenceTamperTask(), pocATask(), pocBTask(), pocCTask(), pocCInsufficientTask(), pocCAnomalyTask(), oracleRobustnessTask(), recoveryChaosTask()].filter((t) => !seen.has(t.taskId) && seen.add(t.taskId));
   return { suiteId: 'deep', revision: TIER_SUITE_REVISION, tasks };
 }
 

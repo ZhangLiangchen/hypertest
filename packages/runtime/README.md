@@ -37,10 +37,25 @@ the real policy engine).
 
 Architecture-improvements §Runtime Manifest 与版本钉死 / §回滚与恢复. Every runtime manifest a deployment may run is a
 **release**: `candidate → shadow → canary → active → retiring → retired`, one audited step per `promote` (no skipping,
-no promotion out of `active`/`retiring`/`retired`). Every promotion requires the **latest** recorded result of BOTH
-compatibility suites of that manifest to be a pass: `engine_contract` (the AgentEngine ABI golden suite) and `replay`
-(a replay / golden eval suite id with its pass/fail record); a later failing result blocks the next step. A suite
-result claiming a pass over failed cases, or over zero cases (NOT RUN), is refused.
+no promotion out of `active`/`retiring`/`retired`). (F[0], wave 3) **Each step has its own gate**
+(`STAGE_REQUIREMENTS`, cumulative): the **latest** recorded result of every suite kind the target stage needs must be a
+pass BOUND to this manifest (`suiteBindingProblems`, `ACCEPTED_BINDINGS`):
+
+| target | needs | binding of a passing result |
+|---|---|---|
+| shadow | `engine_contract` + `compatibility` | engine contract: `executed` here (`manifestIds` = this one) or `attested` by CI (report digest required); compatibility: `eval_trials` — every trial of the eval SuiteResult ran under exactly this manifest |
+| canary | + `production_replay` | `shadow_comparisons`: the recorded shadow comparisons it names, re-counted at record time (total = comparisons, failed = diverged) |
+| active | + `release_gate` | `eval_gate`: suite id `core` only (`RELEASE_GATE_SUITE_ID`), candidate trials under this manifest, candidate and baseline digests (different: never gated against itself) |
+
+A later failing result of an earlier kind blocks every later step; a legacy `replay` row (recorded before the stage
+gates, migration `runtime/008-release-stages`) reads as an unbound compatibility result and counts for nothing. A suite
+result claiming a pass over failed cases, or over zero cases (NOT RUN), is refused; a passing one without its binding is
+refused at record time (`precondition_failed`). The promotion transition records the gate's kinds and result ids.
+- **Shadow** (F[0]): a shadow release admits only MIRRORED runs (`admit({ shadowOf })`, run label `hypertest.shadow_of`
+  = `SHADOW_OF_LABEL`) — also while no release is active yet (an unmanaged installation bootstrapping its first release),
+  and only a shadow release admits a mirrored run (managed or not); `recordShadowComparison` / `shadowComparisons` keep the comparison of each mirrored run with its
+  production run (append-only `ht_runtime_shadow_comparisons`; only while the release is `shadow`; a shadow mirrors runs
+  of ANOTHER release). The app layer dry-runs the mirrors' effects and compares the decisions.
 
 - **Active pointer** (`ht_runtime_release_pointer`, revisioned): names the release new TestRuns are created under and
   remembers the previous one. Promotion to active moves the previous active release to `retiring` (its runs continue on

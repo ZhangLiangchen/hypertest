@@ -646,6 +646,7 @@ export function suiteBindingProblems(input: Pick<RecordSuiteInput, 'manifestId' 
   if (b.kind === 'eval_gate') {
     if (input.suiteId !== RELEASE_GATE_SUITE_ID) problems.push(`the release gate runs the core eval: suite ${JSON.stringify(input.suiteId)} does not count (only ${RELEASE_GATE_SUITE_ID})`);
     for (const k of ['candidateDigest', 'baselineDigest'] as const) if (typeof b[k] !== 'string' || !/^[0-9a-f]{64}$/.test(b[k]!)) problems.push(`binding eval_gate needs ${k} (sha256 hex)`);
+    if (typeof b.candidateDigest === 'string' && b.candidateDigest === b.baselineDigest) problems.push('binding eval_gate: the candidate was gated against itself (baseline digest = candidate digest)');
   }
   return problems;
 }
@@ -1016,9 +1017,25 @@ export function createRuntimeReleaseRegistry(deps: RuntimeReleaseRegistryDeps): 
       const runId = requireText(input.runId, 'admit: runId');
       const cur = await pointer(db);
       const release = await load(db, manifestId);
+      // (F[0], review) a shadow release creates ONLY mirrored (dry-run) runs, whether or not a release is active yet: in an
+      // unmanaged installation (the bootstrap of the first release) it must not run production work either
+      if (release?.state === 'shadow' && !release.rolledBack) {
+        if (input.shadowOf !== undefined) return { allowed: true, mode: 'shadow', ...(cur ? { activeManifestId: cur.manifestId } : {}) };
+        return {
+          allowed: false, state: 'shadow', ...(cur ? { activeManifestId: cur.manifestId } : {}),
+          reason: `runtime ${short(manifestId)} is a shadow release: it creates only mirrored (dry-run) runs of production runs (hypertest runtime shadow)${cur ? `; new runs go to the active release ${short(cur.manifestId)}` : ''}`,
+        };
+      }
       if (!cur) {
         if (input.requireActive) {
           return { allowed: false, reason: 'no runtime release is active (runtime.requireActiveRelease): register this runtime, record its compatibility suites and promote it to active first' };
+        }
+        // (F[0], review) a mirrored run (dry-run effects) exists only on a shadow release (handled above), managed or not
+        if (input.shadowOf !== undefined) {
+          return {
+            allowed: false, ...(release ? { state: release.state } : {}),
+            reason: `runtime ${short(manifestId)} is ${release ? `a ${release.state}${release.rolledBack ? ' (rolled back)' : ''} release` : 'not a registered release'}: only a shadow release mirrors runs (run ${input.shadowOf})`,
+          };
         }
         // unmanaged (no release was ever activated): any runtime may create runs — except one that was rolled back/retired
         if (release && (release.rolledBack || release.state === 'retired')) {

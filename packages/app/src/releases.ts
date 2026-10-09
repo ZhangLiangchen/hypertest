@@ -116,7 +116,7 @@ export function agentClassification(deps: { controlStore: Pick<ControlStore, 'ag
  * The control plane new runs are created through: a run that does not exist yet is admitted by the runtime release
  * registry first — created only under the ACTIVE release, or a canary whose selection picks it (unmanaged installations,
  * where no release was ever activated, admit any runtime except a rolled-back one; `runtime.requireActiveRelease` makes
- * them refuse too). A refused start is `precondition_failed` and creates nothing. `resumeRun` of a run paused
+ * them refuse too). A shadow release creates only mirrored (dry-run) runs, in an unmanaged installation too. A refused start is `precondition_failed` and creates nothing. `resumeRun` of a run paused
  * `quarantined` (its release was rolled back) or `migrating` (an explicit migration holds its checkpoint) is refused:
  * such a run continues only through `hypertest runtime migrate` (or is cancelled).
  */
@@ -400,6 +400,19 @@ export function evalTrialManifests(result: unknown): { manifestIds: string[]; un
   return { manifestIds: [...manifestIds].sort(), unbound };
 }
 
+/**
+ * (F[14], review) Refuses a CANCELLED eval SuiteResult (`cancelled: true`, or a trial marked cancelled): it is the partial
+ * result of an interrupted evaluation (`eval run` keeps it, marked) and never certifies or gates a release.
+ */
+function refuseCancelled(doc: { cancelled?: unknown; trials?: unknown }, what: string): void {
+  const cancelledTrials = Array.isArray(doc.trials) ? doc.trials.filter((t) => (t as { cancelled?: unknown } | null)?.cancelled === true).length : 0;
+  if (doc.cancelled === true || cancelledTrials > 0) {
+    throw new HypertestError('precondition_failed', `${what} is a CANCELLED (partial) eval suite result${cancelledTrials > 0 ? ` (${cancelledTrials} cancelled trial(s))` : ''}: it never certifies a release — run the suite to completion`, {
+      details: { cancelled: true, cancelledTrials },
+    });
+  }
+}
+
 // ------------------------------------------------------------------------------------------------ release service
 
 const SETTLED_OPERATIONS: ReadonlySet<OperationStatus> = new Set(['verified', 'not_applied', 'compensated', 'failed']);
@@ -655,6 +668,19 @@ export function createReleaseService(deps: ReleaseServiceDeps): RuntimeReleaseSe
         await events.append([eventFrom(ctx, 'run.migration_driven', 'run', runId, { runId, epochId: last.epochId, seq: last.seq, manifestId: deps.manifest.manifestId })], tx);
         return true;
       });
+    },
+
+    async drive(runId, input = {}) {
+      if (typeof runId !== 'string' || runId === '') throw new HypertestError('invalid_argument', 'drive: runId is required');
+      const last = (await registry.epochs(runId)).at(-1);
+      if (!last || last.toManifestId !== deps.manifest.manifestId) return { needed: false, driven: false };
+      if (await drivenEvent(runId, last.epochId)) return { needed: false, driven: true };
+      const run = await runs.get(runId);
+      if (!run || isTerminalRun(run.status) || run.runtimeManifestId !== deps.manifest.manifestId) return { needed: false, driven: false };
+      const timeoutMs = input.timeoutMs ?? deps.driveTimeoutMs ?? DEFAULT_DRIVE_TIMEOUT_MS;
+      const d = await driveMigrated(runId, last, last.fromManifestId, timeoutMs, input.signal ?? new AbortController().signal);
+      if (d.problem) logger.warn('the migrated run is not driven by this runtime yet', { runId, problem: d.problem });
+      return { needed: true, driven: d.driven, ...(d.problem ? { problem: d.problem } : {}) };
     },
 
     async list() {
@@ -926,8 +952,11 @@ export function createReleaseService(deps: ReleaseServiceDeps): RuntimeReleaseSe
       const by = actorOf(input?.by, 'record-suite');
       const manifestId = await resolve(input.manifestId);
       if (input.kind !== 'compatibility') throw new HypertestError('invalid_argument', `recordEvalSuite: an eval SuiteResult records a compatibility result (the release gate: recordReleaseGate), not ${String(input.kind)}`);
-      const doc = input.result as { suiteId?: unknown; revision?: unknown; trials?: unknown } | null;
+      const doc = input.result as { suiteId?: unknown; revision?: unknown; trials?: unknown; cancelled?: unknown } | null;
       if (!doc || typeof doc.suiteId !== 'string' || !Array.isArray(doc.trials)) throw new HypertestError('invalid_argument', 'recordEvalSuite: not an eval suite result (suiteId, trials)');
+      // (F[14], review) a CANCELLED (partial) result holds only the trials that ran before the cancellation — all of them
+      // may have passed: it never certifies a release (as the release gate refuses it)
+      refuseCancelled(doc, 'the eval result');
       const trials = doc.trials as Array<{ result?: unknown }>;
       const failed = trials.filter((t) => t?.result !== 'pass').length;
       const { manifestIds, unbound } = evalTrialManifests(doc);
@@ -951,8 +980,11 @@ export function createReleaseService(deps: ReleaseServiceDeps): RuntimeReleaseSe
     async recordReleaseGate(input) {
       const by = actorOf(input?.by, 'record-suite');
       const manifestId = await resolve(input.manifestId);
-      const doc = input.candidate as { suiteId?: unknown; revision?: unknown; trials?: unknown } | null;
+      const doc = input.candidate as { suiteId?: unknown; revision?: unknown; trials?: unknown; cancelled?: unknown } | null;
       if (!doc || typeof doc.suiteId !== 'string' || !Array.isArray(doc.trials)) throw new HypertestError('invalid_argument', 'recordReleaseGate: the candidate is not an eval suite result (suiteId, trials)');
+      // (F[14], review) neither side of a release gate is a cancelled (partial) result
+      refuseCancelled(doc, 'the core eval candidate');
+      if (input.baseline !== undefined && input.baseline !== null && typeof input.baseline === 'object') refuseCancelled(input.baseline as { cancelled?: unknown; trials?: unknown }, 'the baseline');
       // F[13]: every runtime release runs the CORE eval — no other suite opens canary → active
       if (doc.suiteId !== RELEASE_GATE_SUITE_ID) {
         throw new HypertestError('precondition_failed', `the release gate runs the core eval: candidate suite ${JSON.stringify(doc.suiteId)} does not count (eval run ${RELEASE_GATE_SUITE_ID} …)`, { details: { suiteId: doc.suiteId } });
@@ -967,6 +999,16 @@ export function createReleaseService(deps: ReleaseServiceDeps): RuntimeReleaseSe
       }
       for (const [k, v] of [['candidateDigest', input.candidateDigest], ['baselineDigest', input.baselineDigest]] as const) {
         if (typeof v !== 'string' || !/^[0-9a-f]{64}$/.test(v)) throw new HypertestError('invalid_argument', `recordReleaseGate: ${k} must be a sha256 hex digest`);
+      }
+      // a release is never gated against itself: not the same file, and not a baseline that ran under this release
+      if (input.candidateDigest === input.baselineDigest) {
+        throw new HypertestError('precondition_failed', 'the release gate compared the candidate with itself (baseline digest = candidate digest): gate against the committed baseline', { details: { manifestId } });
+      }
+      if (input.baseline !== undefined) {
+        const base = evalTrialManifests(input.baseline);
+        if (base.manifestIds.includes(manifestId)) {
+          throw new HypertestError('precondition_failed', `the baseline ran under ${manifestId} itself: a release is gated against the baseline of another runtime (the committed baseline)`, { details: { manifestId } });
+        }
       }
       const trials = doc.trials as Array<{ result?: unknown }>;
       const failedTrials = trials.filter((t) => t?.result !== 'pass').length;
@@ -999,6 +1041,20 @@ export function createReleaseService(deps: ReleaseServiceDeps): RuntimeReleaseSe
       if (!isTerminalRun(source.status)) throw new HypertestError('precondition_failed', `run ${sourceRunId} is ${source.status}: mirror a finished production run (its decision is the reference)`, { details: { runId: sourceRunId, status: source.status } });
       const existing = (await registry.shadowComparisons(manifestId)).find((c) => c.sourceRunId === sourceRunId);
       if (existing) return { comparison: existing, shadowRunId: existing.shadowRunId, created: false };
+      // (review) the reference decision is PRODUCTION's: a run of the active release (an unmanaged installation, with no
+      // active release yet, has only production runs — but never one of a rolled-back or retired release)
+      const pointer = await registry.activePointer();
+      if (pointer && source.runtimeManifestId !== pointer.manifestId) {
+        throw new HypertestError('precondition_failed', `run ${sourceRunId} ran under ${source.runtimeManifestId}, not under the active release ${pointer.manifestId}: a shadow is compared with the decisions of the active release`, {
+          details: { runId: sourceRunId, runtimeManifestId: source.runtimeManifestId, activeManifestId: pointer.manifestId },
+        });
+      }
+      const sourceRelease = pointer ? undefined : await registry.get(source.runtimeManifestId);
+      if (sourceRelease && (sourceRelease.rolledBack || sourceRelease.state === 'retired')) {
+        throw new HypertestError('precondition_failed', `run ${sourceRunId} ran under the ${sourceRelease.rolledBack ? 'rolled-back' : 'retired'} release ${source.runtimeManifestId}: its decision is no production reference`, {
+          details: { runId: sourceRunId, runtimeManifestId: source.runtimeManifestId },
+        });
+      }
       const id = shadowRunId(sourceRunId, manifestId);
       let shadow = await runs.get(id);
       if (!shadow) {

@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HypertestError } from '@hypertest/core';
 import { pidState } from './common.ts';
-import { runRevert, type FaultJobSpec, type FaultJobState, type FaultRevertCommand } from './fault-worker.ts';
+import { runRevert, settleDeadline, type FaultJobSpec, type FaultJobState, type FaultRevertCommand } from './fault-worker.ts';
 
 /**
  * Container and cluster fault injection (env.inject_fault on docker / kubectl environments): what each fault kind applies
@@ -141,7 +141,7 @@ function readJson<T>(path: string): T | undefined {
 /** What the adapter knows of a fault operation (from its job directory). */
 export type FaultJobView =
   | { state: 'absent' }
-  | { state: 'dispatching'; spec: FaultJobSpec }
+  | { state: 'dispatching'; spec: FaultJobSpec; abandoned?: boolean }
   | { state: 'not_applied'; reason: string }
   | { state: 'active'; spec: FaultJobSpec }
   | { state: 'reverted' | 'revert_failed'; spec: FaultJobSpec; outcome: FaultJobState };
@@ -154,7 +154,9 @@ export function readFaultJob(stateDir: string, operationId: string): FaultJobVie
   if (notApplied) return { state: 'not_applied', reason: notApplied.reason };
   const outcome = readJson<FaultJobState>(join(dir, 'state.json'));
   if (outcome) return { state: outcome.state, spec, outcome };
-  if (!existsSync(join(dir, 'applied.json'))) return { state: 'dispatching', spec };
+  // (review) no apply outcome: an apply in flight, one whose applier died, or one it abandoned (timeout / abort) — the fault
+  // may be in place either way
+  if (!existsSync(join(dir, 'applied.json'))) return existsSync(join(dir, 'abandoned.json')) ? { state: 'dispatching', spec, abandoned: true } : { state: 'dispatching', spec };
   return { state: 'active', spec };
 }
 
@@ -170,8 +172,15 @@ export function markFaultApplied(dir: string): void {
   writeAtomic(join(dir, 'applied.json'), { appliedAt: new Date().toISOString() });
 }
 
+/** (review) The applier gave up on the apply (timeout / abort): its outcome is unknown — the reverter ends the fault at expiry. */
+export function markFaultAbandoned(dir: string, reason: string): void {
+  writeAtomic(join(dir, 'abandoned.json'), { reason, at: new Date().toISOString() });
+}
+
 export function markFaultNotApplied(dir: string, reason: string): void {
   writeAtomic(join(dir, 'not-applied.json'), { reason });
+  // (review) wakes the reverter early: a definitively refused fault has nothing to revert
+  writeAtomic(join(dir, 'stop.json'), { reason: 'not applied' });
 }
 
 /** Starts the detached reverter that ends the fault at its expiry. */
@@ -201,9 +210,20 @@ export async function revertOverdue(stateDir: string, spec: FaultJobSpec): Promi
 }
 
 /**
+ * (review) True when a job's fault must be reverted by the adapter now: it is (or, without an apply outcome, may be) in
+ * place, its time box is over (for a job without an apply outcome: also its `settleBy`) and no reverter process holds it.
+ */
+export function overdueWithoutReverter(stateDir: string, view: FaultJobView): boolean {
+  if (view.state !== 'active' && view.state !== 'dispatching') return false;
+  const deadline = view.state === 'active' || (view.state === 'dispatching' && view.abandoned === true) ? Date.parse(view.spec.expiresAt) : settleDeadline(view.spec);
+  return deadline <= Date.now() && !reverterAlive(faultJobDir(stateDir, view.spec.operationId));
+}
+
+/**
  * The faults on `environmentId` that are not (known to be) reverted: an overdue fault whose reverter is gone is reverted
  * here first; what remains is `revert_failed` (the environment may still be faulted) or still `active` (inside its time
- * box). Adapters refuse further operations on an environment with a failed revert (its state is unknown).
+ * box — or (review) a job without an apply outcome: an apply in flight, or one whose applier died; it may be in place).
+ * Adapters refuse further operations on an environment with a failed revert (its state is unknown).
  */
 export async function unrevertedFaults(stateDir: string, environmentId: string): Promise<Array<{ operationId: string; kind: string; state: 'active' | 'revert_failed'; expiresAt: string; detail?: string }>> {
   let ids: string[];
@@ -220,15 +240,15 @@ export async function unrevertedFaults(stateDir: string, environmentId: string):
     } catch {
       continue;
     }
-    if (view.state !== 'active' && view.state !== 'revert_failed') continue;
+    if (view.state !== 'active' && view.state !== 'revert_failed' && view.state !== 'dispatching') continue;
     if (view.spec.environmentId !== environmentId) continue;
-    if (view.state === 'active' && Date.parse(view.spec.expiresAt) <= Date.now() && !reverterAlive(faultJobDir(stateDir, id))) {
+    if ((view.state === 'active' || view.state === 'dispatching') && overdueWithoutReverter(stateDir, view)) {
       const outcome = await revertOverdue(stateDir, view.spec);
       if (outcome.state === 'reverted') continue;
       view = { state: 'revert_failed', spec: view.spec, outcome };
     }
     const detail = view.state === 'revert_failed' ? view.outcome.results.filter((r) => r.exitCode !== 0).map((r) => `${r.argv.slice(1, 4).join(' ')}: ${r.stderr.trim().slice(0, 200)}`).join('; ') : undefined;
-    out.push({ operationId: id, kind: view.spec.kind, state: view.state === 'active' ? 'active' : 'revert_failed', expiresAt: view.spec.expiresAt, ...(detail !== undefined ? { detail } : {}) });
+    out.push({ operationId: id, kind: view.spec.kind, state: view.state === 'revert_failed' ? 'revert_failed' : 'active', expiresAt: view.spec.expiresAt, ...(detail !== undefined ? { detail } : {}) });
   }
   return out;
 }

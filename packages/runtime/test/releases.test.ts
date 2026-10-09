@@ -159,6 +159,7 @@ describe('runtime release registry (SQL)', () => {
       ['attestation without a report', { manifestId: mid, kind: 'engine_contract', suiteId: 'abi', passed: true, summary: { total: 42, failed: 0 }, binding: { kind: 'attested' }, by: 'ci' }, /needs the digest of the report/],
       ['release gate of another suite', { manifestId: mid, kind: 'release_gate', suiteId: 'poc-a-whitebox', passed: true, binding: { kind: 'eval_gate', manifestIds: [mid], candidateDigest: DIGEST, baselineDigest: DIGEST_B }, by: 'ci' }, /only core/],
       ['release gate without digests', { manifestId: mid, kind: 'release_gate', suiteId: 'core', passed: true, binding: { kind: 'eval_gate', manifestIds: [mid] }, by: 'ci' }, /needs candidateDigest/],
+      ['release gate against itself', { manifestId: mid, kind: 'release_gate', suiteId: 'core', passed: true, binding: { kind: 'eval_gate', manifestIds: [mid], candidateDigest: DIGEST, baselineDigest: DIGEST }, by: 'ci' }, /gated against itself/],
       ['replay without comparisons', { manifestId: mid, kind: 'production_replay', suiteId: 'shadow', passed: true, binding: { kind: 'shadow_comparisons', comparisonIds: [] }, by: 'ci' }, /must name the shadow comparisons/],
       ['replay naming unknown comparisons', { manifestId: mid, kind: 'production_replay', suiteId: 'shadow', passed: true, summary: { total: 1, failed: 0 }, binding: { kind: 'shadow_comparisons', comparisonIds: ['rsc_nope'] }, by: 'ci' }, /1 distinct ones exist|0 distinct ones exist/],
     ];
@@ -304,6 +305,28 @@ describe('runtime release registry (SQL)', () => {
     assert.match(!notSelected.allowed ? notSelected.reason : '', /is the canary and its selection \(labels canary=yes\) does not pick run run_1/);
     // the active release still takes every run (the canary is optional exposure)
     assert.equal((await reg.admit({ manifestId: a.manifestId, runId: 'run_2', labels: { canary: 'yes' } })).allowed, true);
+  });
+
+  test('(F[0], review) a shadow release creates only mirrored runs — also before any release is active (unmanaged bootstrap)', async () => {
+    const b = manifest('b');
+    await toShadow(b);
+    assert.equal(await reg.activePointer(), undefined, 'no release is active yet');
+    // before the fix the unmanaged branch admitted every runtime: the shadow release created ordinary (non-dry-run) runs
+    const plain = await reg.admit({ manifestId: b.manifestId, runId: 'run_plain' });
+    assert.deepEqual([plain.allowed, !plain.allowed && plain.state], [false, 'shadow']);
+    assert.match(!plain.allowed ? plain.reason : '', /is a shadow release: it creates only mirrored \(dry-run\) runs/);
+    // its mirrors (dry-run) are admitted; other runtimes of an unmanaged installation still run unmanaged
+    assert.deepEqual(await reg.admit({ manifestId: b.manifestId, runId: 'run_m', shadowOf: 'run_p' }), { allowed: true, mode: 'shadow' });
+    assert.deepEqual(await reg.admit({ manifestId: manifest('a').manifestId, runId: 'run_a' }), { allowed: true, mode: 'unmanaged' });
+    // … but no other runtime creates a MIRRORED (dry-run) run, unmanaged either: a run labelled hypertest.shadow_of on a
+    // candidate or an unregistered runtime would run with every external effect silently dry-run
+    const c = manifest('c');
+    await reg.register(c, { by: BY });
+    for (const m of [c.manifestId, manifest('a').manifestId]) {
+      const mirror = await reg.admit({ manifestId: m, runId: 'run_x', shadowOf: 'run_p' });
+      assert.equal(mirror.allowed, false, m);
+      assert.match(!mirror.allowed ? mirror.reason : '', /only a shadow release mirrors runs \(run run_p\)/);
+    }
   });
 
   test('canary percentage selection is a deterministic bucket of the run id', () => {
